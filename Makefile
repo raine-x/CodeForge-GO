@@ -1,0 +1,96 @@
+# CodeForge-Go 跨平台构建脚本
+# 所有目标均以 CGO_ENABLED=0 构建，产出纯静态单二进制。
+
+BINARY  := codeforge
+CMD     := ./cmd/agent
+LDFLAGS := -s -w
+GOFLAGS := -trimpath
+PYTHON  ?= python
+# 前端渲染器测试用；本机若 node 不在 PATH，可指定：
+#   make test-web NODE=C:/Users/26536/.workbuddy-ai/binaries/node/versions/22.22.2-2/node.exe
+NODE    ?= node
+
+# Windows 上产物带 .exe 后缀，与 cf.cmd / README 中的用法保持一致
+# （go build -o bin/codeforge 不会自动补 .exe，若不统一会出现
+#   bin/codeforge 与 bin/codeforge.exe 两个本机产物各自变旧的问题）。
+ifeq ($(OS),Windows_NT)
+BINEXT  := .exe
+KILL    := taskkill //F //IM $(BINARY).exe
+else
+BINEXT  :=
+KILL    := pkill -f $(BINARY)
+endif
+
+LOCALBIN := bin/$(BINARY)$(BINEXT)
+
+.PHONY: all build windows linux-amd64 linux-arm64 android-arm64 all-platforms \
+        run stop restart test test-go test-web test-llm test-e2e vet fmt clean
+
+all: build
+
+## 本机平台构建
+build:
+	CGO_ENABLED=0 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(LOCALBIN) $(CMD)
+
+## 构建并启动服务（自动读取 .env 与 config/local.yaml，Windows 下为 bin/codeforge.exe）
+##
+## 端口由全局配置 config/default.yaml 决定，不做自动换端口；
+## 端口被占用时请先 `make stop` 关闭旧实例，或改配置。
+## 另注：-config 与 .env 都相对当前工作目录解析，因此必须在项目根目录执行。
+run: build
+	./$(LOCALBIN) -config config
+
+## 停止正在运行的服务（端口被占用时先执行）
+stop:
+	-$(KILL)
+
+## 停止旧实例后重新构建并启动
+restart: stop build
+	./$(LOCALBIN) -config config
+
+## Windows x86_64
+windows:
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-windows-amd64.exe $(CMD)
+
+## Linux x86_64
+linux-amd64:
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-linux-amd64 $(CMD)
+
+## Linux arm64（树莓派 / 低配云主机）
+linux-arm64:
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-linux-arm64 $(CMD)
+
+## Android Termux arm64
+android-arm64:
+	CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-android-arm64 $(CMD)
+
+## 全部平台
+all-platforms: windows linux-amd64 linux-arm64 android-arm64
+
+## 全部测试（Go 单测 / 集成 + 前端渲染器 + LLM 端点 pytest）
+test: test-go test-web test-llm
+
+## Go 单元测试与集成测试
+test-go:
+	go test ./...
+
+## 前端 Markdown 渲染器回归测试（纯 Node，零依赖，无需浏览器；不消耗任何额度）
+test-web:
+	$(NODE) web/test/render_md.test.js
+
+## LLM 端点协议测试（pytest，读取 .env 中的 LLM_API_KEY）
+test-llm:
+	$(PYTHON) -m pytest tests/ -v
+
+## 真实 LLM 端到端测试（Agent 循环 + 工具调用 + HITL 审批）
+test-e2e:
+	CODEFORGE_E2E=1 go test ./pkg/server/ -run TestE2ELiveLLM -v -timeout 600s
+
+vet:
+	go vet ./...
+
+fmt:
+	gofmt -w .
+
+clean:
+	rm -rf bin

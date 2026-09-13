@@ -1,0 +1,65 @@
+# ============================================================== 构建产物
+/bin/
+*.exe
+*.test
+*.out
+
+# ============================================================== 运行时数据
+# 会话记录、审计日志、撤销快照 —— 由程序自动生成
+.codeforge/
+# 运行实例信息（含内部关闭令牌），供 codeforge stop / restart 使用
+config/codeforge.run
+
+# ============================================================== 密钥与本地配置
+# 严禁提交任何包含 API Key 的内容。
+# 下列文件均可自动生成（见 README「配置与密钥」一节）：
+#   config/local.yaml  → 首次启动自动生成模板；界面「设置」保存时写入密钥
+#   .env / tests/.env  → 由 .env.example 复制生成
+
+# --- 本地覆盖配置（可能含 API Key）
+config/local.yaml
+config/local.yml
+config/*.local.yaml
+config/*.local.yml
+# --- 模型库（设置页统一管理；明文 Key 只存服务端）
+config/models.yaml
+
+# --- 环境变量文件（密钥入口）
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# --- 按命名约定兜底的密钥文件
+*apikey*
+*api_key*
+*api-key*
+*secret*
+*credential*
+*credentials*
+!.gitignore
+!*.example
+!*.example.*
+
+# --- 密钥目录
+secrets/
+.secrets/
+.credentials/
+
+# ============================================================== 编辑器 / 系统
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ============================================================== Python（pytest）
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ============================================================== 临时文件
+*.tmp
+*.log

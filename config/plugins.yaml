@@ -1,0 +1,40 @@
+plugins:
+    - name: github_tools
+      type: mcp
+      enabled: false
+      description: GitHub 仓库操作工具（官方 MCP Server）
+      command: npx
+      args:
+        - -y
+        - '@modelcontextprotocol/server-github'
+      env:
+        GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN}
+      endpoint: ""
+      path: ""
+      security_policy:
+        requires_approval: false
+        allowed_actions: []
+    - name: sql_runner
+      type: http
+      enabled: false
+      description: 通过 HTTP Webhook 执行 SQL 查询
+      command: ""
+      args: []
+      env: {}
+      endpoint: http://127.0.0.1:9090/v1/tools/sql
+      path: ""
+      security_policy:
+        requires_approval: false
+        allowed_actions: []
+    - name: wasm_calc
+      type: wasm
+      enabled: false
+      description: WASM 沙盒中的轻量计算工具
+      command: ""
+      args: []
+      env: {}
+      endpoint: ""
+      path: ./plugins/calc.wasm
+      security_policy:
+        requires_approval: false
+        allowed_actions: []

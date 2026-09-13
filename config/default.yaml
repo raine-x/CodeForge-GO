@@ -1,0 +1,55 @@
+# CodeForge-Go 默认全局配置
+# 可被同目录 local.yaml 覆盖；API Key 建议通过环境变量注入。
+
+server:
+  host: "127.0.0.1"
+  # 监听端口：全局唯一来源（命令行不提供端口参数）。
+  # 程序不会自动换端口 —— 若端口被占用会直接报错退出，
+  # 请先 `make stop` 关闭旧实例，或修改此处端口。
+  port: 8420
+  auto_open: true          # 启动后自动拉起浏览器
+
+llm:
+  provider: "anthropic"    # anthropic | openai
+  base_url: ""             # 留空使用官方默认地址
+  api_key: ""              # 留空则回退到环境变量（CODEFORGE_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY）
+  model: "claude-sonnet-4-20250514"
+  max_tokens: 8192
+  temperature: 0.2
+  # 上游瞬时故障（429/500/502/503/504）自动指数退避重试；4xx 客户端错误不重试
+  max_attempts: 5          # 含首次请求在内的总尝试次数
+  retry_backoff_ms: 1500   # 首次退避间隔（毫秒），之后按 2 倍增长
+
+agent:
+  max_steps: 25            # ReAct 最大迭代步数
+  context_token_budget: 120000
+  system_prompt_file: ""   # 留空使用内置中文 System Prompt
+  work_dir: ""             # 留空使用当前工作目录
+
+security:
+  default_decision: "ask"  # allow | deny | ask
+  auto_approve_readonly: true
+  # 是否允许文件 / 命令工具访问工作区之外的路径。
+  # false（默认）：路径解析后必须落在 agent.work_dir 之内，否则直接拒绝。
+  # 只读工具是自动放行的，所以这里是防止「工作区外文件被静默读入上下文」的关键开关；
+  # 确实需要操作工作区外的文件时，在 config/local.yaml 里覆盖为 true。
+  allow_outside_workspace: false
+  # 危险命令内置黑名单会强制 Deny；下列正则为「追加」，不会覆盖内置规则
+  deny_patterns:
+    - "(?i)rm\\s+-rf\\s+/\\s*$"
+    - "(?i)mkfs(\\.[a-z0-9]+)?\\s"
+    - "(?i)format\\s+[a-z]:"
+    - "(?i)shutdown\\s+-[hr]"
+    - "(?i)dd\\s+if=.*of=/dev/"
+  rules:
+    - tools: ["read_file", "list_dir", "search_files"]
+      decision: "allow"
+    - tools: ["write_file", "edit_file", "delete_file", "run_command"]
+      decision: "ask"
+
+data_dir: ".codeforge"
+audit_log: ".codeforge/audit.jsonl"
+
+# 内置插件（进程内增强能力，可开关；缺省开启，写 false 关闭）
+builtin_plugins:
+  skill_creator: true      # Skill Creator：让 AI 动态创建/迭代工作区技能（SKILL.md）

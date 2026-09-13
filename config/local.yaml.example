@@ -1,0 +1,24 @@
+# CodeForge 本地覆盖配置模板
+#
+# 用法：复制为 config/local.yaml 后按需填写。
+#   cp config/local.yaml.example config/local.yaml
+#
+# 注意：config/local.yaml 已被 .gitignore 忽略（可能含 API Key）。
+# 程序首次启动时若发现 local.yaml 缺失，会自动生成一份同样内容的模板。
+
+# llm:
+#   provider: anthropic          # anthropic | openai | custom
+#   base_url: ""                 # 留空使用官方默认地址；custom 时填写 OpenAI 兼容端点
+#   api_key: "sk-..."            # 敏感信息，切勿提交到版本库
+#   model: "claude-sonnet-4-20250514"
+#   max_tokens: 8192
+#   temperature: 0.2
+
+# server:
+#   host: 127.0.0.1
+#   port: 8420
+#   auto_open: true
+
+# security:
+#   default_decision: ask        # allow | deny | ask
+#   auto_approve_readonly: true
