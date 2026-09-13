@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 
 	"codeforge/pkg/tools"
@@ -88,5 +89,20 @@ func TestScopesOverlapRules(t *testing.T) {
 	}
 	if scopesOverlap([]string{"partA"}, []string{"partA2"}) {
 		t.Error("partA 与 partA2 是 / 边界分隔的不同目录，不应判定重叠")
+	}
+}
+
+// TestTruncateTail 截尾保末：错误关键信息在末尾，截断必须保留结尾而非开头。
+func TestTruncateTail(t *testing.T) {
+	if got := truncateTail("short", 300); got != "short" {
+		t.Errorf("短文本不应截断: %q", got)
+	}
+	long := strings.Repeat("a", 400) + "ERROR-HERE"
+	got := truncateTail(long, 300)
+	if len(got) != 3+300 || !strings.HasSuffix(got, "ERROR-HERE") {
+		t.Errorf("截断必须保结尾: len=%d suffix-ok=%v", len(got), strings.HasSuffix(got, "ERROR-HERE"))
+	}
+	if truncateTail("  \n ok \t", 10) != "ok" {
+		t.Error("先 TrimSpace 再截断")
 	}
 }

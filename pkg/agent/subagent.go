@@ -79,19 +79,20 @@ func (r *SubagentRunner) runOne(ctx context.Context, task tools.SubagentTask) to
 				Detail: fmt.Sprintf("正在调用 %s", ev.ToolName)})
 		}
 	})
+	// 先算出 summary 再发终态事件：completed 事件要携带摘要给前端展示。
+	result.Summary = strings.TrimSpace(summary.String())
 	if err != nil {
 		result.Status = "failed"
 		result.Error = err.Error()
 		emitEvent(tools.SubagentEvent{ID: task.ID, Mode: task.Mode, Status: "failed",
 			Detail: "子任务失败", Summary: truncateTail(err.Error(), 300)})
-	} else {
-		emitEvent(tools.SubagentEvent{ID: task.ID, Mode: task.Mode, Status: "completed",
-			Detail: "子任务完成", Summary: truncateTail(result.Summary, 300)})
+		return result
 	}
-	result.Summary = strings.TrimSpace(summary.String())
-	if result.Summary == "" && result.Error == "" {
+	if result.Summary == "" {
 		result.Summary = "子智能体完成，但没有返回文本摘要"
 	}
+	emitEvent(tools.SubagentEvent{ID: task.ID, Mode: task.Mode, Status: "completed",
+		Detail: "子任务完成", Summary: truncateTail(result.Summary, 300)})
 	return result
 }
 
