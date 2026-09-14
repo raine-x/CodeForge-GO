@@ -92,6 +92,25 @@ func TestModelStoreSanitizedHidesPlainKey(t *testing.T) {
 	}
 }
 
+// TestModelStoreSanitizedKeepsContextWindows 上下文上限必须随脱敏视图下发。
+// 早前漏了 ctx_in/ctx_out，设置页表单只能显示前端写死的默认值（262144），
+// 用户改过也看不到回显；上下文进度条也依赖这里拿到「模型窗口」。
+func TestModelStoreSanitizedKeepsContextWindows(t *testing.T) {
+	s := newTestStore(t)
+	_ = s.Upsert(ModelEntry{ID: "m1", Protocol: "openai", CtxIn: 262144, CtxOut: 131072})
+
+	view := s.Sanitized()
+	if len(view) != 1 {
+		t.Fatalf("Sanitized 应返回 1 条，实际 %d", len(view))
+	}
+	if got := view[0]["ctx_in"]; got != 262144 {
+		t.Errorf("ctx_in = %v，期望 262144", got)
+	}
+	if got := view[0]["ctx_out"]; got != 131072 {
+		t.Errorf("ctx_out = %v，期望 131072", got)
+	}
+}
+
 func TestModelEntryDisplayName(t *testing.T) {
 	if (ModelEntry{ID: "a/b", Name: "别名"}).DisplayName() != "别名" {
 		t.Fatal("有 name 时应优先 name")
@@ -114,4 +133,35 @@ func TestNormalizeModelProtocol(t *testing.T) {
 	if NormalizeModelProtocol(" Custom ") != "openai" {
 		t.Fatal("历史 custom 应归一化为 openai（界面不再区分兼容网关）")
 	}
+}
+
+// 空路径 = 纯内存库：Save/Load 都必须是无害的空操作。
+//
+// 这条守卫防的是一类真实事故：调用方拿到空 configDir 后拼出相对路径 "models.yaml"，
+// 结果把文件写进进程的当前工作目录（曾在 pkg/server/ 里凭空出现 models.yaml）。
+func TestModelStoreEmptyPathStaysInMemory(t *testing.T) {
+	s := NewModelStore("")
+	if s.Path() != "" {
+		t.Fatalf("纯内存库 Path 期望空串，实际 %q", s.Path())
+	}
+	if err := s.Load(); err != nil {
+		t.Fatalf("纯内存库 Load 应无错，实际 %v", err)
+	}
+	if err := s.Upsert(ModelEntry{ID: "m1", Name: "内存模型", Protocol: "openai"}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if err := s.Save(); err != nil {
+		t.Fatalf("纯内存库 Save 应无错（不落盘），实际 %v", err)
+	}
+
+	// 条目仍在内存里可读，但不会在磁盘上留下任何痕迹。
+	if _, ok := s.Find("m1"); !ok {
+		t.Fatal("纯内存库应能读到刚写入的条目")
+	}
+	if got := s.Sanitized(); len(got) != 1 {
+		t.Fatalf("纯内存库应能导出 1 条脱敏条目，实际 %d", len(got))
+	}
+	// 注意：这里不能直接 Stat("models.yaml") —— config/ 目录下本就有一个
+	// 合法的模型库文件（config/models.yaml）。「不污染工作目录」的回归测试
+	// 放在 pkg/server（那里出现 models.yaml 才是异常）。
 }

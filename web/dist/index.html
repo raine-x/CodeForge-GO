@@ -34,6 +34,15 @@
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.09a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.09a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z"/></svg>
           <span>设置</span>
         </button>
+        <!-- 上下文占用进度条（底部栏右侧空位）：条宽 = 已用 token / 压缩预算，
+             点击向上弹出明细（模型窗口、已用、预算、占比、消息条数）。 -->
+        <div class="pop-anchor ctx-anchor">
+          <button type="button" id="ctx-meter" class="ctx-meter" title="上下文使用情况">
+            <span class="ctx-bar"><i id="ctx-fill" class="ctx-fill"></i></span>
+            <span id="ctx-pct" class="ctx-pct">—</span>
+          </button>
+          <div id="ctx-pop" class="popup ctx-pop hidden"></div>
+        </div>
       </div>
     </aside>
     <div id="drag-handle"><span class="grip"></span></div>
@@ -45,7 +54,13 @@
       <div id="composer-wrap">
         <div id="workspace-label"></div>
         <form id="composer">
-          <textarea id="input" rows="2" placeholder="随心输入"></textarea>
+          <!-- 输入框高亮镜像层：textarea 自身没法局部着色，于是垫一层排版参数完全一致的
+               文字层在它下面，只把 @提及 染成蓝色；textarea 的文字设为 transparent，
+               只留光标。两层必须严格重合，参数改动要同步（见 app.css 的 .input-mirror）。 -->
+          <div id="input-wrap" class="input-wrap">
+            <div id="input-mirror" class="input-mirror" aria-hidden="true"></div>
+            <textarea id="input" rows="2" placeholder="随心输入"></textarea>
+          </div>
           <div class="composer-bottom">
             <div class="bottom-left">
               <!-- ＋ → 上拉菜单：添加文件（Windows 用资源管理器，Linux/Termux 用内置选择器）/ Skills（右展已加载技能） -->
@@ -56,6 +71,9 @@
                 <div id="more-pop" class="popup hidden">
                   <button type="button" class="pop-opt more-item" id="more-add-file">
                     <span>添加文件</span><span class="more-arrow">›</span>
+                  </button>
+                  <button type="button" class="pop-opt more-item" id="more-browse-workspace">
+                    <span>当前目录的文件</span><span class="more-arrow">›</span>
                   </button>
                   <div class="pop-anchor">
                     <button type="button" class="pop-opt more-item" id="more-skills">
@@ -123,6 +141,10 @@
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1m0-12.8-2.1 2.1M7.7 16.3l-2.1 2.1"/><circle cx="12" cy="12" r="3.2"/></svg>
           <span>插件</span>
         </button>
+        <button class="nav-item" data-page="subagents">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="4.5" r="2.2"/><circle cx="5" cy="19" r="2.2"/><circle cx="19" cy="19" r="2.2"/><path d="M12 6.7v5.1M12 11.8 6.4 17.2M12 11.8l5.6 5.4"/></svg>
+          <span>子智能体</span>
+        </button>
         <button class="nav-item" data-page="mcp">
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="2.4"/><circle cx="19" cy="12" r="2.4"/><circle cx="12" cy="5" r="2.4"/><circle cx="12" cy="19" r="2.4"/><path d="M7.2 10.8 10.4 6.7M16.8 10.8 13.6 6.7M7.2 13.2l3.2 4.1M16.8 13.2l-3.2 4.1"/></svg>
           <span>MCP 服务</span>
@@ -153,6 +175,16 @@
                 <div class="row-desc">当前使用的大模型</div>
               </div>
               <span id="settings-model" class="row-value mono"></span>
+            </div>
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">系统通知<span class="tag-total">总开关</span></div>
+                <div class="row-desc">关闭后不再发送任何系统通知（任务完成 / 执行失败）。开启时也只在窗口切到后台（标签页不可见 / 最小化）才提醒，前台看着页面时不打扰</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="settings-notify">
+                <span class="switch-track"><span class="switch-knob"></span></span>
+              </label>
             </div>
           </div>
         </section>
@@ -198,6 +230,73 @@
             </div>
             <div id="builtin-items"></div>
           </div>
+        </section>
+
+        <!-- 子智能体：总开关 / 并发上限 / 能力限制 -->
+        <section id="page-subagents" class="settings-page">
+          <h2>子智能体</h2>
+          <div class="settings-card">
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">多智能体协作<span class="tag-total">总开关</span></div>
+                <div class="row-desc">允许主智能体把互不重叠的探索 / 实现任务并行委派给子智能体。关闭后该能力完全不可用（与「插件」页的内置插件开关同一项）</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="sub-enabled">
+                <span class="switch-track"><span class="switch-knob"></span></span>
+              </label>
+            </div>
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">并发上限</div>
+                <div class="row-desc">一次委派最多同时运行几个子智能体（上限 <span id="sub-max-cap">5</span>，只能调小）</div>
+              </div>
+              <div class="appear-slider">
+                <input type="range" id="sub-max" min="1" max="5" step="1">
+                <span id="sub-max-val" class="appear-val"></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-card" style="margin-top:16px">
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">能力限制</div>
+                <div class="row-desc">限制子智能体可用的工具。探索（explore）型子任务始终只读，不受这里影响；子智能体永远无法运行命令、加载插件或再次委派</div>
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">允许写入文件</div>
+                <div class="row-desc">关闭后所有子智能体一律只读：只能读取、列目录、搜索，改动交由主智能体执行</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="sub-allow-write">
+                <span class="switch-track"><span class="switch-knob"></span></span>
+              </label>
+            </div>
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">允许删除文件</div>
+                <div class="row-desc">关闭后子智能体只能写入 / 编辑，删除动作需要主智能体执行</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="sub-allow-delete">
+                <span class="switch-track"><span class="switch-knob"></span></span>
+              </label>
+            </div>
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">允许写入记忆</div>
+                <div class="row-desc">关闭后子智能体不能调用 save_memory 修改项目长期记忆</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="sub-allow-memory">
+                <span class="switch-track"><span class="switch-knob"></span></span>
+              </label>
+            </div>
+          </div>
+          <div id="subagents-result" class="settings-note"></div>
         </section>
 
         <section id="page-mcp" class="settings-page">
@@ -281,11 +380,11 @@
           </div>
         </section>
 
-        <!-- 模型管理：列表 / 配置 -->
+        <!-- 模型管理：列表 / 添加（列表的「编辑」复用同一表单，标题切为「编辑模型」） -->
         <section id="page-models" class="settings-page">
           <div class="models-tabs">
             <button type="button" class="models-tab active" data-mtab="list">模型列表</button>
-            <button type="button" class="models-tab" data-mtab="config">模型配置</button>
+            <button type="button" class="models-tab" data-mtab="config">添加模型</button>
           </div>
 
           <!-- 模型列表 -->
@@ -293,12 +392,18 @@
             <div id="model-items" class="settings-card model-items"></div>
           </div>
 
-          <!-- 模型配置 -->
+          <!-- 添加模型（编辑复用同款表单，仅标题切换） -->
           <div id="mtab-config" class="mtab-pane">
             <div class="settings-card">
+              <div id="mf-title" class="mf-title">添加模型</div>
               <div class="form-grid">
                 <label class="f-field"><span>显示名称</span><input id="mf-name" type="text" placeholder="界面显示的名称"></label>
-                <label class="f-field"><span>模型 id</span><input id="mf-id" type="text" placeholder="如 gpt-4o / claude-sonnet-4"></label>
+                <label class="f-field"><span>模型 id</span>
+                  <div class="id-row">
+                    <input id="mf-id" type="text" placeholder="如 gpt-4o / claude-sonnet-4">
+                    <button type="button" id="mf-discover" title="向上游请求模型列表，选中后填入模型 id">获取模型列表</button>
+                  </div>
+                </label>
                 <label class="f-field"><span>请求地址</span><input id="mf-url" type="text" placeholder="https://api.openai.com/v1"></label>
                 <div class="f-field">
                   <span>密钥</span>
@@ -326,6 +431,21 @@
                     <label>输入 <input id="mf-ctx-in" type="number" value="262144"></label>
                     <label>输出 <input id="mf-ctx-out" type="number" value="131072"></label>
                   </div>
+                </div>
+              </div>
+              <!-- 从上游 /models 拉取的模型列表（点「获取模型列表」后展开，选中后填入模型 id） -->
+              <div id="mf-discover-panel" class="discover-panel hidden">
+                <div class="disc-head">
+                  <div class="disc-title">上游可用模型<span id="disc-count" class="disc-count"></span></div>
+                  <div class="disc-tools">
+                    <input id="disc-filter" type="text" placeholder="筛选模型 id…">
+                    <button type="button" id="disc-close">收起</button>
+                  </div>
+                </div>
+                <div id="disc-list" class="disc-list"></div>
+                <div class="disc-foot">
+                  <span id="disc-result" class="mf-test-result"></span>
+                  <button type="button" id="disc-add" class="primary">添加选中</button>
                 </div>
               </div>
               <div class="mf-actions">

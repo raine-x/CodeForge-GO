@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -39,6 +40,7 @@ type wsMessage struct {
 	ApprovalID string `json:"approval_id"`
 	Approved   bool   `json:"approved"`
 	Thinking   string `json:"thinking"` // 思考强度：low/medium/high
+	Hidden     bool   `json:"hidden"`   // 页面是否不可见（visibility 消息携带）
 }
 
 // wsClient 表示一个浏览器 WebSocket 连接。
@@ -50,6 +52,12 @@ type wsClient struct {
 
 	cancelMu sync.Mutex
 	cancel   context.CancelFunc
+
+	// 任务完成通知的状态：页面可见性 + 节流时间戳。
+	notifyMu        sync.Mutex
+	pageHidden      bool      // 页面是否不可见（缺省 true：未知时按「不可见」处理，保持通知可用）
+	visibilityKnown bool      // 前端是否已上报过可见性
+	lastNotify      time.Time // 上次发送通知的时间（节流用）
 }
 
 func (c *wsClient) send(v any) {
@@ -65,7 +73,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[ws] 升级失败: %v", err)
 		return
 	}
-	client := &wsClient{srv: s, conn: conn}
+	client := &wsClient{srv: s, conn: conn, pageHidden: true}
 	client.approver = &wsApprover{client: client, pending: map[string]chan bool{}}
 
 	defer func() {
@@ -109,7 +117,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 			}
 			sessionID = sess.ID
 		}
-		go c.run(sessionID, msg.Thinking, func(ctx context.Context, emit func(agent.Event)) error {
+		go c.run(sessionID, msg.Thinking, "用户消息", msg.Text, func(ctx context.Context, emit func(agent.Event)) error {
 			return c.srv.agent.Run(ctx, sessionID, msg.Text, emit)
 		})
 
@@ -118,7 +126,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		if msg.SessionID == "" {
 			return
 		}
-		go c.run(msg.SessionID, msg.Thinking, func(ctx context.Context, emit func(agent.Event)) error {
+		go c.run(msg.SessionID, msg.Thinking, "重新生成", "", func(ctx context.Context, emit func(agent.Event)) error {
 			return c.srv.agent.Regenerate(ctx, msg.SessionID, emit)
 		})
 
@@ -130,6 +138,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		}
 		c.send(map[string]any{"type": "session", "session_id": sess.ID, "title": sess.Title})
 		c.send(map[string]any{"type": "sessions", "items": c.srv.agent.History().List("", false)})
+		c.send(c.srv.contextUsage(sess.ID))
 
 	case "list_sessions":
 		c.send(map[string]any{"type": "sessions", "items": c.srv.agent.History().List("", false)})
@@ -143,9 +152,18 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		}
 		// 内存缓存换成用户想继续的那条（后续 user_message 直接续聊）
 		c.send(map[string]any{"type": "history", "session_id": sess.ID, "title": sess.Title, "messages": sess.Messages})
+		c.send(c.srv.contextUsage(sess.ID))
 
 	case "hitl_decision":
 		c.approver.resolve(msg.ApprovalID, msg.Approved)
+
+	case "context":
+		// 前端打开上下文进度条明细时主动拉一次最新占用（会话可能刚被切换）。
+		c.send(c.srv.contextUsage(msg.SessionID))
+
+	case "visibility":
+		// 前端上报页面可见性：窗口在前台可见时，任务完成不弹系统通知（不打扰）。
+		c.setVisibility(msg.Hidden)
 
 	case "cancel":
 		// 打断当前任务：由 run() 统一收尾发送 idle；无任务时兜底复位前端状态。
@@ -156,8 +174,12 @@ func (c *wsClient) dispatch(msg wsMessage) {
 }
 
 // run 在独立 goroutine 中执行一轮 Agent 交互（正常对话或重新生成）。
-func (c *wsClient) run(sessionID, thinking string, agentFn func(ctx context.Context, emit func(agent.Event)) error) {
+// trigger/label 仅用于日志：明确「这一轮是谁、以什么方式触发的」，
+// 便于事后排查「我没操作，怎么跑了一轮」这类问题。
+func (c *wsClient) run(sessionID, thinking, trigger, label string, agentFn func(ctx context.Context, emit func(agent.Event)) error) {
 	c.stop()
+
+	log.Printf("[run] 会话=%s 触发=%s 输入=%q", sessionID, trigger, clipText(label, 80))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancelMu.Lock()
@@ -196,19 +218,145 @@ func (c *wsClient) run(sessionID, thinking string, agentFn func(ctx context.Cont
 	}
 	c.send(map[string]any{"type": "idle"})
 	c.send(map[string]any{"type": "sessions", "items": c.srv.agent.History().List("", false)})
+	// 本轮结束后刷新上下文占用：进度条要跟着对话一起长。
+	c.send(c.srv.contextUsage(sessionID))
 
 	// 任务结束后发送系统通知。通知失败只记日志，不影响对话结果；主动取消不算完成通知。
 	if ctx.Err() == nil {
-		title, message := "CodeForge", "任务已完成"
-		if runErr != nil {
-			title, message = "CodeForge", "任务执行失败："+runErr.Error()
-		}
-		go func() {
-			if err := platform.Notify(title, message); err != nil {
-				log.Printf("系统通知发送失败（已忽略）：%v", err)
-			}
-		}()
+		c.notifyDone(sessionID, runErr)
 	}
+}
+
+// notifyDone 在任务结束后发送「任务完成 / 失败」系统通知。
+//
+// 发送前依次判断（任一不满足即静默跳过，只记日志）：
+//  1. 配置开关（notify.enabled，写 false 完全关闭）；
+//  2. 页面可见性 —— 窗口在前台可见（用户正看着）时不打扰；
+//  3. 节流 —— 距上次通知不足 notify.min_interval_ms 时不重复打扰。
+func (c *wsClient) notifyDone(sessionID string, runErr error) {
+	now := time.Now()
+
+	c.notifyMu.Lock()
+	reason := notifySkipReason(c.srv.cfg.NotifyEnabled(), c.visibilityKnown, c.pageHidden,
+		c.lastNotify, now, c.srv.cfg.NotifyMinInterval())
+	if reason == "" {
+		c.lastNotify = now
+	}
+	c.notifyMu.Unlock()
+	if reason != "" {
+		log.Printf("[notify] 跳过系统通知（会话=%s）：%s", sessionID, reason)
+		return
+	}
+
+	title, message := "CodeForge", "任务已完成"
+	if label := c.sessionLabel(sessionID); label != "" {
+		message = "任务已完成：" + label
+	}
+	if runErr != nil {
+		title, message = "CodeForge", "任务执行失败："+clipText(runErr.Error(), 120)
+	}
+	log.Printf("[notify] 发送系统通知（会话=%s）：%s", sessionID, message)
+	go func() {
+		if err := platform.Notify(title, message); err != nil {
+			log.Printf("系统通知发送失败（已忽略）：%v", err)
+		}
+	}()
+}
+
+// notifySkipReason 返回「不发送通知」的原因；返回空串表示应当发送。
+// 拆成返回原因（而非布尔）是为了在日志里明确写出被哪一道闸挡住 ——
+// 用户反馈过「我什么都没干，怎么就通知任务完成了」，日志必须能自证原因。
+//
+//   - enabled 为 false：整体关闭；
+//   - hasVisibility 且页面可见（!pageHidden）：用户正看着，不打扰；
+//   - last 距 now 不足 minInterval：节流，避免连续任务刷屏。
+func notifySkipReason(enabled, hasVisibility, pageHidden bool, last, now time.Time, minInterval time.Duration) string {
+	if !enabled {
+		return "配置已关闭系统通知（notify.enabled=false）"
+	}
+	if hasVisibility && !pageHidden {
+		return "页面在前台可见，无需提醒"
+	}
+	if !last.IsZero() && now.Sub(last) < minInterval {
+		return "处于节流窗口（距上次通知不足 " + minInterval.String() + "）"
+	}
+	return ""
+}
+
+// shouldNotify 判断是否应发送任务完成通知（纯函数，便于测试）。
+func shouldNotify(enabled, hasVisibility, pageHidden bool, last, now time.Time, minInterval time.Duration) bool {
+	return notifySkipReason(enabled, hasVisibility, pageHidden, last, now, minInterval) == ""
+}
+
+// setVisibility 记录前端上报的页面可见性。
+func (c *wsClient) setVisibility(hidden bool) {
+	c.notifyMu.Lock()
+	c.pageHidden = hidden
+	c.visibilityKnown = true
+	c.notifyMu.Unlock()
+}
+
+// sessionLabel 返回会话标题（供通知文案使用），无标题时返回空串。
+func (c *wsClient) sessionLabel(sessionID string) string {
+	sess, ok := c.srv.agent.History().Get(sessionID)
+	if !ok {
+		return ""
+	}
+	return clipText(strings.TrimSpace(sess.Title), 40)
+}
+
+// contextUsage 汇总指定会话的上下文占用，供前端底部进度条展示。
+//
+// 口径完全交给 agent.ContextStat（进度条与自动压缩共用同一个函数），
+// 否则进度条会骗人：显示 80% 而实际已经触发压缩，或反过来永不触发。
+//
+// 语义：
+//   - used   = 实际送模的估算 tokens（已用摘要替换掉的旧历史不再计入）；
+//   - raw    = 会话历史原文的估算 tokens（用户仍能在界面里看到全部内容）；
+//   - budget = 自动压缩的触发线（= (模型窗口 − 输出预留) × 95%，窗口未知时
+//     回退 agent.context_token_budget）；
+//   - 进度条 100% 的含义就是「下一步请求前会触发摘要压缩」，是有意义的阈值。
+//
+// percent 保留一位小数且**不封顶**：>100% 表示已越过压缩线（over_budget=true），
+// 前端画条时自行夹到 100%，明细里照实显示。
+func (s *Server) contextUsage(sessionID string) map[string]any {
+	sess, _ := s.agent.History().Get(sessionID)
+	st := s.agent.ContextStat(sess)
+
+	// 千分比取整再除 10 = 一位小数的百分比（避免为此引入 math 依赖）。
+	percent := float64(0)
+	if st.Budget > 0 {
+		percent = float64(st.Used*1000/st.Budget) / 10
+	}
+	return map[string]any{
+		"type":        "context",
+		"session_id":  sessionID,
+		"used":        st.Used,
+		"raw":         st.Raw,
+		"budget":      st.Budget,
+		"messages":    st.Messages,
+		"percent":     percent,
+		"compressed":  st.Compressed,
+		"over_budget": st.OverBudget,
+		"summarized":  st.Summarized,
+		"window":      st.Window,
+		"reserve":     st.Reserve,
+		"model":       s.cfg.LLM.DisplayName,
+		"model_id":    s.cfg.LLM.Model,
+	}
+}
+
+// clipText 按「字符」截断文本（避免把多字节汉字截成半个），超长时追加省略号。
+func clipText(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if max <= 0 {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
 }
 
 // stop 取消当前正在执行的任务，返回是否有任务被取消。

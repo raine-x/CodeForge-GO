@@ -172,6 +172,25 @@ func TestArchiveFlow(t *testing.T) {
 		t.Errorf("归档列表应有 2 条，实际 %d", len(arch))
 	}
 
+	// 整组恢复（与整组归档对称）：侧栏一次点掉整组，恢复也得能一次点回来
+	if err := s.UnarchiveWorkspace("C:\\ws\\x"); err != nil {
+		t.Fatal(err)
+	}
+	if list, _ := s.ListSessions("C:\\ws\\x", false); len(list) != 2 {
+		t.Errorf("整组恢复后应回到 2 条未归档，实际 %d", len(list))
+	}
+	if arch, _ := s.ListSessions("", true); len(arch) != 0 {
+		t.Errorf("整组恢复后归档列表应为空，实际 %d", len(arch))
+	}
+	// 幂等：对没有已归档会话的组调用也不该报错
+	if err := s.UnarchiveWorkspace("C:\\ws\\y"); err != nil {
+		t.Errorf("对无归档会话的组恢复不应报错: %v", err)
+	}
+	// 再归档回去，供下面的「满期删除」继续用
+	if err := s.ArchiveWorkspace("C:\\ws\\x"); err != nil {
+		t.Fatal(err)
+	}
+
 	// 满期删除（直接 UPDATE 把归档时间改到 11 天前模拟）
 	if _, err := s.db.Exec(`UPDATE sessions SET archived_at = ? WHERE archived_at > 0`,
 		now.AddDate(0, 0, -11).Unix()); err != nil {
@@ -189,12 +208,41 @@ func TestArchiveFlow(t *testing.T) {
 		t.Errorf("工作区列表应只剩 y，实际 %v", wss)
 	}
 
-	// 工作区重命名（分组键改写）
-	if err := s.RenameWorkspace("C:\\ws\\y", "C:\\ws\\z"); err != nil {
+	// 项目「重命名」= 只改显示名：workspace 键（= 磁盘工作区路径）必须原样不动。
+	// 这里守护的正是历史事故：改键会把 C:\...\Desktop\test 抹成 test，项目随即失去工作目录。
+	if err := s.SetWorkspaceName("C:\\ws\\y", "我的项目"); err != nil {
 		t.Fatal(err)
 	}
-	if list, _ := s.ListSessions("C:\\ws\\z", false); len(list) != 1 {
-		t.Errorf("重命名后应能在新键下找到会话，实际 %d", len(list))
+	if name, _ := s.WorkspaceName("C:\\ws\\y"); name != "我的项目" {
+		t.Errorf("显示名应为「我的项目」，实际 %q", name)
+	}
+	list, _ := s.ListSessions("C:\\ws\\y", false)
+	if len(list) != 1 {
+		t.Fatalf("改显示名后会话仍应挂在原键下，实际 %d 条", len(list))
+	}
+	if list[0].Workspace != "C:\\ws\\y" {
+		t.Errorf("⚠️ 重命名不得改写工作区键（否则项目失去工作目录），实际 %q", list[0].Workspace)
+	}
+	if list[0].WorkspaceName != "我的项目" {
+		t.Errorf("会话元信息应带上项目显示名，实际 %q", list[0].WorkspaceName)
+	}
+	// 清空显示名 = 清除自定义名，前端回落按路径末段显示
+	if err := s.SetWorkspaceName("C:\\ws\\y", ""); err != nil {
+		t.Fatal(err)
+	}
+	if name, _ := s.WorkspaceName("C:\\ws\\y"); name != "" {
+		t.Errorf("清空后显示名应为空串，实际 %q", name)
+	}
+
+	// 删除项目要连带清掉显示名记录（否则同名项目重建后会“继承”旧名字）
+	if err := s.SetWorkspaceName("C:\\ws\\y", "待删项目"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteWorkspace("C:\\ws\\y"); err != nil {
+		t.Fatal(err)
+	}
+	if name, _ := s.WorkspaceName("C:\\ws\\y"); name != "" {
+		t.Errorf("删除项目后显示名记录应一并清掉，实际 %q", name)
 	}
 }
 

@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -18,7 +20,7 @@ import (
 // POST {path} → 校验目录存在后热切换（文件工具 + Agent System Prompt 同步生效），
 //
 //	并把绝对路径持久化到 config/local.yaml 的 agent.work_dir，
-//	重启后自动恢复，不必每次重新选择。
+//	重启后自动恢复，不必每次重新选择。path 传空串只清运行态、**不落盘**。
 func (s *Server) handleWorkspace(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -38,13 +40,38 @@ func (s *Server) handleWorkspace(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "当前文件系统不支持切换工作区"})
 			return
 		}
-		// path 为空 = 清除工作区（回到「未选择」状态），供「新建对话」打开空工作区。
+		// path 为空 = 清除工作区（回到「未选择」状态），供「新建项目」打开空工作区。
+		// 非空时**必须是绝对路径**：别的接口的相对路径语义是「相对工作区根」，但工作区根
+		// 没法相对自己 —— 放任相对路径会被 FS.SetRoot 的 filepath.Abs 静默按**进程 CWD**
+		// 解析（cf 是项目根、直接跑二进制又可能是别处），换个启动方式工作区就变了。
+		if path != "" && !filepath.IsAbs(path) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "工作区必须是绝对路径：" + path,
+			})
+			return
+		}
+		// 再校验目录存在 —— 与启动时的检查同源
+		//（cmd/agent/main.go：「配置的工作目录不存在或不是目录，按未选择工作区处理」）。
+		// 否则一个已删除的目录（或历史遗留的坏分组键）会被静默设成工作目录：
+		// 文件工具随后全线报错，用户却看不出是哪一步坏的。
+		if path != "" {
+			if info, err := os.Stat(path); err != nil || !info.IsDir() {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": "目录不存在或不是目录：" + path + "（请重新选择工作区）",
+				})
+				return
+			}
+		}
 		setter.SetRoot(path)
 		wd := s.fs.Root()
 		if wd == "" {
 			s.agent.SetWorkDir("")
 		} else {
 			s.agent.SetWorkDir(wd)
+			// 只有真正选中目录时才落盘：空串是「新建项目」的**临时**清空语义，
+			// 若一并写回，用户只是点一下「新建项目」就会把原先选好的工作区从
+			// local.yaml 里抹掉，重启后找不回来。
+			s.persistWorkDir(wd)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "root": s.fs.Root()})
 
@@ -62,6 +89,46 @@ func (s *Server) persistWorkDir(dir string) {
 		if err := s.cfg.Save(filepath.Join(cfgDir, "local.yaml")); err != nil {
 			log.Printf("警告：工作区已切换但写回配置失败（重启后需重新选择）: %v", err)
 		}
+	}
+}
+
+// handleNotifyPrefs 查看 / 设置「任务完成系统通知」偏好。
+// GET  → {enabled, min_interval_ms}
+// POST {enabled} → 热更新并写回 config/local.yaml（重启后保持）。
+//
+// 通知只在窗口不可见（切走标签页 / 最小化）时发送，且受最小间隔节流，
+// 避免「什么都没做却弹出任务已完成」这类打扰。
+func (s *Server) handleNotifyPrefs(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled":         s.cfg.NotifyEnabled(),
+			"min_interval_ms": s.cfg.NotifyMinInterval().Milliseconds(),
+		})
+
+	case http.MethodPost:
+		var body struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体解析失败"})
+			return
+		}
+		if body.Enabled == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "缺少 enabled 字段"})
+			return
+		}
+		on := *body.Enabled
+		s.cfg.Notify.Enabled = &on
+		if cfgDir := s.cfg.ConfigDir(); cfgDir != "" {
+			if err := s.cfg.Save(filepath.Join(cfgDir, "local.yaml")); err != nil {
+				log.Printf("警告：通知开关已生效但写回配置失败（重启后需重新设置）: %v", err)
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": s.cfg.NotifyEnabled()})
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
@@ -90,6 +157,118 @@ func (s *Server) handlePickFolder(w http.ResponseWriter, r *http.Request) {
 		"start_path": defaultDir,
 		"platform":   runtime.GOOS,
 	})
+}
+
+// handleStageFile 把工作区外的文件复制一份进工作区（attachments/ 目录）。
+// POST {path} → {ok, staged_path(相对工作区), name}
+// 用途：@工作区外文件 时，代理默认读不到区外内容；先 stage 一份副本到
+// 工作区内，模型通过副本路径操作。副本命名保持原文件名（同名加序号防覆盖）。
+func (s *Server) handleStageFile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体解析失败"})
+		return
+	}
+	src := strings.TrimSpace(body.Path)
+	if src == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "path 不能为空"})
+		return
+	}
+	root := s.fs.Root()
+	if root == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "还没有选择工作区"})
+		return
+	}
+
+	// ⚠️ 相对路径按**工作区根**解析（与文件工具 FS.Resolve 的约定一致：「相对路径基于工作区根」），
+	// 不能落到进程 CWD。否则 `@sub/a.go` 会去「进程启动目录」找同名文件：
+	// 找不到就报「文件不存在」这种莫名其妙的错；**恰好找到，就把另一个文件静默拷进
+	// attachments/**，模型读到的东西完全不是用户指的那个。
+	if !filepath.IsAbs(src) {
+		src = filepath.Join(root, src)
+	}
+
+	// 只 stage 工作区外的文件；区内文件模型本来就看得见，无需副本。
+	// 词法判断即可：这里只是分流「要不要 copy」，真正的越权拦截在文件工具层。
+	if pathWithin(root, src) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "inside": true, "staged_path": filepath.ToSlash(src), "name": filepath.Base(src)})
+		return
+	}
+
+	info, err := os.Stat(src)
+	if err != nil || info.IsDir() {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "文件不存在: " + src})
+		return
+	}
+
+	// 副本目录：attachments（不走 .codeforge —— 那是隐藏目录，会被 tree/搜索排除）
+	dstDir := filepath.Join(root, "attachments")
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "创建附件目录失败: " + err.Error()})
+		return
+	}
+
+	// 同名防覆盖：存在同名不同源文件时追加 -1 / -2 序号
+	name := filepath.Base(src)
+	dst := filepath.Join(dstDir, name)
+	for i := 1; ; i++ {
+		if _, err := os.Stat(dst); err != nil {
+			break // 不存在：可用
+		}
+		// 已存在：若内容与源一致（重复 stage 同一文件）直接复用，不再复制
+		if sameFile(src, dst) {
+			rel, _ := filepath.Rel(root, dst)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": true, "inside": false,
+				"staged_path": filepath.ToSlash(rel), "name": name, "reused": true,
+			})
+			return
+		}
+		ext := filepath.Ext(name)
+		stem := strings.TrimSuffix(name, ext)
+		name = fmt.Sprintf("%s-%d%s", stem, i, ext)
+		dst = filepath.Join(dstDir, name)
+	}
+
+	data, err := os.ReadFile(src)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "读取源文件失败: " + err.Error()})
+		return
+	}
+	if err := os.WriteFile(dst, data, 0o644); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "写入副本失败: " + err.Error()})
+		return
+	}
+	rel, _ := filepath.Rel(root, dst)
+	log.Printf("已暂存工作区外文件：%s → %s", src, rel)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "inside": false,
+		"staged_path": filepath.ToSlash(rel), "name": name,
+	})
+}
+
+// sameFile 粗比较两个文件是否同一内容（大小一致且字节相同）。
+func sameFile(a, b string) bool {
+	ia, ea := os.Stat(a)
+	ib, eb := os.Stat(b)
+	if ea != nil || eb != nil || ia.Size() != ib.Size() {
+		return false
+	}
+	da, err := os.ReadFile(a)
+	if err != nil {
+		return false
+	}
+	db, err := os.ReadFile(b)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(da, db)
 }
 
 // handlePickFile 选一个文件（输入区 ＋ → 添加文件）。

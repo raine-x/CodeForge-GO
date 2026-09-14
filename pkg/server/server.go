@@ -66,6 +66,8 @@ type Server struct {
 	pluginManager *plugins.Manager
 	// builtinApply 内置插件开关的运行时应用钩子（main.go 注入）。
 	builtinApply func(id string, on bool)
+	// subagentApply 子智能体策略变更后的运行时应用钩子（main.go 注入）。
+	subagentApply func()
 
 	// done 在服务开始关闭后关闭，供主流程与信号等待统一收口。
 	done       chan struct{}
@@ -77,17 +79,33 @@ func (s *Server) SetPluginManager(m *plugins.Manager) { s.pluginManager = m }
 
 // New 构造 Web 服务。
 func New(cfg *config.Config, ag *agent.Agent, executor *tools.Executor, registry *tools.Registry, fsys Undoer) *Server {
-	return &Server{
+	s := &Server{
 		cfg:        cfg,
 		agent:      ag,
 		executor:   executor,
 		registry:   registry,
 		fs:         fsys,
 		token:      randomToken(),
-		modelStore: config.NewModelStore(filepath.Join(cfg.ConfigDir(), "models.yaml")),
+		modelStore: config.NewModelStore(modelStorePath(cfg)),
 		plugins:    cfg.Plugins,
 		done:       make(chan struct{}),
 	}
+	// 启动即把当前生效模型的上下文窗口同步给 Agent：压缩阈值（窗口 × 95%）
+	// 从第一轮对话就生效，而不是等用户在设置里点一次「应用」。
+	s.SyncContextWindow()
+	return s
+}
+
+// modelStorePath 返回模型库落盘路径。
+//
+// 配置目录已知时是 <configDir>/models.yaml；未知（空串，仅测试或异常启动会出现）
+// 时返回空串，让模型库退化成纯内存库 —— 否则 filepath.Join("", "models.yaml")
+// 会得到相对路径，把 models.yaml 写进进程的当前工作目录。
+func modelStorePath(cfg *config.Config) string {
+	if dir := cfg.ConfigDir(); dir != "" {
+		return filepath.Join(dir, "models.yaml")
+	}
+	return ""
 }
 
 // ModelStore 返回模型库（懒加载；供 /api/models/* 使用）。
@@ -125,6 +143,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/config", s.requireAuth(s.handleConfig))
 	mux.HandleFunc("/api/perm", s.requireAuth(s.handlePerm))
+	mux.HandleFunc("/api/notify", s.requireAuth(s.handleNotifyPrefs))
 	mux.HandleFunc("/api/tree", s.requireAuth(s.handleTree))
 	mux.HandleFunc("/api/sessions", s.requireAuth(s.handleSessions))
 	mux.HandleFunc("/api/workspaces", s.requireAuth(s.handleWorkspaces))
@@ -132,11 +151,15 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/skills", s.requireAuth(s.handleSkills))
 	mux.HandleFunc("/api/plugins", s.requireAuth(s.handlePlugins))
 	mux.HandleFunc("/api/builtin-plugins", s.requireAuth(s.handleBuiltinPlugins))
+	mux.HandleFunc("/api/subagents", s.requireAuth(s.handleSubagentPrefs))
 	mux.HandleFunc("/api/undo", s.requireAuth(s.handleUndo))
 	mux.HandleFunc("/api/workspace", s.requireAuth(s.handleWorkspace))
 	mux.HandleFunc("/api/pick_folder", s.requireAuth(s.handlePickFolder))
 	mux.HandleFunc("/api/pick_file", s.requireAuth(s.handlePickFile))
+	mux.HandleFunc("/api/stage_file", s.requireAuth(s.handleStageFile))
 	mux.HandleFunc("/api/models/test", s.requireAuth(s.handleModelTest))
+	mux.HandleFunc("/api/models/discover", s.requireAuth(s.handleModelDiscover))
+	mux.HandleFunc("/api/models/save_batch", s.requireAuth(s.handleModelSaveBatch))
 	mux.HandleFunc("/api/models/list", s.requireAuth(s.handleModelList))
 	mux.HandleFunc("/api/models/save", s.requireAuth(s.handleModelSave))
 	mux.HandleFunc("/api/models/delete", s.requireAuth(s.handleModelDelete))
@@ -317,7 +340,8 @@ func randomToken() string {
 }
 
 // rebuildProvider 按当前配置重建 LLM 适配器，并同步 Agent 的请求参数
-// （MaxTokens/Temperature 随模型条目「输出上限」等热切换）。
+// （MaxTokens/Temperature 随模型条目「输出上限」等热切换）与上下文窗口
+// （压缩阈值随之切换）。
 func (s *Server) rebuildProvider() error {
 	p, err := llm.NewProvider(s.cfg.LLM)
 	if err != nil {
@@ -325,7 +349,22 @@ func (s *Server) rebuildProvider() error {
 	}
 	s.agent.SetProvider(p)
 	s.agent.SetLLMConfig(s.cfg.LLM)
+	s.SyncContextWindow()
 	return nil
+}
+
+// SyncContextWindow 把当前生效模型条目里的「输入上下文窗口」（ctx_in）
+// 同步给 Agent，作为自动压缩阈值的依据。
+//
+// 该字段以往只存不用：模型库填了 ctx_in 但压缩阈值仍是写死的
+// agent.context_token_budget，导致换小窗口模型时压缩不触发、直接超窗。
+// 未配置（0）时传 0，Agent 侧自动回退到 context_token_budget。
+func (s *Server) SyncContextWindow() {
+	window := 0
+	if m, ok := s.ModelStore().Find(s.cfg.LLM.Model); ok {
+		window = m.CtxIn
+	}
+	s.agent.SetContextWindow(window)
 }
 
 // platformName 返回平台名（供健康检查使用）。

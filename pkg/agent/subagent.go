@@ -9,12 +9,53 @@ import (
 	"sync"
 	"time"
 
+	"codeforge/config"
 	"codeforge/pkg/llm"
 	"codeforge/pkg/tools"
 )
 
-// MaxSubagents 是一次委派允许启动的最大子智能体数。
-const MaxSubagents = 5
+// MaxSubagents 是一次委派允许启动的最大子智能体数（硬上限）。
+// 与 config.SubagentConcurrencyCap 同源：配置只能把并发调小，不能突破它。
+const MaxSubagents = config.SubagentConcurrencyCap
+
+// SubagentPolicy 是子智能体的运行策略（由 config.subagents 派生，设置页可热更新）。
+//
+// 设计取向是「只收不放」：所有开关都只能缩小能力，不能扩大 —— 子智能体的工具
+// 白名单本身就不含 shell、插件、技能创建与递归委派，策略再叠加一层收窄。
+type SubagentPolicy struct {
+	MaxConcurrent int  // 一次委派最多并行几个子智能体（1..MaxSubagents）
+	AllowWrite    bool // implement 子智能体是否可写入/编辑文件
+	AllowDelete   bool // 是否可删除文件（AllowWrite=false 时无意义）
+	AllowMemory   bool // 是否可写入用户记忆（save_memory）
+}
+
+// DefaultSubagentPolicy 返回与历史行为完全一致的默认策略。
+func DefaultSubagentPolicy() SubagentPolicy {
+	return SubagentPolicy{
+		MaxConcurrent: MaxSubagents,
+		AllowWrite:    true,
+		AllowDelete:   true,
+		AllowMemory:   true,
+	}
+}
+
+// Normalize 收敛越界值，保证策略在任何情况下都可用。
+func (p SubagentPolicy) Normalize() SubagentPolicy {
+	if p.MaxConcurrent <= 0 || p.MaxConcurrent > MaxSubagents {
+		p.MaxConcurrent = MaxSubagents
+	}
+	return p
+}
+
+// NewSubagentPolicy 从全局配置派生运行策略。
+func NewSubagentPolicy(cfg config.Config) SubagentPolicy {
+	return SubagentPolicy{
+		MaxConcurrent: cfg.SubagentMaxConcurrent(),
+		AllowWrite:    cfg.SubagentAllowWrite(),
+		AllowDelete:   cfg.SubagentAllowDelete(),
+		AllowMemory:   cfg.SubagentAllowMemory(),
+	}.Normalize()
+}
 
 // SubagentRunner 调度互不重叠的临时子智能体。
 type SubagentRunner struct {
@@ -22,6 +63,9 @@ type SubagentRunner struct {
 }
 
 // NewSubagentRunner 构造绑定到主 Agent 的子智能体调度器。
+//
+// 调度器每次运行都从 parent 现读策略（而非缓存），因此设置页改动对
+// 已经构造好的工具实例立即生效，无需重建 runner。
 func NewSubagentRunner(parent *Agent) *SubagentRunner {
 	return &SubagentRunner{parent: parent}
 }
@@ -31,7 +75,8 @@ func (r *SubagentRunner) RunSubagents(ctx context.Context, tasks []tools.Subagen
 	if r == nil || r.parent == nil {
 		return nil, fmt.Errorf("子智能体调度器未初始化")
 	}
-	if err := validateSubagentTasks(tasks); err != nil {
+	policy := r.parent.SubagentPolicy()
+	if err := validateSubagentTasksMax(tasks, policy.MaxConcurrent); err != nil {
 		return nil, err
 	}
 
@@ -41,17 +86,17 @@ func (r *SubagentRunner) RunSubagents(ctx context.Context, tasks []tools.Subagen
 		wg.Add(1)
 		go func(i int, task tools.SubagentTask) {
 			defer wg.Done()
-			results[i] = r.runOne(ctx, task)
+			results[i] = r.runOne(ctx, task, policy)
 		}(i, task)
 	}
 	wg.Wait()
 	return results, nil
 }
 
-func (r *SubagentRunner) runOne(ctx context.Context, task tools.SubagentTask) tools.SubagentResult {
+func (r *SubagentRunner) runOne(ctx context.Context, task tools.SubagentTask, policy SubagentPolicy) tools.SubagentResult {
 	result := tools.SubagentResult{ID: task.ID, Mode: task.Mode, Status: "completed"}
 	child := r.parent.newSubagent(task.Mode)
-	prompt := subagentPrompt(task)
+	prompt := subagentPrompt(task, policy)
 	sess := &Session{ID: "subagent-" + task.ID, Workspace: r.parent.workDir, Messages: nil}
 	sess.Messages = append(sess.Messages, llm.TextMessage(llm.RoleUser, prompt))
 	child.lastUserInput = prompt
@@ -115,7 +160,7 @@ func truncateTail(s string, n int) string {
 
 func (a *Agent) newSubagent(mode string) *Agent {
 	registry := tools.NewRegistry()
-	allowed := subagentToolSet(mode)
+	allowed := subagentToolSetPolicy(mode, a.SubagentPolicy())
 	for _, tool := range a.registry.List() {
 		// 子智能体只允许使用受控白名单工具集：绝不暴露 delegate_subagents（防递归委派）
 		// 与插件/外部工具（越权风险）；implement 限文件工具集，explore 仅只读子集。
@@ -138,25 +183,52 @@ func (a *Agent) newSubagent(mode string) *Agent {
 	return child
 }
 
-func subagentPrompt(task tools.SubagentTask) string {
+// subagentPrompt 生成子智能体的任务提示词。
+// 措辞必须与「实际授予的工具集」一致：被策略禁写时不能还说「你是实现子智能体」，
+// 否则模型会反复尝试调用不存在的写工具而空转。
+func subagentPrompt(task tools.SubagentTask, policy SubagentPolicy) string {
 	paths := append([]string(nil), task.Paths...)
 	sort.Strings(paths)
 	scope := "未声明具体路径；只做与其它子任务不重叠的工作"
 	if len(paths) > 0 {
 		scope = strings.Join(paths, ", ")
 	}
+	const readonlyRule = "严格约束：只能调用只读工具（读取文件、列目录、搜索）；不要写文件、编辑文件、删除文件、运行命令、调用其它子智能体。"
 	if task.Mode == "explore" {
-		return fmt.Sprintf("你是 CodeForge 的只读代码探索子智能体。\n任务：%s\n关注范围：%s\n严格约束：只能调用只读工具（读取文件、列目录、搜索）；不要写文件、编辑文件、删除文件、运行命令、调用其它子智能体。输出简洁的证据、涉及文件/函数和结论，供主智能体汇总。", task.Prompt, scope)
+		return fmt.Sprintf("你是 CodeForge 的只读代码探索子智能体。\n任务：%s\n关注范围：%s\n%s输出简洁的证据、涉及文件/函数和结论，供主智能体汇总。",
+			task.Prompt, scope, readonlyRule)
 	}
-	return fmt.Sprintf("你是 CodeForge 的实现子智能体。\n任务：%s\n允许关注/修改的路径范围：%s\n严格约束：只处理声明范围，不修改其它子任务范围；不要调用其它子智能体。完成后说明改了哪些文件、验证了什么、遗留什么问题。", task.Prompt, scope)
+	if !policy.AllowWrite {
+		return fmt.Sprintf("你是 CodeForge 的子智能体。当前被限制为只读，不能修改任何文件。\n任务：%s\n关注范围：%s\n%s"+
+			"请给出需要主智能体落地的改动清单（文件 + 具体修改点 + 验证方式），由主智能体执行。",
+			task.Prompt, scope, readonlyRule)
+	}
+	ban := "不要调用其它子智能体。"
+	if !policy.AllowDelete {
+		ban = "不要删除文件（需要删除时请在结论中说明，由主智能体执行）；不要调用其它子智能体。"
+	}
+	return fmt.Sprintf("你是 CodeForge 的实现子智能体。\n任务：%s\n允许关注/修改的路径范围：%s\n严格约束：只处理声明范围，不修改其它子任务范围；%s完成后说明改了哪些文件、验证了什么、遗留什么问题。",
+		task.Prompt, scope, ban)
 }
 
+// validateSubagentTasks 以硬上限校验任务集合（保持既有签名，供测试与历史调用方使用）。
 func validateSubagentTasks(tasks []tools.SubagentTask) error {
+	return validateSubagentTasksMax(tasks, MaxSubagents)
+}
+
+// validateSubagentTasksMax 以 max 为并发上限校验任务集合。
+//
+// 三道校验都在调度之前完成，不依赖模型自觉：
+// 数量上限 → id 唯一且必填 → 实现任务必须声明 paths 且彼此不重叠。
+func validateSubagentTasksMax(tasks []tools.SubagentTask, max int) error {
+	if max <= 0 || max > MaxSubagents {
+		max = MaxSubagents
+	}
 	if len(tasks) == 0 {
 		return fmt.Errorf("至少需要一个子任务")
 	}
-	if len(tasks) > MaxSubagents {
-		return fmt.Errorf("一次最多只能委派 %d 个子智能体", MaxSubagents)
+	if len(tasks) > max {
+		return fmt.Errorf("一次最多只能委派 %d 个子智能体", max)
 	}
 	seen := map[string]bool{}
 	for _, task := range tasks {
@@ -206,20 +278,32 @@ func cleanScope(p string) string {
 	return strings.ToLower(p)
 }
 
-// subagentToolSet 返回子智能体允许使用的工具白名单（按模式）。
-// 原则：只暴露代码工作所必需的文件工具，绝不暴露 shell 运行、插件/外部工具、
-// 技能创建或其它子智能体委派工具，从源头消除越权与递归委派风险。
+// subagentToolSet 返回子智能体允许使用的工具白名单（按模式，默认策略）。
+// 保留此签名供既有调用方与测试使用；带策略的版本是 subagentToolSetPolicy。
 func subagentToolSet(mode string) map[string]bool {
+	return subagentToolSetPolicy(mode, DefaultSubagentPolicy())
+}
+
+// subagentToolSetPolicy 返回子智能体允许使用的工具白名单（按模式 + 能力策略）。
+//
+// 原则：只暴露代码工作所必需的文件工具，绝不暴露 shell 运行、插件/外部工具、
+// 技能创建或其它子智能体委派工具，从源头消除越权与递归委派风险；
+// 策略只在此基础上做减法（禁写 / 禁删 / 禁写记忆）。
+func subagentToolSetPolicy(mode string, policy SubagentPolicy) map[string]bool {
 	set := map[string]bool{
 		"read_file":    true,
 		"list_dir":     true,
 		"search_files": true,
-		"save_memory":  true,
 	}
-	if mode == "implement" {
+	if policy.AllowMemory {
+		set["save_memory"] = true
+	}
+	if mode == "implement" && policy.AllowWrite {
 		set["write_file"] = true
 		set["edit_file"] = true
-		set["delete_file"] = true
+		if policy.AllowDelete {
+			set["delete_file"] = true
+		}
 	}
 	return set
 }

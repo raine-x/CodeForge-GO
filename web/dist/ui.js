@@ -140,13 +140,26 @@
   let thinkingSpec = null; // 上游思考分级规格（steps/range/none)
   let thinkingVal = '';    // 当前思考参数原值（枚举或 budget 数字）
   let modelsLoaded = false;
+  let modelChoices = [];   // 模型库快照（/api/models/list 脱敏列表）：对话框弹层据此列出全部可选模型
 
   const modelBtn = $('#model-btn');
   const modelPop = $('#model-pop');
   const modelList = $('#model-list');
   const levelList = $('#level-list');
 
-  // 从后端拉取配置：模型 + 思考分级规格（首次展开时执行一次）
+  // 拉取模型库快照：失败时保留上一次结果，不打断当前生效配置的加载。
+  // 新增 / 删除 / 切换模型后由调用方置 modelsLoaded=false 再走 loadModels 刷新。
+  async function fetchModelChoices() {
+    try {
+      const res = await fetch('/api/models/list');
+      if (res.ok) {
+        const d = await res.json();
+        modelChoices = d.models || [];
+      }
+    } catch (_) { /* 服务不可达：保留旧快照 */ }
+  }
+
+  // 从后端拉取配置：模型 + 模型库 + 思考分级规格（首次展开时执行一次）
   async function loadModels() {
     if (modelsLoaded) return;
     modelsLoaded = true;
@@ -161,6 +174,7 @@
         thinkingVal = thinkingSpec.default || '';
       }
     } catch (_) { /* 拉取失败按无模型处理 */ }
+    await fetchModelChoices();
     buildSlider();
     renderModelBtn();
     renderModelPop();
@@ -191,23 +205,61 @@
     $('#model-name').textContent = modelName || model; // 优先显示显示名，缺省回退模型 id
     $('#model-name').title = model;
   }
+  // 模型弹层：列出模型库全部条目，点击即切换生效模型（POST /api/models/apply）；
+  // 当前生效项带选中小圆点。库为空 / 生效项被删出库时补一行提示，避免弹层空无一物。
   function renderModelPop() {
-    // 模型列表：展示当前配置的模型；无模型或已被删出库时显示提示
     modelList.innerHTML = '';
-    if (model && modelInLib) {
+    const activeInLib = !!model && modelInLib;
+    modelChoices.forEach(function (m) {
       const b = document.createElement('button');
       b.type = 'button';
-      b.className = 'pop-opt selected';
-      b.dataset.model = model;
-      b.textContent = modelName || model; // 弹层同样优先显示显示名
+      const active = activeInLib && m.id === model;
+      b.className = 'pop-opt' + (active ? ' selected' : '');
+      b.dataset.model = m.id;
+      b.textContent = m.name || m.id; // 显示名优先，缺省回退模型 id
+      b.title = m.id;
+      if (!active) b.addEventListener('click', function () { switchActiveModel(m.id); });
       modelList.appendChild(b);
-    } else {
+    });
+    if (!modelChoices.length) {
       const tip = document.createElement('div');
       tip.className = 'pop-tip';
-      tip.textContent = '请先配置模型';
+      tip.textContent = '模型库为空，请在 设置 → 模型 → 添加模型 中添加';
+      modelList.appendChild(tip);
+    } else if (!activeInLib) {
+      const tip = document.createElement('div');
+      tip.className = 'pop-tip';
+      tip.textContent = model ? '当前模型已不在模型库中，请重新选择' : '请选择模型';
       modelList.appendChild(tip);
     }
     syncLevelUI(); // 同步思考强度滑条
+  }
+
+  // 切换生效模型：服务端热切换后回填配置（含思考分级与显示名），刷新弹层/按钮/设置页。
+  let switchingModel = false;
+  function switchActiveModel(id) {
+    if (switchingModel || !id || id === model) return;
+    switchingModel = true;
+    fetch('/api/models/apply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: id })
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (!d.ok) { alert('切换模型失败：' + (d.error || '未知错误')); return; }
+      const cfg = d.config || {};
+      model = (cfg.model || id).trim();
+      modelName = (cfg.display_name || cfg.model_display_name || '').trim();
+      modelInLib = cfg.model_in_library !== false;
+      thinkingSpec = cfg.thinking || { mode: 'none' };
+      thinkingVal = thinkingSpec.default || '';
+      modelsLoaded = false; // 强制重拉，保证弹层选中态与思考分级是服务端的最新值
+      loadModels();
+      const mEl = document.getElementById('settings-model');
+      if (mEl) { mEl.textContent = modelName || model || '--'; mEl.title = model || ''; }
+      // 设置页开着时同步列表里的「当前」徽标
+      if (!settingsOverlay.classList.contains('hidden')) renderModelItems();
+    }).catch(function (e) {
+      alert('切换模型失败：' + e);
+    }).then(function () { switchingModel = false; });
   }
 
   // ---------- 思考强度滑条（按上游分级动态构建） ----------
@@ -513,12 +565,58 @@
     ensureCol().appendChild(d);
     scrollBottom();
   }
+  // 提及 token 的统一切分规则：`@名字`（不含空白）或 `@"名字"`（名字含空白时用引号）。
+  // ⚠️ 两条例外规矩：
+  //   ① 只能有**一个**捕获组，且内部不许再嵌套分组 —— String.split 会把**所有**捕获组
+  //      都塞进结果数组，多一个组就会把内容多切一份（引号内的名字曾被重复吐出来）。
+  //   ② **不加 `g` 标志**：这三处都只用 split（split 本来就会切所有匹配，不需要 g），
+  //      而带 g 的正则一旦被谁拿去做 test()/exec() 就会残留 lastIndex、结果飘忽。
+  // 输入框镜像高亮、发送前展开别名、抽取待 stage 的文件，三处必须共用这一套。
+  const MENTION_SPLIT = /(@"(?:[^"]*)"|@[^\s@]+)/;
+  // ＋添加文件插入的是「@文件名」而不是完整路径，真实路径记在这张表里（发送前展开）。
+  // ⚠️ 声明必须早于 syncInputMirror 的**首次调用**（那里会 prune），否则会撞 TDZ。
+  const fileAlias = new Map(); // 提及 token（含 @ 与可能的引号）→ 完整路径
+  // 取出 token 里的真正内容（去掉 @ 与可能的引号）
+  function mentionBody(tok) {
+    const s = String(tok).slice(1);
+    return (s.length >= 2 && s.charAt(0) === '"' && s.charAt(s.length - 1) === '"') ? s.slice(1, -1) : s;
+  }
+  // 渲染 @提及（@技能名 / @文件路径）为蓝色 <span class="at-mention">。两处复用：
+  //   ① 消息气泡（addUser）：文件提及**只显示文件名**（title 悬浮看完整路径），
+  //      否则一长串路径会把气泡撑爆；
+  //   ② 输入框的镜像高亮层（syncInputMirror）：必须**原样显示**——那里就是用户正在编辑的
+  //      文字，缩成文件名会与 textarea 的真实内容错位（所以传 { shortenPath: false }）。
+  function renderUserText(container, text, opts) {
+    const shorten = !opts || opts.shortenPath !== false;
+    const parts = String(text).split(MENTION_SPLIT);
+    parts.forEach(function (p) {
+      if (!p) return;
+      if (p.charAt(0) === '@' && p.length > 1) {
+        const s = document.createElement('span');
+        s.className = 'at-mention';
+        const body = mentionBody(p);
+        // 含路径分隔符 = 文件提及：气泡里只显示文件名（title 存完整路径）
+        if (shorten && /[\\/]/.test(body)) {
+          const name = body.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || body;
+          s.textContent = '@' + name;
+          s.title = body; // 悬浮看完整路径
+        } else {
+          // 气泡（shorten=true）顺手去掉可能的引号：`@"a b.txt"` → `@a b.txt`。
+          // ⚠️ 输入框镜像层必须**逐字原样**（textarea 里就是带引号的），否则会与真实文字错位。
+          s.textContent = shorten ? '@' + body : p;
+        }
+        container.appendChild(s);
+      } else {
+        container.appendChild(document.createTextNode(p));
+      }
+    });
+  }
   function addUser(text) {
     const row = document.createElement('div');
     row.className = 'msg-user';
     const b = document.createElement('div');
     b.className = 'bubble';
-    b.textContent = text;
+    renderUserText(b, text);
     row.appendChild(b);
     ensureCol().appendChild(row);
     scrollBottom();
@@ -813,6 +911,116 @@
   function wsSend(obj) {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
   }
+  // 上报页面可见性：窗口在前台可见（用户正看着）时，任务完成不弹系统通知。
+  // 连接建立时上报一次，之后每次切换标签页/最小化/回到前台都上报。
+  function sendVisibility() {
+    wsSend({ type: 'visibility', hidden: !!document.hidden });
+  }
+  document.addEventListener('visibilitychange', sendVisibility);
+
+  // ---------- 上下文占用进度条（底部栏右侧）----------
+  // 服务端在「切换会话 / 新建会话 / 每轮 idle」时下发 {type:'context', ...}；
+  // 前端打开明细时再主动拉一次，保证数字是当前会话的。
+  const ctxMeter = $('#ctx-meter');
+  const ctxFill = $('#ctx-fill');
+  const ctxPct = $('#ctx-pct');
+  const ctxPop = $('#ctx-pop');
+  let ctxUsage = null;   // 最近一次下发的上下文占用数据
+
+  // 把 token 数缩写成 12.3k / 1.2M（明细与提示里空间有限）。
+  function fmtTokens(n) {
+    n = Number(n) || 0;
+    if (n >= 1000000) return (n / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+    return String(n);
+  }
+
+  function renderCtxUsage(d) {
+    ctxUsage = d || null;
+    const pct = ctxUsage ? Math.max(0, Number(ctxUsage.percent) || 0) : 0;
+    ctxFill.style.width = Math.min(100, pct) + '%'; // 条宽封顶 100%，数字照实显示
+    ctxPct.textContent = ctxUsage ? pct.toFixed(1) + '%' : '—';
+    ctxMeter.classList.toggle('warn', pct >= 70 && pct < 90);
+    ctxMeter.classList.toggle('danger', pct >= 90);
+    ctxMeter.classList.toggle('compressed', !!(ctxUsage && ctxUsage.compressed));
+    ctxMeter.title = '上下文使用：' + fmtTokens(ctxUsage && ctxUsage.used) + ' / ' +
+      fmtTokens(ctxUsage && ctxUsage.budget) + ' tokens（' + pct.toFixed(1) + '%，达 100% 自动摘要压缩）';
+    if (!ctxPop.classList.contains('hidden')) renderCtxPop();
+  }
+
+  function ctxRow(k, v) {
+    const row = document.createElement('div');
+    row.className = 'ctx-row';
+    const kEl = document.createElement('span');
+    kEl.className = 'k'; kEl.textContent = k;
+    const vEl = document.createElement('span');
+    vEl.className = 'v'; vEl.textContent = v; vEl.title = v;
+    row.appendChild(kEl); row.appendChild(vEl);
+    return row;
+  }
+
+  function renderCtxPop() {
+    ctxPop.innerHTML = '';
+    const title = document.createElement('div');
+    title.className = 'ctx-title';
+    title.textContent = '上下文使用情况';
+    ctxPop.appendChild(title);
+
+    if (!ctxUsage) {
+      const tip = document.createElement('div');
+      tip.className = 'ctx-tip';
+      tip.textContent = '暂无数据（当前没有活动会话）。';
+      ctxPop.appendChild(tip);
+      return;
+    }
+    const d = ctxUsage;
+    const pct = Math.max(0, Number(d.percent) || 0);
+    const summarized = Number(d.summarized) || 0;
+    const rows = [
+      ['模型', d.model || d.model_id || '—'],
+      ['送模占用', fmtTokens(d.used) + ' / ' + fmtTokens(d.budget) + ' tokens'],
+      ['占比', pct.toFixed(1) + '%'],
+    ];
+    if (d.window) rows.push(['模型窗口', fmtTokens(d.window) + ' tokens']);
+    if (d.window && d.reserve) rows.push(['输出预留', fmtTokens(d.reserve) + ' tokens']);
+    if (d.raw && d.raw !== d.used) rows.push(['历史原文', fmtTokens(d.raw) + ' tokens']);
+    rows.push(['历史消息', (Number(d.messages) || 0) + ' 条']);
+    if (summarized > 0) rows.push(['已摘要', summarized + ' 条']);
+    rows.forEach(function (r) { ctxPop.appendChild(ctxRow(r[0], r[1])); });
+
+    const tip = document.createElement('div');
+    const level = pct >= 90 ? ' danger' : (pct >= 70 ? ' warn' : '');
+    tip.className = 'ctx-tip' + level;
+    if (d.over_budget && !d.compressed) {
+      tip.textContent = '已越过压缩线，正在压缩上下文…';
+    } else if (d.compressed) {
+      tip.textContent = '已自动压缩：前 ' + summarized +
+        ' 条历史被压成摘要送入模型，完整历史仍保留在会话里（可正常回看）。' +
+        '占比达 100% 时会继续增量压缩。';
+    } else {
+      tip.textContent = '占比 = 送模占用 / 压缩线（模型窗口扣除输出预留后的 95%）。' +
+        '达 100% 时自动调用模型把较早历史压成详细摘要。';
+    }
+    ctxPop.appendChild(tip);
+  }
+
+  ctxMeter.addEventListener('click', function (e) {
+    e.stopPropagation(); // 别让下面的 document 收起逻辑立刻又关掉
+    if (ctxPop.classList.contains('hidden')) {
+      wsSend({ type: 'context', session_id: sessionID }); // 打开即拉最新占用
+      renderCtxPop();
+      ctxPop.classList.remove('hidden');
+    } else {
+      ctxPop.classList.add('hidden');
+    }
+  });
+  document.addEventListener('click', function (e) {
+    if (ctxPop.classList.contains('hidden')) return;
+    if (ctxPop.contains(e.target) || ctxMeter.contains(e.target)) return;
+    ctxPop.classList.add('hidden'); // 点击别处收起
+  });
+  renderCtxUsage(null);
+
   // 模型尚未开始输出时的等待提示（首字用户消息、工具返回后再次等待模型时都会显示）。
   function showThinking() {
     if (thinkingEl) return;
@@ -886,11 +1094,20 @@
   const sessionListEl = document.getElementById('session-list');
   let sessionsCache = []; // 最近一次 sessions 事件/列表（全部项目）
 
-  // 项目名显示：取路径最后一段；空串（未选择项目）显示「新项目」
-  function wsDisplayName(ws) {
+  // 项目名显示：优先用**项目自定义显示名**（workspace_names 表，随 /api/sessions 的
+  // workspace_name 下发）；没设过则取路径最后一段；空串（未选择项目）显示「新项目」。
+  // 注意：显示名只是标签，真实工作区键（ws）永远不变。
+  function wsDisplayName(ws, name) {
+    if (name) return name;
     if (!ws) return '新项目';
     const parts = String(ws).replace(/[\\/]+$/, '').split(/[\\/]/);
     return parts[parts.length - 1] || ws;
+  }
+  // 从最近一次会话列表里取某项目的显示名（没取到返回空串，交给 wsDisplayName 回落）
+  function wsNameOf(ws) {
+    const k = ws || '';
+    const hit = sessionsCache.find(function (s) { return (s.workspace || '') === k; });
+    return (hit && hit.workspace_name) || '';
   }
 
   // 通用内联菜单（三点按钮旁弹出，无浏览器弹窗）；点击外部自动关闭
@@ -944,6 +1161,8 @@
   const wsFolded = {}; // workspace → 是否折叠（内存态，刷新重置）
   function renderSessions(items) {
     sessionsCache = items || [];
+    // 项目显示名可能刚变（重命名）→ 顺手同步输入框上方的工作区标签
+    syncWorkspaceLabel();
     sessionListEl.innerHTML = '';
     if (!sessionsCache.length) {
       sessionListEl.innerHTML = '<li class="session-empty" style="cursor:default">暂无项目</li>';
@@ -961,6 +1180,8 @@
       group.className = 'ws-group';
       const head = document.createElement('div');
       head.className = 'ws-group-head';
+      // 显示名取组内任一条会话带下来的 workspace_name（同组必然一致）
+      const groupName = wsDisplayName(ws, list[0] && list[0].workspace_name);
 
       // 折叠箭头（点击整行名称也可折叠）
       const fold = document.createElement('button');
@@ -979,8 +1200,8 @@
 
       const name = document.createElement('span');
       name.className = 'ws-name';
-      name.textContent = wsDisplayName(ws);
-      name.title = ws || '新项目';
+      name.textContent = groupName;
+      name.title = ws || '新项目'; // 悬浮看真实工作区路径
 
       function toggleFold() {
         wsFolded[ws] = !wsFolded[ws];
@@ -1013,16 +1234,21 @@
       dots.appendChild(dotsvg);
       dots.addEventListener('click', function (e) {
         e.stopPropagation();
-        const displayName = wsDisplayName(ws);
-        showInlineMenu(dots, [
-          { label: '重命名', fn: function () { renameWorkspaceInline(dots, ws, name); } },
-          { label: '归档', fn: function () { archiveWorkspace(ws); } },
-          { label: '删除项目', danger: true, fn: function () {
-            if (confirm('删除项目「' + displayName + '」及其全部会话？此操作不可恢复。')) {
-              deleteWorkspace(ws);
-            }
-          } },
-        ]);
+        const items = [
+          { label: '重命名', fn: function () { renameWorkspaceInline(dots, ws, name, groupName); } },
+        ];
+        // 只有设过自定义显示名才给「恢复默认名」：清掉 workspace_names 里的记录，
+        // 回落按工作区路径末段显示（后端 new_name 传空串即清除）。
+        if (list[0] && list[0].workspace_name) {
+          items.push({ label: '恢复默认名', fn: function () { clearWorkspaceName(ws); } });
+        }
+        items.push({ label: '归档', fn: function () { archiveWorkspace(ws); } });
+        items.push({ label: '删除项目', danger: true, fn: function () {
+          if (confirm('删除项目「' + groupName + '」及其全部会话？此操作不可恢复。')) {
+            deleteWorkspace(ws);
+          }
+        } });
+        showInlineMenu(dots, items);
       });
 
       head.appendChild(fold);
@@ -1078,13 +1304,16 @@
   function newSessionInWorkspace(ws) {
     if (running) return;
     if (ws && ws !== workspaceRoot) {
-      // 先切换工作区，再新建会话（服务端 Create 挂当前工作区）
-      fetch('/api/workspace', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: ws })
-      }).then(function (r) { return r.json(); }).then(function () {
-        workspaceRoot = ws;
-        wsLabel.textContent = wsDisplayName(ws);
+      // 先切换工作区，再新建会话（服务端 Create 挂当前工作区）。
+      // ⚠️ 必须看 res.ok：目录已被删除时服务端会拒绝，若照样往下走，
+      // 新会话会带着**没切换成功**的旧工作区落进上一个项目下（静默错位）。
+      setWorkspace(ws).then(function (res) {
+        if (!res.ok) {
+          addError(res.error || ('无法切换到该项目的目录：' + ws));
+          loadSessionList2(); // 标签/workspaceRoot 回滚成服务端真实状态
+          return;
+        }
+        wsLabel.textContent = wsDisplayName(ws, wsNameOf(ws));
         wsLabel.title = ws;
         doNewSession();
       });
@@ -1148,12 +1377,13 @@
       }).then(function () { loadSessionList(); });
     });
   }
-  function renameWorkspaceInline(anchor, ws, nameEl) {
+  function renameWorkspaceInline(anchor, ws, nameEl, currentName) {
     closeInlineMenu();
-    // 只把项目名替换为输入框，不清空组头（保留箭头/三点/加号）
+    // 只把项目名替换为输入框，不清空组头（保留箭头/三点/加号）。
+    // 预填当前**显示名**：重命名只改显示名，改回原样也不会有副作用。
     const input = document.createElement('input');
     input.type = 'text';
-    input.value = wsDisplayName(ws);
+    input.value = currentName || wsDisplayName(ws);
     input.style.cssText = 'flex:1;min-width:0;font-size:12px;font-family:inherit;' +
       'border:1px solid var(--accent);border-radius:6px;padding:2px 5px;background:var(--bg);color:var(--text)';
     const done = function () {
@@ -1176,6 +1406,13 @@
       if (e.key === 'Escape') renderSessions(sessionsCache);
     });
     input.addEventListener('blur', done);
+  }
+  // 清除项目自定义显示名 → 回落按工作区路径末段显示（new_name 传空串 = 清除）
+  function clearWorkspaceName(ws) {
+    fetch('/api/workspaces', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workspace: ws, new_name: '' })
+    }).then(function () { loadSessionList(); });
   }
   function archiveSession(s) {
     fetch('/api/sessions', {
@@ -1236,18 +1473,22 @@
         loadSessionList();
       });
   }
-  // 当前工作区标签同步（重命名工作区后）
+  // 当前工作区标签同步（切换 / 重命名项目后）
   let workspaceRoot = '';
+  // 输入框上方的工作区标签：优先项目自定义显示名，回落路径末段。
+  // 显示名只随 /api/sessions 下发，所以 renderSessions 刷新列表后会再调一次它。
+  function syncWorkspaceLabel() {
+    const lbl = document.getElementById('workspace-label');
+    if (!lbl) return;
+    const ws = workspaceRoot || '';
+    lbl.textContent = ws ? wsDisplayName(ws, wsNameOf(ws)) : '';
+    lbl.title = ws;
+  }
   function loadSessionList2() {
     fetch('/api/workspace').then(function (r) { return r.json(); })
       .then(function (d) {
         workspaceRoot = d.root || '';
-        const lbl = document.getElementById('workspace-label');
-        if (lbl && workspaceRoot) {
-          const parts = workspaceRoot.replace(/[\\/]+$/, '').split(/[\\/]/);
-          lbl.textContent = parts[parts.length - 1];
-          lbl.title = workspaceRoot;
-        }
+        syncWorkspaceLabel();
       });
   }
 
@@ -1597,6 +1838,7 @@
     ws = new WebSocket(proto + location.host + '/ws');
     ws.addEventListener('open', function () {
       wsReady = true;
+      sendVisibility(); // 告知服务端当前页面是否可见（决定任务完成是否弹系统通知）
       loadModels(); // 连接后预取模型名与思考分级（供操作栏显示模型名称）
     });
     ws.addEventListener('close', function () {
@@ -1624,6 +1866,9 @@
         case 'session':
           if (ev.session_id) sessionID = ev.session_id;
           break;
+        case 'context':
+          renderCtxUsage(ev);
+          break;
         case 'busy':
           running = true;
           lastReply = '';        // 新一轮开始：清空回复累积
@@ -1637,6 +1882,23 @@
         case 'retry':
           removeThinking();
           addRetry(ev.error || '');
+          break;
+        case 'compress':
+          // 上下文越过压缩线，服务端已自动压缩。这一段是「无声发生」的关键动作，
+          // 必须告诉用户：否则他会以为历史丢了（实际完整保留，只是送模内容变了）。
+          (function () {
+            const ci = ev.compress || {};
+            if (ci.degraded) {
+              addInfo('上下文超出阈值，已临时压缩历史（' + fmtTokens(ci.before) + ' → ' +
+                fmtTokens(ci.after) + ' tokens）。' + (ci.reason || ''));
+              return;
+            }
+            const added = Number(ci.added) || 0;
+            const total = Number(ci.summarized) || 0;
+            addInfo('上下文已自动摘要压缩：' + added + ' 条历史并入摘要' +
+              (total ? '（累计 ' + total + ' 条）' : '') + '，' +
+              fmtTokens(ci.before) + ' → ' + fmtTokens(ci.after) + ' tokens。完整历史仍保留在会话中。');
+          })();
           break;
         case 'reasoning':
           removeThinking();
@@ -1715,38 +1977,53 @@
 
   // 初始化：回显后端当前工作区（服务重启后为空 → 保持「选择工作区」占位，与后端一致）
   fetch('/api/workspace').then(function (r) { return r.json(); }).then(function (d) {
-    if (d.root) { wsLabel.textContent = baseName(d.root); wsLabel.title = d.root; }
+    if (d.root) { workspaceRoot = d.root; syncWorkspaceLabel(); }
   }).catch(function () {});
 
-  function baseName(p) {
-    if (!p) return '';
-    const parts = p.split(/[\\/]/).filter(Boolean);
-    return parts.length ? parts[parts.length - 1] : p;
-  }
   function setWorkspace(path) {
     workspaceRoot = path || '';
-    wsLabel.textContent = baseName(path);
+    wsLabel.textContent = path ? wsDisplayName(path, wsNameOf(path)) : '';
     wsLabel.title = path;
     // 返回 Promise：需要「先切工作区、再新建会话」的调用方必须等它，否则 new_session 会
     // 抢在清空请求前面到达服务端，新会话被挂到上一个项目下（见「新建项目」按钮）。
+    // ⚠️ resolve 成 {ok, error}：fetch 对 400 也是 resolve，**调用方必须看 ok** ——
+    // 服务端会拒绝不存在的目录，忽略状态码会把「切换失败」当成成功。
     const done = fetch('/api/workspace', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: path })
-    });
-    // 新建的空工作区会话选中工作区后，把该会话归属到新工作区
-    // （否则它会一直留在「未选择工作区」分组，名字不更新）
-    if (path && sessionID) {
-      const cur = sessionsCache.find(function (s) { return s.id === sessionID; });
-      if (cur && !cur.workspace) {
-        fetch('/api/sessions', {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: sessionID, workspace: path })
-        }).then(function () { loadSessionList(); });
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (d) {
+        return { ok: r.ok, error: (d && d.error) || '' };
+      });
+    }).then(function (res) {
+      // 新建的空工作区会话选中工作区后，把该会话归属到新工作区
+      // （否则它会一直留在「未选择工作区」分组，名字不更新）。
+      // ⚠️ 只在**切换成功**时做：失败时这个路径是坏的，写进会话键又是一次损坏。
+      if (res.ok && path && sessionID) {
+        const cur = sessionsCache.find(function (s) { return s.id === sessionID; });
+        if (cur && !cur.workspace) {
+          fetch('/api/sessions', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: sessionID, workspace: path })
+          }).then(function () { loadSessionList(); });
+        }
       }
-    }
+      return res;
+    });
     return done;
+  }
+  // 切换工作区并在失败时报错 + 把标签回滚成服务端真实状态（成功时无副作用）。
+  // 系统对话框 / 内置选择器只会给出真实存在的目录，这里主要防「选完之后目录被删/移动」这类竞态。
+  function switchWorkspace(path) {
+    return setWorkspace(path).then(function (res) {
+      if (res && !res.ok) {
+        addError(res.error || '切换工作区失败');
+        loadSessionList2();
+      }
+      return res;
+    });
   }
   // 内置目录浏览选择器（Linux/macOS 等）；startPath 为服务端给出的默认起始目录
   // 内置选择器（Linux/macOS/Termux 等没有原生对话框的平台）。
@@ -1784,7 +2061,7 @@
           if (pickerOnPick) pickerOnPick(picked);
           return;
         }
-        setWorkspace(picker.dataset.current || '');
+        switchWorkspace(picker.dataset.current || '');
         hideWithAnim(picker);
       });
     }
@@ -1839,7 +2116,7 @@
           // Linux/Termux 等：用内置选择器，起始目录由服务端按平台决定
           openBuiltinPicker(res.data.start_path || '');
         } else if (res.data.ok && res.data.path) {
-          setWorkspace(res.data.path); // Windows 资源管理器对话框选中
+          switchWorkspace(res.data.path); // Windows 资源管理器对话框选中
         }
         // res.data.ok === false：用户在系统对话框点了取消，无需任何动作
       })
@@ -1852,23 +2129,101 @@
   const input = $('#input');
   let running = false;
 
+  // 输入框 @提及 蓝色高亮：textarea 自身无法局部着色，靠 .input-mirror 这层
+  // 「镜像文字」画字（textarea 文字是 transparent，只留光标）。见 index.html 注释
+  // 与 app.css 的「共享排版」块。内容或滚动位置一变就要同步，否则会和真实文字错位。
+  const inputMirror = $('#input-mirror');
+  function syncInputMirror() {
+    // 先按当前内容清理「@文件名」别名表（放在最前面：即使镜像层缺失也要保持别名与输入一致）
+    pruneFileAliases(input.value);
+    if (!inputMirror) return;
+    inputMirror.innerHTML = '';
+    // 原样渲染（不把路径缩成文件名）：这里就是用户正在编辑的文字
+    renderUserText(inputMirror, input.value, { shortenPath: false });
+    // 末尾补零宽字符：value 以换行结尾时，保证镜像层也保留那个空行
+    inputMirror.appendChild(document.createTextNode('\u200b'));
+    inputMirror.scrollTop = input.scrollTop;
+  }
+  input.addEventListener('scroll', syncInputMirror);
+  syncInputMirror();
+
+  // 提取文本里的 @文件路径 提及（含分隔符/盘符的才算文件；@技能名 忽略）。
+  // 与渲染共用 MENTION_SPLIT，因此 `@"C:\a b\c.txt"` 这种带空白的写法也能取到。
+  function fileMentions(text) {
+    const out = [];
+    String(text).split(MENTION_SPLIT).forEach(function (p) {
+      if (!p || p.charAt(0) !== '@' || p.length < 2) return;
+      const body = mentionBody(p);
+      if (/[\\/]/.test(body)) out.push(body);
+    });
+    return out;
+  }
+
+  // 发送前的处理链：把 @区外文件 stage 成工作区副本。
+  //   text    —— 真正发出去、给模型看的文本（别名已展开成真实路径）
+  //   display —— 消息气泡里展示的文本（= 用户原本输入的样子，@文件名 保持蓝色）
+  // 两者刻意分开：模型要能读到路径，用户要看自己写的东西。
+  // staging 失败的文件保持原样（模型看不到，但至少消息可发；会附带提示）。
+  async function prepareMentions(text, display) {
+    const notes = [];
+    for (const f of fileMentions(text)) {
+      if (insideWorkspace(f)) continue;
+      try {
+        const res = await fetch('/api/stage_file', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: f })
+        });
+        const d = await res.json();
+        if (res.ok && d.ok && d.staged_path) {
+          // 按 token 粒度整体替换（含 @、含可能的引号），换成模型可直接用的路径
+          text = text.split(MENTION_SPLIT).map(function (part) {
+            return (part && part.charAt(0) === '@' && mentionBody(part) === f) ? d.staged_path : part;
+          }).join('');
+          // ⚠️ inside=true 表示它本来就在工作区内、**没有复制** —— 别说「已复制到 attachments/」。
+          // （前端自己的 insideWorkspace 是词法判断，手打的相对路径会被它误判成区外，
+          //   于是走到这里；以服务端的 inside 为准才不会弹假提示。）
+          if (!d.inside) {
+            notes.push('已把 ' + d.name + ' 复制到工作区 attachments/，模型将通过副本访问');
+          }
+        } else {
+          notes.push('文件 ' + f + ' 在工作区外且副本创建失败：' + (d.error || '未知错误'));
+        }
+      } catch (_) {
+        notes.push('文件 ' + f + ' 暂存失败（服务不可达）');
+      }
+    }
+    return { text: text, display: display === undefined ? text : display, notes: notes };
+  }
+
   form.addEventListener('submit', function (e) {
     e.preventDefault();
     if (running) { wsSend({ type: 'cancel' }); return; } // ▶ 运行中点击 = 打断当前任务
-    const text = input.value.trim();
-    if (!text) return;
+    const raw = input.value.trim();
+    if (!raw) return;
     if (!wsReady) { addError('未连接到服务，请稍候重试'); return; }
+    // ⚠️ 顺序要紧：别名展开必须在清空输入框**之前**。syncInputMirror() 会按当前内容
+    // 清理「@文件名」别名表，先清空就等于把别名全删了，expandFileAliases 只能原样返回。
+    const outgoing = expandFileAliases(raw);
     input.value = '';
-    lastUserText = text; // 记录供「重新生成」
-    composerSnap = false; // 用户主动发出第一句：位置切换要有下放动画
-    addUser(text);
-    // 不等服务端 busy 往返：用户消息发出后，模型尚未回复的空窗立即显示提示。
-    showThinking();
-    wsSend({
-      type: 'user_message',
-      session_id: sessionID,
-      text: text,
-      thinking: thinkingVal // 上游参数原值：枚举（minimal/low/…）或 budget 数字
+    syncInputMirror();
+    // 再把区外文件 stage 成工作区副本（attachments/），最后发出去。
+    // 第二个参数 = 气泡要显示的原文（raw），与发出去的 outgoing 分开。
+    prepareMentions(outgoing, raw).then(function (p) {
+      lastUserText = p.text; // 记录供「重新生成」（用发送文本，可直接重放）
+      composerSnap = false; // 用户主动发出第一句：位置切换要有下放动画
+      // 气泡显示 p.display（= 用户原本输入的样子，@文件名 保持蓝色），
+      // 模型拿到的仍是 p.text（真实路径 / attachments 暂存路径）——显示与发送分离。
+      addUser(p.display);
+      p.notes.forEach(function (n) { addInfo(n); });
+      // 不等服务端 busy 往返：用户消息发出后，模型尚未回复的空窗立即显示提示。
+      showThinking();
+      wsSend({
+        type: 'user_message',
+        session_id: sessionID,
+        text: p.text,
+        thinking: thinkingVal // 上游参数原值：枚举（minimal/low/…）或 budget 数字
+      });
     });
   });
 
@@ -2022,12 +2377,14 @@
     const before = input.value.slice(0, atStart);
     const after = input.value.slice(input.selectionStart);
     input.value = before + '@' + it.name + ' ' + after;
+    syncInputMirror();
     closeAtPop();
     input.focus();
     const pos = (before + '@' + it.name + ' ').length;
     input.setSelectionRange(pos, pos);
   }
   input.addEventListener('input', function () {
+    syncInputMirror(); // 内容一变就重画 @提及 高亮
     const cur = atContext();
     if (!cur) { closeAtPop(); atLoadedFor = -1; return; }
     atStart = cur.start;
@@ -2099,6 +2456,7 @@
     const sep = (before && !/\s$/.test(before)) ? ' ' : '';
     const ins = text + ' ';
     input.value = before + sep + ins + after;
+    syncInputMirror();
     const np = (before + sep + ins).length;
     input.focus();
     input.setSelectionRange(np, np);
@@ -2110,10 +2468,51 @@
     const f = norm(p);
     return !!root && (f === root || f.indexOf(root + '/') === 0);
   }
+  // ＋添加文件 /「当前目录的文件」：输入框里只放「@文件名」（蓝色高亮），
+  // 完整路径记进别名表，发送前由 expandFileAliases() 展开 —— 输入区保持干净，
+  // 模型那边拿到的仍是可读的完整路径。文件名含空白时用 `@"名字"` 形式
+  //（提及语法以空白分隔，不加引号会被切成两段）。
+  // 输入框里已经不存在的 token → 别名一并清掉。否则删掉提及后又手打一个同名 token 时，
+  // 会被上一次的旧路径悄悄劫持（输入框显示 A、实际发出去 B）。
+  function pruneFileAliases(text) {
+    if (!fileAlias.size) return;
+    const alive = new Set(String(text).split(MENTION_SPLIT));
+    fileAlias.forEach(function (_, tok) { if (!alive.has(tok)) fileAlias.delete(tok); });
+  }
+  function mentionToken(name) {
+    return /[\s"]/.test(name) ? '@"' + name + '"' : '@' + name;
+  }
+  // 把输入框里的「@文件名」别名展开成真实路径；没有别名的 token 原样保留
+  //（例如用户手打的 @技能名 / @完整路径）。
+  // ⚠️ 展开后必须重新按 mentionToken 的规则加引号：真实路径可能含空白
+  //（`C:\...\新建 文本文档.txt`），裸着写回去会被 MENTION_SPLIT / fileMentions
+  // 在空格处切断，暂存出一个不存在的路径。
+  function expandFileAliases(text) {
+    if (!fileAlias.size) return text;
+    return String(text).split(MENTION_SPLIT).map(function (part) {
+      const real = fileAlias.get(part);
+      return real ? mentionToken(real) : part;
+    }).join('');
+  }
+  // 为某个文件挑一个不冲突的提及 token：优先只用文件名（满足「只显示文件名」），
+  // 只有当该 token 已被**另一个**文件占用时，才逐级多带父目录（如 @b/hello.html）。
+  // 否则两个同名文件会互相顶掉 —— 输入框看着是两份，实际都指向后选的那个。
+  function mentionTokenFor(fullPath) {
+    const segs = String(fullPath).replace(/[\\/]+$/, '').split(/[\\/]/);
+    for (let take = 1; take <= segs.length; take++) {
+      const tok = mentionToken(segs.slice(-take).join('/'));
+      const exist = fileAlias.get(tok);
+      if (!exist || exist === fullPath) return tok;
+    }
+    return mentionToken(segs.join('/'));
+  }
   function insertPickedFile(p) {
-    insertIntoInput(p);
+    const name = String(p).replace(/[\\/]+$/, '').split(/[\\/]/).pop() || p;
+    const token = mentionTokenFor(p);
+    fileAlias.set(token, p);
+    insertIntoInput(token);
     if (workspaceRoot && !insideWorkspace(p)) {
-      addInfo('已插入工作区外的文件：' + p + '（代理默认只能读工作区内的文件，需要时可在设置里放开工作区边界）');
+      addInfo('已插入工作区外的文件 ' + name + '（代理默认只能读工作区内的文件，需要时可在设置里放开工作区边界）');
     }
   }
   document.getElementById('more-add-file').addEventListener('click', function () {
@@ -2131,6 +2530,18 @@
         // res.data.ok === false：用户在系统对话框点了取消，无需任何动作
       })
       .catch(function () { openBuiltinPicker('', 'file', insertPickedFile); });
+  });
+
+  // 当前目录的文件：内置选择器（文件模式），起点 = 工作区根。
+  // 与「添加文件」的区别：不弹系统对话框，直接浏览工作区树（所有平台一致），
+  // 选中后同样以 @文件 路径插入输入框。
+  document.getElementById('more-browse-workspace').addEventListener('click', function () {
+    setMoreOpen(false);
+    if (!workspaceRoot) {
+      addInfo('还没有选择工作区：请先在左上角选择工作区，再浏览当前目录的文件');
+      return;
+    }
+    openBuiltinPicker(workspaceRoot, 'file', insertPickedFile);
   });
 
   // Skills 二级菜单：每次展开都重新拉一次（刚建的技能能立刻出现）
@@ -2241,6 +2652,32 @@
       b.classList.toggle('active', b.dataset.skin === skin);
     });
   }
+  // 「任务完成通知」开关：读服务端当前偏好并回填；切换时写回并落盘 config/local.yaml。
+  function refreshNotifySwitch() {
+    var el = document.getElementById('settings-notify');
+    if (!el) return;
+    fetch('/api/notify').then(function (r) { return r.json(); }).then(function (d) {
+      el.checked = d.enabled !== false;
+    }).catch(function () { /* 读取失败保持原状 */ });
+  }
+  (function bindNotifySwitch() {
+    var el = document.getElementById('settings-notify');
+    if (!el) return;
+    el.addEventListener('change', function () {
+      var want = el.checked;
+      el.disabled = true;
+      fetch('/api/notify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: want })
+      }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+        .then(function (res) {
+          if (!res.ok) { el.checked = !want; addError('通知设置保存失败：' + (res.d.error || '未知错误')); }
+        })
+        .catch(function () { el.checked = !want; addError('通知设置保存失败（服务不可达）'); })
+        .then(function () { el.disabled = false; });
+    });
+  })();
   openSettingsBtn.addEventListener('click', function () {
     refreshSkinSeg();
     // 常规页信息回填
@@ -2250,6 +2687,7 @@
     });
     var mEl = document.getElementById('settings-model');
     if (mEl) { mEl.textContent = modelName || model || '--'; mEl.title = model || ''; }
+    refreshNotifySwitch();
     settingsOverlay.classList.remove('leaving', 'hidden');
   });
   settingsOverlay.addEventListener('click', function (e) {
@@ -2497,12 +2935,177 @@
     n.addEventListener('click', renderBuiltinPlugins);
   });
 
+  // ---------- 子智能体页：总开关 / 并发上限 / 能力限制 ----------
+  // 后端 /api/subagents 按指针语义做「部分更新」：这里永远只提交被改动的那一项，
+  // 避免用界面上的旧值覆盖用户刚在别处（如插件页）改过的开关。
+  // 总开关与「插件」页的内置插件开关是同一字段，两边切换都会立即互相体现。
+  function setSubagentNote(msg, ok) {
+    const el = document.getElementById('subagents-result');
+    if (!el) return;
+    el.className = 'settings-note' + (ok === true ? ' ok' : ok === false ? ' fail' : '');
+    el.textContent = msg || '';
+  }
+
+  // syncSubagentLocks 让界面反映真实的生效关系：
+  // 总开关关闭 → 其余项都无意义，置灰；总开关开启但禁写 → 删除开关无意义，置灰。
+  function syncSubagentLocks() {
+    const on = document.getElementById('sub-enabled');
+    if (!on) return;
+    const enabled = on.checked;
+    ['sub-max', 'sub-allow-write', 'sub-allow-delete', 'sub-allow-memory'].forEach(function (id) {
+      document.getElementById(id).disabled = !enabled;
+    });
+    if (enabled && !document.getElementById('sub-allow-write').checked) {
+      document.getElementById('sub-allow-delete').disabled = true;
+    }
+  }
+
+  function applySubagentView(d) {
+    const cap = d.max_allowed || 5;
+    const max = d.max_concurrent || cap;
+    document.getElementById('sub-enabled').checked = d.enabled !== false;
+    const range = document.getElementById('sub-max');
+    range.max = cap;
+    range.value = max;
+    document.getElementById('sub-max-cap').textContent = cap;
+    document.getElementById('sub-max-val').textContent = max + ' 个';
+    document.getElementById('sub-allow-write').checked = d.allow_write !== false;
+    document.getElementById('sub-allow-delete').checked = d.allow_delete !== false;
+    document.getElementById('sub-allow-memory').checked = d.allow_memory !== false;
+    syncSubagentLocks();
+  }
+
+  function loadSubagentSettings() {
+    if (!document.getElementById('sub-enabled')) return;
+    setSubagentNote('加载中…');
+    fetch('/api/subagents').then(function (r) { return r.json(); }).then(function (d) {
+      applySubagentView(d);
+      setSubagentNote('');
+    }).catch(function () {
+      setSubagentNote('子智能体设置加载失败，请确认服务正在运行', false);
+    });
+  }
+
+  // postSubagentSetting 提交一项改动；成功后用服务端回传的设置整体重绘（含越界收敛后的值）。
+  function postSubagentSetting(patch, okMsg) {
+    setSubagentNote('保存中…');
+    return fetch('/api/subagents', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch)
+    }).then(function (r) {
+      return r.json().then(function (d) { return { ok: r.ok, d: d }; });
+    }).then(function (res) {
+      if (!res.ok) {
+        setSubagentNote('保存失败：' + (res.d.error || '未知错误'), false);
+        return false;
+      }
+      if (res.d.settings) applySubagentView(res.d.settings);
+      setSubagentNote(okMsg || '已保存', true);
+      return true;
+    }).catch(function () {
+      setSubagentNote('保存失败（服务不可达）', false);
+      return false;
+    });
+  }
+
+  (function bindSubagentSettings() {
+    const on = document.getElementById('sub-enabled');
+    if (!on) return;
+
+    on.addEventListener('change', function () {
+      const want = on.checked;
+      on.disabled = true;
+      postSubagentSetting({ enabled: want }, want ? '已启用多智能体协作' : '已关闭多智能体协作')
+        .then(function (ok) { if (!ok) on.checked = !want; syncSubagentLocks(); });
+    });
+
+    const range = document.getElementById('sub-max');
+    const val = document.getElementById('sub-max-val');
+    range.addEventListener('input', function () { val.textContent = range.value + ' 个'; });
+    range.addEventListener('change', function () {
+      postSubagentSetting({ max_concurrent: Number(range.value) }, '并发上限已设为 ' + range.value + ' 个')
+        .then(function (ok) { if (!ok) loadSubagentSettings(); });
+    });
+
+    [['sub-allow-write', 'allow_write', '写入文件'],
+     ['sub-allow-delete', 'allow_delete', '删除文件'],
+     ['sub-allow-memory', 'allow_memory', '写入记忆']].forEach(function (pair) {
+      const el = document.getElementById(pair[0]);
+      el.addEventListener('change', function () {
+        const patch = {};
+        patch[pair[1]] = el.checked;
+        postSubagentSetting(patch, (el.checked ? '已允许子智能体' : '已禁止子智能体') + pair[2])
+          .then(function (ok) { if (!ok) el.checked = !el.checked; syncSubagentLocks(); });
+      });
+    });
+  })();
+  settingsOverlay.querySelectorAll('.nav-item[data-page="subagents"]').forEach(function (n) {
+    n.addEventListener('click', loadSubagentSettings);
+  });
+
   // ---------- 归档管理页：查看 / 恢复 / 永久删除 ----------
   function fmtArchDays(at) {
     if (!at) return '';
     const days = Math.floor((Date.now() / 1000 - at) / 86400);
     return days <= 0 ? '今天归档' : '已归档 ' + days + ' 天（满 10 天自动删除）';
   }
+  // 单条已归档会话的行（三点：恢复到侧栏 / 永久删除）
+  function archSessionRow(s) {
+    const row = document.createElement('div');
+    row.className = 'arch-item';
+    const main = document.createElement('div');
+    main.className = 'arch-main';
+    const t = document.createElement('div');
+    t.className = 'arch-title';
+    t.textContent = s.title || '未命名会话';
+    const meta = document.createElement('div');
+    meta.className = 'arch-meta';
+    meta.textContent = (s.message_count || 0) + ' 条消息'; // 项目名在组头上，这里不重复
+    main.appendChild(t);
+    main.appendChild(meta);
+    const days = document.createElement('span');
+    days.className = 'arch-days';
+    days.textContent = fmtArchDays(s.archived_at);
+    // 三点：恢复 / 永久删除（内联菜单，无浏览器弹窗）
+    const dots = document.createElement('button');
+    dots.type = 'button';
+    dots.className = 'dots-btn';
+    dots.textContent = '⋯';
+    dots.title = '操作';
+    dots.addEventListener('click', function (e) {
+      e.stopPropagation();
+      showInlineMenu(dots, [
+        { label: '恢复到侧栏', fn: function () {
+          fetch('/api/sessions', {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: s.id, archived: false })
+          }).then(function () { loadArchived(); loadSessionList(); });
+        } },
+        { label: '永久删除', danger: true, fn: function () {
+          fetch('/api/sessions?id=' + encodeURIComponent(s.id), { method: 'DELETE' })
+            .then(function () { loadArchived(); loadSessionList(); });
+        } },
+      ]);
+    });
+    row.appendChild(main);
+    row.appendChild(days);
+    row.appendChild(dots);
+    return row;
+  }
+  // 恢复整个项目：把该项目下全部已归档会话一次性恢复。
+  // 与侧栏 ⋯ 的「归档」（一次点掉整组）对称 —— 否则归档是一步、恢复是 N 步。
+  function restoreWorkspace(ws, n) {
+    fetch('/api/workspaces', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workspace: ws, archive: false })
+    }).then(function (r) {
+      if (!r.ok) { addError('恢复项目失败，请重试'); return; }
+      addInfo('已把 ' + (n ? n + ' 条' : '') + '会话恢复到侧栏');
+      loadArchived();
+      loadSessionList();
+    }).catch(function () { addError('恢复项目失败（服务不可达）'); });
+  }
+  // 归档页：按项目分组渲染，组头带「恢复整个项目」
   function renderArchived(items) {
     const box = document.getElementById('archived-items');
     box.innerHTML = '';
@@ -2510,47 +3113,36 @@
       box.innerHTML = '<div class="arch-empty">没有已归档的会话。</div>';
       return;
     }
+    const groups = new Map();
     items.forEach(function (s) {
-      const row = document.createElement('div');
-      row.className = 'arch-item';
-      const main = document.createElement('div');
-      main.className = 'arch-main';
-      const t = document.createElement('div');
-      t.className = 'arch-title';
-      t.textContent = s.title || '未命名会话';
-      const meta = document.createElement('div');
-      meta.className = 'arch-meta';
-      meta.textContent = wsDisplayName(s.workspace) + ' · ' + (s.message_count || 0) + ' 条消息';
-      main.appendChild(t);
-      main.appendChild(meta);
-      const days = document.createElement('span');
-      days.className = 'arch-days';
-      days.textContent = fmtArchDays(s.archived_at);
-      // 三点：恢复 / 永久删除（内联菜单，无浏览器弹窗）
-      const dots = document.createElement('button');
-      dots.type = 'button';
-      dots.className = 'dots-btn';
-      dots.textContent = '⋯';
-      dots.title = '操作';
-      dots.addEventListener('click', function (e) {
-        e.stopPropagation();
-        showInlineMenu(dots, [
-          { label: '恢复到侧栏', fn: function () {
-            fetch('/api/sessions', {
-              method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ id: s.id, archived: false })
-            }).then(function () { loadArchived(); loadSessionList(); });
-          } },
-          { label: '永久删除', danger: true, fn: function () {
-            fetch('/api/sessions?id=' + encodeURIComponent(s.id), { method: 'DELETE' })
-              .then(function () { loadArchived(); loadSessionList(); });
-          } },
-        ]);
-      });
-      row.appendChild(main);
-      row.appendChild(days);
-      row.appendChild(dots);
-      box.appendChild(row);
+      const k = s.workspace || '';
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(s);
+    });
+    groups.forEach(function (list, ws) {
+      const group = document.createElement('div');
+      group.className = 'arch-group';
+      const head = document.createElement('div');
+      head.className = 'arch-group-head';
+      const nameEl = document.createElement('span');
+      nameEl.className = 'arch-group-name';
+      nameEl.textContent = wsDisplayName(ws, list[0] && list[0].workspace_name);
+      nameEl.title = ws || '新项目';
+      const countEl = document.createElement('span');
+      countEl.className = 'arch-group-count';
+      countEl.textContent = list.length + ' 条会话';
+      const restore = document.createElement('button');
+      restore.type = 'button';
+      restore.className = 'arch-group-restore';
+      restore.textContent = '恢复整个项目';
+      restore.title = '把该项目下全部已归档会话一次性恢复到侧栏';
+      restore.addEventListener('click', function () { restoreWorkspace(ws, list.length); });
+      head.appendChild(nameEl);
+      head.appendChild(countEl);
+      head.appendChild(restore);
+      group.appendChild(head);
+      list.forEach(function (s) { group.appendChild(archSessionRow(s)); });
+      box.appendChild(group);
     });
   }
   function loadArchived() {
@@ -2674,6 +3266,9 @@
   //  - 普通条目是脱敏视图（无明文，只有 key_set），明文框只显示占位；
   //  - 「当前生效」模型会带 key_plain 明文，回填到掩码框并可用眼睛切换查看。
   function fillForm(m) {
+    // 编辑与新增复用同一表单，仅标题区分；editingIndex 由调用方先行设置。
+    document.getElementById('mf-title').textContent = editingIndex >= 0 ? '编辑模型' : '添加模型';
+    keyTouched = false; // 刚回填的表单没有改过密钥（脱敏明文框为空 ≠ 删除）
     document.getElementById('mf-name').value = m.name || '';
     document.getElementById('mf-id').value = m.id || '';
     document.getElementById('mf-url').value = m.base_url || '';
@@ -2688,6 +3283,7 @@
     document.getElementById('mf-ctx-in').value = m.ctx_in || 262144;
     document.getElementById('mf-ctx-out').value = m.ctx_out || 131072;
     setTestResult('', '');
+    collapseDiscover(); // 换了模型就收起上一次的上游列表，避免勾选状态串味
   }
   function resetForm() {
     editingIndex = -1;
@@ -2715,8 +3311,9 @@
     el.textContent = msg || '';
   }
 
-  // 密钥来源分段
+  // 密钥来源分段；keyTouched 记录本次编辑是否动过密钥（决定保存时是否提交 key_value）。
   let keySrc = 'env';
+  let keyTouched = false;
   function setKeySrc(ks) {
     keySrc = ks === 'plain' ? 'plain' : 'env';
     document.querySelectorAll('#mf-key-seg button').forEach(function (b) {
@@ -2743,9 +3340,16 @@
     kp.type = show ? 'text' : 'password';
     this.textContent = show ? '🙈' : '👁';
   });
-  document.getElementById('mf-key-plain').addEventListener('input', updateKeyEye);
+  document.getElementById('mf-key-plain').addEventListener('input', function () {
+    keyTouched = true;
+    updateKeyEye();
+  });
+  document.getElementById('mf-key-env').addEventListener('input', function () { keyTouched = true; });
   document.querySelectorAll('#mf-key-seg button').forEach(function (b) {
-    b.addEventListener('click', function () { setKeySrc(b.dataset.ks); });
+    b.addEventListener('click', function () {
+      if (b.dataset.ks !== keySrc) keyTouched = true; // 主动切换来源也算动过密钥
+      setKeySrc(b.dataset.ks);
+    });
   });
 
   // ＋ 模型：左侧导航项 → 模型管理页（列表视图）
@@ -2756,9 +3360,12 @@
     showMTab('list');
     renderModelItems();
   });
-  // 子 Tab：模型列表 / 模型配置
+  // 子 Tab：模型列表 / 添加模型（点「添加模型」即回到空白新建态，编辑态复用同一表单）
   document.querySelectorAll('.models-tab').forEach(function (t) {
-    t.addEventListener('click', function () { showMTab(t.dataset.mtab); });
+    t.addEventListener('click', function () {
+      if (t.dataset.mtab === 'config') resetForm();
+      showMTab(t.dataset.mtab);
+    });
   });
 
   // 测试连接
@@ -2785,8 +3392,12 @@
   document.getElementById('mf-save').addEventListener('click', function () {
     const m = collectForm();
     if (!m.id) { setTestResult(false, '模型 id 不能为空'); return; }
-    // 编辑时明文框留空 = 保持库里已存密钥，服务端会回填旧值。
-    if (m.key_source === 'plain' && !m.key_value.trim()) {
+    // 编辑已有模型：本次没动过密钥 → 不提交 key_value，服务端按「保持库里已存
+    // 密钥」处理。前端拿到的列表是脱敏视图，明文框为空只是回显受限，绝不能被
+    // 当成「用户清空了密钥」而覆盖掉。
+    if (editingIndex >= 0 && !keyTouched) {
+      delete m.key_value;
+    } else if (m.key_source === 'plain' && !m.key_value.trim()) {
       delete m.key_value;
     }
     setTestResult(null, '保存中…');
@@ -2796,9 +3407,10 @@
     }).then(function (r) { return r.json(); }).then(function (d) {
       if (d.ok) {
         editingIndex = -1;
+        collapseDiscover();
         showMTab('list');
-        renderModelItems();
-        modelsLoaded = false; // 保存可能改了当前模型的显示名，刷新主界面模型显示
+        renderModelItems();   // 新增/编辑立即出现在模型列表
+        modelsLoaded = false; // 置假后 loadModels 会重拉模型库快照，对话框的模型选择同步出现新条目
         loadModels();
       } else {
         setTestResult(false, d.error || '保存失败');
@@ -2807,4 +3419,149 @@
       setTestResult(false, '保存失败：' + e);
     });
   });
+
+  // ---------- 添加模型：从上游 /models 拉取列表 → 选中 → 填入表单 ----------
+  // 与「测试连接」的区别：测试是「所见即所测」，这里允许在表单没填地址/密钥时
+  // 回退到当前生效模型（用户常在同一个网关上添加模型），服务端会在响应里
+  // 用 key_from_active 如实告知，界面据此提示。
+  //
+  // 用 var 而非 let 声明状态：collapseDiscover 会被 fillForm/resetForm 早期调用，
+  // var 提升到函数顶部（值为 undefined）不会踩 let 的暂时性死区。
+  var discModels = [];
+  var discSelected = {};
+
+  function discPanel() { return document.getElementById('mf-discover-panel'); }
+
+  function setDiscResult(ok, msg) {
+    const el = document.getElementById('disc-result');
+    if (!el) return;
+    el.className = 'mf-test-result' + (ok === true ? ' ok' : ok === false ? ' fail' : '');
+    el.textContent = msg || '';
+  }
+
+  // collapseDiscover 收起面板并清空状态（切换模型 / 保存成功后调用，避免上次的结果串味）。
+  function collapseDiscover() {
+    discModels = [];
+    discSelected = {};
+    const panel = discPanel();
+    if (panel) panel.classList.add('hidden');
+    const list = document.getElementById('disc-list');
+    if (list) list.innerHTML = '';
+    const flt = document.getElementById('disc-filter');
+    if (flt) flt.value = '';
+    const cnt = document.getElementById('disc-count');
+    if (cnt) cnt.textContent = '';
+    setDiscResult(null, '');
+  }
+
+  function updateDiscCount() {
+    const n = Object.keys(discSelected).length;
+    const cnt = document.getElementById('disc-count');
+    if (cnt) cnt.textContent = '共 ' + (discModels || []).length + ' 个' + (n ? '，已选 ' + n + ' 个' : '');
+    const btn = document.getElementById('disc-add');
+    if (btn) btn.disabled = n === 0;
+  }
+
+  function renderDiscList() {
+    const box = document.getElementById('disc-list');
+    if (!box) return;
+    const q = (document.getElementById('disc-filter').value || '').trim().toLowerCase();
+    const shown = (discModels || []).filter(function (m) {
+      if (!q) return true;
+      return m.id.toLowerCase().indexOf(q) >= 0 ||
+        (m.name || '').toLowerCase().indexOf(q) >= 0;
+    });
+    box.innerHTML = '';
+    if (!shown.length) {
+      box.innerHTML = '<div class="disc-empty">' +
+        ((discModels || []).length ? '没有匹配的模型' : '没有可添加的模型') + '</div>';
+      updateDiscCount();
+      return;
+    }
+    shown.forEach(function (m) {
+      const row = document.createElement('label');
+      row.className = 'disc-item' + (m.in_library ? ' added' : '');
+      const cb = document.createElement('input');
+      // 单选：模型 id 只能一个一个填进表单，不做批量添加。
+      cb.type = 'radio';
+      cb.name = 'disc-model';
+      cb.checked = !!discSelected[m.id];
+      cb.disabled = !!m.in_library; // 已在库中：不可选，也不覆盖
+      cb.addEventListener('change', function () {
+        if (cb.checked) { discSelected = {}; discSelected[m.id] = true; }
+        updateDiscCount();
+      });
+      const idEl = document.createElement('span');
+      idEl.className = 'disc-id';
+      idEl.textContent = m.id;
+      row.appendChild(cb);
+      row.appendChild(idEl);
+      if (m.name && m.name !== m.id) {
+        const nm = document.createElement('span');
+        nm.className = 'disc-name';
+        nm.textContent = m.name;
+        row.appendChild(nm);
+      }
+      if (m.in_library) {
+        const badge = document.createElement('span');
+        badge.className = 'disc-badge';
+        badge.textContent = '已添加';
+        row.appendChild(badge);
+      }
+      box.appendChild(row);
+    });
+    updateDiscCount();
+  }
+
+  function discoverModels() {
+    const btn = document.getElementById('mf-discover');
+    btn.disabled = true;
+    setDiscResult(null, '正在获取模型列表…');
+    discPanel().classList.remove('hidden');
+    fetch('/api/models/discover', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(collectForm())
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (!d.ok) {
+        discModels = [];
+        discSelected = {};
+        document.getElementById('disc-list').innerHTML = '';
+        updateDiscCount();
+        setDiscResult(false, '获取失败：' + (d.error || '未知错误'));
+        return;
+      }
+      discModels = d.models || [];
+      discSelected = {};
+      document.getElementById('disc-filter').value = '';
+      renderDiscList();
+      setDiscResult(true, '已获取 ' + discModels.length + ' 个模型' +
+        (d.key_from_active ? '（密钥取自当前生效模型）' : ''));
+    }).catch(function (e) {
+      setDiscResult(false, '获取失败：' + e);
+    }).then(function () { btn.disabled = false; });
+  }
+
+  // 「添加选中」：只把选中的模型 id（及上游显示名）填进上方表单，
+  // 由用户确认连接信息、补好密钥后点「保存」正式入库 —— 所见即所得，
+  // 不会把表单里还没确认的内容偷偷写进模型库。
+  function fillSelectedDiscModel() {
+    const ids = Object.keys(discSelected);
+    if (!ids.length) { setDiscResult(false, '请先选择一个模型'); return; }
+    const id = ids[0];
+    const hit = (discModels || []).filter(function (m) { return m.id === id; })[0] || {};
+    document.getElementById('mf-id').value = id;
+    const nameEl = document.getElementById('mf-name');
+    if (!nameEl.value.trim() && hit.name && hit.name !== id) nameEl.value = hit.name;
+    setTestResult(true, '已填入模型 id：' + id + '，填好密钥后点「保存」');
+    collapseDiscover();
+  }
+
+  (function bindModelDiscover() {
+    const btn = document.getElementById('mf-discover');
+    if (!btn) return;
+    btn.addEventListener('click', discoverModels);
+    document.getElementById('disc-close').addEventListener('click', collapseDiscover);
+    document.getElementById('disc-filter').addEventListener('input', renderDiscList);
+    document.getElementById('disc-add').addEventListener('click', fillSelectedDiscModel);
+  })();
 })();

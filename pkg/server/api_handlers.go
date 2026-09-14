@@ -174,7 +174,17 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 
 	target := root
 	if rel != "" {
-		target = filepath.Join(root, filepath.Clean("/"+rel))
+		if filepath.IsAbs(rel) {
+			// 绝对路径（内置选择器 browse 传的是 tree 返回的绝对路径）：
+			// 必须落在工作区内，防越权浏览区外目录；未选工作区时一律拒绝。
+			if root == "" || !pathWithin(root, rel) {
+				writeJSON(w, http.StatusForbidden, map[string]any{"error": "路径越出工作区范围"})
+				return
+			}
+			target = filepath.Clean(rel)
+		} else {
+			target = filepath.Join(root, filepath.Clean("/"+rel))
+		}
 	}
 	info, err := os.Stat(target)
 	if err != nil {
@@ -226,6 +236,20 @@ func listTree(dir string, depth int) []treeNode {
 		return out[i].Name < out[j].Name
 	})
 	return out
+}
+
+// pathWithin 词法判断 path 是否位于 root 之内（含 root 自身；不做软链解析，
+// tree 浏览属低危面，词法层足够；深度防线在文件工具的 FS.checkScope）。
+func pathWithin(root, path string) bool {
+	root, path = filepath.Clean(root), filepath.Clean(path)
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func skipEntry(name string) bool {
@@ -326,8 +350,9 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleWorkspaces 工作区分组的重命名 / 归档。
-// 侧栏分组键 = 会话的 workspace 字段；重命名 = 批量改写分组键（仅影响分组显示与数据归属）。
+// handleWorkspaces 项目的重命名 / 归档 / 删除。
+// 侧栏分组键 = 会话的 workspace 字段（= 磁盘工作区路径，不可变）；
+// 「重命名」只改 workspace_names 表里的**显示名**，不动键、不动磁盘。
 func (s *Server) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 	hist := s.agent.History()
 	switch r.Method {
@@ -336,35 +361,40 @@ func (s *Server) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPatch:
 		var body struct {
-			Workspace string `json:"workspace"`
-			NewName   string `json:"new_name"` // 重命名分组
-			Archive   bool   `json:"archive"`  // 归档该组全部会话
+			Workspace string  `json:"workspace"`
+			NewName   *string `json:"new_name"` // 重命名分组（显示名）；显式传空串 = 清除自定义名
+			Archive   *bool   `json:"archive"`  // true = 归档该组全部会话；false = 恢复（与侧栏「归档」对称）
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体解析失败"})
 			return
 		}
-		// workspace 允许为空串 = 「未选择工作区」分组，同样可重命名 / 归档。
-		if body.Archive {
-			if err := hist.ArchiveWorkspace(body.Workspace); err != nil {
+		// workspace 允许为空串 = 「未选择工作区」分组，同样可重命名 / 归档 / 恢复。
+		// ⚠️ Archive 用指针：区分「没传这个字段」和「显式传 false（= 恢复整个项目）」。
+		// 若用裸 bool，`{archive:false}` 会被当成「没传」而落到 400，项目级恢复就没法表达。
+		if body.Archive != nil {
+			var err error
+			if *body.Archive {
+				err = hist.ArchiveWorkspace(body.Workspace)
+			} else {
+				err = hist.UnarchiveWorkspace(body.Workspace)
+			}
+			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 			return
 		}
-		if name := strings.TrimSpace(body.NewName); name != "" {
-			if err := hist.RenameWorkspace(body.Workspace, name); err != nil {
+		// 用指针区分「没传 new_name」和「传了空串」：后者 = 清除自定义显示名，
+		// 前端回落按工作区路径末段显示（不是错误，所以不能和缺失一起走 400）。
+		if body.NewName != nil {
+			// 重命名 = 只改**显示名**（workspace_names 表）。
+			// ⚠️ 绝不顺手改 sessions.workspace / agent 工作目录：那个键就是磁盘路径，
+			// 一改项目就失去工作区（文件工具全线报错），历史上这里正是这么坏的。
+			if err := hist.SetWorkspaceName(body.Workspace, *body.NewName); err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 				return
-			}
-			// 当前工作区被重命名 → 同步运行态，避免新会话仍挂旧键
-			if body.Workspace == s.agent.WorkDir() {
-				s.agent.SetWorkDir(name)
-				s.cfg.Agent.WorkDir = name
-				if dir := s.cfg.ConfigDir(); dir != "" {
-					_ = s.cfg.Save(filepath.Join(dir, "local.yaml"))
-				}
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 			return

@@ -63,9 +63,16 @@ type ModelStore struct {
 }
 
 // NewModelStore 构造模型库（path 通常为 <configDir>/models.yaml）。
+//
+// path 为空串表示「只在内存中工作」：读写都不落盘（见 Load/Save 的守卫）。
+// 这是必要的安全刹车 —— 配置目录未知时若把空串拼成相对路径 "models.yaml"，
+// 落盘会写到进程的当前工作目录（曾因此在 pkg/server/ 里凭空出现 models.yaml）。
 func NewModelStore(path string) *ModelStore {
 	return &ModelStore{path: path}
 }
+
+// Path 返回落盘路径（空串表示纯内存库）。
+func (s *ModelStore) Path() string { return s.path }
 
 // Load 从磁盘读取模型库；文件不存在时返回空库（不视为错误）。
 func (s *ModelStore) Load() error {
@@ -77,6 +84,9 @@ func (s *ModelStore) Load() error {
 func (s *ModelStore) loadLocked() error {
 	s.entries = nil
 	s.loaded = true
+	if s.path == "" { // 纯内存库：无盘可读
+		return nil
+	}
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -107,9 +117,14 @@ func (s *ModelStore) ensureLoaded() error {
 }
 
 // Save 把当前模型库写回磁盘（0600，与 local.yaml 同级权限）。
+//
+// path 为空时直接返回 nil（纯内存库，不落盘）—— 绝不退化成写相对路径 "models.yaml"。
 func (s *ModelStore) Save() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.path == "" {
+		return nil
+	}
 	f := modelsFile{Models: s.entries}
 	data, err := yaml.Marshal(&f)
 	if err != nil {
@@ -197,6 +212,10 @@ func (s *ModelStore) Sanitized() []map[string]any {
 			"key_source": m.KeySource,
 			"key_name":   m.KeyName,
 			"key_set":    s.entryKeySet(m),
+			// 上下文上限必须下发：设置页表单要回显、上下文进度条要展示模型窗口。
+			// 早前漏了这两项，表单只能落到前端默认值（262144），用户改过也看不到。
+			"ctx_in":  m.CtxIn,
+			"ctx_out": m.CtxOut,
 		}
 	}
 	return out

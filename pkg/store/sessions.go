@@ -21,14 +21,17 @@ type SessionRow struct {
 }
 
 // SessionMetaRow 是会话元信息。
+// WorkspaceName 是所属项目的**显示名**（来自 workspace_names 表，未设置时为空串，
+// 由前端回落到路径末段），与 Workspace（真实工作区键）解耦。
 type SessionMetaRow struct {
-	ID           string    `json:"id"`
-	Workspace    string    `json:"workspace"`
-	Title        string    `json:"title"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
-	MessageCount int       `json:"message_count"`
-	ArchivedAt   int64     `json:"archived_at"` // 0 = 未归档；>0 = 归档时间戳（unix 秒）
+	ID            string    `json:"id"`
+	Workspace     string    `json:"workspace"`
+	WorkspaceName string    `json:"workspace_name"`
+	Title         string    `json:"title"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	MessageCount  int       `json:"message_count"`
+	ArchivedAt    int64     `json:"archived_at"` // 0 = 未归档；>0 = 归档时间戳（unix 秒）
 }
 
 // CreateSession 新建会话（无消息）。
@@ -112,10 +115,12 @@ func (s *Store) SessionMessages(id string) ([]llm.Message, error) {
 
 // ListSessions 列出会话元信息（更新时间倒序）。
 // workspace 为空返回全部工作区；archived=false 只返回未归档，true 只返回已归档。
+// 顺带 LEFT JOIN workspace_names 带上项目显示名（没有自定义名时为 ''）。
 func (s *Store) ListSessions(workspace string, archived bool) ([]SessionMetaRow, error) {
-	q := `SELECT s.id, s.workspace, s.title, s.created_at, s.updated_at, s.archived_at,
-	      (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS cnt
-	      FROM sessions s WHERE s.archived_at ` + opArchived(archived)
+	q := `SELECT s.id, s.workspace, COALESCE(n.name, ''), s.title, s.created_at, s.updated_at,
+	      s.archived_at, (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS cnt
+	      FROM sessions s LEFT JOIN workspace_names n ON n.workspace = s.workspace
+	      WHERE s.archived_at ` + opArchived(archived)
 	var args []any
 	if strings.TrimSpace(workspace) != "" {
 		q += ` AND s.workspace = ?`
@@ -133,7 +138,8 @@ func (s *Store) ListSessions(workspace string, archived bool) ([]SessionMetaRow,
 	for rows.Next() {
 		var m SessionMetaRow
 		var created, updated int64
-		if err := rows.Scan(&m.ID, &m.Workspace, &m.Title, &created, &updated, &m.ArchivedAt, &m.MessageCount); err != nil {
+		if err := rows.Scan(&m.ID, &m.Workspace, &m.WorkspaceName, &m.Title,
+			&created, &updated, &m.ArchivedAt, &m.MessageCount); err != nil {
 			return nil, err
 		}
 		m.CreatedAt = time.Unix(created, 0)
@@ -170,10 +176,46 @@ func (s *Store) ArchiveWorkspace(workspace string) error {
 	return err
 }
 
-// RenameWorkspace 重命名工作区：仅改分组显示名（工作区路径本身不可改，
-// 分组显示名存储见 workspace_names 表；这里同步改会话行的归属展示键）。
-func (s *Store) RenameWorkspace(oldWS, newWS string) error {
-	_, err := s.db.Exec(`UPDATE sessions SET workspace = ? WHERE workspace = ?`, newWS, oldWS)
+// UnarchiveWorkspace 把整个工作区的已归档会话一次性恢复。
+// 与 ArchiveWorkspace 对称：侧栏的「归档」是一次点掉整组，恢复不该让用户逐条点 N 次。
+func (s *Store) UnarchiveWorkspace(workspace string) error {
+	_, err := s.db.Exec(
+		`UPDATE sessions SET archived_at = 0 WHERE workspace = ? AND archived_at > 0`,
+		workspace)
+	return err
+}
+
+// SetWorkspaceName 设置项目的**显示名**（存 workspace_names 表）。
+//
+// ⚠️ 这里刻意不改 sessions.workspace：那个键同时是 agent 的工作目录路径，
+// 一改就会让「重命名项目」变成「把工作区路径抹成一个裸名字」，之后文件工具全部失效
+// （历史上就是这么把 C:\...\Desktop\test 变成 test、把中文名变成 ???? 的）。
+// name 传空串 = 清除自定义名，前端回落到按路径末段显示。
+func (s *Store) SetWorkspaceName(workspace, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		_, err := s.db.Exec(`DELETE FROM workspace_names WHERE workspace = ?`, workspace)
+		return err
+	}
+	_, err := s.db.Exec(
+		`INSERT OR REPLACE INTO workspace_names (workspace, name, updated_at) VALUES (?, ?, ?)`,
+		workspace, name, time.Now().Unix())
+	return err
+}
+
+// WorkspaceName 返回某个项目的显示名（未设置返回空串）。
+func (s *Store) WorkspaceName(workspace string) (string, error) {
+	var name string
+	err := s.db.QueryRow(`SELECT name FROM workspace_names WHERE workspace = ?`, workspace).Scan(&name)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return name, err
+}
+
+// DeleteWorkspaceName 删除某个项目的显示名记录（项目被删时一并清理）。
+func (s *Store) DeleteWorkspaceName(workspace string) error {
+	_, err := s.db.Exec(`DELETE FROM workspace_names WHERE workspace = ?`, workspace)
 	return err
 }
 
@@ -238,8 +280,10 @@ func (s *Store) DeleteSession(id string) error {
 	return err
 }
 
-// DeleteWorkspace 删除整个项目（工作区）下的全部会话及其消息。
+// DeleteWorkspace 删除整个项目（工作区）下的全部会话及其消息，并清掉它的显示名记录。
 func (s *Store) DeleteWorkspace(workspace string) error {
-	_, err := s.db.Exec(`DELETE FROM sessions WHERE workspace = ?`, workspace)
-	return err
+	if _, err := s.db.Exec(`DELETE FROM sessions WHERE workspace = ?`, workspace); err != nil {
+		return err
+	}
+	return s.DeleteWorkspaceName(workspace)
 }

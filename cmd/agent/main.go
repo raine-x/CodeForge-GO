@@ -199,12 +199,31 @@ func startCmd(configDir, workDir string, noOpen bool) int {
 		log.Printf("内置插件已启用：Skill Creator（config: builtin_plugins.skill_creator=false 可关闭）")
 	}
 
-	// 内置插件：Multi-Agent（最多 5 个；配置 builtin_plugins.multi_agent=false 可关闭）
+	// 内置插件：Multi-Agent（并发与能力限制见 config.subagents）
+	//
+	// 策略有三个落点，每次设置变更都要一起同步，否则会出现「界面显示 2、
+	// 实际放行 5」这种不一致：
+	//   1) Agent —— 子智能体工具白名单与任务提示词（newSubagent / subagentPrompt）
+	//   2) 调度器校验 —— 一次委派的数量上限（读 Agent 的策略，无需单独同步）
+	//   3) 委派工具 —— Description 与 InputSchema 里的 maxItems
 	subagentRunner := agent.NewSubagentRunner(ag)
+	var subagentTool *builtin.SubagentsTool
+
+	applySubagentPolicy := func() {
+		policy := agent.NewSubagentPolicy(*cfg)
+		ag.SetSubagentPolicy(policy)
+		if subagentTool != nil {
+			subagentTool.SetMaxConcurrent(policy.MaxConcurrent)
+		}
+	}
+	applySubagentPolicy() // 主智能体侧先行生效（工具尚未注册时只影响后续创建的子智能体）
+
 	if cfg.BuiltinPlugins.MultiAgentEnabled() {
-		builtin.RegisterSubagents(registry, subagentRunner)
+		subagentTool = builtin.RegisterSubagents(registry, subagentRunner)
+		applySubagentPolicy() // 把并发上限同步进工具描述与 schema
 		ag.SetMultiAgentEnabled(true)
-		log.Printf("内置插件已启用：Multi-Agent（最多 %d 个子智能体；config: builtin_plugins.multi_agent=false 可关闭）", agent.MaxSubagents)
+		log.Printf("内置插件已启用：Multi-Agent（并发上限 %d，能力：写=%v 删=%v 记忆=%v；config: builtin_plugins.multi_agent=false 可关闭）",
+			cfg.SubagentMaxConcurrent(), cfg.SubagentAllowWrite(), cfg.SubagentAllowDelete(), cfg.SubagentAllowMemory())
 	}
 
 	// 归档自动清理：启动即清一次 + 每天定时（归档满 10 天即删）
@@ -227,6 +246,7 @@ func startCmd(configDir, workDir string, noOpen bool) int {
 	// 6) Web 服务（端口固定取自全局配置文件，端口被占用时直接失败）
 	srv := server.New(cfg, ag, executor, registry, fsys)
 	srv.SetPluginManager(manager) // 供 /api/plugins 添加/启停后热加载
+	srv.SetSubagentApply(applySubagentPolicy) // 设置 → 子智能体：并发/能力变更即时生效
 	srv.SetBuiltinPluginApply(func(id string, on bool) {
 		// 内置插件开关的运行时应用：注册/注销工具 + 同步提示词注入
 		if id == agent.BuiltinSkillCreator.ID {
@@ -242,10 +262,12 @@ func startCmd(configDir, workDir string, noOpen bool) int {
 		if id == agent.BuiltinMultiAgent.ID {
 			if on {
 				if _, ok := registry.Get("delegate_subagents"); !ok {
-					builtin.RegisterSubagents(registry, subagentRunner)
+					subagentTool = builtin.RegisterSubagents(registry, subagentRunner)
+					applySubagentPolicy() // 重新注册的工具要带上当前并发上限
 				}
 			} else {
 				registry.Unregister("delegate_subagents")
+				subagentTool = nil
 			}
 			ag.SetMultiAgentEnabled(on)
 		}

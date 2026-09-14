@@ -55,6 +55,9 @@ func openBrowser(url string) error {
 
 // notify 发送 Linux 桌面通知；Termux 优先调用 termux-notification，
 // 普通 Linux 使用 notify-send，二者都没有时返回错误（通知失败不影响任务）。
+//
+// 各分支都尽量带上「应用名 + 固定替换 ID」：同一 ID 的新通知会替换旧通知，
+// 避免在通知中心里越堆越多（Windows 侧同类做法见 sys_windows.go 的 Tag/Group）。
 func notify(title, message string) error {
 	if IsTermux() {
 		if _, err := exec.LookPath("termux-notification"); err != nil {
@@ -64,7 +67,14 @@ func notify(title, message string) error {
 			"--id", "codeforge-task").Run()
 	}
 	if _, err := exec.LookPath("notify-send"); err == nil {
-		return exec.Command("notify-send", title, message).Run()
+		// -a 应用名；-r 固定替换 ID（同 ID 的新通知替换旧的，而非新增一条）。
+		// 个别老版本 libnotify 不接受 -r，回退到不带替换 ID 的调用，保证能发出。
+		err := exec.Command("notify-send", "-a", "CodeForge", "-r", "1",
+			title, message).Run()
+		if err != nil {
+			return exec.Command("notify-send", "-a", "CodeForge", title, message).Run()
+		}
+		return nil
 	}
 	if _, err := exec.LookPath("zenity"); err == nil {
 		return exec.Command("zenity", "--notification", "--text", title+": "+message).Run()

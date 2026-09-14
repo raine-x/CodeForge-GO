@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -41,10 +42,15 @@ type LLMConfig struct {
 
 // AgentConfig 描述 Agent 引擎行为。
 type AgentConfig struct {
-	MaxSteps           int    `yaml:"max_steps"`
-	ContextTokenBudget int    `yaml:"context_token_budget"`
-	SystemPromptFile   string `yaml:"system_prompt_file"`
-	WorkDir            string `yaml:"work_dir"`
+	MaxSteps           int `yaml:"max_steps"`
+	ContextTokenBudget int `yaml:"context_token_budget"`
+	// ContextCompressRatio 是自动压缩的触发比例，缺省 0.95（95%）。
+	// 压缩线 = (模型窗口 − 输出预留) × 该比例；
+	// 仅在模型窗口已知（模型库条目 ctx_in > 0）时按窗口计算，
+	// 窗口未知时改用 ContextTokenBudget 作为绝对阈值。
+	ContextCompressRatio float64 `yaml:"context_compress_ratio"`
+	SystemPromptFile     string  `yaml:"system_prompt_file"`
+	WorkDir              string  `yaml:"work_dir"`
 }
 
 // SecurityRule 是一条有序匹配的权限规则。
@@ -90,13 +96,15 @@ type PluginConfig struct {
 
 // Config 是全局配置聚合。
 type Config struct {
-	Server   ServerConfig   `yaml:"server"`
-	LLM      LLMConfig      `yaml:"llm"`
-	Agent    AgentConfig    `yaml:"agent"`
-	Security SecurityConfig `yaml:"security"`
-	Plugins  []PluginConfig `yaml:"plugins"`
-	DataDir  string         `yaml:"data_dir"`
-	AuditLog string         `yaml:"audit_log"`
+	Server    ServerConfig   `yaml:"server"`
+	LLM       LLMConfig      `yaml:"llm"`
+	Agent     AgentConfig    `yaml:"agent"`
+	Security  SecurityConfig `yaml:"security"`
+	Notify    NotifyConfig   `yaml:"notify"`
+	Subagents SubagentConfig `yaml:"subagents"`
+	Plugins   []PluginConfig `yaml:"plugins"`
+	DataDir   string         `yaml:"data_dir"`
+	AuditLog  string         `yaml:"audit_log"`
 
 	// 内置插件开关（增强能力，见 BuiltinPluginsConfig）。
 	BuiltinPlugins BuiltinPluginsConfig `yaml:"builtin_plugins"`
@@ -114,6 +122,30 @@ type BuiltinPluginsConfig struct {
 	MultiAgent *bool `yaml:"multi_agent"`
 }
 
+// NotifyConfig 是「任务完成」系统通知（Windows Toast / Linux notify-send）的开关与节流。
+//
+// 通知只在窗口不可见（切走标签页 / 最小化）时发送，窗口在前台可见时不打扰；
+// 两次通知之间还有最小间隔，避免连续多轮任务刷屏。
+type NotifyConfig struct {
+	// Enabled：指针字段，缺省（未配置）= 开启，写 false 完全关闭系统通知。
+	Enabled *bool `yaml:"enabled"`
+	// MinIntervalMs 两次通知的最小间隔（毫秒）。<=0 时用默认值 3000。
+	MinIntervalMs int `yaml:"min_interval_ms"`
+}
+
+// NotifyEnabled 返回系统通知是否启用（缺省 true）。
+func (c Config) NotifyEnabled() bool {
+	return c.Notify.Enabled == nil || *c.Notify.Enabled
+}
+
+// NotifyMinInterval 返回两次通知的最小间隔（缺省 3s）。
+func (c Config) NotifyMinInterval() time.Duration {
+	if c.Notify.MinIntervalMs <= 0 {
+		return 3 * time.Second
+	}
+	return time.Duration(c.Notify.MinIntervalMs) * time.Millisecond
+}
+
 // SkillCreatorEnabled 返回 Skill Creator 是否启用（缺省 true）。
 func (c BuiltinPluginsConfig) SkillCreatorEnabled() bool {
 	return c.SkillCreator == nil || *c.SkillCreator
@@ -122,6 +154,54 @@ func (c BuiltinPluginsConfig) SkillCreatorEnabled() bool {
 // MultiAgentEnabled 缺省开启，写 false 才关闭。
 func (c BuiltinPluginsConfig) MultiAgentEnabled() bool {
 	return c.MultiAgent == nil || *c.MultiAgent
+}
+
+// SubagentConcurrencyCap 是子智能体并发上限的硬上限：配置可以调小，但不能突破它。
+// pkg/agent 的 MaxSubagents 直接引用本常量，保证「设置页显示的上限」与
+// 「校验时实际生效的上限」永远同源。
+const SubagentConcurrencyCap = 5
+
+// SubagentConfig 描述子智能体（多智能体协作）的运行策略，可在设置页热更新。
+//
+// 总开关不在这里：它与内置插件开关 builtin_plugins.multi_agent 是同一个真源
+// （关闭后 delegate_subagents 工具不注册，模型无从调用），设置页读写同一字段，
+// 避免出现两个互相矛盾的「开关」。
+type SubagentConfig struct {
+	// MaxConcurrent 是一次委派允许同时运行的子智能体数量，范围 1..SubagentConcurrencyCap；
+	// <=0 或越界时按硬上限处理。
+	MaxConcurrent int `yaml:"max_concurrent"`
+	// AllowWrite：implement 子智能体是否可写入 / 编辑文件。缺省 true。
+	AllowWrite *bool `yaml:"allow_write"`
+	// AllowDelete：子智能体是否可删除文件。缺省 true。
+	AllowDelete *bool `yaml:"allow_delete"`
+	// AllowMemory：子智能体是否可写入用户记忆（save_memory）。缺省 true。
+	AllowMemory *bool `yaml:"allow_memory"`
+}
+
+// SubagentMaxConcurrent 返回子智能体并发上限（缺省 / 越界时回落硬上限）。
+func (c Config) SubagentMaxConcurrent() int {
+	n := c.Subagents.MaxConcurrent
+	if n <= 0 || n > SubagentConcurrencyCap {
+		return SubagentConcurrencyCap
+	}
+	return n
+}
+
+// SubagentAllowWrite 返回子智能体是否可写入文件（缺省 true）。
+func (c Config) SubagentAllowWrite() bool { return boolDefault(c.Subagents.AllowWrite, true) }
+
+// SubagentAllowDelete 返回子智能体是否可删除文件（缺省 true）。
+func (c Config) SubagentAllowDelete() bool { return boolDefault(c.Subagents.AllowDelete, true) }
+
+// SubagentAllowMemory 返回子智能体是否可写入用户记忆（缺省 true）。
+func (c Config) SubagentAllowMemory() bool { return boolDefault(c.Subagents.AllowMemory, true) }
+
+// boolDefault 解析「缺省为真」的三态布尔字段。
+func boolDefault(p *bool, def bool) bool {
+	if p == nil {
+		return def
+	}
+	return *p
 }
 
 // Default 返回内置默认配置。
@@ -138,8 +218,9 @@ func Default() *Config {
 			RetryBackoffMs: 1500,
 		},
 		Agent: AgentConfig{
-			MaxSteps:           25,
-			ContextTokenBudget: 120000,
+			MaxSteps:             25,
+			ContextTokenBudget:   120000,
+			ContextCompressRatio: 0.95,
 		},
 		Security: SecurityConfig{
 			DefaultDecision:     "ask",
@@ -275,6 +356,11 @@ func normalize(cfg *Config) {
 	}
 	if cfg.Agent.ContextTokenBudget <= 0 {
 		cfg.Agent.ContextTokenBudget = 120000
+	}
+	// 压缩比例夹紧到 [0.5, 0.99]：太小会频繁压缩（每次都多一次模型调用），
+	// 太大则留给输出与摘要的空间不足。
+	if cfg.Agent.ContextCompressRatio < 0.5 || cfg.Agent.ContextCompressRatio > 0.99 {
+		cfg.Agent.ContextCompressRatio = 0.95
 	}
 	if cfg.LLM.MaxTokens <= 0 {
 		cfg.LLM.MaxTokens = 8192

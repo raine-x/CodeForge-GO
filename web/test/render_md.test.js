@@ -44,12 +44,17 @@ function extractFunction(src, name) {
 
 function loadRenderer() {
   const src = fs.readFileSync(UI_PATH, 'utf8');
+  // 注意：新增纯函数必须同时改两处 —— 这里的截取列表，以及文件下方的顶层 let 声明。
+  // 漏改后者不会报「哪个函数缺了」，而是整段注入执行时 ReferenceError，
+  // 表现成「无法从 ui.js 加载 renderMD」，极易误判。
   const code = [
     extractFunction(src, 'escapeHtml'),
     extractFunction(src, 'renderMD'),
     extractFunction(src, 'toolLabel'),
     extractFunction(src, 'countLines'),
-    'module.exports = { renderMD: renderMD, toolLabel: toolLabel, countLines: countLines };',
+    extractFunction(src, 'fmtTokens'),
+    extractFunction(src, 'wsDisplayName'),
+    'module.exports = { renderMD: renderMD, toolLabel: toolLabel, countLines: countLines, fmtTokens: fmtTokens, wsDisplayName: wsDisplayName };',
   ].join('\n');
   return new Function('module', code + '\nreturn module.exports;')({});
 }
@@ -76,12 +81,14 @@ function check(name, cond) {
 // ---------------------------------------------------------------------------
 // 开始
 // ---------------------------------------------------------------------------
-let renderMD, toolLabel, countLines;
+let renderMD, toolLabel, countLines, fmtTokens, wsDisplayName;
 try {
   const api = loadRenderer();
   renderMD = api.renderMD;
   toolLabel = api.toolLabel;
   countLines = api.countLines;
+  fmtTokens = api.fmtTokens;
+  wsDisplayName = api.wsDisplayName;
 } catch (err) {
   console.error('无法从 ui.js 加载 renderMD：' + err.message);
   process.exit(1);
@@ -232,6 +239,101 @@ check('项目行按钮顺序为 ＋ 在前、⋯ 在后',
 check('侧栏入口文案为「新建项目」', htmlSrc.includes('<span>新建项目</span>') && !htmlSrc.includes('新建对话'));
 check('空态文案为「暂无项目」', uiSrc.includes('暂无项目'));
 
+// ---------- 6.1 项目显示名与工作区键解耦（2026-09-14） ----------
+// 「重命名项目」只改显示名（workspace_names 表），绝不动 sessions.workspace ——
+// 那个键同时是 agent 的工作目录路径，一改项目就失去工作区。
+// 历史事故：改键把 C:\...\Desktop\test 抹成 test；中文名还会被转义成 ????。
+group('项目显示名（与工作区键解耦）');
+check('wsDisplayName 优先用自定义显示名',
+  wsDisplayName('C:\\Users\\26536\\Desktop\\test', '我的项目') === '我的项目');
+check('没有自定义名时回落路径末段',
+  wsDisplayName('C:\\Users\\26536\\Desktop\\test', '') === 'test' &&
+  wsDisplayName('/home/u/proj', '') === 'proj');
+check('空工作区显示「新项目」',
+  wsDisplayName('', '') === '新项目' && wsDisplayName('', undefined) === '新项目');
+check('路径末尾有分隔符也能取到末段',
+  wsDisplayName('C:\\Users\\26536\\Desktop\\test\\', '') === 'test');
+check('后端重命名走 SetWorkspaceName，不再有 RenameWorkspace',
+  uiSrc.indexOf('new_name: v') > 0);
+check('会话元信息带 workspace_name，侧栏按它渲染项目名',
+  /list\[0\]\s*&&\s*list\[0\]\.workspace_name/.test(uiSrc));
+check('重命名预填当前显示名（改回原样无副作用）',
+  /input\.value = currentName \|\| wsDisplayName\(ws\)/.test(uiSrc));
+check('工作区标签也用显示名（与侧栏一致）',
+  /function syncWorkspaceLabel\(\)/.test(uiSrc) &&
+  /lbl\.textContent = ws \? wsDisplayName\(ws, wsNameOf\(ws\)\)/.test(uiSrc));
+check('项目 ⋯ 菜单里「恢复默认名」只在设过自定义名时出现',
+  /if \(list\[0\] && list\[0\]\.workspace_name\) \{\s*\n\s*items\.push\(\{ label: '恢复默认名'/.test(uiSrc));
+check('「恢复默认名」用 new_name 空串清除（后端据此删记录）',
+  /function clearWorkspaceName\(ws\)[\s\S]{0,220}?JSON\.stringify\(\{ workspace: ws, new_name: '' \}\)/.test(uiSrc));
+check('重命名输入框留空仍是「取消」（不会误清显示名）',
+  /if \(!v\) \{ renderSessions\(sessionsCache\); return; \}/.test(uiSrc));
+
+// ---------- 6.15 工作区切换：失败要报错、不能静默错位（2026-09-14） ----------
+// 服务端现在会拒绝不存在的目录（与启动时的检查同源），但 **fetch 对 400 也是 resolve** ——
+// 前端若不看 res.ok，「切换失败」会被当成成功：新会话会带着没换成的旧工作区
+// 悄悄落进上一个项目下。所以这条链路必须显式检查状态码。
+group('工作区切换的失败处理');
+check('setWorkspace 把状态码暴露成 {ok, error}',
+  /return \{ ok: r\.ok, error: \(d && d\.error\) \|\| '' \};/.test(uiSrc));
+check('newSessionInWorkspace 先看 res.ok 再建会话',
+  /setWorkspace\(ws\)\.then\(function \(res\) \{\s*\n\s*if \(!res\.ok\)/.test(uiSrc));
+check('切换失败时报错并回滚标签',
+  /addError\(res\.error \|\| \('无法切换到该项目的目录：' \+ ws\)\)/.test(uiSrc) &&
+  /loadSessionList2\(\); \/\/ 标签\/workspaceRoot 回滚成服务端真实状态/.test(uiSrc));
+check('选择器路径走 switchWorkspace（失败也报错）',
+  /function switchWorkspace\(path\)/.test(uiSrc) &&
+  /switchWorkspace\(picker\.dataset\.current \|\| ''\)/.test(uiSrc) &&
+  /switchWorkspace\(res\.data\.path\)/.test(uiSrc));
+check('空工作区会话只在切换成功时挂到新工作区（失败时路径是坏的）',
+  /if \(res\.ok && path && sessionID\)/.test(uiSrc));
+
+// ---------- 6.2 上下文占用进度条（底部栏右侧） ----------
+// 放在设置按钮右侧的空位里：条宽 = 已用 token / 压缩预算，点击向上弹明细。
+// 易回归点：① 弹层必须贴右边缘，用 .popup 默认的 left:0 会在窄侧栏里溢出视口；
+// ② 百分比数字要用等宽数字，否则跳动时条会左右抖；③ 条宽必须封顶 100%，
+// 超预算（历史已被压缩）时数字照实显示 >100%，但条不能画出容器外。
+group('上下文占用进度条');
+const footerHtml = htmlSrc.slice(htmlSrc.indexOf('class="sidebar-footer"'), htmlSrc.indexOf('</aside>'));
+check('进度条挂在底部栏、位于设置按钮右侧',
+  footerHtml.indexOf('id="ctx-meter"') > footerHtml.indexOf('id="open-settings"'));
+check('进度条含 条 / 填充 / 百分比 / 明细弹层 四个部件',
+  htmlSrc.includes('id="ctx-meter"') && htmlSrc.includes('id="ctx-fill"') &&
+  htmlSrc.includes('id="ctx-pct"') && htmlSrc.includes('id="ctx-pop"'));
+check('底部栏用 space-between 把进度条推到右侧',
+  /\.sidebar-footer\s*\{[^}]*justify-content:\s*space-between/.test(css));
+check('百分比用等宽数字防抖动', /\.ctx-pct\s*\{[^}]*tabular-nums/.test(css));
+check('占用过高变警告 / 危险色',
+  /\.ctx-meter\.warn\s+\.ctx-fill\s*\{[^}]*var\(--warn\)/.test(css) &&
+  /\.ctx-meter\.danger\s+\.ctx-fill\s*\{[^}]*var\(--danger\)/.test(css));
+check('明细弹层贴右边缘（否则侧栏内会溢出视口）',
+  /\.ctx-anchor\s+\.ctx-pop\s*\{[^}]*right:\s*0/.test(css));
+check('前端订阅服务端 context 事件',
+  /case 'context':\s*\n\s*renderCtxUsage\(/.test(uiSrc));
+check('点击进度条主动拉取最新占用', uiSrc.indexOf("type: 'context', session_id: sessionID") > 0);
+check('条宽封顶 100%（超预算不越界）', /Math\.min\(100,\s*pct\)/.test(uiSrc));
+check('阈值与 CSS 类同步（70% 警告 / 90% 危险）',
+  /classList\.toggle\('warn',\s*pct >= 70/.test(uiSrc) &&
+  /classList\.toggle\('danger',\s*pct >= 90\)/.test(uiSrc));
+// ⚠️ 服务端 over_budget 与 compressed 是**两件事**，别再混用（这里踩过一次）：
+//   over_budget = 送模占用越过压缩线；compressed = 会话里已经存在摘要。
+// 刚超线那一瞬间是 over_budget=true 而 compressed=false。
+check('区分 over_budget 与 compressed 两个状态位',
+  uiSrc.includes('d.over_budget && !d.compressed') && /classList\.toggle\('compressed'/.test(uiSrc));
+check('历史原文 / 输出预留 / 已摘要 也进明细（解释压缩线为何小于窗口）',
+  uiSrc.includes('历史原文') && uiSrc.includes('输出预留') && uiSrc.includes('已摘要'));
+check('样式契约：压缩态有独立标记（.ctx-meter.compressed）',
+  /\.ctx-meter\.compressed\s+\.ctx-pct\s*\{/.test(css));
+
+group('token 数缩写（fmtTokens）');
+check('0 → 0', fmtTokens(0) === '0');
+check('未定义按 0 处理', fmtTokens(undefined) === '0');
+check('999 不缩写', fmtTokens(999) === '999');
+check('1000 → 1k（去掉多余的 .0）', fmtTokens(1000) === '1k');
+check('1050 → 1.1k', fmtTokens(1050) === '1.1k');
+check('120000 → 120k', fmtTokens(120000) === '120k');
+check('1200000 → 1.2M', fmtTokens(1200000) === '1.2M');
+
 // ---------- 6.5 新建项目：清空工作区必须先于新建会话 ----------
 // 易回归点：setWorkspace 走 HTTP、doNewSession 走 WS，不等待就会抢跑，
 // 新会话被挂到**上一个项目**下（而不是形成空工作区的「新项目」分组）。
@@ -276,7 +378,7 @@ check('页面加载自动回放历史时不做过渡（composer-no-anim）',
 check('ready 自动恢复前重新武装「直接落位」标记',
   /case 'ready':[\s\S]{0,500}?composerSnap\s*=\s*true/.test(uiSrc));
 check('用户发言走平滑下放（submit 清掉落位标记后 addUser）',
-  /composerSnap\s*=\s*false;[\s\S]{0,200}?addUser\(text\)/.test(uiSrc));
+  /composerSnap\s*=\s*false;[\s\S]{0,300}?addUser\(p\.display\)/.test(uiSrc));
 
 // ---------- 8. 输入框 @ 提及：技能 + 插件 ----------
 // 输入 @ 弹出面板，同时列「技能」和「插件」两组；插件条目还要显示它注册的工具
@@ -288,6 +390,21 @@ check('同时拉技能与插件列表',
   /fetch\('\/api\/skills'\)/.test(uiSrc) && /fetch\('\/api\/plugins'\)/.test(uiSrc));
 check('插件工具按「插件名.」前缀从工具表归属',
   /indexOf\(p\.name \+ '\.'\)\s*===\s*0/.test(uiSrc));
+
+// ---------- 8.5 ＋菜单 / @文件 stage / @高亮（2026-09-14） ----------
+group('＋菜单与 @文件');
+check('＋菜单含「当前目录的文件」入口（内置选择器·文件模式）',
+  /more-browse-workspace/.test(uiSrc) && /more-browse-workspace/.test(
+    fs.readFileSync(path.join(__dirname, '../dist/index.html'), 'utf8')));
+check('浏览入口起点 = 工作区根，未选工作区给提示',
+  /openBuiltinPicker\(workspaceRoot, 'file'/.test(uiSrc) &&
+  /还没有选择工作区/.test(uiSrc));
+check('@文件路径提及只显示文件名（title 悬浮完整路径）',
+  uiSrc.indexOf("'at-mention'") > 0 && uiSrc.indexOf('s.title = body') > 0);
+check('@提及蓝色高亮样式契约（.at-mention 用 accent）',
+  /\.at-mention\s*\{[^}]*color:\s*var\(--accent\)/.test(css));
+check('发送前 stage 区外文件到 attachments（/api/stage_file）',
+  /\/api\/stage_file/.test(uiSrc) && /attachments/.test(uiSrc));
 check('分「技能」「插件」两组',
   /addGroup\('技能'\)/.test(uiSrc) && /addGroup\('插件'\)/.test(uiSrc));
 check('插件条目显示可调用工具 / 未启用状态',
@@ -306,6 +423,90 @@ check('样式契约：分组标题 / 工具清单 / 空提示',
   /\.at-skill-pop\s+button\s+\.at-tools\s*\{/.test(css) &&
   /\.at-skill-pop\s+\.at-empty\s*\{/.test(css));
 
+// ---------- 8.55 ＋添加文件只插入「@文件名」 ----------
+// 需求：＋→添加文件 不要往输入框塞完整路径，只放 @文件名（蓝色高亮），
+// 真实路径记进别名表、发送前展开。文件名含空白时用 @"名字"（提及语法以空白分隔）。
+group('＋添加文件：只插 @文件名');
+check('插入的是提及 token 而不是完整路径',
+  /function insertPickedFile\(p\) \{[\s\S]{0,200}?const token = mentionTokenFor\(p\)[\s\S]{0,200}?insertIntoInput\(token\)/.test(uiSrc));
+check('文件名含空白 / 引号时改用 @"..." 形式',
+  /function mentionToken\(name\) \{[\s\S]{0,120}?@"/.test(uiSrc));
+check('别名表 + 发送前展开（在 staging 之前）',
+  /const fileAlias = new Map\(\)/.test(uiSrc) &&
+  /function expandFileAliases\(text\)/.test(uiSrc) &&
+  /const outgoing = expandFileAliases\(raw\);[\s\S]{0,200}?prepareMentions\(outgoing, raw\)/.test(uiSrc));
+check('工作区外文件的提示也只报文件名（不暴露完整路径）',
+  /已插入工作区外的文件 ' \+ name/.test(uiSrc));
+check('服务端说 inside（本来就在区内、没复制）时不弹「已复制到 attachments」的假提示',
+  /if \(!d\.inside\) \{\s*\n\s*notes\.push\('已把 '/.test(uiSrc));
+check('别名表随输入内容收缩（删掉提及后同名 token 不被旧路径劫持）',
+  /function pruneFileAliases\(text\)/.test(uiSrc) &&
+  /function syncInputMirror\(\) \{\s*\n\s*\/\/[^\n]*\n\s*pruneFileAliases\(input\.value\);/.test(uiSrc));
+check('fileAlias 声明早于 syncInputMirror 定义（否则首次调用撞 TDZ）',
+  uiSrc.indexOf('const fileAlias = new Map()') > 0 &&
+  uiSrc.indexOf('const fileAlias = new Map()') < uiSrc.indexOf('function syncInputMirror()'));
+check('同名文件不互相顶掉（token 冲突时逐级多带父目录）',
+  /function mentionTokenFor\(fullPath\)/.test(uiSrc) &&
+  /const token = mentionTokenFor\(p\)/.test(uiSrc));
+check('气泡显示用户输入原文（p.display），发送用展开后的 p.text',
+  /addUser\(p\.display\)/.test(uiSrc) && /lastUserText = p\.text/.test(uiSrc));
+check('别名展开必须早于清空输入框（否则 prune 先把别名删光，展开拿不到）',
+  /const outgoing = expandFileAliases\(raw\);[\s\S]{0,200}?input\.value = '';[\s\S]{0,200}?prepareMentions\(outgoing, raw\)/.test(uiSrc));
+check('prepareMentions 显式分开「发送文本」与「气泡显示文本」',
+  /async function prepareMentions\(text, display\)/.test(uiSrc) &&
+  /return \{ text: text, display: display === undefined \? text : display, notes: notes \}/.test(uiSrc));
+check('别名展开后重新加引号（路径含空白时不被切断）',
+  /const real = fileAlias\.get\(part\);\s*\n\s*return real \? mentionToken\(real\) : part;/.test(uiSrc));
+check('气泡去掉引号、镜像层逐字原样（否则与 textarea 错位）',
+  /s\.textContent = shorten \? '@' \+ body : p;/.test(uiSrc));
+
+// 提及 token 切分：String.split 会把**所有**捕获组都塞进结果数组，正则里多一个分组
+// 就会把内容多切一份（引号内的名字曾被重复吐出来）。这里抽出真正则跑一遍。
+const mentionReSrc = (uiSrc.match(/const MENTION_SPLIT = (\/.*?\/);/) || [])[1];
+const mentionRe = mentionReSrc ? eval(mentionReSrc) : null;
+const splitMention = (s) => String(s).split(mentionRe);
+group('提及切分（MENTION_SPLIT）');
+check('正则可抽出，且只有一个捕获组（无嵌套分组）',
+  !!mentionRe && (mentionRe.source.match(/\((?!\?:|\?=|\?!)/g) || []).length === 1);
+check('不带 g 标志（带 g 的正则被拿去做 test/exec 会残留 lastIndex）',
+  !!mentionRe && !mentionRe.global);
+check('普通 @token 只切一份',
+  JSON.stringify(splitMention('a @b c')) === JSON.stringify(['a ', '@b', ' c']));
+check('带引号的 @token 只切一份（含空白）',
+  JSON.stringify(splitMention('x @"c d.txt" y')) === JSON.stringify(['x ', '@"c d.txt"', ' y']));
+check('无提及时不切分',
+  JSON.stringify(splitMention('纯文本')) === JSON.stringify(['纯文本']));
+
+// ---------- 8.6 输入框里的 @提及 蓝色高亮（2026-09-14） ----------
+// textarea 自身无法局部着色，方案是垫一层排版完全一致的 .input-mirror 画字，
+// textarea 文字设成 transparent（只留光标）。两层排版参数一旦不同步就会错位，
+// 所以这里把「共享排版块」和几个同步点都锁住。
+group('输入框 @提及 高亮（镜像层）');
+check('输入框外包一层 #input-wrap，镜像层与 textarea 同级',
+  /id="input-wrap"/.test(htmlSrc) &&
+  /id="input-mirror"[\s\S]{0,400}?id="input"/.test(htmlSrc));
+check('镜像层与 textarea 共用同一套排版（font/行高/内边距/换行）',
+  /#composer textarea,\s*\n?\s*\.input-mirror\s*\{[^}]*font-size:\s*14px[^}]*line-height:\s*1\.5[^}]*padding:\s*2px 2px 6px[^}]*white-space:\s*pre-wrap/.test(css));
+check('textarea 文字透明、只留光标（否则两层字会叠影）',
+  /#composer textarea\s*\{[^}]*color:\s*transparent[^}]*caret-color:\s*var\(--text\)/.test(css));
+check('镜像层绝对定位铺满、不接收事件、不可选中',
+  /\.input-mirror\s*\{[^}]*position:\s*absolute[^}]*inset:\s*0[^}]*pointer-events:\s*none/.test(css));
+check('隐藏 textarea 滚动条（滚动条会挤掉宽度 → 错位）',
+  /#composer textarea\s*\{[^}]*scrollbar-width:\s*none/.test(css));
+check('镜像层里渲染 @提及 时原样显示（不缩成文件名，否则与真实文字错位）',
+  /renderUserText\(inputMirror, input\.value, \{ shortenPath: false \}\)/.test(uiSrc));
+check('末尾补零宽字符，保证以换行结尾时镜像也保留空行',
+  /inputMirror\.appendChild\(document\.createTextNode\('\\u200b'\)\)/.test(uiSrc));
+check('内容变化即重画：input 事件',
+  /input\.addEventListener\('input', function \(\) \{\s*\n?\s*syncInputMirror\(\)/.test(uiSrc));
+check('滚动位置同步：scroll 事件',
+  /input\.addEventListener\('scroll', syncInputMirror\)/.test(uiSrc));
+check('程序化改动也同步：发出后清空',
+  /input\.value = '';\s*\n\s*syncInputMirror\(\)/.test(uiSrc));
+check('程序化改动也同步：@面板选中 / ＋菜单插入',
+  /input\.value = before \+ '@' \+ it\.name \+ ' ' \+ after;\s*\n\s*syncInputMirror\(\)/.test(uiSrc) &&
+  /input\.value = before \+ sep \+ ins \+ after;\s*\n\s*syncInputMirror\(\)/.test(uiSrc));
+
 // ---------- 9. 发送 / 打断按钮共色 ----------
 group('发送 / 打断按钮颜色');
 check('运行中的打断按钮与发送按钮共用 accent 色',
@@ -318,7 +519,7 @@ group('任务等待提示');
 check('等待文案为「等待模型响应」',
   /等待模型响应/.test(uiSrc) && !/innerHTML = '思考中/.test(uiSrc));
 check('用户发送后立即显示等待提示',
-  /addUser\(text\);[\s\S]{0,180}?showThinking\(\)/.test(uiSrc));
+  /addUser\(p\.display\);[\s\S]{0,260}?showThinking\(\)/.test(uiSrc));
 check('busy 事件显示等待提示',
   /case 'busy':[\s\S]{0,350}?showThinking\(\)/.test(uiSrc));
 check('tool_result 后模型再次等待时显示提示',
@@ -377,6 +578,154 @@ check('样式契约：禁用态 / 选中态 / 右展子菜单',
   /\.picker-actions button:disabled\s*\{/.test(css) &&
   /\.picker-item\.sel\s*\{/.test(css) &&
   /\.popup\.popup-right\s*\{/.test(css));
+
+// ---------------------------------------------------------------------------
+// 任务完成系统通知：前端必须上报页面可见性（窗口可见时不弹通知、不打扰）
+check('连接建立后上报页面可见性',
+  /function sendVisibility/.test(uiSrc) &&
+  /wsSend\(\{ type: 'visibility', hidden: !!document\.hidden \}\)/.test(uiSrc));
+check('切换标签页/最小化时同步可见性',
+  /document\.addEventListener\('visibilitychange', sendVisibility\)/.test(uiSrc));
+check('open 事件里主动上报一次可见性',
+  /sendVisibility\(\); \/\/ 告知服务端当前页面是否可见/.test(uiSrc));
+// 设置页「任务完成通知」开关：读 /api/notify 回填、切换写回；样式契约随开关组件
+check('设置页通知开关会读回服务端偏好',
+  /function refreshNotifySwitch/.test(uiSrc) &&
+  /fetch\('\/api\/notify'\)/.test(uiSrc));
+check('通知开关切换后写回服务端（失败回滚）',
+  /fetch\('\/api\/notify',\s*\{[\s\S]{0,80}method: 'POST'/.test(uiSrc) &&
+  /JSON\.stringify\(\{ enabled: want \}\)/.test(uiSrc) &&
+  /el\.checked = !want/.test(uiSrc));
+check('通知开关 DOM 与样式契约',
+  /id="settings-notify"/.test(htmlSrc) &&
+  /\.switch-track/.test(css) && /\.switch-knob/.test(css) &&
+  /\.switch input:checked \+ \.switch-track/.test(css));
+// 「总开关」语义必须写在界面上，否则用户无法判断关掉它到底管多宽
+check('通知为总开关：标题带总开关标记且描述点明关闭即全关',
+  /id="settings-notify"/.test(htmlSrc) &&
+  /总开关/.test(htmlSrc) &&
+  /class="tag-total"/.test(htmlSrc) &&
+  /\.tag-total\s*\{/.test(css));
+
+// ---------------------------------------------------------------------------
+// 子智能体设置：总开关 / 并发上限 / 能力限制
+check('子智能体设置页存在且四项控件齐全',
+  /id="page-subagents"/.test(htmlSrc) &&
+  /data-page="subagents"/.test(htmlSrc) &&
+  /id="sub-enabled"/.test(htmlSrc) &&
+  /id="sub-max"/.test(htmlSrc) &&
+  /id="sub-allow-write"/.test(htmlSrc) &&
+  /id="sub-allow-delete"/.test(htmlSrc) &&
+  /id="sub-allow-memory"/.test(htmlSrc));
+check('子智能体设置读写服务端 /api/subagents',
+  /function loadSubagentSettings/.test(uiSrc) &&
+  /fetch\('\/api\/subagents'\)/.test(uiSrc) &&
+  /fetch\('\/api\/subagents',\s*\{[\s\S]{0,80}method: 'POST'/.test(uiSrc));
+// 部分更新：只提交被改动的一项，避免用界面旧值覆盖别处刚改的开关
+check('子智能体改动按单项提交（部分更新语义）',
+  /postSubagentSetting\(\{ enabled: want \}/.test(uiSrc) &&
+  /postSubagentSetting\(\{ max_concurrent: Number\(range\.value\) \}/.test(uiSrc) &&
+  /patch\[pair\[1\]\] = el\.checked/.test(uiSrc));
+// 失败回滚：写失败时把控件恢复原状，不能让界面显示成「已保存」
+check('子智能体设置失败回滚',
+  /if \(!ok\) on\.checked = !want/.test(uiSrc) &&
+  /if \(!ok\) el\.checked = !el\.checked/.test(uiSrc));
+// 联动置灰：总开关关闭 → 其余禁用；禁写 → 删除开关也禁用
+check('子智能体控件联动置灰（总开关/禁写）',
+  /function syncSubagentLocks/.test(uiSrc) &&
+  /disabled = !enabled/.test(uiSrc) &&
+  /sub-allow-delete'\)\.disabled = true/.test(uiSrc));
+
+// ---------------------------------------------------------------------------
+// 添加模型：/models 拉取列表 → 选中 → 填入模型 id 到表单
+check('模型表单有「获取模型列表」入口',
+  /id="mf-discover"/.test(htmlSrc) &&
+  /id="mf-discover-panel"/.test(htmlSrc) &&
+  /id="disc-list"/.test(htmlSrc) &&
+  /id="disc-add"/.test(htmlSrc));
+check('发现模型走 /api/models/discover',
+  /function discoverModels/.test(uiSrc) &&
+  /fetch\('\/api\/models\/discover'/.test(uiSrc));
+// 已在库中的模型不可选、加「已添加」标记；选中只填 id，不再直接批量写库
+check('已在库的模型标记为已添加且不可选',
+  /cb\.disabled = !!m\.in_library/.test(uiSrc) &&
+  /badge\.textContent = '已添加'/.test(uiSrc) &&
+  /'disc-item' \+ \(m\.in_library \? ' added' : ''\)/.test(uiSrc) &&
+  /\.disc-item\.added\s*\{/.test(css));
+check('「添加选中」把模型 id 填入表单（不再调 save_batch）',
+  /function fillSelectedDiscModel/.test(uiSrc) &&
+  /document\.getElementById\('mf-id'\)\.value = id/.test(uiSrc) &&
+  !/models\/save_batch/.test(uiSrc));
+check('上游列表单选（radio）',
+  /cb\.type = 'radio'/.test(uiSrc) &&
+  /discSelected = \{\}; discSelected\[m\.id\] = true;/.test(uiSrc));
+check('上游列表只保留筛选 + 收起，去掉全选/清空',
+  /id="disc-filter"/.test(htmlSrc) &&
+  /id="disc-close"/.test(htmlSrc) &&
+  !htmlSrc.includes('id="disc-all"') && !htmlSrc.includes('id="disc-none"') &&
+  /document\.getElementById\('disc-filter'\)\.addEventListener\('input', renderDiscList\)/.test(uiSrc));
+check('填入后收起面板并提示补密钥保存',
+  /setTestResult\(true, '已填入模型 id/.test(uiSrc) &&
+  /collapseDiscover\(\);\s*\n\s*\}/.test(uiSrc));
+check('切换/保存模型时收起上游列表（防状态串味）',
+  /collapseDiscover\(\); \/\/ 换了模型就收起上一次的上游列表/.test(uiSrc) &&
+  /collapseDiscover\(\);\s*\n\s*showMTab\('list'\)/.test(uiSrc));
+
+// ---------------------------------------------------------------------------
+// 模型管理：子 Tab「添加模型」+ 列表「编辑」复用同款表单 + 保存后进入对话框模型选择
+// 需求链路：设置 → 模型 → 添加模型 → 保存 = 模型列表与对话框弹层同时出现新条目。
+group('模型管理：添加 / 编辑 / 对话框选择');
+check('子 Tab 文案为「模型列表 / 添加模型」',
+  /data-mtab="config">添加模型</.test(htmlSrc) && !htmlSrc.includes('模型配置'));
+check('表单标题区分添加 / 编辑（编辑复用同一表单）',
+  /id="mf-title"/.test(htmlSrc) &&
+  /editingIndex >= 0 \? '编辑模型' : '添加模型'/.test(uiSrc));
+check('列表「编辑」回填表单并切到添加模型面板',
+  /editingIndex = i;[\s\S]{0,160}?fillForm\(m\);[\s\S]{0,160}?showMTab\('config'\)/.test(uiSrc));
+check('点「添加模型」tab 回到空白新建态',
+  /t\.dataset\.mtab === 'config'\) resetForm\(\)/.test(uiSrc));
+check('对话框模型弹层列出模型库全部条目（不再只显示当前一个）',
+  /function renderModelPop[\s\S]{0,700}?modelChoices\.forEach/.test(uiSrc) &&
+  /b\.dataset\.model = m\.id/.test(uiSrc) &&
+  /fetchModelChoices[\s\S]{0,200}?fetch\('\/api\/models\/list'\)/.test(uiSrc));
+check('弹层点选即切换生效模型（/api/models/apply）',
+  /function switchActiveModel/.test(uiSrc) &&
+  /switchActiveModel\(m\.id\)/.test(uiSrc) &&
+  /fetch\('\/api\/models\/apply'/.test(uiSrc));
+check('保存成功：刷新模型列表并用新快照刷新对话框选择',
+  /showMTab\('list'\);[\s\S]{0,220}?renderModelItems\(\);[\s\S]{0,260}?modelsLoaded = false;[\s\S]{0,80}?loadModels\(\)/.test(uiSrc));
+check('样式契约：弹层列表限高滚动 + 表单标题',
+  /#model-list\s*\{[^}]*max-height[^}]*overflow-y:\s*auto/.test(css) &&
+  /\.mf-title\s*\{/.test(css));
+// 编辑已有模型：脱敏回显的明文框是空的，保存时绝不能把空值当成「用户清空了密钥」。
+// 前端用 keyTouched 记录本次是否动过密钥，没动过就不提交 key_value，服务端保持旧值。
+check('编辑未动密钥时不提交 key_value（不删除已存 key）',
+  /let keyTouched = false/.test(uiSrc) &&
+  /editingIndex >= 0 && !keyTouched/.test(uiSrc) &&
+  /keyTouched = false; \/\/ 刚回填的表单没有改过密钥/.test(uiSrc) &&
+  /keyTouched = true/.test(uiSrc));
+
+// ---------- 归档页：项目级恢复（与侧栏「归档」对称） ----------
+// 侧栏 ⋯ 的「归档」一次点掉整组会话；归档页必须能一次恢复整组，
+// 否则归档是一步、恢复是 N 步。API 靠 `archive:false` 表达。
+group('归档页：项目级恢复');
+check('归档页按项目分组渲染（arch-group）',
+  /function renderArchived\(items\)[\s\S]{0,1200}?const groups = new Map\(\)/.test(uiSrc) &&
+  /arch-group-head/.test(uiSrc));
+check('组头有「恢复整个项目」按钮',
+  /restore\.textContent = '恢复整个项目'/.test(uiSrc));
+check('恢复走 /api/workspaces + archive:false',
+  /function restoreWorkspace\(ws, n\)[\s\S]{0,300}?JSON\.stringify\(\{ workspace: ws, archive: false \}\)/.test(uiSrc));
+check('恢复后刷新归档页与侧栏，失败有提示',
+  /addInfo\('已把 ' \+ \(n \? n \+ ' 条' : ''\) \+ '会话恢复到侧栏'\)/.test(uiSrc) &&
+  /addError\('恢复项目失败，请重试'\)/.test(uiSrc));
+check('侧栏「归档」仍发 archive:true（指针改动没破坏它）',
+  /JSON\.stringify\(\{ workspace: ws, archive: true \}\)/.test(uiSrc));
+check('单条会话仍可单独恢复',
+  /label: '恢复到侧栏'/.test(uiSrc) && /id: s\.id, archived: false/.test(uiSrc));
+check('样式契约：组头 / 项目名 / 计数 / 恢复按钮',
+  /\.arch-group-head\s*\{/.test(css) && /\.arch-group-name\s*\{/.test(css) &&
+  /\.arch-group-count\s*\{/.test(css) && /\.arch-group-restore\s*\{/.test(css));
 
 // ---------------------------------------------------------------------------
 console.log('\n' + '-'.repeat(52));

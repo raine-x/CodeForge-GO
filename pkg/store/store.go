@@ -89,6 +89,14 @@ func (s *Store) migrate() error {
 			updated_at INTEGER NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_memories_ws ON memories(workspace)`,
+		// 项目显示名：键 = sessions.workspace，值 = 用户起的显示名。
+		// 与 workspace 键解耦 —— 重命名项目**只动这张表**，绝不改写会话归属键，
+		// 否则会把工作区路径抹成一个裸名字（文件工具随即失效）。
+		`CREATE TABLE IF NOT EXISTS workspace_names (
+			workspace  TEXT PRIMARY KEY,
+			name       TEXT NOT NULL,
+			updated_at INTEGER NOT NULL
+		)`,
 		// 升级路径：旧库补归档列（CREATE TABLE IF NOT EXISTS 不会给已存在的表加列）
 		`ALTER TABLE sessions ADD COLUMN archived_at INTEGER NOT NULL DEFAULT 0`,
 	}

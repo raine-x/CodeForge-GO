@@ -260,6 +260,27 @@ html, body {
 .arch-item .arch-meta { color: var(--text-dim); font-size: 11.5px; margin-top: 2px; }
 .arch-item .arch-days { color: #d97706; font-size: 11.5px; flex: none; }
 .arch-empty { color: var(--text-dim); font-size: 13px; padding: 8px 0; }
+/* 归档页按项目分组：组头的「恢复整个项目」是侧栏 ⋯「归档」的对偶操作
+   （归档一次点掉整组，恢复不该让用户逐条点 N 次） */
+.arch-group { margin-bottom: 12px; }
+.arch-group:last-child { margin-bottom: 0; }
+.arch-group-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 4px 5px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px; color: var(--text-dim);
+}
+.arch-group-name {
+  flex: 1; min-width: 0; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.arch-group-count { flex: none; }
+.arch-group-restore {
+  flex: none; border: none; background: transparent;
+  color: var(--accent); font-size: 12.5px; font-family: inherit;
+  padding: 2px 6px; border-radius: 6px; cursor: pointer;
+}
+.arch-group-restore:hover { background: var(--accent-dim); }
 /* 输入框 @ 技能选择器（内联面板） */
 .at-skill-pop {
   position: absolute; z-index: 70;
@@ -307,6 +328,9 @@ html, body {
   padding-top: 10px;
   border-top: 1px solid var(--border);
   display: flex;
+  align-items: center;
+  justify-content: space-between;  /* 设置靠左，上下文进度条靠右 */
+  gap: 8px;
 }
 /* 齿轮图标 + 文字横排样式 */
 .settings-btn {
@@ -321,6 +345,60 @@ html, body {
 .settings-btn:hover { background: var(--bg-elev-2); }
 .settings-btn svg { color: var(--text-dim); flex: 0 0 auto; }
 .settings-btn:hover svg { color: var(--text); }
+
+/* ---------- 上下文占用进度条（底部栏右侧） ---------- */
+.ctx-meter {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: none; background: transparent; cursor: pointer;
+  font-family: inherit; font-size: 11px; color: var(--text-dim);
+  padding: 6px 8px; border-radius: 8px;
+}
+.ctx-meter:hover { background: var(--bg-elev-2); color: var(--text); }
+.ctx-bar {
+  display: block; width: 64px; height: 6px;
+  border-radius: 999px; background: var(--bg-elev-2); overflow: hidden;
+}
+.ctx-fill {
+  display: block; height: 100%; width: 0;
+  border-radius: 999px; background: var(--accent);
+  transition: width .25s ease, background-color .25s ease;
+}
+/* 占用百分比决定条的颜色：<70% 常规，70~90% 警告，≥90% 危险 */
+.ctx-meter.warn .ctx-fill { background: var(--warn); }
+.ctx-meter.danger .ctx-fill { background: var(--danger); }
+/* 已处于摘要压缩态：百分比文字用强调色，提示「送模内容已不是原始历史」 */
+.ctx-meter.compressed .ctx-pct { color: var(--accent); }
+.ctx-meter.compressed .ctx-bar { box-shadow: inset 0 0 0 1px var(--accent); }
+/* 数字化百分比：等宽数字，避免跳动时宽度抖动 */
+.ctx-pct {
+  font-variant-numeric: tabular-nums;
+  font-family: var(--mono); min-width: 30px; text-align: right;
+}
+/* 明细弹层：必须贴右边缘向上弹（复用 .popup 的向上逻辑，只覆盖水平定位），
+   否则在窄侧栏里会溢出到视口外。用双类提高优先级，不受声明顺序影响。 */
+.ctx-anchor .ctx-pop {
+  left: auto; right: 0;
+  min-width: 218px; padding: 10px 12px; gap: 0;
+  cursor: default; text-align: left;
+}
+.ctx-pop .ctx-title {
+  font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 8px;
+}
+.ctx-pop .ctx-row {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 14px; font-size: 12px; padding: 3px 0;
+}
+.ctx-pop .ctx-row .k { color: var(--text-dim); flex: 0 0 auto; }
+.ctx-pop .ctx-row .v {
+  color: var(--text); font-family: var(--mono);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ctx-pop .ctx-tip {
+  margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border);
+  font-size: 11px; line-height: 1.55; color: var(--text-dim);
+}
+.ctx-pop .ctx-tip.warn { color: var(--warn); }
+.ctx-pop .ctx-tip.danger { color: var(--danger); }
 
 /* ---------- 设置：左导航 + 右内容 ---------- */
 .settings-overlay {
@@ -402,6 +480,29 @@ html, body {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .mono { font-family: var(--mono); }
+/* 开关（设置页「任务完成通知」等布尔项） */
+.switch { position: relative; display: inline-flex; align-items: center; cursor: pointer; flex: none; }
+.switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.switch-track {
+  width: 40px; height: 22px; border-radius: 999px;
+  background: var(--bg-elev-2); border: 1px solid var(--border);
+  transition: background .18s ease, border-color .18s ease;
+  display: inline-flex; align-items: center; padding: 2px;
+  box-sizing: border-box;
+}
+.switch-knob {
+  width: 16px; height: 16px; border-radius: 50%;
+  background: var(--text-dim);
+  transition: transform .18s ease, background .18s ease;
+}
+.switch input:checked + .switch-track {
+  background: var(--accent); border-color: var(--accent);
+}
+.switch input:checked + .switch-track .switch-knob {
+  background: #fff; transform: translateX(18px);
+}
+.switch input:focus-visible + .switch-track { outline: 2px solid var(--accent); outline-offset: 2px; }
+.switch input:disabled + .switch-track { opacity: .5; }
 /* 皮肤分段选择 */
 .skin-seg {
   display: inline-flex;
@@ -491,7 +592,8 @@ html, body {
 .mi-actions button.apply:hover { background: var(--accent-dim); }
 .mi-empty { padding: 18px; text-align: center; color: var(--text-dim); font-size: 13px; }
 
-/* 模型配置表单 */
+/* 添加 / 编辑模型表单 */
+.mf-title { font-size: 14px; font-weight: 600; padding: 4px 0 12px; }
 .form-grid { display: flex; flex-direction: column; gap: 14px; padding: 6px 0 2px; }
 .f-field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; color: var(--text-dim); }
 .f-field > span { font-weight: 600; }
@@ -545,6 +647,83 @@ html, body {
 .mf-test-result { margin-right: auto; font-size: 12.5px; }
 .mf-test-result.ok { color: var(--ok); }
 .mf-test-result.fail { color: var(--danger); }
+
+/* 模型 id + 「获取模型列表」按钮同行 */
+.id-row { display: flex; gap: 8px; align-items: center; }
+.id-row input { flex: 1; min-width: 0; }
+.id-row button {
+  flex: none; white-space: nowrap;
+  border: 1px solid var(--border); background: var(--bg);
+  color: var(--text); font-size: 12.5px; font-family: inherit;
+  border-radius: 9px; padding: 7px 12px; cursor: pointer;
+}
+.id-row button:hover { border-color: var(--text-dim); }
+.id-row button:disabled { opacity: .55; cursor: default; }
+
+/* 上游模型勾选面板（「获取模型列表」展开） */
+.discover-panel {
+  margin-top: 14px; border: 1px solid var(--border); border-radius: 11px;
+  background: var(--bg-elev); overflow: hidden;
+}
+.disc-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 12px; border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.disc-title { font-size: 13px; font-weight: 600; color: var(--text); }
+.disc-count { font-weight: 400; color: var(--text-dim); font-size: 12.5px; margin-left: 6px; }
+.disc-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.disc-tools input {
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+  border-radius: 8px; padding: 6px 10px; font-size: 12.5px; font-family: inherit;
+  width: 180px; outline: none;
+}
+.disc-tools input:focus { border-color: var(--accent); }
+.disc-tools button {
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+  border-radius: 8px; padding: 6px 11px; font-size: 12.5px; font-family: inherit;
+  cursor: pointer;
+}
+.disc-tools button:hover { border-color: var(--text-dim); }
+.disc-list { max-height: 300px; overflow-y: auto; padding: 4px 0; }
+.disc-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 12px; cursor: pointer; font-size: 13px;
+}
+.disc-item:hover { background: var(--bg-elev-2); }
+.disc-item input { flex: none; }
+.disc-item .disc-id { color: var(--text); font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+.disc-item .disc-name { color: var(--text-dim); font-size: 12px; }
+.disc-item .disc-badge {
+  flex: none; margin-left: auto; font-size: 11px; color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px;
+}
+.disc-item.added { opacity: .6; cursor: default; }
+.disc-empty { padding: 14px 12px; font-size: 12.5px; color: var(--text-dim); }
+.disc-foot {
+  display: flex; align-items: center; justify-content: flex-end; gap: 8px;
+  padding: 10px 12px; border-top: 1px solid var(--border);
+}
+.disc-foot #disc-result { margin-right: auto; }
+.disc-foot button {
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+  font-size: 13px; font-family: inherit; border-radius: 9px; padding: 7px 16px; cursor: pointer;
+}
+.disc-foot button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.disc-foot button.primary:hover { filter: brightness(1.1); }
+
+/* 「总开关」标记：与行标题同行的小徽标 */
+.tag-total {
+  display: inline-block; margin-left: 8px; vertical-align: middle;
+  font-size: 11px; font-weight: 600; line-height: 1;
+  color: var(--accent); border: 1px solid var(--accent);
+  border-radius: 999px; padding: 3px 8px;
+}
+
+/* 设置页脚注（保存反馈等） */
+.settings-note { margin-top: 12px; font-size: 12.5px; color: var(--text-dim); min-height: 18px; }
+.settings-note.ok { color: var(--ok); }
+.settings-note.fail { color: var(--danger); }
 
 /* 中分割线：鼠标悬停显示可拖拽光标；加宽热区适配触摸 */
 #drag-handle {
@@ -731,6 +910,12 @@ body.resizing { cursor: col-resize; user-select: none; }
   flex: none;
 }
 @keyframes toolSpin { to { transform: rotate(360deg); } }
+
+/* 用户消息内 @提及（@技能名 / @文件名）：蓝色高亮 */
+.at-mention {
+  color: var(--accent);
+  word-break: break-all; /* @长路径 不撑爆气泡 */
+}
 
 /* ---------- 子智能体进度卡片 ---------- */
 /* 每个子任务一行卡片：徽标（模式·ID）+ 标签 + 单行进度；终态变色 */
@@ -1081,16 +1266,46 @@ body.resizing { cursor: col-resize; user-select: none; }
   padding: 10px 14px 8px;
 }
 
-/* 中部：输入区 */
-#composer textarea {
-  border: none; outline: none; resize: none;
-  background: transparent; color: var(--text);
+/* 中部：输入区
+   textarea 自身无法局部着色 → 用 .input-mirror 垫一层排版完全一致的文字层，
+   只把 @提及 染成蓝色，textarea 的文字设成 transparent（只留光标）。
+   ⚠️ 下面「共享排版」块里的每一项（font / line-height / padding / white-space /
+   word-break / overflow-wrap）两个元素必须一致，否则镜像层会和真实文字错位。 */
+#composer textarea,
+.input-mirror {
   font-size: 14px; font-family: inherit; line-height: 1.5;
+  padding: 2px 2px 6px;
+  white-space: pre-wrap;
+  word-break: normal;
+  overflow-wrap: break-word;
+}
+.input-wrap {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
   min-height: var(--composer-min-h); /* 最小高度由外观页滑条控制 */
   max-height: 260px;
-  padding: 2px 2px 6px;
 }
+.input-wrap textarea { width: 100%; flex: 1 1 auto; }
+#composer textarea {
+  border: none; outline: none; resize: none;
+  background: transparent;
+  color: transparent;          /* 字由镜像层画，这里只保留光标 */
+  caret-color: var(--text);
+  scrollbar-width: none;       /* 滚动条会挤掉内容宽度 → 镜像层错位，索性藏掉 */
+}
+#composer textarea::-webkit-scrollbar { width: 0; height: 0; }
 #composer textarea::placeholder { color: var(--text-dim); }
+/* 镜像层：绝对定位铺满输入框，只显示、不接收事件、不可选中 */
+.input-mirror {
+  position: absolute; inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  user-select: none;
+  color: var(--text);
+}
+/* 镜像层里的 @提及 与消息流同样用主色；但要撤掉气泡那套 word-break: break-all（会错行） */
+.input-mirror .at-mention { word-break: normal; overflow-wrap: break-word; }
 
 /* 底部操作栏 */
 .composer-bottom {
@@ -1180,8 +1395,10 @@ body.resizing { cursor: col-resize; user-select: none; }
   text-align: center;
 }
 .pop-sep { height: 1px; background: var(--border); margin: 4px 6px; }
-/* 模型弹层加宽（贴右缘时向左弹出） */
-#model-pop { min-width: 280px; left: auto; right: 0; }
+/* 模型弹层加宽（贴右缘时向左弹出）；模型多时列表内部滚动，弹层不会顶出屏幕 */
+#model-pop { min-width: 280px; max-width: 360px; left: auto; right: 0; }
+#model-list { max-height: 260px; overflow-y: auto; }
+#model-list .pop-opt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---------- ＋ 更多菜单：上拉两级 ---------- */
 /* ＋ ↔ ✕ 的过渡：加号整体旋转 45° 正好就是叉号，所以用旋转做形变，

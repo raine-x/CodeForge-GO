@@ -22,11 +22,18 @@ llm:
 
 agent:
   max_steps: 25            # ReAct 最大迭代步数
+  # 自动上下文压缩：可用输入空间占用达到该比例时，调用当前模型把较早的历史
+  # 压成详细摘要（会话里的历史原文仍完整保留，只影响送模内容）。
+  # 压缩线 = (模型窗口 − 输出预留) × 该比例；输出预留 = min(llm.max_tokens, 窗口/2)。
+  context_compress_ratio: 0.95
+  # 仅在模型窗口未知（模型库条目未填「输入上下文」）时作为绝对阈值兜底。
   context_token_budget: 120000
   system_prompt_file: ""   # 留空使用内置中文 System Prompt
   work_dir: ""             # 留空使用当前工作目录
 
 security:
+  # 前端「权限控制」三态：readonly / ask / auto。缺省 ask（请求审批）。
+  permission_mode: "ask"
   default_decision: "ask"  # allow | deny | ask
   auto_approve_readonly: true
   # 是否允许文件 / 命令工具访问工作区之外的路径。
@@ -50,6 +57,25 @@ security:
 data_dir: ".codeforge"
 audit_log: ".codeforge/audit.jsonl"
 
+# 「任务完成」系统通知（Windows Toast / Linux notify-send）
+notify:
+  enabled: true            # 写 false 完全关闭系统通知
+  min_interval_ms: 3000    # 两次通知的最小间隔（毫秒），防止连续任务刷屏
+  # 仅当窗口不可见（切走标签页 / 最小化）时才通知；窗口在前台可见时不打扰。
+  # 通知使用固定 Tag/Group，新的会替换旧的，不会在通知中心里堆积。
+
 # 内置插件（进程内增强能力，可开关；缺省开启，写 false 关闭）
 builtin_plugins:
   skill_creator: true      # Skill Creator：让 AI 动态创建/迭代工作区技能（SKILL.md）
+  multi_agent: true        # Multi-Agent：允许委派子智能体并行处理互不重叠的任务（策略见 subagents）
+
+# 子智能体（多智能体协作）策略
+#
+# 总开关就是上面的 builtin_plugins.multi_agent：关闭后 delegate_subagents 工具
+# 不再注册，模型无从调用（设置页「子智能体」与「插件」两个入口读写同一字段）。
+# 本节只负责「并发」与「能力」限制，均可在设置 → 子智能体中热调整。
+subagents:
+  max_concurrent: 5        # 一次委派最多同时运行几个子智能体（硬上限 5，只能调小）
+  allow_write: true        # 允许 implement 子智能体写入/编辑文件；false 则子智能体一律只读
+  allow_delete: true       # 允许子智能体删除文件（allow_write=false 时自动无效）
+  allow_memory: true       # 允许子智能体写入用户记忆（save_memory）

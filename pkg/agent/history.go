@@ -12,14 +12,16 @@ import (
 )
 
 // SessionMeta 是会话的轻量元信息。
+// WorkspaceName 是所属项目的显示名（未设置时为空串，前端回落到路径末段）。
 type SessionMeta struct {
-	ID           string    `json:"id"`
-	Workspace    string    `json:"workspace"`
-	Title        string    `json:"title"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
-	MessageCount int       `json:"message_count"`
-	ArchivedAt   int64     `json:"archived_at"` // 0 = 未归档
+	ID            string    `json:"id"`
+	Workspace     string    `json:"workspace"`
+	WorkspaceName string    `json:"workspace_name"`
+	Title         string    `json:"title"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	MessageCount  int       `json:"message_count"`
+	ArchivedAt    int64     `json:"archived_at"` // 0 = 未归档
 }
 
 // Session 是一次完整会话。
@@ -30,6 +32,45 @@ type Session struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 	Messages  []llm.Message
+
+	// ---- 上下文压缩缓存（刻意不持久化：摘要可从 Messages 重新生成）----
+	//
+	// Messages 永远是完整历史，压缩只影响「送模视图」（见 Agent.requestView）。
+	// 把压缩状态放在 Session 上而不是全局 map，生命周期与缓存会话一致，
+	// 会话被删除/换出时自动释放。
+	//
+	// compressedUpTo 表示 Messages[:compressedUpTo] 已被 summaryText 覆盖。
+	compressedUpTo int
+	summaryText    string
+}
+
+// compressionState 返回（是否处于压缩态、被摘要覆盖的消息条数）。
+// 越界（历史被 Regenerate 截断或整体替换）时按未压缩处理。
+func (s *Session) compressionState() (bool, int) {
+	if s == nil || s.compressedUpTo <= 0 || strings.TrimSpace(s.summaryText) == "" {
+		return false, 0
+	}
+	if s.compressedUpTo > len(s.Messages) {
+		return false, 0
+	}
+	return true, s.compressedUpTo
+}
+
+// normalizeCompression 自愈压缩状态：历史被回退（Regenerate 截断）或整体替换
+// （换会话、测试直接赋值）后，压缩游标可能越过末尾，必须复位，
+// 否则 requestView 会切出不存在的区间、或把摘要错误地覆盖到新历史上。
+func (s *Session) normalizeCompression() {
+	if s == nil {
+		return
+	}
+	if s.compressedUpTo < 0 {
+		s.compressedUpTo = 0
+	}
+	if s.compressedUpTo > len(s.Messages) ||
+		(s.compressedUpTo > 0 && strings.TrimSpace(s.summaryText) == "") {
+		s.compressedUpTo = 0
+		s.summaryText = ""
+	}
 }
 
 // History 负责会话历史的持久化（SQLite）与缓存。
@@ -117,13 +158,14 @@ func (h *History) List(workspace string, archived bool) []SessionMeta {
 	metas := make([]SessionMeta, 0, len(rows))
 	for _, r := range rows {
 		metas = append(metas, SessionMeta{
-			ID:           r.ID,
-			Workspace:    r.Workspace,
-			Title:        r.Title,
-			CreatedAt:    r.CreatedAt,
-			UpdatedAt:    r.UpdatedAt,
-			MessageCount: r.MessageCount,
-			ArchivedAt:   r.ArchivedAt,
+			ID:            r.ID,
+			Workspace:     r.Workspace,
+			WorkspaceName: r.WorkspaceName,
+			Title:         r.Title,
+			CreatedAt:     r.CreatedAt,
+			UpdatedAt:     r.UpdatedAt,
+			MessageCount:  r.MessageCount,
+			ArchivedAt:    r.ArchivedAt,
 		})
 	}
 	return metas
@@ -141,6 +183,12 @@ func (h *History) Unarchive(id string) error { return h.st.UnarchiveSession(id) 
 // ArchiveWorkspace 归档整个工作区的会话。
 func (h *History) ArchiveWorkspace(workspace string) error {
 	return h.st.ArchiveWorkspace(workspace)
+}
+
+// UnarchiveWorkspace 恢复整个工作区的会话（与 ArchiveWorkspace 对称）。
+// 不动缓存：恢复的会话下次 Get/List 时按需从库里读回来。
+func (h *History) UnarchiveWorkspace(workspace string) error {
+	return h.st.UnarchiveWorkspace(workspace)
 }
 
 // ListWorkspaces 返回全部工作区路径（有未归档会话的）。
@@ -177,18 +225,19 @@ func (h *History) SetWorkspace(id, workspace string) error {
 	return h.st.SetSessionWorkspace(id, workspace)
 }
 
-// RenameWorkspace 重命名工作区分组（批量改写会话归属键）。
-func (h *History) RenameWorkspace(oldWS, newWS string) error {
-	if err := h.st.RenameWorkspace(oldWS, newWS); err != nil {
-		return err
+// SetWorkspaceName 设置项目的显示名（仅显示用）。
+// 刻意不改会话归属键：那个键同时是 agent 的工作目录路径，一改就会让项目「失去工作区」。
+func (h *History) SetWorkspaceName(workspace, name string) error {
+	return h.st.SetWorkspaceName(workspace, name)
+}
+
+// WorkspaceName 返回项目的显示名（未设置返回空串）。
+func (h *History) WorkspaceName(workspace string) string {
+	name, err := h.st.WorkspaceName(workspace)
+	if err != nil {
+		return ""
 	}
-	// 缓存里属于旧键的会话同步改归属
-	for _, s := range h.cache {
-		if s.Workspace == oldWS {
-			s.Workspace = newWS
-		}
-	}
-	return nil
+	return name
 }
 
 // Delete 删除一个会话。

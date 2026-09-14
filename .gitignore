@@ -23,6 +23,9 @@ config/*.local.yaml
 config/*.local.yml
 # --- 模型库（设置页统一管理；明文 Key 只存服务端）
 config/models.yaml
+# 模型库只应出现在 config/ 下。测试/异常退化成相对路径时会在别的目录生成同名文件
+# （pkg/server/models.yaml 曾被误提交进仓库），这里一并忽略，防复发。
+*models.yaml
 
 # --- 环境变量文件（密钥入口）
 .env

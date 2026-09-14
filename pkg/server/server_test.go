@@ -49,11 +49,26 @@ type testDeps struct {
 }
 
 // newTestDeps 在临时目录中组装完整的服务依赖。
-func newTestDeps(t *testing.T) *testDeps {
+func newTestDeps(t *testing.T) *testDeps { return newTestDepsAt(t, "") }
+
+// newTestDepsAt 与 newTestDeps 相同，但可指定一个真实的配置目录。
+//
+// configDir 非空时 cfg 会绑定该目录（ConfigDir() != ""），于是
+// 「写回 config/local.yaml」「模型库落盘 config/models.yaml」这些
+// 依赖配置目录的行为才真正被覆盖到；为空则等同 config.Default()，
+// 模型库退化为纯内存库（见 modelStorePath）。
+func newTestDepsAt(t *testing.T, configDir string) *testDeps {
 	t.Helper()
 	dir := t.TempDir()
 
 	cfg := config.Default()
+	if configDir != "" {
+		loaded, err := config.Load(configDir)
+		if err != nil {
+			t.Fatalf("加载测试配置失败: %v", err)
+		}
+		cfg = loaded
+	}
 	cfg.Server.Host = "127.0.0.1"
 	cfg.Server.AutoOpen = false
 	cfg.Agent.WorkDir = dir
