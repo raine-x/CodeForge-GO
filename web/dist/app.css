@@ -1188,20 +1188,6 @@ body.resizing { cursor: col-resize; user-select: none; }
 /* 页面加载后服务端会自动回放上次会话：这一次「居中 → 下放」直接落位，
    不做过渡，否则会看到输入卡片先出现在中间、再滑到底部。 */
 #composer-wrap.composer-no-anim { transition: none; }
-/* 卡片外的工作区文字：点击区域仅覆盖文字，整体略右移 */
-#workspace-label {
-  display: inline-block;
-  width: fit-content;
-  margin-left: 8px;            /* 文字向右移一点 */
-  padding: 2px 6px;            /* 仅包住文字的小热区 */
-  font-size: 13px;
-  color: var(--text-dim);
-  border-radius: 8px;
-  cursor: pointer;
-}
-#workspace-label:hover { color: var(--text); background: var(--bg-elev-2); }
-/* 默认挂载为空：显示浅灰占位提示 */
-#workspace-label:empty::before { content: '选择项目'; color: var(--text-dim); }
 
 /* ---------- 内置目录选择器（系统对话框不可用时） ---------- */
 #picker-overlay {
@@ -1810,6 +1796,70 @@ body.resizing { cursor: col-resize; user-select: none; }
 
 .muted { color: var(--text-dim); }
 .hidden { display: none !important; }
+
+/* ---------- 新建项目弹窗 ---------- */
+.newproj-modal { width: min(460px, 100%); gap: 14px; }
+.newproj-modal h2 { font-size: 16px; }
+/* 字段：标签在上、控件在下（项目名沿用 .modal label 的列布局，这里统一两类字段） */
+.np-field { display: flex; flex-direction: column; gap: 6px; }
+.np-field .np-label { font-size: 12.5px; color: var(--text-dim); }
+/* 工作区行：路径占满剩余宽度 + 选择/清除按钮 */
+.np-ws-row { display: flex; align-items: center; gap: 8px; }
+#np-ws-path {
+  flex: 1; min-width: 0;
+  font-size: 12.5px; font-family: var(--mono); color: var(--text);
+  background: var(--bg-elev-2); border: 1px solid var(--border); border-radius: 10px;
+  padding: 8px 10px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#np-ws-path.empty { color: var(--text-dim); font-family: inherit; }
+.np-btn {
+  border: 1px solid var(--border);
+  background: var(--bg-elev-2); color: var(--text);
+  font-size: 13px; font-family: inherit;
+  border-radius: 10px; padding: 8px 14px; cursor: pointer;
+  flex: 0 0 auto;
+}
+.np-btn:hover { border-color: var(--accent); color: var(--accent); }
+.np-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.np-btn.primary:hover { filter: brightness(1.1); color: #fff; }
+.np-btn:disabled { opacity: .5; cursor: default; }
+.np-btn.primary:disabled:hover { filter: none; }
+/* 权限三段选择（复用皮肤分段的结构样式） */
+.np-seg {
+  display: inline-flex; align-self: flex-start;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 3px; gap: 2px;
+}
+.np-seg button {
+  border: none; background: transparent;
+  color: var(--text-dim);
+  font-size: 12.5px; font-family: inherit;
+  padding: 6px 18px;
+  border-radius: 8px; cursor: pointer;
+}
+.np-seg button:hover { color: var(--text); }
+.np-seg button.active { background: var(--bg); color: var(--text); font-weight: 600; box-shadow: 0 1px 4px rgba(31,36,48,.12); }
+/* 错误提示：占据操作行左侧 */
+.np-error { flex: 1; text-align: left; font-size: 12.5px; color: var(--danger); }
+
+/* ---------- Termux 工具安装建议弹窗（安卓平台） ---------- */
+.termux-modal { width: min(430px, 100%); }
+.termux-modal h2 { font-size: 16px; }
+/* 顶部一行：左「跳过」右「不再提示」，弱化为文字链接 */
+.th-top { display: flex; justify-content: space-between; }
+.th-link {
+  border: none; background: transparent;
+  color: var(--text-dim);
+  font-size: 12.5px; font-family: inherit;
+  padding: 2px 6px; border-radius: 8px; cursor: pointer;
+}
+.th-link:hover { color: var(--accent); background: var(--accent-dim); }
+.th-body { font-size: 13.5px; color: var(--text); line-height: 1.6; }
+.th-body b { color: var(--accent); }
+.th-desc { margin-top: 8px; font-size: 12.5px; color: var(--text-dim); line-height: 1.6; }
 
 /* ---------- 切换 / 弹出过渡动画（极短，120ms 级） ----------
    进场：元素从 hidden 移除的下一帧自动播放（animation）；

@@ -252,6 +252,11 @@ type ContextStat struct {
 	Summarized int  // 已被摘要覆盖的消息条数
 	Compressed bool // 是否处于压缩态（存在摘要）
 	OverBudget bool // Used 是否已越过压缩线
+
+	// ---- 用量统计（来自 LLM 上游的真实计费口径，进程内存态、重启归零）----
+	TotalTokens int // 累计消耗 tokens（输入 + 输出）
+	CacheHit    int // 累计命中上游提示缓存的输入 tokens
+	CacheMiss   int // 累计未命中缓存的输入 tokens
 }
 
 // ContextStat 汇总指定会话的上下文占用。
@@ -270,6 +275,11 @@ func (a *Agent) ContextStat(sess *Session) ContextStat {
 	st.Compressed, st.Summarized = sess.compressionState()
 	st.Used = EstimateTokens(a.requestView(sess))
 	st.OverBudget = st.Used > budget
+	st.TotalTokens = sess.usageIn + sess.usageOut
+	st.CacheHit = sess.usageHit
+	if miss := sess.usageIn - sess.usageHit; miss > 0 {
+		st.CacheMiss = miss
+	}
 	return st
 }
 
@@ -465,7 +475,7 @@ func (a *Agent) runLoopWithPersistence(ctx context.Context, sess *Session, emit 
 			return err
 		}
 
-		turn, err := a.consumeStream(ctx, stream, emit)
+		turn, err := a.consumeStream(ctx, sess, stream, emit)
 		if err != nil {
 			emit(Event{Type: EventError, Error: err.Error()})
 			a.save(sess, persist)
@@ -547,7 +557,8 @@ type partialCall struct {
 }
 
 // consumeStream 消费流式事件并拼装为一轮助手回复。
-func (a *Agent) consumeStream(ctx context.Context, stream <-chan llm.StreamEvent, emit Emitter) (*llm.AssistantTurn, error) {
+// 顺带把 LLM 上报的用量（EventUsage）累计到会话上（内存态，供上下文统计展示）。
+func (a *Agent) consumeStream(ctx context.Context, sess *Session, stream <-chan llm.StreamEvent, emit Emitter) (*llm.AssistantTurn, error) {
 	turn := &llm.AssistantTurn{}
 	parts := map[string]*partialCall{}
 	order := make([]string, 0, 4)
@@ -563,6 +574,10 @@ func (a *Agent) consumeStream(ctx context.Context, stream <-chan llm.StreamEvent
 			emit(Event{Type: EventText, Text: ev.Text})
 		case llm.EventReasoningDelta:
 			emit(Event{Type: "reasoning", Text: ev.Text})
+		case llm.EventUsage:
+			if ev.Usage != nil {
+				sess.AddUsage(*ev.Usage)
+			}
 		case llm.EventToolUseStart:
 			if _, ok := parts[ev.ToolUseID]; !ok {
 				parts[ev.ToolUseID] = &partialCall{name: ev.ToolName}

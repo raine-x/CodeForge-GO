@@ -977,15 +977,12 @@
     const pct = Math.max(0, Number(d.percent) || 0);
     const summarized = Number(d.summarized) || 0;
     const rows = [
-      ['模型', d.model || d.model_id || '—'],
-      ['送模占用', fmtTokens(d.used) + ' / ' + fmtTokens(d.budget) + ' tokens'],
-      ['占比', pct.toFixed(1) + '%'],
+      ['模型名称', d.model || d.model_id || '—'],
+      ['上下文长度', d.window ? fmtTokens(d.window) + ' tokens' : '—'],
+      ['已使用总 tokens', fmtTokens(d.total_tokens) + ' tokens'],
+      ['缓存命中', fmtTokens(d.cache_hit) + ' tokens'],
+      ['缓存未命中', fmtTokens(d.cache_miss) + ' tokens'],
     ];
-    if (d.window) rows.push(['模型窗口', fmtTokens(d.window) + ' tokens']);
-    if (d.window && d.reserve) rows.push(['输出预留', fmtTokens(d.reserve) + ' tokens']);
-    if (d.raw && d.raw !== d.used) rows.push(['历史原文', fmtTokens(d.raw) + ' tokens']);
-    rows.push(['历史消息', (Number(d.messages) || 0) + ' 条']);
-    if (summarized > 0) rows.push(['已摘要', summarized + ' 条']);
     rows.forEach(function (r) { ctxPop.appendChild(ctxRow(r[0], r[1])); });
 
     const tip = document.createElement('div');
@@ -1001,6 +998,7 @@
       tip.textContent = '占比 = 送模占用 / 压缩线（模型窗口扣除输出预留后的 95%）。' +
         '达 100% 时自动调用模型把较早历史压成详细摘要。';
     }
+    tip.textContent += '用量与缓存统计自服务启动后累计（重启重新计数）。';
     ctxPop.appendChild(tip);
   }
 
@@ -1161,8 +1159,6 @@
   const wsFolded = {}; // workspace → 是否折叠（内存态，刷新重置）
   function renderSessions(items) {
     sessionsCache = items || [];
-    // 项目显示名可能刚变（重命名）→ 顺手同步输入框上方的工作区标签
-    syncWorkspaceLabel();
     sessionListEl.innerHTML = '';
     if (!sessionsCache.length) {
       sessionListEl.innerHTML = '<li class="session-empty" style="cursor:default">暂无项目</li>';
@@ -1310,11 +1306,9 @@
       setWorkspace(ws).then(function (res) {
         if (!res.ok) {
           addError(res.error || ('无法切换到该项目的目录：' + ws));
-          loadSessionList2(); // 标签/workspaceRoot 回滚成服务端真实状态
+          loadSessionList2(); // workspaceRoot 回滚成服务端真实状态
           return;
         }
-        wsLabel.textContent = wsDisplayName(ws, wsNameOf(ws));
-        wsLabel.title = ws;
         doNewSession();
       });
     } else {
@@ -1330,15 +1324,296 @@
     syncComposerMode(); // 新会话为空：输入卡片回到居中
   }
 
-  // 侧栏「新建项目」：打开**空工作区**的全新项目（默认名「新项目」），逻辑与旧「新建对话」一致
-  // （清除当前工作区 → 新会话挂在空工作区下，渲染成名为「新项目」的项目分组，自带 ⋯ 菜单）
+  // 侧栏「新建项目」：先弹窗选好 工作区 / 项目名 / 默认权限，确认后才真正创建。
+  // （不再一键直建 —— 直接点一下就建好会跳过所有项目级设置。）
   document.getElementById('new-chat-btn').addEventListener('click', function () {
     if (running) return;
-    workspaceRoot = '';
-    // 必须先等服务端清空工作区、再新建会话：两者一个走 HTTP、一个走 WS，
-    // 不等待时 new_session 常抢在清空请求前到达，新会话会被挂到上一个项目下。
-    setWorkspace('').then(doNewSession, doNewSession); // 后端清除工作区（回到未选择状态）→ 新建会话 + 清空对话区
+    openNewProjectDialog();
   });
+
+  // ---------- 新建项目弹窗 ----------
+  let npOverlay = null;   // 弹窗 DOM（只建一次，复用）
+  let npWs = '';          // 已选工作区（'' = 不挂目录的临时项目）
+  let npPerm = 'ask';     // 弹窗里选中的默认权限
+  let npPermInit = 'ask'; // 打开弹窗时服务端的权限值（没改就不提交）
+  let npPermTouched = false; // 用户是否已手动选过权限（回显晚到时不覆盖）
+  function npEl(id) { return npOverlay.querySelector('#' + id); }
+
+  function openNewProjectDialog() {
+    if (!npOverlay) buildNewProjectDialog();
+    // 每次打开都复位：不挂目录 + 空项目名；权限回显服务端当前值（打开时拉取）
+    npWs = '';
+    npPermTouched = false;
+    npEl('np-name').value = '';
+    npEl('np-create').disabled = false;
+    setNpError('');
+    renderNpWs();
+    fetch('/api/perm').then(function (r) { return r.json(); })
+      .then(function (d) { npPermInit = d.mode || 'ask'; })
+      .catch(function () { npPermInit = 'ask'; })
+      .then(function () {
+        if (!npPermTouched) { npPerm = npPermInit; renderNpPerm(); }
+      });
+    npOverlay.classList.remove('leaving', 'hidden');
+    setTimeout(function () { npEl('np-name').focus(); }, 60);
+  }
+
+  function buildNewProjectDialog() {
+    npOverlay = document.createElement('div');
+    npOverlay.id = 'newproj-overlay';
+    npOverlay.className = 'overlay hidden';
+    npOverlay.innerHTML =
+      '<div class="modal newproj-modal">' +
+      '<h2>新建项目</h2>' +
+      '<label class="np-field"><span class="np-label">项目名</span>' +
+      '<input id="np-name" type="text" placeholder="默认取文件夹名，未选目录则为「新项目」" maxlength="60"></label>' +
+      '<div class="np-field"><span class="np-label">工作区</span>' +
+      '<div class="np-ws-row">' +
+      '<span id="np-ws-path"></span>' +
+      '<button type="button" id="np-ws-pick" class="np-btn">选择文件夹…</button>' +
+      '<button type="button" id="np-ws-clear" class="np-btn" hidden>清除</button>' +
+      '</div></div>' +
+      '<div class="np-field"><span class="np-label">默认权限</span>' +
+      '<div class="np-seg" id="np-perm-seg">' +
+      '<button type="button" data-perm="readonly">只读</button>' +
+      '<button type="button" data-perm="ask">请求</button>' +
+      '<button type="button" data-perm="auto">自主</button>' +
+      '</div></div>' +
+      '<div class="modal-actions">' +
+      '<span id="np-error" class="np-error"></span>' +
+      '<button type="button" id="np-cancel" class="np-btn">取消</button>' +
+      '<button type="button" id="np-create" class="np-btn primary">创建</button>' +
+      '</div></div>';
+    document.body.appendChild(npOverlay);
+
+    // 选工作区：与左上角工作区标签同一套入口（Windows 系统对话框 / 其他平台内置选择器），
+    // 区别是这里只把路径记在弹窗里，确认创建时才真正切换。
+    npEl('np-ws-pick').addEventListener('click', function () {
+      fetch('/api/pick_folder', { method: 'POST' })
+        .then(function (r) { return r.json().then(function (d) { return { status: r.status, data: d }; }); })
+        .then(function (res) {
+          if (res.status !== 200) { openBuiltinPicker('', 'dir', setNpWs); return; }
+          if (res.data.builtin) {
+            openBuiltinPicker(res.data.start_path || '', 'dir', setNpWs);
+          } else if (res.data.ok && res.data.path) {
+            setNpWs(res.data.path); // Windows 资源管理器对话框选中
+          }
+          // res.data.ok === false：用户在系统对话框点了取消，无需任何动作
+        })
+        .catch(function () { openBuiltinPicker('', 'dir', setNpWs); });
+    });
+    npEl('np-ws-clear').addEventListener('click', function () { setNpWs(''); });
+    npEl('np-perm-seg').querySelectorAll('button').forEach(function (b) {
+      b.addEventListener('click', function () { npPermTouched = true; npPerm = b.dataset.perm; renderNpPerm(); });
+    });
+    npEl('np-cancel').addEventListener('click', function () { hideWithAnim(npOverlay); });
+    npEl('np-create').addEventListener('click', confirmNewProject);
+    // 点遮罩关闭 / 弹窗内 Esc 关闭 / 项目名里 Enter 直接创建
+    npOverlay.addEventListener('mousedown', function (e) { if (e.target === npOverlay) hideWithAnim(npOverlay); });
+    npOverlay.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') hideWithAnim(npOverlay);
+    });
+    npEl('np-name').addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); confirmNewProject(); }
+    });
+  }
+
+  function setNpWs(p) {
+    npWs = p || '';
+    setNpError('');
+    renderNpWs();
+  }
+  function renderNpWs() {
+    const el = npEl('np-ws-path');
+    if (npWs) {
+      el.textContent = npWs;
+      el.title = npWs;
+      el.classList.remove('empty');
+    } else {
+      el.textContent = '未选择（不挂目录的临时项目）';
+      el.title = '';
+      el.classList.add('empty');
+    }
+    npEl('np-ws-clear').hidden = !npWs;
+  }
+  function renderNpPerm() {
+    npEl('np-perm-seg').querySelectorAll('button').forEach(function (b) {
+      b.classList.toggle('active', b.dataset.perm === npPerm);
+    });
+  }
+  function setNpError(msg) { npEl('np-error').textContent = msg || ''; }
+
+  function confirmNewProject() {
+    if (npEl('np-create').disabled) return;
+    const name = npEl('np-name').value.trim();
+    npEl('np-create').disabled = true;
+    setNpError('');
+    // ⚠️ 先清 sessionID 再切工作区：setWorkspace 会把「无工作区的当前会话」挂到新工作区下
+    //（见其内部逻辑），旧会话会被错误吸进新项目组。失败时再回滚，会话区保持原样。
+    const prevSession = sessionID;
+    sessionID = '';
+    setWorkspace(npWs).then(function (res) {
+      if (!res.ok) {
+        sessionID = prevSession; // 切换失败：只在弹窗里报错，不破坏当前对话
+        npEl('np-create').disabled = false;
+        setNpError(res.error || '切换工作区失败');
+        loadSessionList2(); // workspaceRoot 回滚成服务端真实状态
+        return;
+      }
+      const jobs = [];
+      // 项目显示名（可选）：写入 workspace_names 表，侧栏分组即显示该名
+      if (name) {
+        jobs.push(fetch('/api/workspaces', {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ workspace: npWs, new_name: name })
+        }).catch(function () {}));
+      }
+      // 默认权限：只在用户改了打开时的值才提交（服务端权威，改完同步输入区的权限按钮）
+      if (npPerm !== npPermInit) {
+        jobs.push(fetch('/api/perm', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode: npPerm })
+        }).then(function () {
+          if (window.CodeForgePerm) window.CodeForgePerm.refresh();
+        }).catch(function () {}));
+      }
+      Promise.all(jobs).then(function () {
+        doNewSession(); // 清空对话区 + WS new_session（挂在刚切好的工作区下；sessions 事件会带出新分组名）
+        hideWithAnim(npOverlay);
+      });
+    }).catch(function () { // 网络断开等：fetch 本身失败
+      sessionID = prevSession;
+      npEl('np-create').disabled = false;
+      setNpError('无法连接服务端，请重试');
+      loadSessionList2();
+    });
+  }
+
+  // ---------- Termux 工具安装建议弹窗（安卓平台） ----------
+  // 服务端在 GET /api/termux/tools 报告「Termux 且未安装 termux-tools」时弹出：
+  // 点「安装」→ 后台 pkg install → 按钮变「安装中…」→ 轮询到装好变「已安装 ✓」。
+  // 左上角「跳过」只关本次；右上角「不再提示」写 localStorage 永久关闭。
+  let thOverlay = null;       // 弹窗 DOM（只建一次）
+  let thTimer = null;         // 安装中轮询定时器（关弹窗时必须清掉）
+  let thInstalling = false;   // 是否处于安装中（重开弹窗时恢复轮询）
+  const TH_NEVER_KEY = 'cf_termux_tools_hint'; // localStorage：不再提示
+
+  function maybeShowTermuxHint() {
+    fetch('/api/termux/tools').then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || !d.termux || d.installed || d.installing) return;
+        if (localStorage.getItem(TH_NEVER_KEY) === 'never') return;
+        openTermuxHint();
+      })
+      .catch(function () {}); // 探测失败静默：弹窗只是建议，不该打扰
+  }
+
+  function thEl(id) { return thOverlay.querySelector('#' + id); }
+
+  function openTermuxHint() {
+    if (!thOverlay) buildTermuxHint();
+    thEl('th-error').textContent = '';
+    renderThInstall('安装');
+    thOverlay.classList.remove('leaving', 'hidden');
+    if (thInstalling) startThPolling(); // 关弹窗期间装完了/装挂了：重开时立即同步
+  }
+
+  function buildTermuxHint() {
+    thOverlay = document.createElement('div');
+    thOverlay.id = 'termux-overlay';
+    thOverlay.className = 'overlay hidden';
+    thOverlay.innerHTML =
+      '<div class="modal termux-modal">' +
+      '<div class="th-top">' +
+      '<button type="button" id="th-skip" class="th-link">跳过</button>' +
+      '<button type="button" id="th-never" class="th-link">不再提示</button>' +
+      '</div>' +
+      '<h2>建议安装工具</h2>' +
+      '<div class="th-body">为了更好地使用 CodeForge，建议您安装以下工具：<b>termux-tools</b>' +
+      '<div class="th-desc">提供 termux-open-url（自动打开浏览器）与 termux-setup-storage（授权访问手机存储）。' +
+      '安装完成后会自动运行一次存储授权，请在弹出的系统对话框中允许；安装过程在后台进行，不影响当前使用。</div></div>' +
+      '<div class="modal-actions">' +
+      '<span id="th-error" class="np-error"></span>' +
+      '<button type="button" id="th-install" class="np-btn primary">安装</button>' +
+      '</div></div>';
+    document.body.appendChild(thOverlay);
+
+    thEl('th-skip').addEventListener('click', function () { closeTermuxHint(); });
+    thEl('th-never').addEventListener('click', function () {
+      localStorage.setItem(TH_NEVER_KEY, 'never');
+      closeTermuxHint();
+    });
+    thEl('th-install').addEventListener('click', requestTermuxInstall);
+    // 点遮罩 = 跳过（本次不再打扰），Esc 同效
+    thOverlay.addEventListener('mousedown', function (e) { if (e.target === thOverlay) closeTermuxHint(); });
+    thOverlay.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeTermuxHint(); });
+  }
+
+  function renderThInstall(text, disabled) {
+    const btn = thEl('th-install');
+    btn.textContent = text;
+    btn.disabled = !!disabled;
+  }
+
+  function requestTermuxInstall() {
+    thEl('th-error').textContent = '';
+    renderThInstall('安装中…', true);
+    fetch('/api/termux/tools', { method: 'POST' })
+      .then(function (r) { return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, data: d }; }); })
+      .then(function (res) {
+        if (!res.ok) {
+          thFail(res.data.error || '无法启动安装');
+          return;
+        }
+        if (res.data.installed) { thDone(); return; }
+        thInstalling = true;
+        startThPolling();
+      })
+      .catch(function () { thFail('无法连接服务端，请重试'); });
+  }
+
+  // 轮询安装状态：装好 →「已安装 ✓」并自动关窗；失败 → 显示错误并允许重试。
+  // 服务端兜底超时 10 分钟，这里 15 分钟不再继续（按失败收场）。
+  function startThPolling() {
+    if (thTimer) return;
+    const started = Date.now();
+    thTimer = setInterval(function () {
+      fetch('/api/termux/tools').then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d.installed) { thDone(); return; }
+          if (!d.installing || Date.now() - started > 15 * 60 * 1000) {
+            thFail(d.error || '安装失败，请稍后重试');
+          }
+        })
+        .catch(function () {}); // 单次轮询失败不打断，下个周期再试
+    }, 2000);
+  }
+
+  function stopThPolling() {
+    if (thTimer) { clearInterval(thTimer); thTimer = null; }
+  }
+
+  function thDone() {
+    thInstalling = false;
+    stopThPolling();
+    renderThInstall('已安装 ✓', true);
+    setTimeout(closeTermuxHint, 1200); // 让用户看到结果再自动收起
+  }
+
+  function thFail(msg) {
+    thInstalling = false;
+    stopThPolling();
+    renderThInstall('重试安装');
+    thEl('th-error').textContent = msg;
+  }
+
+  function closeTermuxHint() {
+    stopThPolling();
+    hideWithAnim(thOverlay);
+  }
+
+  // 页面就绪后稍作延迟再探测：避免与首屏渲染 / 会话回放抢资源
+  setTimeout(maybeShowTermuxHint, 1200);
 
   // 内联重命名输入（无浏览器 prompt）：原位替换为输入框 + ✓
   function attachInlineRename(anchor, current, apply) {
@@ -1467,28 +1742,17 @@
           messagesEl.innerHTML = '';
           msgCol = null; currentTextEl = null; textBuffer = '';
           reasonEl = null; reasonBuffer = ''; lastReply = '';
-          const lbl = document.getElementById('workspace-label');
-          if (lbl) { lbl.textContent = ''; lbl.title = ''; }
         }
         loadSessionList();
       });
   }
-  // 当前工作区标签同步（切换 / 重命名项目后）
+  // 当前工作区状态（侧栏分组 / 发消息挂靠都用它；入口只剩「新建项目」弹窗与项目组 ＋）
   let workspaceRoot = '';
-  // 输入框上方的工作区标签：优先项目自定义显示名，回落路径末段。
-  // 显示名只随 /api/sessions 下发，所以 renderSessions 刷新列表后会再调一次它。
-  function syncWorkspaceLabel() {
-    const lbl = document.getElementById('workspace-label');
-    if (!lbl) return;
-    const ws = workspaceRoot || '';
-    lbl.textContent = ws ? wsDisplayName(ws, wsNameOf(ws)) : '';
-    lbl.title = ws;
-  }
+  // 从服务端回读当前工作区（切换失败后把 workspaceRoot 回滚成真实状态）
   function loadSessionList2() {
     fetch('/api/workspace').then(function (r) { return r.json(); })
       .then(function (d) {
         workspaceRoot = d.root || '';
-        syncWorkspaceLabel();
       });
   }
 
@@ -1972,18 +2236,14 @@
   }
   connectWS();
 
-  // ---------- 工作区选择 ----------
-  const wsLabel = $('#workspace-label');
-
-  // 初始化：回显后端当前工作区（服务重启后为空 → 保持「选择工作区」占位，与后端一致）
+  // ---------- 工作区状态 ----------
+  // 初始化：回读后端当前工作区（发消息、侧栏归属都以它为准）
   fetch('/api/workspace').then(function (r) { return r.json(); }).then(function (d) {
-    if (d.root) { workspaceRoot = d.root; syncWorkspaceLabel(); }
+    if (d.root) { workspaceRoot = d.root; }
   }).catch(function () {});
 
   function setWorkspace(path) {
     workspaceRoot = path || '';
-    wsLabel.textContent = path ? wsDisplayName(path, wsNameOf(path)) : '';
-    wsLabel.title = path;
     // 返回 Promise：需要「先切工作区、再新建会话」的调用方必须等它，否则 new_session 会
     // 抢在清空请求前面到达服务端，新会话被挂到上一个项目下（见「新建项目」按钮）。
     // ⚠️ resolve 成 {ok, error}：fetch 对 400 也是 resolve，**调用方必须看 ok** ——
@@ -2014,20 +2274,9 @@
     });
     return done;
   }
-  // 切换工作区并在失败时报错 + 把标签回滚成服务端真实状态（成功时无副作用）。
-  // 系统对话框 / 内置选择器只会给出真实存在的目录，这里主要防「选完之后目录被删/移动」这类竞态。
-  function switchWorkspace(path) {
-    return setWorkspace(path).then(function (res) {
-      if (res && !res.ok) {
-        addError(res.error || '切换工作区失败');
-        loadSessionList2();
-      }
-      return res;
-    });
-  }
   // 内置目录浏览选择器（Linux/macOS 等）；startPath 为服务端给出的默认起始目录
   // 内置选择器（Linux/macOS/Termux 等没有原生对话框的平台）。
-  //   mode='dir'（默认）：只列子目录，确认键「选择当前目录」→ setWorkspace；
+  //   mode='dir'（默认）：只列子目录，确认键「选择当前目录」→ onPick(当前路径)；
   //   mode='file'：目录可进入、文件可点选（高亮），确认键「选择此文件」→ onPick(绝对路径)。
   // 面板 DOM 只建一次并复用，所以 mode / 回调 / 当前选中项放在外层变量里。
   let pickerMode = 'dir', pickerOnPick = null, pickerSel = '';
@@ -2061,20 +2310,30 @@
           if (pickerOnPick) pickerOnPick(picked);
           return;
         }
-        switchWorkspace(picker.dataset.current || '');
+        const cur = picker.dataset.current || '';
         hideWithAnim(picker);
+        // 目录模式同样走 onPick：把选中路径交回调用方（「新建项目」弹窗），
+        // 切不切、什么时候切由调用方决定。
+        if (pickerOnPick) pickerOnPick(cur);
       });
     }
     const okBtn = picker.querySelector('#picker-ok');
     okBtn.textContent = pickerMode === 'file' ? '选择此文件' : '选择当前目录';
     okBtn.disabled = pickerMode === 'file'; // 文件模式：选中文件后才可确认
     function browse(rel) {
-      fetch('/api/tree?depth=1' + (rel ? '&path=' + encodeURIComponent(rel) : ''))
+      // picker=1：内置选择器要浏览工作区外的目录（如 Termux 的 ~/storage/shared），
+      // 服务端只在这个模式下放行绝对路径 —— 不带它会被「路径越出工作区范围」403，
+      // 表现正是「选择目录时列表永远为空」。
+      fetch('/api/tree?depth=1&picker=1' + (rel ? '&path=' + encodeURIComponent(rel) : ''))
         .then(function (r) { return r.json(); })
         .then(function (data) {
+          const list = picker.querySelector('#picker-list');
+          if (data.error) { // 出错明确显示，不再静默渲染成「无子目录」
+            list.innerHTML = '<div class="picker-empty">' + (data.error || '浏览失败') + '</div>';
+            return;
+          }
           picker.dataset.current = data.path || '';
           picker.querySelector('#picker-path').textContent = data.path || '';
-          const list = picker.querySelector('#picker-list');
           list.innerHTML = '';
           const items = data.items || [];
           items.filter(function (it) { return it.is_dir; }).forEach(function (it) {
@@ -2107,21 +2366,6 @@
     picker.classList.remove('leaving', 'hidden');
     browse(startPath || '');
   }
-  wsLabel.addEventListener('click', function () {
-    fetch('/api/pick_folder', { method: 'POST' })
-      .then(function (r) { return r.json().then(function (d) { return { status: r.status, data: d }; }); })
-      .then(function (res) {
-        if (res.status !== 200) { openBuiltinPicker(''); return; }
-        if (res.data.builtin) {
-          // Linux/Termux 等：用内置选择器，起始目录由服务端按平台决定
-          openBuiltinPicker(res.data.start_path || '');
-        } else if (res.data.ok && res.data.path) {
-          switchWorkspace(res.data.path); // Windows 资源管理器对话框选中
-        }
-        // res.data.ok === false：用户在系统对话框点了取消，无需任何动作
-      })
-      .catch(function () { openBuiltinPicker(''); });
-  });
 
   // ---------- 发送按钮两态：↑ 空闲 / ▶ 运行中 ----------
   const form = $('#composer');

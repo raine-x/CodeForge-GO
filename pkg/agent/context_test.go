@@ -640,3 +640,31 @@ func TestContextStatNilSession(t *testing.T) {
 		t.Errorf("Budget = %d，期望 12345", st.Budget)
 	}
 }
+
+// TestConsumeStreamAccumulatesUsage 用量累计：LLM 流里的 EventUsage 必须落到
+// 会话上，ContextStat 才能给出「已使用总 / 缓存命中 / 缓存未命中」。
+// 未命中 = 输入总数 − 缓存命中（口径见 llm.Usage 注释）。
+func TestConsumeStreamAccumulatesUsage(t *testing.T) {
+	a := newCtxAgent(config.AgentConfig{}, config.LLMConfig{}, &ctxStubProvider{})
+	sess := &Session{ID: "s-usage"}
+	ch := make(chan llm.StreamEvent, 3)
+	ch <- llm.StreamEvent{Type: llm.EventUsage, Usage: &llm.Usage{
+		InputTokens: 620, CachedTokens: 500, OutputTokens: 42,
+	}}
+	ch <- llm.StreamEvent{Type: llm.EventTextDelta, Text: "回答"}
+	close(ch)
+
+	if _, err := a.consumeStream(context.Background(), sess, ch, func(Event) {}); err != nil {
+		t.Fatalf("consumeStream 报错: %v", err)
+	}
+	st := a.ContextStat(sess)
+	if st.TotalTokens != 662 {
+		t.Errorf("TotalTokens = %d，期望 662（620 输入 + 42 输出）", st.TotalTokens)
+	}
+	if st.CacheHit != 500 {
+		t.Errorf("CacheHit = %d，期望 500", st.CacheHit)
+	}
+	if st.CacheMiss != 120 {
+		t.Errorf("CacheMiss = %d，期望 120（620 − 500）", st.CacheMiss)
+	}
+}

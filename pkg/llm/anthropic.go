@@ -170,13 +170,28 @@ type anthropicEvent struct {
 		Thinking    string `json:"thinking"`
 		PartialJSON string `json:"partial_json"`
 	} `json:"delta"`
+	// message_start 的 message.usage 携带输入用量（含缓存三段）
+	Message struct {
+		Usage anthropicUsage `json:"usage"`
+	} `json:"message"`
+	// message_delta 的顶层 usage 携带输出用量（随流递增，取最后一次）
+	Usage *anthropicUsage `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
 }
 
+// anthropicUsage 是 Anthropic 流里的用量片段。
+type anthropicUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+}
+
 func (p *AnthropicProvider) consume(ctx context.Context, r io.Reader, out chan<- StreamEvent) {
 	toolIndex := map[int]string{}
+	var usage *Usage // message_start 建立输入侧，message_delta 补输出侧
 
 	err := scanSSE(r, func(_ string, data string) {
 		if data == "" {
@@ -187,6 +202,12 @@ func (p *AnthropicProvider) consume(ctx context.Context, r io.Reader, out chan<-
 			return
 		}
 		switch ev.Type {
+		case "message_start":
+			u := ev.Message.Usage
+			usage = &Usage{
+				InputTokens:  u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens,
+				CachedTokens: u.CacheReadInputTokens,
+			}
 		case "content_block_start":
 			if ev.Block.Type == BlockToolUse {
 				toolIndex[ev.Index] = ev.Block.ID
@@ -220,6 +241,11 @@ func (p *AnthropicProvider) consume(ctx context.Context, r io.Reader, out chan<-
 				send(ctx, out, StreamEvent{Type: EventToolUseStop, ToolUseID: id})
 				delete(toolIndex, ev.Index)
 			}
+		case "message_delta":
+			// 输出用量随流递增，只取最后一次的值
+			if ev.Usage != nil && usage != nil {
+				usage.OutputTokens = ev.Usage.OutputTokens
+			}
 		case "error":
 			if ev.Error != nil {
 				send(ctx, out, StreamEvent{Type: EventError, Error: ev.Error.Message})
@@ -228,6 +254,10 @@ func (p *AnthropicProvider) consume(ctx context.Context, r io.Reader, out chan<-
 	})
 	if err != nil {
 		send(ctx, out, StreamEvent{Type: EventError, Error: err.Error()})
+	}
+	// 用量在流结束时统一上报（message_stop 之前），上层按会话累计
+	if usage != nil {
+		send(ctx, out, StreamEvent{Type: EventUsage, Usage: usage})
 	}
 	send(ctx, out, StreamEvent{Type: EventMessageStop})
 }

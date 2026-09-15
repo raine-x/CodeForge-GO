@@ -162,9 +162,15 @@ type treeNode struct {
 }
 
 // handleTree 返回工作区文件树（懒加载）。
+//
+// query 参数 picker=1 是内置目录选择器专用：挑选工作区必须能浏览**工作区外**的
+// 目录（如 Termux 的 ~/storage/shared、Linux 桌面的 ~），此时绝对路径不再要求
+// 落在工作区内。tree 只暴露条目名/大小、不读内容，且在 requireAuth 之后，
+// 越权风险面仅限「列目录名」，与系统对话框任选目录一致。
 func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 	root := s.fs.Root()
 	rel := strings.TrimSpace(r.URL.Query().Get("path"))
+	picker := r.URL.Query().Get("picker") == "1"
 	depth := 1
 	if d := r.URL.Query().Get("depth"); d != "" {
 		if n, err := strconv.Atoi(d); err == nil && n > 0 && n <= 5 {
@@ -176,14 +182,23 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 	if rel != "" {
 		if filepath.IsAbs(rel) {
 			// 绝对路径（内置选择器 browse 传的是 tree 返回的绝对路径）：
-			// 必须落在工作区内，防越权浏览区外目录；未选工作区时一律拒绝。
+			// 默认必须落在工作区内，防越权浏览区外目录；picker 模式放行（见函数注释）。
 			if root == "" || !pathWithin(root, rel) {
-				writeJSON(w, http.StatusForbidden, map[string]any{"error": "路径越出工作区范围"})
-				return
+				if !picker {
+					writeJSON(w, http.StatusForbidden, map[string]any{"error": "路径越出工作区范围"})
+					return
+				}
 			}
 			target = filepath.Clean(rel)
 		} else {
 			target = filepath.Join(root, filepath.Clean("/"+rel))
+		}
+	}
+	// picker 模式下连工作区都没选（root=""）且没传 path：回落到用户主目录，
+	// 让「选工作区」的入口在任何状态下都有内容可浏览（否则列表永远为空）。
+	if target == "" && picker {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			target = home
 		}
 	}
 	info, err := os.Stat(target)

@@ -92,6 +92,9 @@ func (p *OpenAIProvider) buildPayload(req Request) map[string]any {
 		"max_tokens":  clampMaxTokens(req.MaxTokens),
 		"temperature": req.Temperature,
 	}
+	// 让上游在流的末块附带 usage（choices 为空、带 usage 字段），
+	// 否则拿不到 prompt/completion/cached tokens，用量统计无从谈起。
+	payload["stream_options"] = map[string]any{"include_usage": true}
 	if len(req.Tools) > 0 {
 		tools := make([]map[string]any, 0, len(req.Tools))
 		for _, d := range req.Tools {
@@ -162,6 +165,14 @@ func convertOAIMessages(m Message) []oaiMessage {
 	return out
 }
 
+type oaiUsage struct {
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
 type oaiChunk struct {
 	Choices []struct {
 		Delta struct {
@@ -179,6 +190,8 @@ type oaiChunk struct {
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
+	// include_usage=true 时末块（choices 为空）携带的用量
+	Usage *oaiUsage `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
@@ -188,6 +201,7 @@ func (p *OpenAIProvider) consume(ctx context.Context, r io.Reader, out chan<- St
 	ids := map[int]string{}
 	names := map[int]string{}
 	finish := ""
+	var usage *Usage // 部分兼容网关会在多个块带 usage，取最后一次
 
 	err := scanSSE(r, func(_ string, data string) {
 		if data == "" || data == "[DONE]" {
@@ -200,6 +214,17 @@ func (p *OpenAIProvider) consume(ctx context.Context, r io.Reader, out chan<- St
 		if chunk.Error != nil {
 			send(ctx, out, StreamEvent{Type: EventError, Error: chunk.Error.Message})
 			return
+		}
+		if chunk.Usage != nil {
+			cached := 0
+			if chunk.Usage.PromptTokensDetails != nil {
+				cached = chunk.Usage.PromptTokensDetails.CachedTokens
+			}
+			usage = &Usage{
+				InputTokens:  chunk.Usage.PromptTokens,
+				CachedTokens: cached,
+				OutputTokens: chunk.Usage.CompletionTokens,
+			}
 		}
 		for _, ch := range chunk.Choices {
 			if ch.Delta.Reasoning != "" {
@@ -243,6 +268,10 @@ func (p *OpenAIProvider) consume(ctx context.Context, r io.Reader, out chan<- St
 	// 不显式上报会被上层当作正常完成，表现为「思考到一半就停了」。
 	if finish == "length" {
 		send(ctx, out, StreamEvent{Type: EventError, Error: "输出因达到 max_tokens 上限被截断（思考与回答共享该预算），请在设置中调大模型条目的「输出上限」后重新应用"})
+	}
+	// 用量在流结束时统一上报（message_stop 之前），上层按会话累计
+	if usage != nil {
+		send(ctx, out, StreamEvent{Type: EventUsage, Usage: usage})
 	}
 	send(ctx, out, StreamEvent{Type: EventMessageStop})
 }

@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -72,6 +73,10 @@ type Server struct {
 	// done 在服务开始关闭后关闭，供主流程与信号等待统一收口。
 	done       chan struct{}
 	shutdownMu sync.Once
+
+	// termux-tools 安装状态（安卓 Termux 平台的建议弹窗用，见 termux.go）。
+	termuxState atomic.Int32
+	termuxErr   atomic.Value // 最近一次失败的输出尾部（string）
 }
 
 // SetPluginManager 注入插件管理器（供 /api/plugins 热加载）。
@@ -157,6 +162,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/pick_folder", s.requireAuth(s.handlePickFolder))
 	mux.HandleFunc("/api/pick_file", s.requireAuth(s.handlePickFile))
 	mux.HandleFunc("/api/stage_file", s.requireAuth(s.handleStageFile))
+	mux.HandleFunc("/api/termux/tools", s.requireAuth(s.handleTermuxTools))
 	mux.HandleFunc("/api/models/test", s.requireAuth(s.handleModelTest))
 	mux.HandleFunc("/api/models/discover", s.requireAuth(s.handleModelDiscover))
 	mux.HandleFunc("/api/models/save_batch", s.requireAuth(s.handleModelSaveBatch))

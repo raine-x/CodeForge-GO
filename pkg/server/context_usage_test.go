@@ -18,6 +18,7 @@ import (
 // ⚠️ 两个状态位是**不同**的事，别再混为一谈（这里踩过一次）：
 //   - OverBudget = Used 越过压缩线（本步送模会触发压缩）；
 //   - Compressed = 会话里**已经存在**摘要（压缩发生过）。
+//
 // 刚超线的那一瞬间 OverBudget=true 而 Compressed 仍为 false。
 //
 // fillSession 往指定会话的缓存对象里塞一条纯文本消息。
@@ -46,7 +47,7 @@ func TestContextUsageEmptySession(t *testing.T) {
 	if got["type"] != "context" {
 		t.Errorf("type = %v，期望 context", got["type"])
 	}
-	for _, k := range []string{"used", "raw", "messages", "summarized"} {
+	for _, k := range []string{"used", "raw", "messages", "summarized", "total_tokens", "cache_hit", "cache_miss"} {
 		if got[k] != 0 {
 			t.Errorf("%s = %v，空会话应为 0", k, got[k])
 		}
@@ -64,6 +65,28 @@ func TestContextUsageEmptySession(t *testing.T) {
 	}
 	if got["window"] != 0 {
 		t.Errorf("window = %v，期望 0（测试环境未配置模型窗口）", got["window"])
+	}
+}
+
+// TestContextUsageCarriesCacheStats 用量三字段（累计总量 / 缓存命中 / 未命中）
+// 必须原样透传给前端明细 —— 明细的五项里有三项靠它们。
+func TestContextUsageCarriesCacheStats(t *testing.T) {
+	deps := newTestDeps(t)
+	srv := deps.newServer()
+	id := fillSession(t, deps, 10)
+
+	sess, _ := deps.agent.History().Get(id)
+	sess.AddUsage(llm.Usage{InputTokens: 620, CachedTokens: 500, OutputTokens: 42})
+
+	got := srv.contextUsage(id)
+	if got["total_tokens"] != 662 {
+		t.Errorf("total_tokens = %v，期望 662（620 输入 + 42 输出）", got["total_tokens"])
+	}
+	if got["cache_hit"] != 500 {
+		t.Errorf("cache_hit = %v，期望 500", got["cache_hit"])
+	}
+	if got["cache_miss"] != 120 {
+		t.Errorf("cache_miss = %v，期望 120（620 − 500）", got["cache_miss"])
 	}
 }
 

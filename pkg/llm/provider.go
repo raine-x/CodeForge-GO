@@ -91,9 +91,24 @@ const (
 	EventToolUseStop StreamEventType = "tool_use_stop"
 	// EventMessageStop 本轮消息结束。
 	EventMessageStop StreamEventType = "message_stop"
+	// EventUsage 用量统计（每轮请求的流结束时发出一次，字段见 Usage）。
+	EventUsage StreamEventType = "usage"
 	// EventError 错误。
 	EventError StreamEventType = "error"
 )
+
+// Usage 是一次请求的用量统计，由各适配器从流式响应解析、随 EventUsage 发出。
+//
+// 口径统一（两家上游换算到同一把尺子）：
+//   - InputTokens  = 输入 tokens 总数（含缓存命中部分）；
+//   - CachedTokens = 输入中命中上游提示缓存的部分（= 缓存命中）；
+//   - 未命中 = InputTokens − CachedTokens；
+//   - Anthropic 的 input_tokens 不含缓存三段，总数 = input + cache_creation + cache_read。
+type Usage struct {
+	InputTokens  int `json:"input_tokens"`  // 输入 tokens 总数（含缓存命中部分）
+	CachedTokens int `json:"cached_tokens"` // 其中命中上游缓存的部分
+	OutputTokens int `json:"output_tokens"` // 输出 tokens
+}
 
 // StreamEvent 是统一流式事件。
 type StreamEvent struct {
@@ -103,6 +118,7 @@ type StreamEvent struct {
 	ToolName   string          `json:"tool_name,omitempty"`
 	InputDelta string          `json:"input_delta,omitempty"`
 	Error      string          `json:"error,omitempty"`
+	Usage      *Usage          `json:"usage,omitempty"` // 仅 EventUsage 携带
 }
 
 // Request 是一次对话请求。

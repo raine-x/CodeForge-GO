@@ -42,6 +42,24 @@ type Session struct {
 	// compressedUpTo 表示 Messages[:compressedUpTo] 已被 summaryText 覆盖。
 	compressedUpTo int
 	summaryText    string
+
+	// ---- 用量统计（进程内存态，不持久化；重启后从零累计）----
+	//
+	// 由 LLM 适配器在每轮流结束时上报（llm.EventUsage），consumeStream 累加到这里。
+	// 放在 Session 上与压缩缓存同理：生命周期跟随缓存会话，删除/换出自动释放。
+	usageIn  int // 累计输入 tokens（含缓存命中部分）
+	usageHit int // 其中命中上游缓存的 tokens
+	usageOut int // 累计输出 tokens
+}
+
+// AddUsage 累计一次请求的用量（供上下文统计展示「已使用总 / 缓存命中 / 未命中」）。
+func (s *Session) AddUsage(u llm.Usage) {
+	if s == nil {
+		return
+	}
+	s.usageIn += u.InputTokens
+	s.usageHit += u.CachedTokens
+	s.usageOut += u.OutputTokens
 }
 
 // compressionState 返回（是否处于压缩态、被摘要覆盖的消息条数）。

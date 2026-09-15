@@ -259,9 +259,9 @@ check('会话元信息带 workspace_name，侧栏按它渲染项目名',
   /list\[0\]\s*&&\s*list\[0\]\.workspace_name/.test(uiSrc));
 check('重命名预填当前显示名（改回原样无副作用）',
   /input\.value = currentName \|\| wsDisplayName\(ws\)/.test(uiSrc));
-check('工作区标签也用显示名（与侧栏一致）',
-  /function syncWorkspaceLabel\(\)/.test(uiSrc) &&
-  /lbl\.textContent = ws \? wsDisplayName\(ws, wsNameOf\(ws\)\)/.test(uiSrc));
+check('输入框上方的工作区标签已移除（选工作区只在「新建项目」弹窗）',
+  !htmlSrc.includes('id="workspace-label"') &&
+  !uiSrc.includes('syncWorkspaceLabel') && !uiSrc.includes('wsLabel'));
 check('项目 ⋯ 菜单里「恢复默认名」只在设过自定义名时出现',
   /if \(list\[0\] && list\[0\]\.workspace_name\) \{\s*\n\s*items\.push\(\{ label: '恢复默认名'/.test(uiSrc));
 check('「恢复默认名」用 new_name 空串清除（后端据此删记录）',
@@ -278,13 +278,12 @@ check('setWorkspace 把状态码暴露成 {ok, error}',
   /return \{ ok: r\.ok, error: \(d && d\.error\) \|\| '' \};/.test(uiSrc));
 check('newSessionInWorkspace 先看 res.ok 再建会话',
   /setWorkspace\(ws\)\.then\(function \(res\) \{\s*\n\s*if \(!res\.ok\)/.test(uiSrc));
-check('切换失败时报错并回滚标签',
+check('切换失败时报错并回滚 workspaceRoot',
   /addError\(res\.error \|\| \('无法切换到该项目的目录：' \+ ws\)\)/.test(uiSrc) &&
-  /loadSessionList2\(\); \/\/ 标签\/workspaceRoot 回滚成服务端真实状态/.test(uiSrc));
-check('选择器路径走 switchWorkspace（失败也报错）',
-  /function switchWorkspace\(path\)/.test(uiSrc) &&
-  /switchWorkspace\(picker\.dataset\.current \|\| ''\)/.test(uiSrc) &&
-  /switchWorkspace\(res\.data\.path\)/.test(uiSrc));
+  /loadSessionList2\(\); \/\/ workspaceRoot 回滚成服务端真实状态/.test(uiSrc));
+check('选择器目录模式只回传路径，切不切由调用方决定（新建项目弹窗）',
+  /if \(pickerOnPick\) pickerOnPick\(cur\);/.test(uiSrc) &&
+  !uiSrc.includes('switchWorkspace'));
 check('空工作区会话只在切换成功时挂到新工作区（失败时路径是坏的）',
   /if \(res\.ok && path && sessionID\)/.test(uiSrc));
 
@@ -320,8 +319,11 @@ check('阈值与 CSS 类同步（70% 警告 / 90% 危险）',
 // 刚超线那一瞬间是 over_budget=true 而 compressed=false。
 check('区分 over_budget 与 compressed 两个状态位',
   uiSrc.includes('d.over_budget && !d.compressed') && /classList\.toggle\('compressed'/.test(uiSrc));
-check('历史原文 / 输出预留 / 已摘要 也进明细（解释压缩线为何小于窗口）',
-  uiSrc.includes('历史原文') && uiSrc.includes('输出预留') && uiSrc.includes('已摘要'));
+check('明细五项：模型名称 / 上下文长度 / 已使用总 / 缓存命中 / 缓存未命中',
+  uiSrc.includes("'模型名称'") && uiSrc.includes("'上下文长度'") &&
+  uiSrc.includes("'已使用总 tokens'") && uiSrc.includes("'缓存命中'") && uiSrc.includes("'缓存未命中'"));
+check('缓存三项来自服务端 usage 字段（total_tokens / cache_hit / cache_miss）',
+  uiSrc.includes('d.total_tokens') && uiSrc.includes('d.cache_hit') && uiSrc.includes('d.cache_miss'));
 check('样式契约：压缩态有独立标记（.ctx-meter.compressed）',
   /\.ctx-meter\.compressed\s+\.ctx-pct\s*\{/.test(css));
 
@@ -334,15 +336,48 @@ check('1050 → 1.1k', fmtTokens(1050) === '1.1k');
 check('120000 → 120k', fmtTokens(120000) === '120k');
 check('1200000 → 1.2M', fmtTokens(1200000) === '1.2M');
 
-// ---------- 6.5 新建项目：清空工作区必须先于新建会话 ----------
-// 易回归点：setWorkspace 走 HTTP、doNewSession 走 WS，不等待就会抢跑，
-// 新会话被挂到**上一个项目**下（而不是形成空工作区的「新项目」分组）。
-group('新建项目：清空工作区与建会话的先后');
+// ---------- 6.5 新建项目：弹窗设置后创建，切工作区必须先于建会话 ----------
+// 「新建项目」先弹窗选 工作区/项目名/默认权限；确认后 setWorkspace（HTTP）成功才
+// doNewSession（WS）。不等待就会抢跑，新会话被挂到**上一个项目**下。
+group('新建项目：弹窗与清空工作区、建会话的先后');
 check('setWorkspace 返回 Promise 供调用方等待',
   /const done = fetch\('\/api\/workspace'/.test(extractFunction(uiSrc, 'setWorkspace')) &&
   /return done;/.test(extractFunction(uiSrc, 'setWorkspace')));
-check('「新建项目」按钮先清空工作区再建会话',
-  /setWorkspace\(''\)\s*\.then\(doNewSession/.test(uiSrc));
+check('「新建项目」先弹窗（工作区/项目名/默认权限），确认才创建',
+  /openNewProjectDialog\(\);/.test(uiSrc) &&
+  /function openNewProjectDialog\(\)/.test(uiSrc) &&
+  /id="np-name"/.test(uiSrc) && /id="np-ws-pick"/.test(uiSrc) && /id="np-perm-seg"/.test(uiSrc));
+check('确认创建：先等服务端切好工作区，再新建会话',
+  /setWorkspace\(npWs\)\.then\(function \(res\)/.test(uiSrc) &&
+  /doNewSession\(\); \/\/ 清空对话区 \+ WS new_session/.test(uiSrc));
+
+// ---------- 6.6 Termux 工具安装建议弹窗（安卓平台） ----------
+// 服务端报告「Termux 且未装」时弹窗；安装走后台 + 轮询；「不再提示」持久化。
+group('Termux 工具安装建议弹窗');
+check('启动后探测 /api/termux/tools，非 Termux / 已装 / 不再提示时不弹',
+  /function maybeShowTermuxHint\(\)/.test(uiSrc) &&
+  /!d\.termux \|\| d\.installed \|\| d\.installing/.test(uiSrc) &&
+  /TH_NEVER_KEY\) === 'never'/.test(uiSrc));
+check('弹窗文案含建议安装 termux-tools 与跳过/不再提示/安装按钮',
+  uiSrc.includes('建议您安装以下工具') && uiSrc.includes('<b>termux-tools</b>') &&
+  /id="th-skip"/.test(uiSrc) && /id="th-never"/.test(uiSrc) && /id="th-install"/.test(uiSrc));
+check('「不再提示」写 localStorage（跳过只关本次）',
+  /localStorage\.setItem\(TH_NEVER_KEY, 'never'\)/.test(uiSrc));
+check('安装走 POST + 轮询 GET，装好显示已安装并自动关窗',
+  /fetch\('\/api\/termux\/tools', \{ method: 'POST' \}\)/.test(uiSrc) &&
+  /function startThPolling\(\)/.test(uiSrc) &&
+  /renderThInstall\('已安装 ✓', true\)/.test(uiSrc));
+check('失败可重试：错误显示在弹窗内，按钮恢复',
+  /function thFail\(msg\)/.test(uiSrc) &&
+  /renderThInstall\('重试安装'\)/.test(uiSrc));
+
+// ---------- 6.7 内置选择器：picker 模式修「选目录列表为空」 ----------
+// Termux 上选择器起始目录（~ 等）在工作区外，tree 不带 picker 会 403 → 列表空。
+group('内置选择器 picker 模式');
+check('browse 请求带 picker=1（选工作区必须能浏览工作区外目录）',
+  /fetch\('\/api\/tree\?depth=1&picker=1'/.test(uiSrc));
+check('tree 返回错误时显示错误而非静默渲染成「无子目录」',
+  /if \(data\.error\) \{[\s\S]{0,120}?picker-empty/.test(uiSrc));
 
 // ---------- 7. 输入框：空对话居中 / 有对话下放 ----------
 // 空对话（消息区无任何记录）时输入卡片在主对话栏内上下左右居中；用户发出第一句话

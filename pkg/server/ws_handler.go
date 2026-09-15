@@ -329,20 +329,23 @@ func (s *Server) contextUsage(sessionID string) map[string]any {
 		percent = float64(st.Used*1000/st.Budget) / 10
 	}
 	return map[string]any{
-		"type":        "context",
-		"session_id":  sessionID,
-		"used":        st.Used,
-		"raw":         st.Raw,
-		"budget":      st.Budget,
-		"messages":    st.Messages,
-		"percent":     percent,
-		"compressed":  st.Compressed,
-		"over_budget": st.OverBudget,
-		"summarized":  st.Summarized,
-		"window":      st.Window,
-		"reserve":     st.Reserve,
-		"model":       s.cfg.LLM.DisplayName,
-		"model_id":    s.cfg.LLM.Model,
+		"type":         "context",
+		"session_id":   sessionID,
+		"used":         st.Used,
+		"raw":          st.Raw,
+		"budget":       st.Budget,
+		"messages":     st.Messages,
+		"percent":      percent,
+		"compressed":   st.Compressed,
+		"over_budget":  st.OverBudget,
+		"summarized":   st.Summarized,
+		"window":       st.Window,
+		"reserve":      st.Reserve,
+		"model":        s.cfg.LLM.DisplayName,
+		"model_id":     s.cfg.LLM.Model,
+		"total_tokens": st.TotalTokens, // 累计消耗（输入+输出，内存态）
+		"cache_hit":    st.CacheHit,    // 累计缓存命中 tokens
+		"cache_miss":   st.CacheMiss,   // 累计缓存未命中 tokens
 	}
 }
 

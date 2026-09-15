@@ -134,9 +134,7 @@ func (s *Server) handleNotifyPrefs(w http.ResponseWriter, r *http.Request) {
 
 // handlePickFolder 平台相关的文件夹选择入口：
 //   - Windows：弹出 PowerShell/.NET 资源管理器选择对话框（失败直接报错，不回退内置选择器）；
-//   - Linux/macOS：返回内置选择器的默认起始路径（"builtin":true）：
-//     Termux 默认 ~/storage/shared（不存在/无权限时自动运行一次 termux-setup-storage
-//     申请存储权限后重试，仍失败退回 ~）；其余 Linux/macOS 默认 ~。
+//   - Linux/macOS/Termux：返回内置选择器的起始路径（"builtin":true）= 用户主目录 ~。
 func (s *Server) handlePickFolder(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -358,32 +356,17 @@ func (s *Server) pickFileWindows(w http.ResponseWriter) {
 	s.finishPick(w, path, err, "文件")
 }
 
-// pickDefaultDir 计算 Linux/macOS 内置选择器的默认起始目录：
-// Termux（PREFIX 含 com.termux）→ ~/storage/shared，失败逐级退回 ~；
-// 其他系统 → ~。
+// pickDefaultDir 计算 Linux/macOS/Termux 内置选择器的默认起始目录：直接挂 ~。
+//
+// 之前 Termux 默认跳 ~/storage/shared（授权异常时还会自动跑 termux-setup-storage），
+// 但 shared 权限不在位时整个浏览列表就空了（安卓「选择工作目录为空」的成因之一）。
+// 改为直接挂 ~：~ 一定能列出；授权过存储后 storage/shared 软链就在 ~ 下，点进去即可。
 func pickDefaultDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		home = "/"
+		return "/"
 	}
-	if !isTermux() {
-		return home
-	}
-
-	shared := filepath.Join(home, "storage", "shared")
-	if dirAccessible(shared) {
-		return shared
-	}
-	// 目录不存在或无权限：申请一次存储权限（termux-setup-storage 会弹授权框并建软链）
-	if setupTermuxStorage(home) && dirAccessible(shared) {
-		return shared
-	}
-	return home // 最终退回 ~
-}
-
-// isTermux 判断是否运行在 Termux 环境（$PREFIX 指向 com.termux）。
-func isTermux() bool {
-	return strings.Contains(os.Getenv("PREFIX"), "com.termux")
+	return home
 }
 
 // dirAccessible 目录存在且可列出内容。
