@@ -51,6 +51,11 @@ type AgentConfig struct {
 	ContextCompressRatio float64 `yaml:"context_compress_ratio"`
 	SystemPromptFile     string  `yaml:"system_prompt_file"`
 	WorkDir              string  `yaml:"work_dir"`
+	// HiddenTools 是隐藏工具名列表（Exposure 层的确定性规则）：这些注册工具的
+	// 定义不再下发给 LLM（模型收不到定义，通常不会主动调用），但注册/执行/权限/
+	// 审计链路不变 —— 隐藏 ≠ 禁止执行，如需隐藏即禁用应在 Executor/Policy 加规则。
+	// 按真实工具名匹配（如 "web_fetch"），不是清洗后的 wire 名。
+	HiddenTools []string `yaml:"hidden_tools"`
 }
 
 // SecurityRule 是一条有序匹配的权限规则。
@@ -102,6 +107,7 @@ type Config struct {
 	Security  SecurityConfig `yaml:"security"`
 	Notify    NotifyConfig   `yaml:"notify"`
 	Subagents SubagentConfig `yaml:"subagents"`
+	Web       WebConfig      `yaml:"web"`
 	Plugins   []PluginConfig `yaml:"plugins"`
 	DataDir   string         `yaml:"data_dir"`
 	AuditLog  string         `yaml:"audit_log"`
@@ -120,6 +126,8 @@ type BuiltinPluginsConfig struct {
 	SkillCreator *bool `yaml:"skill_creator"`
 	// MultiAgent：允许主智能体委派最多 5 个互不重叠的子智能体。
 	MultiAgent *bool `yaml:"multi_agent"`
+	// Plan：计划模式（@plan 触发，只读产出结构化项目计划书）。
+	Plan *bool `yaml:"plan"`
 }
 
 // NotifyConfig 是「任务完成」系统通知（Windows Toast / Linux notify-send）的开关与节流。
@@ -154,6 +162,11 @@ func (c BuiltinPluginsConfig) SkillCreatorEnabled() bool {
 // MultiAgentEnabled 缺省开启，写 false 才关闭。
 func (c BuiltinPluginsConfig) MultiAgentEnabled() bool {
 	return c.MultiAgent == nil || *c.MultiAgent
+}
+
+// PlanEnabled 缺省开启，写 false 才关闭。
+func (c BuiltinPluginsConfig) PlanEnabled() bool {
+	return c.Plan == nil || *c.Plan
 }
 
 // SubagentConcurrencyCap 是子智能体并发上限的硬上限：配置可以调小，但不能突破它。
@@ -195,6 +208,25 @@ func (c Config) SubagentAllowDelete() bool { return boolDefault(c.Subagents.Allo
 
 // SubagentAllowMemory 返回子智能体是否可写入用户记忆（缺省 true）。
 func (c Config) SubagentAllowMemory() bool { return boolDefault(c.Subagents.AllowMemory, true) }
+
+// WebConfig 描述联网工具（web_fetch / web_search）的开关与提供方。
+type WebConfig struct {
+	// Enabled：联网工具总开关。缺省 false（未配置 API Key 前不打扰模型）。
+	Enabled *bool `yaml:"enabled"`
+	// SearchProvider：web_search 的提供方，tavily（POST JSON）| searxng（?format=json）。
+	// 空 / 未知时 web_search 工具不注册（web_fetch 仍可用）。
+	SearchProvider string `yaml:"search_provider"`
+	// SearchEndpoint：searxng 实例的 JSON 端点（如 https://searx.example.com/search）。
+	SearchEndpoint string `yaml:"search_endpoint"`
+	// APIKeyEnv：tavily 的 API Key 环境变量名（缺省 TAVILY_API_KEY）。
+	APIKeyEnv string `yaml:"api_key_env"`
+	// AllowPrivate：允许访问回环/私网地址（内网服务等）。默认 false ——
+	// web_fetch 会拒绝私网目标（SSRF 防护），除非显式放行。
+	AllowPrivate bool `yaml:"allow_private"`
+}
+
+// WebEnabledAt 返回某 WebConfig 是否启用（缺省 false）。
+func (w WebConfig) WebEnabledAt() bool { return w.Enabled != nil && *w.Enabled }
 
 // boolDefault 解析「缺省为真」的三态布尔字段。
 func boolDefault(p *bool, def bool) bool {

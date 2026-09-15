@@ -692,12 +692,17 @@ func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request) {
 	skills := s.agent.ListSkills()
 	out := make([]map[string]any, 0, len(skills))
 	for _, sk := range skills {
+		display := sk.DisplayName
+		if display == "" {
+			display = sk.Name // 未配置显示名时回退技能 slug
+		}
 		out = append(out, map[string]any{
-			"name":        sk.Name,
-			"description": sk.Description,
-			"triggers":    sk.Triggers,
-			"enabled":     sk.Enabled,
-			"path":        sk.Path,
+			"name":         sk.Name,
+			"display_name": display,
+			"description":  sk.Description,
+			"triggers":     sk.Triggers,
+			"enabled":      sk.Enabled,
+			"path":         sk.Path,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": out})

@@ -287,3 +287,55 @@ func (s *Store) DeleteWorkspace(workspace string) error {
 	}
 	return s.DeleteWorkspaceName(workspace)
 }
+
+// TodoRow 是会话任务清单的一条记录。
+type TodoRow struct {
+	Content  string `json:"content"`  // 任务内容
+	Status   string `json:"status"`   // pending / in_progress / completed / cancelled
+	Priority int    `json:"priority"` // 0=普通 1=优先
+	Sort     int    `json:"sort"`     // 排序序号（行内索引）
+}
+
+// ListTodos 列出会话的全部任务（按 sort 升序）。
+func (s *Store) ListTodos(sessionID string) ([]TodoRow, error) {
+	rows, err := s.db.Query(
+		`SELECT content, status, priority, sort FROM session_todos WHERE session_id = ? ORDER BY sort ASC`,
+		sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TodoRow
+	for rows.Next() {
+		var r TodoRow
+		if err := rows.Scan(&r.Content, &r.Status, &r.Priority, &r.Sort); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ReplaceTodos 用整表数组整体替换会话的任务清单（todo_write 的
+// 「Claude TodoWrite 语义」：模型每次提交完整列表，缺项即删除）。
+// 在事务里先清后插，保证前后一致。
+func (s *Store) ReplaceTodos(sessionID string, todos []TodoRow) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM session_todos WHERE session_id = ?`, sessionID); err != nil {
+		return err
+	}
+	now := time.Now().Unix()
+	for i, t := range todos {
+		if _, err := tx.Exec(
+			`INSERT INTO session_todos (session_id, sort, content, status, priority, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			sessionID, i, t.Content, t.Status, t.Priority, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}

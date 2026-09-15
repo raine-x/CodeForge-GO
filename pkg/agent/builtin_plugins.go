@@ -26,7 +26,7 @@ var BuiltinSkillCreator = BuiltinPlugin{
 	WhenToUse: "当用户要求「创建一个技能 / 把这套流程保存下来以后复用 / 改进某个技能」时使用；一次性任务或普通问答不要使用",
 	Instructions: "使用步骤：" +
 		"1) 与用户确认技能名（英文 slug）与触发词；" +
-		"2) 调用 create_skill 工具写入 SKILL.md（正文写清操作步骤与约定，让未来的模型能独立照做）；" +
+		"2) 使用技能创建工具写入 SKILL.md（正文写清操作步骤与约定，让未来的模型能独立照做）；" +
 		"3) 完成后告知用户技能名与唤起方式（@技能名 或命中触发词）。",
 }
 
@@ -39,13 +39,29 @@ var BuiltinMultiAgent = BuiltinPlugin{
 	Instructions: "使用步骤：" +
 		"1) 先拆分任务并为每个子任务声明唯一 id、mode（explore/implement）和 paths；" +
 		"2) 确认不同子任务 paths 不重叠；implement 必须声明 paths，explore 只能读文件/列目录/搜索；" +
-		"3) 调用 delegate_subagents，最多 5 个；" +
+		"3) 使用多智能体委派能力，最多 5 个；" +
 		"4) 汇总子任务结果后再由主智能体做跨范围整合与最终验证。不要为了并行而拆分单一连续操作。",
+}
+
+// BuiltinPlan 是「计划模式」插件：用户 @plan（或要求方案设计）时，AI 只读探索
+// 后输出可执行的结构化项目计划书。与 Skill Creator/Multi-Agent 不同，它不需要
+// 专属工具 —— 探索用已有只读工具完成，产物是计划书文本。常驻注入 WhenToUse
+// 让模型在收到 @plan 时立即进入计划模式。
+var BuiltinPlan = BuiltinPlugin{
+	ID:        "plan",
+	Name:      "Plan（计划模式）",
+	Purpose:   "针对问题产出可执行的结构化项目计划书（@plan 触发，只读规划，不改任何文件）",
+	WhenToUse: "当用户输入 @plan、或要求「出方案 / 做计划 / 写实现方案 / 计划书」时使用；只读产出计划书，不执行修改",
+	Instructions: "只读规划模式：本轮禁止创建/修改/删除任何文件，禁止运行改变系统状态的命令；" +
+		"探索用只读能力（读取文件、列目录、检索代码、查看版本历史）。" +
+		"流程：理解需求 → 彻底探索（读关键文件、找既有模式与调用方、追踪代码路径）→ 设计方案（说明权衡）→ 拆分步骤。" +
+		"输出 Markdown 计划书：目标 / 现状与关键文件（文件:行号）/ 实现方案 / 实施步骤（标注依赖与改动文件）/ 风险与验证。" +
+		"计划书必须具体到可直接照做。若输入是普通对话而非计划任务，回复简短说明不需要计划即可，不要强套格式。",
 }
 
 // builtinPlugins 列出全部内置插件定义（新增内置插件时在此追加）。
 func builtinPlugins() []BuiltinPlugin {
-	return []BuiltinPlugin{BuiltinSkillCreator, BuiltinMultiAgent}
+	return []BuiltinPlugin{BuiltinSkillCreator, BuiltinMultiAgent, BuiltinPlan}
 }
 
 // ListBuiltinPlugins 导出全部内置插件定义（设置页列表用）。
@@ -67,6 +83,14 @@ func (a *Agent) SetMultiAgentEnabled(on bool) {
 		a.builtinOn = map[string]bool{}
 	}
 	a.builtinOn[BuiltinMultiAgent.ID] = on
+}
+
+// SetPlanEnabled 同步计划模式插件的提示词开关（不注册工具，纯 System Prompt 注入）。
+func (a *Agent) SetPlanEnabled(on bool) {
+	if a.builtinOn == nil {
+		a.builtinOn = map[string]bool{}
+	}
+	a.builtinOn[BuiltinPlan.ID] = on
 }
 
 // builtinPluginSection 生成启用的内置插件注入段（含使用约定与工作流提醒要求）。

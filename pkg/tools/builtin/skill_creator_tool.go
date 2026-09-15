@@ -36,6 +36,7 @@ func (t *SkillCreatorTool) Description() string {
 func (t *SkillCreatorTool) InputSchema() json.RawMessage {
 	return tools.NewSchema().
 		Str("name", "技能名（英文 slug：小写字母/数字/-/_，最长 40 字符）", true).
+		Str("display_name", "显示名（@ 提及 面板/菜单展示用；留空则用技能名）", false).
 		Str("description", "一句话描述技能用途", true).
 		Str("triggers", "触发词，逗号分隔（可选，如：部署, deploy）", false).
 		Str("content", "技能正文：可独立照做的操作步骤与约定（Markdown）", true).
@@ -46,6 +47,7 @@ func (t *SkillCreatorTool) InputSchema() json.RawMessage {
 func (t *SkillCreatorTool) Execute(_ context.Context, args json.RawMessage) (*tools.ToolResult, error) {
 	var p struct {
 		Name        string `json:"name"`
+		DisplayName string `json:"display_name"`
 		Description string `json:"description"`
 		Triggers    string `json:"triggers"`
 		Content     string `json:"content"`
@@ -65,6 +67,9 @@ func (t *SkillCreatorTool) Execute(_ context.Context, args json.RawMessage) (*to
 	var sb strings.Builder
 	sb.WriteString("---\n")
 	fmt.Fprintf(&sb, "name: %s\n", p.Name)
+	if d := strings.TrimSpace(p.DisplayName); d != "" {
+		fmt.Fprintf(&sb, "display_name: %s\n", strings.ReplaceAll(d, "\n", " "))
+	}
 	if d := strings.TrimSpace(p.Description); d != "" {
 		fmt.Fprintf(&sb, "description: %s\n", strings.ReplaceAll(d, "\n", " "))
 	}

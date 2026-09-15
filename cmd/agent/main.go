@@ -191,6 +191,16 @@ func startCmd(configDir, workDir string, noOpen bool) int {
 	ag := agent.New(cfg.Agent, cfg.LLM, provider, executor, history, wd)
 	ag.SetMemoryStore(st)                // 用户记忆与 History 共用同一 SQLite 库
 	builtin.RegisterMemory(registry, ag) // save_memory 工具
+	// 任务清单工具（存储在 session_todos 表，落库由 Agent 桥接）
+	builtin.RegisterTodo(registry, ag)
+	// 联网工具（web_fetch / web_search）：web.enabled=false 时自动跳过
+	builtin.RegisterWeb(registry, cfg.Web)
+
+	// Exposure 层：按 agent.hidden_tools 隐藏工具（不把定义发给 LLM）。
+	// 与「注册期裁剪」（如 web.enabled=false 不注册）互补：hidden_tools 保留注册与
+	// 审计链路，只削减 LLM 的可见面；两者都不改变 Executor 与权限判定。
+	// 注意：隐藏只影响可见面，不代表禁止执行 —— 执行放行由 Executor/Policy 判定。
+	ag.SetExposure(hiddenToolsExposure(cfg.Agent.HiddenTools))
 
 	// 内置插件：Skill Creator（配置 builtin_plugins.skill_creator，缺省开）
 	if cfg.BuiltinPlugins.SkillCreatorEnabled() {
@@ -226,6 +236,12 @@ func startCmd(configDir, workDir string, noOpen bool) int {
 			cfg.SubagentMaxConcurrent(), cfg.SubagentAllowWrite(), cfg.SubagentAllowDelete(), cfg.SubagentAllowMemory())
 	}
 
+	// 内置插件：Plan 计划模式（纯 System Prompt 注入，无需注册工具）
+	if cfg.BuiltinPlugins.PlanEnabled() {
+		ag.SetPlanEnabled(true)
+		log.Printf("内置插件已启用：Plan 计划模式（输入 @plan 出计划书；config: builtin_plugins.plan=false 可关闭）")
+	}
+
 	// 归档自动清理：启动即清一次 + 每天定时（归档满 10 天即删）
 	purgeArchived := func() {
 		if n, err := st.DeleteArchivedOlderThan(10); err != nil {
@@ -245,7 +261,7 @@ func startCmd(configDir, workDir string, noOpen bool) int {
 
 	// 6) Web 服务（端口固定取自全局配置文件，端口被占用时直接失败）
 	srv := server.New(cfg, ag, executor, registry, fsys)
-	srv.SetPluginManager(manager) // 供 /api/plugins 添加/启停后热加载
+	srv.SetPluginManager(manager)             // 供 /api/plugins 添加/启停后热加载
 	srv.SetSubagentApply(applySubagentPolicy) // 设置 → 子智能体：并发/能力变更即时生效
 	srv.SetBuiltinPluginApply(func(id string, on bool) {
 		// 内置插件开关的运行时应用：注册/注销工具 + 同步提示词注入
@@ -270,6 +286,10 @@ func startCmd(configDir, workDir string, noOpen bool) int {
 				subagentTool = nil
 			}
 			ag.SetMultiAgentEnabled(on)
+		}
+		if id == agent.BuiltinPlan.ID {
+			// Plan 计划模式无专属工具：只同步 System Prompt 注入开关
+			ag.SetPlanEnabled(on)
 		}
 	})
 	if err := srv.Start(); err != nil {
@@ -355,4 +375,17 @@ func displayWorkDir(wd string) string {
 		return "未选择（等待用户在界面选择工作区）"
 	}
 	return wd
+}
+
+// hiddenToolsExposure 把 agent.hidden_tools 配置转成 Exposure 过滤函数：
+// 集合中的工具不暴露给 LLM，其余全量。空列表返回 nil（暴露全部）。
+func hiddenToolsExposure(hidden []string) func(name string) bool {
+	if len(hidden) == 0 {
+		return nil
+	}
+	blocked := make(map[string]bool, len(hidden))
+	for _, h := range hidden {
+		blocked[h] = true
+	}
+	return func(name string) bool { return !blocked[name] }
 }

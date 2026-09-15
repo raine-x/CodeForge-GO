@@ -139,6 +139,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		c.send(map[string]any{"type": "session", "session_id": sess.ID, "title": sess.Title})
 		c.send(map[string]any{"type": "sessions", "items": c.srv.agent.History().List("", false)})
 		c.send(c.srv.contextUsage(sess.ID))
+		c.send(c.srv.todoEvent(sess.ID)) // 新会话无清单：前端清空任务列
 
 	case "list_sessions":
 		c.send(map[string]any{"type": "sessions", "items": c.srv.agent.History().List("", false)})
@@ -153,6 +154,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		// 内存缓存换成用户想继续的那条（后续 user_message 直接续聊）
 		c.send(map[string]any{"type": "history", "session_id": sess.ID, "title": sess.Title, "messages": sess.Messages})
 		c.send(c.srv.contextUsage(sess.ID))
+		c.send(c.srv.todoEvent(sess.ID)) // 切会话：回放该会话的任务清单
 
 	case "hitl_decision":
 		c.approver.resolve(msg.ApprovalID, msg.Approved)
@@ -197,6 +199,13 @@ func (c *wsClient) run(sessionID, thinking, trigger, label string, agentFn func(
 			return // 主任务已取消：不再转发子智能体事件
 		}
 		c.send(map[string]any{"type": "subagent", "subagent": sev})
+	})
+	// 注入任务清单刷新槽：todo_write 落库后向前端实时推送最新清单。
+	ctx = tools.WithTodoSink(ctx, func(sid string) {
+		if ctx.Err() != nil {
+			return
+		}
+		c.send(c.srv.todoEvent(sid))
 	})
 	// 注入思考强度（low/medium/high），由 LLM 适配器转换为厂商参数。
 	if thinking != "" {
@@ -348,6 +357,16 @@ func (s *Server) contextUsage(sessionID string) map[string]any {
 		"total_tokens": st.TotalTokens, // 累计消耗（输入+输出，内存态）
 		"cache_hit":    st.CacheHit,    // 累计缓存命中 tokens
 		"cache_miss":   st.CacheMiss,   // 累计缓存未命中 tokens
+	}
+}
+
+// todoEvent 构造推送给前端的「任务清单」事件帧。
+// 会话存在与否都返回合法帧：无会话/无清单时 todos 为空数组，前端渲染为空态。
+func (s *Server) todoEvent(sessionID string) map[string]any {
+	return map[string]any{
+		"type":       "todo",
+		"session_id": sessionID,
+		"todos":      s.agent.Todos(sessionID),
 	}
 }
 

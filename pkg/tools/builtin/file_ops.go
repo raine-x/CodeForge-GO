@@ -487,7 +487,7 @@ func (t *WriteFileTool) Name() string { return "write_file" }
 
 // Description 实现 tools.Tool。
 func (t *WriteFileTool) Description() string {
-	return "将内容写入指定文件（覆盖式）。若文件不存在则创建，父目录自动补齐。写入前会记录快照以支持撤销。"
+	return "将内容写入指定文件（覆盖式）。若文件不存在则创建，父目录自动补齐。"
 }
 
 // InputSchema 实现 tools.Tool。
@@ -673,7 +673,7 @@ func (t *DeleteFileTool) Name() string { return "delete_file" }
 
 // Description 实现 tools.Tool。
 func (t *DeleteFileTool) Description() string {
-	return "删除指定文件（不递归删除目录）。删除前会记录快照以支持撤销。"
+	return "删除指定文件（不递归删除目录）。"
 }
 
 // InputSchema 实现 tools.Tool。

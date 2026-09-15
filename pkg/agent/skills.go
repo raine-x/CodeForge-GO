@@ -27,6 +27,7 @@ import (
 // Skill 是一个已解析的技能。
 type Skill struct {
 	Name        string
+	DisplayName string // 展示名（@ 面板/菜单用；缺省回退 Name，见 server/api_handlers.go）
 	Description string
 	Triggers    []string
 	Enabled     bool
@@ -105,6 +106,8 @@ func parseSkill(text string) Skill {
 		switch k {
 		case "name":
 			s.Name = v
+		case "display_name":
+			s.DisplayName = v
 		case "description":
 			s.Description = v
 		case "triggers":

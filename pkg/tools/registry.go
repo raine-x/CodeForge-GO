@@ -15,9 +15,9 @@ import (
 // 插件工具名带点号（如 github_tools.create_issue）会被 400 拒绝。
 // Definitions() 统一在出关口清洗，ResolveWire() 在调用回来时还原。
 type Registry struct {
-	mu         sync.RWMutex
-	tools      map[string]Tool
-	wireNames  map[string]string // wire 名 → 注册名
+	mu        sync.RWMutex
+	tools     map[string]Tool
+	wireNames map[string]string // wire 名 → 注册名
 }
 
 // NewRegistry 创建一个空的工具注册中心。
@@ -126,8 +126,26 @@ func (r *Registry) ResolveWire(wire string) string {
 }
 
 // Definitions 生成供 LLM 使用的工具定义列表（名字统一清洗为上游合法格式）。
+// 等价于 DefinitionsFor(nil)：暴露全部工具，保持既有行为。
 func (r *Registry) Definitions() []llm.ToolDef {
+	return r.DefinitionsFor(nil)
+}
+
+// DefinitionsFor 生成供 LLM 使用的工具定义列表，只包含 pick 返回 true 的工具。
+//
+// Exposure 层入口：决定「这一轮 LLM 能看到哪些工具」。pick 为 nil 时暴露全部
+// （与 Definitions 一致）。语义边界要分清：
+//   - 这里只控制「模型收不收得到 Tool Definition」；
+//   - 隐藏 ≠ 禁止执行：模型通常只调用它收到的定义，但若请求里人为带有隐藏
+//     工具名，Executor 仍会按注册表执行（是否放行由 Executor/Policy 判定，
+//     P2 若需「隐藏即禁用」应在该层加规则）。
+//
+// 过滤按注册名判定（不是清洗后的 wire 名），因此配置/策略里写真实工具名即可，
+// 如 "web_fetch"。
+func (r *Registry) DefinitionsFor(pick func(name string) bool) []llm.ToolDef {
 	r.mu.Lock() // 写锁：wireNames 是随 Definitions 增量的缓存
+	defer r.mu.Unlock()
+
 	names := make([]string, 0, len(r.tools))
 	for n := range r.tools {
 		names = append(names, n)
@@ -139,6 +157,9 @@ func (r *Registry) Definitions() []llm.ToolDef {
 	r.wireNames = map[string]string{}
 	defs := make([]llm.ToolDef, 0, len(names))
 	for _, n := range names {
+		if pick != nil && !pick(n) {
+			continue
+		}
 		t := r.tools[n]
 		defs = append(defs, llm.ToolDef{
 			Name:        r.wireNameFor(n, taken),
@@ -146,6 +167,5 @@ func (r *Registry) Definitions() []llm.ToolDef {
 			InputSchema: t.InputSchema(),
 		})
 	}
-	r.mu.Unlock()
 	return defs
 }

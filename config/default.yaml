@@ -30,6 +30,10 @@ agent:
   context_token_budget: 120000
   system_prompt_file: ""   # 留空使用内置中文 System Prompt
   work_dir: ""             # 留空使用当前工作目录
+  # 隐藏工具（Exposure 层）：这些工具的定义不发给 LLM（模型收不到定义，
+  # 通常也不会主动调用），但注册/执行/权限/审计链路不变。按真实工具名填写，
+  # 如 ["web_search"]。注意：隐藏只影响可见面，禁止执行需在 Executor/Policy 加规则。
+  hidden_tools: []
 
 security:
   # 前端「权限控制」三态：readonly / ask / auto。缺省 ask（请求审批）。
@@ -49,10 +53,19 @@ security:
     - "(?i)shutdown\\s+-[hr]"
     - "(?i)dd\\s+if=.*of=/dev/"
   rules:
-    - tools: ["read_file", "list_dir", "search_files"]
+    - tools: ["read_file", "list_dir", "search_files", "todo_write"]
       decision: "allow"
-    - tools: ["write_file", "edit_file", "delete_file", "run_command"]
+    - tools: ["write_file", "edit_file", "delete_file", "run_command", "web_fetch", "web_search"]
       decision: "ask"
+
+# 联网工具（web_fetch / web_search）
+# 默认关闭：需要时在 config/local.yaml 里把 enabled 改为 true 并配置搜索后端。
+web:
+  # enabled: false                 # 总开关：true 才注册 web_fetch / web_search
+  # search_provider: tavily        # tavily（需 API Key）| searxng（需自建实例）
+  # search_endpoint: ""            # searxng：JSON 端点 URL，如 https://searx.example.com/search
+  # api_key_env: "TAVILY_API_KEY"  # tavily：API Key 的环境变量名
+  # allow_private: false           # true 则放行回环/内网地址（SSRF 防护默认拦截）
 
 data_dir: ".codeforge"
 audit_log: ".codeforge/audit.jsonl"
@@ -68,6 +81,7 @@ notify:
 builtin_plugins:
   skill_creator: true      # Skill Creator：让 AI 动态创建/迭代工作区技能（SKILL.md）
   multi_agent: true        # Multi-Agent：允许委派子智能体并行处理互不重叠的任务（策略见 subagents）
+  plan: true               # Plan 计划模式：@plan 触发，只读探索后输出结构化项目计划书
 
 # 子智能体（多智能体协作）策略
 #

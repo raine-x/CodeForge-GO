@@ -852,6 +852,53 @@ body.resizing { cursor: col-resize; user-select: none; }
   flex-direction: column;
   gap: 14px;
 }
+/* ---------- 任务清单栏（会话顶部，可折叠） ---------- */
+.todo-bar {
+  max-width: 760px;
+  margin: 0 auto 2px;
+  width: 100%;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.todo-bar.hidden { display: none; }
+.todo-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.todo-head:hover { background: var(--bg-elev-2); }
+.todo-title {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+.todo-title::before { content: '▾ '; }
+.todo-bar.collapsed .todo-title::before { content: '▸ '; }
+.todo-count {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  background: var(--bg-elev-2);
+  border-radius: 10px;
+  padding: 1px 8px;
+}
+.todo-body { padding: 0 12px 8px; display: flex; flex-direction: column; gap: 4px; }
+.todo-bar.collapsed .todo-body { display: none; }
+.todo-row {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px;
+  padding: 3px 2px;
+}
+.todo-icon { width: 16px; text-align: center; flex: 0 0 auto; }
+.todo-icon.st-in_progress { color: var(--accent); }
+.todo-icon.st-completed { color: var(--ok); }
+.todo-icon.st-cancelled { color: var(--text-dim); }
+.todo-text { color: var(--text); word-break: break-word; }
+.todo-text.done { color: var(--text-dim); text-decoration: line-through; }
+
 /* 助手消息：纯文本段落 */
 .msg-assistant {
   font-size: 14px;
@@ -1311,6 +1358,74 @@ body.resizing { cursor: col-resize; user-select: none; }
   display: flex; align-items: center; justify-content: space-between;
   margin-top: 2px;
 }
+
+/* ---------- 输入框上方：可复用操作选择面板（ActionPanel） ----------
+   由 @plan 等技能回复完成后弹出：多选项 / 用户输入 / 多页。
+   结构：#action-panel > .ap-header（标题+关闭） .ap-body（页内容） .ap-foot（输入行） */
+#action-panel {
+  display: none;               /* 无面板 / 隐藏时完全收起 */
+  flex-direction: column;
+  gap: 8px;
+  background: var(--bg-elev-3);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+#action-panel.visible { display: flex; }
+.ap-header {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 12px; color: var(--text-dim);
+}
+.ap-title { font-weight: 600; }
+.ap-close {
+  border: none; background: transparent; color: var(--text-dim);
+  width: 22px; height: 22px; border-radius: 6px; font-size: 13px; line-height: 1;
+  cursor: pointer;
+}
+.ap-close:hover { background: var(--bg-hover, rgba(31,36,48,.06)); }
+/* 页内容：一排选项按钮，over 时换行 */
+.ap-body { display: flex; flex-wrap: wrap; gap: 8px; }
+.ap-opt {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  padding: 7px 14px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+.ap-opt:hover { border-color: var(--accent); }
+.ap-opt.primary {
+  background: var(--accent); border-color: var(--accent);
+  color: #fff; font-weight: 600;
+}
+.ap-opt.primary:hover { filter: brightness(1.06); }
+/* 底部行：用户输入 + 发送（可空：无输入行时整行收起） */
+.ap-foot { display: none; gap: 8px; }
+#action-panel.has-input .ap-foot { display: flex; }
+.ap-input {
+  flex: 1 1 auto;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: transparent; color: var(--text);
+  font-size: 13px; padding: 7px 10px; outline: none;
+}
+.ap-input:focus { border-color: var(--accent); }
+.ap-go {
+  border: none; background: var(--accent); color: #fff;
+  font-size: 13px; padding: 7px 14px; border-radius: 10px; cursor: pointer;
+}
+.ap-go:hover { filter: brightness(1.06); }
+/* 分页指示点（多页时显示） */
+.ap-pages { display: none; justify-content: center; gap: 6px; margin-top: 2px; }
+#action-panel.multi-page .ap-pages { display: flex; }
+.ap-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--border); transition: background .15s;
+}
+.ap-dot.on { background: var(--accent); }
+
 .bottom-left, .bottom-right { display: flex; align-items: center; gap: 6px; }
 .icon-btn {
   border: none; background: transparent;

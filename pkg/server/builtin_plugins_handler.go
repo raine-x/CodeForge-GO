@@ -20,6 +20,8 @@ func (s *Server) builtinEnabled(id string) bool {
 		return s.cfg.BuiltinPlugins.SkillCreatorEnabled()
 	case agent.BuiltinMultiAgent.ID:
 		return s.cfg.BuiltinPlugins.MultiAgentEnabled()
+	case agent.BuiltinPlan.ID:
+		return s.cfg.BuiltinPlugins.PlanEnabled()
 	default:
 		return false
 	}
@@ -32,6 +34,8 @@ func (s *Server) setBuiltinEnabled(id string, on bool) error {
 		s.cfg.BuiltinPlugins.SkillCreator = &on
 	case agent.BuiltinMultiAgent.ID:
 		s.cfg.BuiltinPlugins.MultiAgent = &on
+	case agent.BuiltinPlan.ID:
+		s.cfg.BuiltinPlugins.Plan = &on
 	default:
 		return nil // 未知插件：仅运行态应用，不落盘
 	}

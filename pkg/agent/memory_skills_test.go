@@ -57,6 +57,7 @@ func TestProjectMemorySection(t *testing.T) {
 func TestParseSkill(t *testing.T) {
 	text := `---
 name: code-review
+display_name: 代码审查
 description: 按项目规范审查代码
 triggers: 审查, code review
 enabled: false
@@ -67,6 +68,9 @@ enabled: false
 	s := parseSkill(text)
 	if s.Name != "code-review" || s.Description != "按项目规范审查代码" {
 		t.Errorf("frontmatter 解析不正确: %+v", s)
+	}
+	if s.DisplayName != "代码审查" {
+		t.Errorf("display_name 解析不正确: %q", s.DisplayName)
 	}
 	if len(s.Triggers) != 2 || s.Triggers[0] != "审查" || s.Triggers[1] != "code review" {
 		t.Errorf("触发词解析不正确: %v", s.Triggers)

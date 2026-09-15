@@ -84,3 +84,49 @@ func TestWireNameAfterUnregister(t *testing.T) {
 		t.Errorf("注销后遗留映射未清理：ResolveWire(x_y) = %q", got)
 	}
 }
+
+// DefinitionsFor（Exposure 层）：pick=false 的工具不进入 LLM 定义，
+// pick=nil 等价 Definitions 全量；过滤不影响注册与执行（Registry.Get 仍可命中）。
+func TestDefinitionsForFiltersExposure(t *testing.T) {
+	r := NewRegistry()
+	r.Register(stubTool{"read_file"})
+	r.Register(stubTool{"web_fetch"})
+	r.Register(stubTool{"web_search"})
+
+	// 非 nil pick：只暴露 read_file → DefinitionsFor 只含 1 个定义
+	defs := r.DefinitionsFor(func(name string) bool { return name == "read_file" })
+	if len(defs) != 1 || defs[0].Name != "read_file" {
+		t.Fatalf("过滤后应只剩 read_file，实际 %+v", defs)
+	}
+	// 工具仍注册着：执行层不被 Exposure 影响
+	if _, ok := r.Get("web_fetch"); !ok {
+		t.Error("被隐藏的工具仍应保持注册（Exposure 不改变注册表）")
+	}
+	// pick=nil 与 Definitions 等价（全量回归）
+	if got := len(r.DefinitionsFor(nil)); got != 3 {
+		t.Errorf("nil pick 应暴露全部 3 个，实际 %d", got)
+	}
+	if got := len(r.Definitions()); got != 3 {
+		t.Errorf("Definitions 应保持全量 3 个，实际 %d", got)
+	}
+}
+
+// 隐藏工具的 wire 映射不能污染：被过滤的工具不占 wire 名，
+// 暴露工具的清洗/还原不受影响。
+func TestDefinitionsForWireMappingConsistency(t *testing.T) {
+	r := NewRegistry()
+	r.Register(stubTool{"a.b"})
+	r.Register(stubTool{"c.d"})
+
+	defs := r.DefinitionsFor(func(name string) bool { return name == "a.b" })
+	if len(defs) != 1 || defs[0].Name != "a_b" {
+		t.Fatalf("只应暴露 a_b，实际 %+v", defs)
+	}
+	if got := r.ResolveWire("a_b"); got != "a.b" {
+		t.Errorf("a_b 应还原为 a.b，实际 %q", got)
+	}
+	if got := r.ResolveWire("c_d"); got != "c_d" {
+		// c.d 未暴露 → 未生成映射 → wire 名原样
+		t.Errorf("未暴露工具不应有映射，ResolveWire(c_d) = %q", got)
+	}
+}

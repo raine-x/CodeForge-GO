@@ -53,6 +53,9 @@
       <!-- 卡片式输入框 -->
       <div id="composer-wrap">
         <form id="composer">
+          <!-- 可复用操作选择面板（输入框上方）：多选项 / 用户输入 / 多页。
+               当前由 @plan 计划书回复完成后弹出「直接发送 / 取消」。 -->
+          <div id="action-panel"></div>
           <!-- 输入框高亮镜像层：textarea 自身没法局部着色，于是垫一层排版参数完全一致的
                文字层在它下面，只把 @提及 染成蓝色；textarea 的文字设为 transparent，
                只留光标。两层必须严格重合，参数改动要同步（见 app.css 的 .input-mirror）。 -->

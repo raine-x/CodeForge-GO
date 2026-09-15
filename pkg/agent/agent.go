@@ -119,6 +119,16 @@ type Agent struct {
 	// CtxIn 字段），0 表示未知（此时压缩线回退 agent.context_token_budget）。
 	// 由 HTTP 处理器在模型应用时改写、由运行中的循环读取，故用原子量。
 	contextWindow atomic.Int64
+
+	// exposure 决定「每一轮 LLM 能看到哪些工具」（工具可见面过滤）。
+	// nil = 暴露全部（等价于不设置）。只影响 Tools 定义下发，不改变
+	// 工具的注册、执行、权限与审计链路。用锁保护因为它可能在 Agent
+	// 运行期间被配置热更新改写，而 runLoop 是并发的。
+	// 安全边界：Exposure 只回答「模型能不能收到这个工具的定义」（收不到
+	// 自然就不会去调用）；「模型实际上能执行什么」由 Executor 的 Policy/
+	// HITL 判定 —— 隐藏 ≠ 禁止执行，若需隐藏即禁用应在 Executor 层加规则。
+	exposeMu sync.RWMutex
+	exposure func(name string) bool
 }
 
 // New 构造 Agent 引擎。llmCfg 提供请求级参数（MaxTokens/Temperature），
@@ -168,6 +178,25 @@ func (a *Agent) SubagentPolicy() SubagentPolicy {
 
 // WorkDir 返回当前工作目录（会话/记忆的 workspace 隔离键）。
 func (a *Agent) WorkDir() string { return a.workDir }
+
+// SetExposure 设定工具可见面过滤：pick 返回 true 的工具会被下发给 LLM，
+// false 的工具隐藏（模型收不到定义，通常也不会去调用）。nil 恢复为暴露全部。
+// 注意：隐藏只影响「可见面」，不等于禁止执行 —— 执行放行由 Executor/Policy
+// 判定。只改变每轮 Tools 定义，不改变注册/执行/权限/审计链路。
+func (a *Agent) SetExposure(pick func(name string) bool) {
+	a.exposeMu.Lock()
+	a.exposure = pick
+	a.exposeMu.Unlock()
+}
+
+// exposureFn 返回当前工具可见面过滤（nil = 暴露全部）。返回的函数引用
+// 在多次调用间可能被 SetExposure 替换，属预期：每次 runLoop 取一次。
+// 只读路径直接内联函数值（无 CLOSURE 开销），不需要复制接口的全部字段。
+func (a *Agent) exposureFn() func(name string) bool {
+	a.exposeMu.RLock()
+	defer a.exposeMu.RUnlock()
+	return a.exposure
+}
 
 // SetContextWindow 设置当前生效模型的输入上下文窗口（tokens，来自模型库条目
 // 的 ctx_in 字段）。传 0 表示未知，压缩线回退 agent.context_token_budget。
@@ -455,11 +484,11 @@ func (a *Agent) runLoopWithPersistence(ctx context.Context, sess *Session, emit 
 	for step := 1; step <= a.cfg.MaxSteps; step++ {
 		emit(Event{Type: EventStep, Step: step})
 		req := llm.Request{
-			System:      a.systemPrompt(),
-			Messages:    a.prepareMessages(ctx, sess, emit), // 超阈值时自动摘要压缩（历史本身不改）
-			Tools:       a.registry.Definitions(),
-			MaxTokens:   a.llmCfg.MaxTokens,   // 来自模型条目「输出上限」/配置，不再硬编码
-			Temperature: a.llmCfg.Temperature, // 同上
+			System:      a.systemPromptFor(sess),                   // 含会话任务清单（todo 段随进度实时更新）
+			Messages:    a.prepareMessages(ctx, sess, emit),        // 超阈值时自动摘要压缩（历史本身不改）
+			Tools:       a.registry.DefinitionsFor(a.exposureFn()), // Exposure 层：工具可见面过滤（nil=全量）
+			MaxTokens:   a.llmCfg.MaxTokens,                        // 来自模型条目「输出上限」/配置，不再硬编码
+			Temperature: a.llmCfg.Temperature,                      // 同上
 			Thinking:    ThinkingFromCtx(ctx),
 		}
 
@@ -522,7 +551,10 @@ func (a *Agent) runLoopWithPersistence(ctx context.Context, sess *Session, emit 
 				DiffStats:  a.diffStatsFor(tc),
 			})
 
-			res, _ := a.executor.Execute(ctx, tc.Name, tc.Input)
+			// 注入会话运行域：后台任务 / 检查点 / 任务清单等按会话归属的行为
+			// 依赖 sessionID 与 step（见 pkg/tools/session.go）。
+			toolCtx := tools.WithSession(ctx, tools.SessionScope{SessionID: sess.ID, Step: step})
+			res, _ := a.executor.Execute(toolCtx, tc.Name, tc.Input)
 			if res == nil {
 				res = tools.Err("工具无返回")
 			}

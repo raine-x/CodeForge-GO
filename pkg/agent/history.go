@@ -249,6 +249,20 @@ func (h *History) SetWorkspaceName(workspace, name string) error {
 	return h.st.SetWorkspaceName(workspace, name)
 }
 
+// Todos 返回会话的任务清单（按 sort 升序）。无会话返回空数组。
+func (h *History) Todos(sessionID string) []store.TodoRow {
+	todos, err := h.st.ListTodos(sessionID)
+	if err != nil {
+		return []store.TodoRow{}
+	}
+	return todos
+}
+
+// ReplaceTodos 整体替换会话的任务清单（todo_write 的整表语义）。
+func (h *History) ReplaceTodos(sessionID string, todos []store.TodoRow) error {
+	return h.st.ReplaceTodos(sessionID, todos)
+}
+
 // WorkspaceName 返回项目的显示名（未设置返回空串）。
 func (h *History) WorkspaceName(workspace string) string {
 	name, err := h.st.WorkspaceName(workspace)

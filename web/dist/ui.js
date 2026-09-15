@@ -577,6 +577,61 @@
   function scrollBottom() {
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
+  // ---------- 任务清单栏（会话顶部，可折叠） ----------
+  // todo 事件驱动：○待办 / ◐进行中 / ✓完成 / ✕取消；点标题折叠/展开；
+  // 会话切换/新建/清空时由 renderTodoBar([]) 收起为空。
+  let todoBar = null; // 复用 DOM
+  function renderTodoBar(todos) {
+    if (!todoBar) {
+      todoBar = document.createElement('div');
+      todoBar.className = 'todo-bar hidden';
+      const head = document.createElement('div');
+      head.className = 'todo-head';
+      const title = document.createElement('span');
+      title.className = 'todo-title';
+      title.textContent = '任务清单';
+      const badge = document.createElement('span');
+      badge.className = 'todo-count';
+      head.appendChild(title);
+      head.appendChild(badge);
+      head.addEventListener('click', function () {
+        todoBar.classList.toggle('collapsed');
+        renderTodoBar(todoBar.dataset.last ? JSON.parse(todoBar.dataset.last) : []);
+      });
+      const body = document.createElement('div');
+      body.className = 'todo-body';
+      todoBar.appendChild(head);
+      todoBar.appendChild(body);
+      messagesEl.prepend(todoBar); // 插在消息列最顶部
+    }
+    todoBar.dataset.last = JSON.stringify(todos || []);
+    const collapsed = todoBar.classList.contains('collapsed');
+    const list = todos || [];
+    const done = list.filter(function (t) { return t.status === 'completed'; }).length;
+    todoBar.querySelector('.todo-count').textContent = list.length ? (done + '/' + list.length) : '';
+    const body = todoBar.querySelector('.todo-body');
+    body.innerHTML = '';
+    if (!list.length) {
+      todoBar.classList.add('hidden');
+      return;
+    }
+    todoBar.classList.remove('hidden');
+    if (collapsed) return; // 折叠态只更新计数
+    const icon = { pending: '○', in_progress: '◐', completed: '✓', cancelled: '✕' };
+    list.forEach(function (t) {
+      const row = document.createElement('div');
+      row.className = 'todo-row';
+      const i = document.createElement('span');
+      i.className = 'todo-icon st-' + (icon[t.status] ? t.status : 'pending');
+      i.textContent = icon[t.status] || '○';
+      const txt = document.createElement('span');
+      txt.className = 'todo-text' + (t.status === 'completed' || t.status === 'cancelled' ? ' done' : '');
+      txt.textContent = t.content;
+      row.appendChild(i);
+      row.appendChild(txt);
+      body.appendChild(row);
+    });
+  }
   function addAssistant(text) {
     const d = document.createElement('div');
     d.className = 'msg-assistant';
@@ -660,6 +715,9 @@
     edit_file:    '编辑文件',
     delete_file:  '删除文件',
     save_memory:  '保存记忆',
+    todo_write:   '更新任务清单',
+    web_fetch:    '读取网页',
+    web_search:   '搜索网页',
     create_skill: 'Skill Creator 插件', // 内置插件工具：审批显示「需要审批：Skill Creator 插件」
     delegate_subagents: 'Multi-Agent 插件',
   };
@@ -704,6 +762,17 @@
         return '使用插件 Multi-Agent：并行委派 ' + (n > 0 ? n + ' 个子智能体' : '子智能体');
       }
       case 'save_memory': return '保存了记忆';
+      case 'todo_write':  return '更新了任务清单';
+      case 'web_fetch': {
+        const shown = (input && typeof input === 'object' && input.url) ? String(input.url) : '';
+        const sliced = shown.length > 80 ? shown.slice(0, 80) + '…' : shown;
+        return sliced ? '读取了网页 ' + sliced : '读取了网页';
+      }
+      case 'web_search': {
+        const shown = (input && typeof input === 'object' && input.query) ? String(input.query) : '';
+        const sliced = shown.length > 60 ? shown.slice(0, 60) + '…' : shown;
+        return sliced ? '搜索了 ' + sliced : '搜索了网页';
+      }
       default:             return '调用了 ' + name;
     }
   }
@@ -823,6 +892,158 @@
   function removeRetry() {
     if (retryEl) { retryEl.remove(); retryEl = null; }
   }
+
+  // ---------- 可复用操作选择面板（ActionPanel）：输入框上方多选 / 用户输入 / 多页 ----------
+  // 配置（spec）：
+  //   title     面板标题（如「计划书已生成」）
+  //   pages     [{ title?, options: [{label, primary?, send?, value?}] }]
+  //               option.send    点击后要发送的文本（可含 {input} 占位，替换为用户输入）
+  //               option.value   有值时不发送，而是回调 onPick(value)（自定义动作）
+  //               option.primary 主按钮（强调色）
+  //   placeholder 底部输入框占位（提供 = 显示用户输入行；发送即调用 options 中 send 含 {input} 的项）
+  //   onPick    自定义动作回调（value 型 option 触发）
+  // 关闭动作：任何 option / 关闭按钮 / 输入发送后都会收起面板。
+  let actionPanelShown = false; // 本轮回复是否已触发过（避免 idle 反复弹）
+  function showActionPanel(spec) {
+    const host = $('#action-panel');
+    if (!host) return;
+    host.innerHTML = '';
+    host.classList.add('visible');
+    host.classList.toggle('multi-page', (spec.pages || []).length > 1);
+    if ((spec.pages || []).length === 1 && spec.pages[0].options.length <= 1) {
+      host.classList.remove('multi-page');
+    }
+
+    let pageIdx = 0;
+    const pages = spec.pages || [{ options: spec.options || [] }];
+
+    const header = document.createElement('div');
+    header.className = 'ap-header';
+    const title = document.createElement('span');
+    title.className = 'ap-title';
+    title.textContent = spec.title || '选择操作';
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'ap-close';
+    close.textContent = '×';
+    close.title = '关闭';
+    close.addEventListener('click', function () { hideActionPanel(); });
+    header.appendChild(title);
+    header.appendChild(close);
+
+    const body = document.createElement('div');
+    body.className = 'ap-body';
+
+    const foot = document.createElement('div');
+    foot.className = 'ap-foot';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'ap-input';
+    input.placeholder = spec.placeholder || '';
+    input.autocomplete = 'off';
+    const go = document.createElement('button');
+    go.type = 'button';
+    go.className = 'ap-go';
+    go.textContent = '发送';
+    foot.appendChild(input);
+    foot.appendChild(go);
+
+    const pagesRow = document.createElement('div');
+    pagesRow.className = 'ap-pages';
+
+    function draw() {
+      body.innerHTML = '';
+      pagesRow.innerHTML = '';
+      const page = pages[pageIdx] || { options: [] };
+      (page.options || []).forEach(function (opt) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'ap-opt' + (opt.primary ? ' primary' : '');
+        b.textContent = opt.label;
+        b.addEventListener('click', function () { handleOption(opt); });
+        body.appendChild(b);
+      });
+      if (pages.length > 1) {
+        host.classList.add('multi-page');
+        pages.forEach(function (p, i) {
+          const dot = document.createElement('span');
+          dot.className = 'ap-dot' + (i === pageIdx ? ' on' : '');
+          dot.addEventListener('click', function () { pageIdx = i; draw(); });
+          pagesRow.appendChild(dot);
+        });
+      }
+      if (page.title) title.textContent = page.title; else if (spec.title) title.textContent = spec.title;
+    }
+    function handleOption(opt) {
+      if (opt.value !== undefined) {
+        hideActionPanel();
+        if (opt.onPick) opt.onPick(opt.value);
+        return;
+      }
+      // send 型：把 {input} 替换为用户输入框内容（无输入则原样发送）
+      const extra = input.value.trim();
+      const text = (opt.send || '').replace(/\{input\}/g, extra || '');
+      if (!text) { input.focus(); return; }
+      hideActionPanel();
+      sendAsUserText(text);
+    }
+    // 底部输入「发送」：触发当前页所有 send 型 option（用{input}替换的发送完整文案）
+    go.addEventListener('click', function () {
+      const cur = pages[pageIdx] || {};
+      const opt = (cur.options || []).filter(function (o) { return o.send !== undefined; })[0];
+      if (!opt) { hideActionPanel(); return; }
+      handleOption(opt);
+    });
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); go.click(); }
+    });
+
+    draw();
+    host.appendChild(header);
+    host.appendChild(body);
+    foot.classList.toggle('has-input', true);
+    host.classList.toggle('has-input', typeof spec.placeholder === 'string' && spec.placeholder !== '');
+    if (host.classList.contains('has-input')) host.appendChild(foot);
+    if (pages.length > 1) host.appendChild(pagesRow);
+    input.focus();
+  }
+  function hideActionPanel() {
+    const host = $('#action-panel');
+    if (host) host.classList.remove('visible');
+  }
+  // 发送一条用户消息（复用输入框提交链路：别名展开 / 气泡 / 发送）。运行中不允许。
+  function sendAsUserText(text) {
+    if (running || !text || !wsReady) { if (text) addError('正在处理中，请稍后再试'); return; }
+    // 直接走 form.requestSubmit：会把 input 的内容清空并显示气泡 —— 但我们要发送的是
+    // 面板触发的文本，不是输入框内容。为了复用展开链路，先临时借用 input。
+    if (!input) return;
+    const keep = input.value;
+    input.value = text;
+    form.requestSubmit();
+    input.value = keep;
+    syncInputMirror();
+  }
+  // @plan 计划书回复完成后：输入框上方弹出「直接发送 / 取消」（可复用 ActionPanel）。
+  function maybeShowPlanActions() {
+    if (actionPanelShown || running) return;
+    // 只认用户主动 @plan（允许 @ plan / 大小写），别被回复里的「计划书」字样误触发
+    if (!lastUserText || !/@\s*plan/i.test(lastUserText)) return;
+    actionPanelShown = true;
+    showActionPanel({
+      title: '计划书已生成，接下来？',
+      pages: [{
+        title: '计划书已生成，接下来？',
+        options: [
+          { label: '直接发送（按计划执行）', primary: true,
+            send: '请按照上面的计划书开始执行{input}' },
+          { label: '取消', value: 'cancel' }
+        ]
+      }],
+      placeholder: '补充指令（可选，随发送带上）'
+    });
+  }
+  // 发送新消息时重置 ActionPanel 触发状态（下一条 @plan 仍能弹）
+  function resetPlanActions() { actionPanelShown = false; }
 
   // 回复结束后的操作栏：复制 / 模型名 / 重新生成
   function addActions(replyText) {
@@ -2230,6 +2451,10 @@
             sessionID = ev.session_id;
           }
           break;
+        case 'todo':
+          // 任务清单只画当前视图会话的（load_session/new_session/工具写入都会带 session_id）
+          if (ev.session_id && ev.session_id === sessionID) renderTodoBar(ev.todos || []);
+          break;
         case 'context':
           // 上下文占用只画当前视图会话的（后台会话结束也会下发它自己的 context）
           if (!ev.session_id || ev.session_id === sessionID) renderCtxUsage(ev);
@@ -2358,6 +2583,7 @@
           sendBtn.textContent = '↑';
           sendBtn.title = '发送';
           syncRunBadges();
+          maybeShowPlanActions(); // @plan 计划书回复完成后弹出选择面板（须在 running=false 之后，函数内以此判断空闲）
           break;
         }
       }
@@ -2589,6 +2815,7 @@
     // 第二个参数 = 气泡要显示的原文（raw），与发出去的 outgoing 分开。
     prepareMentions(outgoing, raw).then(function (p) {
       lastUserText = p.text; // 记录供「重新生成」（用发送文本，可直接重放）
+      resetPlanActions(); // 新用户消息发出：下一条 @plan 回复完成后可再次弹出选择面板
       composerSnap = false; // 用户主动发出第一句：位置切换要有下放动画
       // 气泡显示 p.display（= 用户原本输入的样子，@文件名 保持蓝色），
       // 模型拿到的仍是 p.text（真实路径 / attachments 暂存路径）——显示与发送分离。
@@ -2632,25 +2859,25 @@
     const m = input.value.slice(0, pos).match(/@([A-Za-z0-9_\-\u4e00-\u9fa5]*)$/);
     return m ? { start: pos - m[0].length, filter: m[1] || '' } : null;
   }
-  // 拉技能 + 插件 + 工具表；插件工具按「插件名.」前缀归属到插件
+  // 拉技能 + 内置插件（不含 MCP 服务），供 @ 提及面板展示（显示名 + 简要介绍）。
   function loadAtData() {
     if (atData || atLoading) return;
     atLoading = true;
     Promise.all([
       fetch('/api/skills').then(function (r) { return r.json(); }).catch(function () { return {}; }),
-      fetch('/api/plugins').then(function (r) { return r.json(); }).catch(function () { return {}; }),
-      fetch('/api/config').then(function (r) { return r.json(); }).catch(function () { return {}; })
+      fetch('/api/builtin-plugins').then(function (r) { return r.json(); }).catch(function () { return {}; })
     ]).then(function (res) {
       atLoading = false;
-      const tools = (res[2] && res[2].tools) || [];
+      const skills = ((res[0] || {}).items || []).filter(function (sk) { return sk.enabled; });
+      const builtins = ((res[1] || {}).items || []).filter(function (p) { return p.enabled; });
       atData = {
-        skills: ((res[0] || {}).items || []).filter(function (sk) { return sk.enabled; }),
-        plugins: ((res[1] || {}).items || []).map(function (p) {
-          p.toolNames = tools.filter(function (t) { return t.indexOf(p.name + '.') === 0; });
-          return p;
-        }).sort(function (a, b) {
-          if (!!b.enabled !== !!a.enabled) return b.enabled ? 1 : -1; // 已启用的排前面
-          return a.name < b.name ? -1 : 1;
+        // 技能：显示名 display_name（缺省回退 name），简介 description
+        skills: skills.map(function (sk) {
+          return { name: sk.name, display_name: sk.display_name || sk.name, description: sk.description || '', builtin: false };
+        }),
+        // 内置插件（Plan 等）：显示名 name，简介 purpose + when_to_use 首句
+        plugins: builtins.map(function (p) {
+          return { builtin: true, id: p.id, name: p.name, description: p.purpose || p.when_to_use || '', enabled: true };
         })
       };
       // 数据回来时用户可能已经改了输入：以当前光标处的 @ 语境为准
@@ -2661,11 +2888,13 @@
   function drawAtPop(filter) {
     if (!atData) return;
     const q = (filter || '').toLowerCase();
-    const hit = function (name, desc) {
-      return !q || (name + ' ' + (desc || '')).toLowerCase().indexOf(q) >= 0;
-    };
-    const skills = atData.skills.filter(function (sk) { return hit(sk.name, sk.description); });
-    const plugins = atData.plugins.filter(function (p) { return hit(p.name, p.description); });
+    const hit = function (d) { return !q || (d + '').toLowerCase().indexOf(q) >= 0; };
+    const skills = atData.skills.filter(function (sk) {
+      return hit(sk.display_name + ' ' + sk.name + ' ' + sk.description);
+    });
+    const plugins = atData.plugins.filter(function (p) {
+      return hit(p.name + ' ' + p.description);
+    });
     if (!skills.length && !plugins.length) {
       closeAtPop();
       if (q) return; // 过滤没命中：直接收起
@@ -2674,7 +2903,7 @@
       atPop.className = 'at-skill-pop';
       const hint = document.createElement('div');
       hint.className = 'at-empty';
-      hint.textContent = '还没有可提及的技能或插件。插件可在 设置 → MCP 服务 里添加。';
+      hint.textContent = '还没有可提及的技能或内置插件。';
       atPop.appendChild(hint);
       atAnchor().appendChild(atPop);
       return;
@@ -2686,7 +2915,7 @@
     atPop.className = 'at-skill-pop';
     const title = document.createElement('div');
     title.className = 'at-title';
-    title.textContent = '提及技能 / 插件（↑↓ 选择，Enter 确认，Esc 取消）';
+    title.textContent = '提及技能 / 内置插件（↑↓ 选择，Enter 确认，Esc 取消）';
     atPop.appendChild(title);
     function addGroup(text) {
       const g = document.createElement('div');
@@ -2695,40 +2924,45 @@
       atPop.appendChild(g);
     }
     // 一条可选行；dataset.idx 指向 atItems 下标，供点击与高亮对齐（分组标题不参与选择）
-    function addRow(name, desc, note, disabled) {
+    function addRow(display, desc, note, meta) {
       const b = document.createElement('button');
       b.type = 'button';
       const idx = atItems.length;
-      atItems.push({ name: name });
+      const item = { name: display || '' };
+      // 插入 @ 提及用的 token：内置插件用 id（@plan），技能用 slug（@codeforge-build）
+      if (meta) {
+        if (meta.kind === 'builtin') { item.builtin = true; item.id = meta.id; }
+        else { item.token = meta.token || display || ''; }
+      }
+      atItems.push(item);
       b.dataset.idx = String(idx);
-      b.textContent = name;
+      b.textContent = display;
       if (desc) {
         const d = document.createElement('span');
         d.className = 'sk-desc-inline';
         d.textContent = desc;
         b.appendChild(d);
       }
-      if (note) {
+      if (meta && meta.note) {
         const t = document.createElement('span');
         t.className = 'at-tools';
-        t.textContent = note;
+        t.textContent = meta.note;
         b.appendChild(t);
       }
-      if (disabled) b.classList.add('at-disabled');
+      if (meta && meta.disabled) b.classList.add('at-disabled');
       b.addEventListener('click', function () { pickAtItem(idx); });
       atPop.appendChild(b);
     }
     if (skills.length) {
       addGroup('技能');
-      skills.forEach(function (sk) { addRow(sk.name, sk.description, '', false); });
+      skills.forEach(function (sk) {
+        addRow(sk.display_name, sk.description, { kind: 'skill', token: sk.name, display: sk.display_name });
+      });
     }
     if (plugins.length) {
-      addGroup('插件');
+      addGroup('内置插件');
       plugins.forEach(function (p) {
-        const note = (p.toolNames && p.toolNames.length)
-          ? '工具：' + p.toolNames.join('、')
-          : (p.enabled ? '已启用' : '未启用（见 设置 → MCP 服务）');
-        addRow(p.name, p.description, note, !p.enabled);
+        addRow(p.name, p.description, { kind: 'builtin', id: p.id || '', note: '@提及即触发', display: p.name });
       });
     }
     atAnchor().appendChild(atPop);
@@ -2751,14 +2985,15 @@
   function pickAtItem(i) {
     const it = atItems[i];
     if (!it) { closeAtPop(); return; }
-    // 用「@名称 」替换刚输入的 @起始段
+    // 内置插件插入 @id（@plan），技能插入 @slug（@codeforge-build），其余回退显示名
+    const token = it.builtin ? it.id : (it.token || it.name);
     const before = input.value.slice(0, atStart);
     const after = input.value.slice(input.selectionStart);
-    input.value = before + '@' + it.name + ' ' + after;
+    input.value = before + '@' + token + ' ' + after;
     syncInputMirror();
     closeAtPop();
     input.focus();
-    const pos = (before + '@' + it.name + ' ').length;
+    const pos = (before + '@' + token + ' ').length;
     input.setSelectionRange(pos, pos);
   }
   input.addEventListener('input', function () {
@@ -2924,21 +3159,27 @@
 
   // Skills 二级菜单：每次展开都重新拉一次（刚建的技能能立刻出现）
   function renderMoreSkills() {
-    fetch('/api/skills').then(function (r) { return r.json(); }).then(function (d) {
-      const items = (d.items || []).filter(function (sk) { return sk.enabled; });
+    Promise.all([
+      fetch('/api/skills').then(function (r) { return r.json(); }).catch(function () { return {}; }),
+      fetch('/api/builtin-plugins').then(function (r) { return r.json(); }).catch(function () { return {}; })
+    ]).then(function (res) {
+      const skills = ((res[0] || {}).items || []).filter(function (sk) { return sk.enabled; });
+      // 内置插件（Plan 等）也在此列出：点击插入 @id（触发词）
+      const builtins = ((res[1] || {}).items || []).filter(function (p) { return p.enabled; })
+        .map(function (p) { return { name: p.name, desc: p.purpose || p.when_to_use || '', at: '@' + p.id }; });
       moreSkillsPop.innerHTML = '';
-      if (!items.length) {
+      if (!skills.length && !builtins.length) {
         const e = document.createElement('div');
         e.className = 'more-sub-empty';
-        e.textContent = '还没有已加载的技能';
+        e.textContent = '还没有已加载的技能或内置插件';
         moreSkillsPop.appendChild(e);
         return;
       }
-      items.forEach(function (sk) {
+      skills.forEach(function (sk) {
         const b = document.createElement('button');
         b.type = 'button';
         b.className = 'pop-opt more-sub-item';
-        b.textContent = sk.name;
+        b.textContent = sk.display_name || sk.name; // 显示名优先，缺省回退 slug
         if (sk.description) {
           const s = document.createElement('span');
           s.className = 'sk-desc-inline';
@@ -2948,7 +3189,25 @@
         b.addEventListener('click', function (e) {
           e.stopPropagation();
           setMoreOpen(false);
-          insertIntoInput('@' + sk.name);
+          insertIntoInput('@' + sk.name); // 插入用 slug，确保后端命中
+        });
+        moreSkillsPop.appendChild(b);
+      });
+      builtins.forEach(function (bp) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'pop-opt more-sub-item';
+        b.textContent = bp.name;
+        if (bp.desc) {
+          const s = document.createElement('span');
+          s.className = 'sk-desc-inline';
+          s.textContent = bp.desc;
+          b.appendChild(s);
+        }
+        b.addEventListener('click', function (e) {
+          e.stopPropagation();
+          setMoreOpen(false);
+          insertIntoInput(bp.at);
         });
         moreSkillsPop.appendChild(b);
       });

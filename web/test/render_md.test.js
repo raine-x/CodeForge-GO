@@ -189,6 +189,9 @@ check('delegate_subagents 显示插件名与数量',
 check('delegate_subagents 缺任务数组时仍可用',
   toolLabel('delegate_subagents', {}) === '使用插件 Multi-Agent：并行委派 子智能体');
 check('save_memory 文案', toolLabel('save_memory', {}) === '保存了记忆');
+check('todo_write 文案', toolLabel('todo_write', {}) === '更新了任务清单');
+check('web_fetch 文案带 URL', toolLabel('web_fetch', { url: 'https://example.com/p' }) === '读取了网页 https://example.com/p');
+check('web_search 文案带 query', toolLabel('web_search', { query: 'codeforge' }) === '搜索了 codeforge');
 check('字符串形式的 tool_input 也能解析',
   toolLabel('read_file', '{"path":"a/b.js"}') === '读取了文件 b.js');
 check('超长命令被截断', toolLabel('run_command', { command: 'x'.repeat(200) }).length <= 90);
@@ -336,6 +339,22 @@ check('缓存三项来自服务端 usage 字段（total_tokens / cache_hit / cac
 check('样式契约：压缩态有独立标记（.ctx-meter.compressed）',
   /\.ctx-meter\.compressed\s+\.ctx-pct\s*\{/.test(css));
 
+// ---------- 6.2b 任务清单（todo）----------
+// 服务端 load_session / new_session / todo_write 完成后推 {type:'todo', todos}；
+// 前端只在会话匹配时渲染；空清单隐藏。
+group('任务清单 todo');
+check('前端订阅 todo 事件且按会话过滤',
+  /case 'todo':[\s\S]{0,220}?renderTodoBar\(ev\.todos \|\| \[\]\)/.test(uiSrc) &&
+  /ev\.session_id === sessionID/.test(uiSrc));
+check('清单栏渲染 4 种状态图标（○/◐/✓/✕）',
+  /pending: '○', in_progress: '◐', completed: '✓', cancelled: '✕'/.test(uiSrc));
+check('空清单自动隐藏',
+  /if \(!list\.length\) \{[\s\S]{0,80}?todoBar\.classList\.add\('hidden'\);/.test(uiSrc));
+check('样式契约：todo 栏存在且有完成态删除线',
+  /\.todo-bar\s*\{/.test(css) && /\.todo-text\.done\s*\{[^}]*line-through/.test(css));
+check('todo 文案进 toolPhrases（审批/卡片显示）',
+  /todo_write:\s+'更新任务清单'/.test(uiSrc));
+
 group('token 数缩写（fmtTokens）');
 check('0 → 0', fmtTokens(0) === '0');
 check('未定义按 0 处理', fmtTokens(undefined) === '0');
@@ -425,15 +444,12 @@ check('用户发言走平滑下放（submit 清掉落位标记后 addUser）',
   /composerSnap\s*=\s*false;[\s\S]{0,300}?addUser\(p\.display\)/.test(uiSrc));
 
 // ---------- 8. 输入框 @ 提及：技能 + 插件 ----------
-// 输入 @ 弹出面板，同时列「技能」和「插件」两组；插件条目还要显示它注册的工具
-// （MCP 工具以「插件名.工具名」注册，故可从 /api/config 的 tools 表按前缀归属）。
+// 输入 @ 弹出面板，同时列「技能」和「内置插件」两组；不含 MCP 服务。
 // 易回归点：① 每敲一个字符就打一轮接口（应该是「每次新打开 @ 拉一次 + 本地过滤」）；
 // ② 分组标题被当成可选项（上下键会把标题算进去）。
-group('输入框 @ 提及：技能 + 插件');
-check('同时拉技能与插件列表',
-  /fetch\('\/api\/skills'\)/.test(uiSrc) && /fetch\('\/api\/plugins'\)/.test(uiSrc));
-check('插件工具按「插件名.」前缀从工具表归属',
-  /indexOf\(p\.name \+ '\.'\)\s*===\s*0/.test(uiSrc));
+group('输入框 @ 提及：技能 + 内置插件');
+check('同时拉技能与内置插件列表（不含 MCP 服务）',
+  /fetch\('\/api\/skills'\)/.test(uiSrc) && /fetch\('\/api\/builtin-plugins'\)/.test(uiSrc));
 
 // ---------- 8.5 ＋菜单 / @文件 stage / @高亮（2026-09-14） ----------
 group('＋菜单与 @文件');
@@ -449,17 +465,17 @@ check('@提及蓝色高亮样式契约（.at-mention 用 accent）',
   /\.at-mention\s*\{[^}]*color:\s*var\(--accent\)/.test(css));
 check('发送前 stage 区外文件到 attachments（/api/stage_file）',
   /\/api\/stage_file/.test(uiSrc) && /attachments/.test(uiSrc));
-check('分「技能」「插件」两组',
-  /addGroup\('技能'\)/.test(uiSrc) && /addGroup\('插件'\)/.test(uiSrc));
-check('插件条目显示可调用工具 / 未启用状态',
-  /'工具：' \+ p\.toolNames\.join/.test(uiSrc) && uiSrc.includes('未启用（见 设置 → MCP 服务）'));
+check('分「技能」「内置插件」两组',
+  /addGroup\('技能'\)/.test(uiSrc) && /addGroup\('内置插件'\)/.test(uiSrc));
+check('技能显示 display_name、内置插件显示 @id 触发',
+  /sk\.display_name \|\| sk\.name/.test(uiSrc) && /it\.builtin \? it\.id : \(it\.token \|\| it\.name\)/.test(uiSrc));
 check('分组标题不参与上下键选择（dataset.idx 对齐 atItems）',
   /b\.dataset\.idx = String\(idx\)/.test(uiSrc) &&
   /Number\(b\.dataset\.idx\) === atIdx/.test(uiSrc));
 check('数据按「每次新打开 @ 拉一次」缓存，不在输入时反复请求',
   /atLoadedFor !== cur\.start/.test(uiSrc) && /if \(!atData\) \{ loadAtData\(\); return; \}/.test(uiSrc));
 check('一条都没有时给提示而不是静默无反应',
-  /还没有可提及的技能或插件/.test(uiSrc) && /at-empty/.test(uiSrc));
+  /还没有可提及的技能或内置插件/.test(uiSrc) && /at-empty/.test(uiSrc));
 check('只有提示行时上下键不越界',
   /if \(!atItems\.length\) return;/.test(uiSrc));
 check('样式契约：分组标题 / 工具清单 / 空提示',
@@ -548,7 +564,7 @@ check('滚动位置同步：scroll 事件',
 check('程序化改动也同步：发出后清空',
   /input\.value = '';\s*\n\s*syncInputMirror\(\)/.test(uiSrc));
 check('程序化改动也同步：@面板选中 / ＋菜单插入',
-  /input\.value = before \+ '@' \+ it\.name \+ ' ' \+ after;\s*\n\s*syncInputMirror\(\)/.test(uiSrc) &&
+  /input\.value = before \+ '@' \+ token \+ ' ' \+ after;\s*\n\s*syncInputMirror\(\)/.test(uiSrc) &&
   /input\.value = before \+ sep \+ ins \+ after;\s*\n\s*syncInputMirror\(\)/.test(uiSrc));
 
 // ---------- 9. 发送 / 打断按钮共色 ----------

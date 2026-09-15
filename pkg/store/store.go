@@ -99,6 +99,18 @@ func (s *Store) migrate() error {
 		)`,
 		// 升级路径：旧库补归档列（CREATE TABLE IF NOT EXISTS 不会给已存在的表加列）
 		`ALTER TABLE sessions ADD COLUMN archived_at INTEGER NOT NULL DEFAULT 0`,
+		// 任务清单：会话级 todo 表（todo_write 整体替换语义，见 sessions.go）
+		`CREATE TABLE IF NOT EXISTS session_todos (
+			session_id  TEXT NOT NULL,
+			sort        INTEGER NOT NULL,
+			content     TEXT NOT NULL,
+			status      TEXT NOT NULL DEFAULT 'pending',
+			priority    INTEGER NOT NULL DEFAULT 0,
+			updated_at  INTEGER NOT NULL,
+			PRIMARY KEY (session_id, sort),
+			FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_todos_session ON session_todos(session_id, sort)`,
 	}
 	for _, q := range stmts {
 		if _, err := s.db.Exec(q); err != nil {
