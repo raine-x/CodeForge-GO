@@ -189,6 +189,8 @@ func (c *wsClient) run(sessionID, thinking, trigger, label string, agentFn func(
 
 	// 将本连接的审批器注入 context，使 HITL 请求路由到当前浏览器。
 	ctx = tools.WithApprover(ctx, c.approver)
+	// 记录审批所属会话：用户切走后审批卡片仍能标注来源。
+	c.approver.setSession(sessionID)
 	// 注入子智能体事件转发槽：SubagentRunner 里的实时进度经此推给前端。
 	ctx = tools.WithSubagentSink(ctx, func(sev tools.SubagentEvent) {
 		if ctx.Err() != nil {
@@ -383,6 +385,23 @@ type wsApprover struct {
 	mu      sync.Mutex
 	next    int
 	pending map[string]chan bool
+	// sessionID 是当前审批所属的会话：前端可能已切到别的会话查看，
+	// 审批卡片要能标注来源，避免被误认为当前会话的操作。
+	sessionID string
+}
+
+// setSession 记录本轮任务所属会话（在 run 启动时调用）。
+func (a *wsApprover) setSession(id string) {
+	a.mu.Lock()
+	a.sessionID = id
+	a.mu.Unlock()
+}
+
+// currentSession 返回当前审批所属会话（无则空串）。
+func (a *wsApprover) currentSession() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sessionID
 }
 
 // RequestApproval 向浏览器推送审批请求并阻塞等待决策。
@@ -403,6 +422,7 @@ func (a *wsApprover) RequestApproval(ctx context.Context, req tools.ApprovalRequ
 	a.client.send(map[string]any{
 		"type":        "hitl_request",
 		"approval_id": id,
+		"session_id":  a.currentSession(),
 		"tool":        req.Tool,
 		"action":      req.Action,
 		"reason":      req.Reason,

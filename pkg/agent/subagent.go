@@ -193,22 +193,26 @@ func subagentPrompt(task tools.SubagentTask, policy SubagentPolicy) string {
 	if len(paths) > 0 {
 		scope = strings.Join(paths, ", ")
 	}
+	const readTips = "探索方式：先广后窄，多换关键词与命名习惯；已知路径直接读，控制读取量，不要把大段原文带回来。"
 	const readonlyRule = "严格约束：只能调用只读工具（读取文件、列目录、搜索）；不要写文件、编辑文件、删除文件、运行命令、调用其它子智能体。"
 	if task.Mode == "explore" {
-		return fmt.Sprintf("你是 CodeForge 的只读代码探索子智能体。\n任务：%s\n关注范围：%s\n%s输出简洁的证据、涉及文件/函数和结论，供主智能体汇总。",
-			task.Prompt, scope, readonlyRule)
+		return fmt.Sprintf("你是 CodeForge 的只读代码探索子智能体。\n任务：%s\n关注范围：%s\n%s\n%s\n"+
+			"产出要求：结论 + 依据（文件:行号）+ 涉及的关键函数/结构，简洁即可，供主智能体汇总。",
+			task.Prompt, scope, readTips, readonlyRule)
 	}
 	if !policy.AllowWrite {
-		return fmt.Sprintf("你是 CodeForge 的子智能体。当前被限制为只读，不能修改任何文件。\n任务：%s\n关注范围：%s\n%s"+
-			"请给出需要主智能体落地的改动清单（文件 + 具体修改点 + 验证方式），由主智能体执行。",
-			task.Prompt, scope, readonlyRule)
+		return fmt.Sprintf("你是 CodeForge 的子智能体。当前被限制为只读，不能修改任何文件。\n任务：%s\n关注范围：%s\n%s\n%s\n"+
+			"产出要求：给出需要主智能体落地的改动清单（文件:行号 + 具体修改点 + 验证方式），由主智能体执行。",
+			task.Prompt, scope, readTips, readonlyRule)
 	}
 	ban := "不要调用其它子智能体。"
 	if !policy.AllowDelete {
 		ban = "不要删除文件（需要删除时请在结论中说明，由主智能体执行）；不要调用其它子智能体。"
 	}
-	return fmt.Sprintf("你是 CodeForge 的实现子智能体。\n任务：%s\n允许关注/修改的路径范围：%s\n严格约束：只处理声明范围，不修改其它子任务范围；%s完成后说明改了哪些文件、验证了什么、遗留什么问题。",
-		task.Prompt, scope, ban)
+	return fmt.Sprintf("你是 CodeForge 的实现子智能体。\n任务：%s\n允许关注/修改的路径范围：%s\n%s\n"+
+		"改动要求：先读后改，遵循项目已有风格；保持最小改动，不顺手重构、不越界。\n"+
+		"严格约束：只处理声明范围，不修改其它子任务范围；%s完成后说明改了哪些文件（文件:行号）、验证了什么、遗留什么问题。",
+		task.Prompt, scope, readTips, ban)
 }
 
 // validateSubagentTasks 以硬上限校验任务集合（保持既有签名，供测试与历史调用方使用）。

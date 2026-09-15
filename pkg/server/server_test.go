@@ -58,6 +58,12 @@ func newTestDeps(t *testing.T) *testDeps { return newTestDepsAt(t, "") }
 // 依赖配置目录的行为才真正被覆盖到；为空则等同 config.Default()，
 // 模型库退化为纯内存库（见 modelStorePath）。
 func newTestDepsAt(t *testing.T, configDir string) *testDeps {
+	return newTestDepsAtProvider(t, configDir, stubProvider{})
+}
+
+// newTestDepsAtProvider 与 newTestDepsAt 相同，但可替换 LLM 适配器
+// （用于断言 WS 参数是否真的进入请求，例如思考强度）。
+func newTestDepsAtProvider(t *testing.T, configDir string, provider llm.Provider) *testDeps {
 	t.Helper()
 	dir := t.TempDir()
 
@@ -98,7 +104,7 @@ func newTestDepsAt(t *testing.T, configDir string) *testDeps {
 	if _, err := history.Create(dir, ""); err != nil {
 		t.Fatalf("创建会话失败: %v", err)
 	}
-	ag := agent.New(cfg.Agent, cfg.LLM, stubProvider{}, executor, history, dir)
+	ag := agent.New(cfg.Agent, cfg.LLM, provider, executor, history, dir)
 
 	return &testDeps{
 		cfg:      cfg,

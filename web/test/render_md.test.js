@@ -225,6 +225,15 @@ check('样式契约：子智能体卡片三终态（运行 spinner / 完成绿 /
 // 绝对定位到整组中点（表现为「项目的三点渲染到会话里去了」）。
 const uiSrc = fs.readFileSync(UI_PATH, 'utf8');
 const htmlSrc = fs.readFileSync(path.join(DIST, 'index.html'), 'utf8');
+
+// 截出 ui.js 里某个 case 分支（到下一个 case 为止）：
+// 比「case 后 N 字符内必须出现 X」稳，分支里加注释/前置守卫都不会误报。
+function uiCase(name) {
+  const start = uiSrc.indexOf("case '" + name + "':");
+  if (start < 0) return '';
+  const next = uiSrc.indexOf("case '", start + 1);
+  return uiSrc.slice(start, next < 0 ? undefined : next);
+}
 group('侧栏：项目 / 会话');
 check('会话行带专属类 session-item', /li\.className\s*=\s*'session-item'/.test(uiSrc));
 check('会话行三点规则限定到 li.session-item',
@@ -308,7 +317,7 @@ check('占用过高变警告 / 危险色',
 check('明细弹层贴右边缘（否则侧栏内会溢出视口）',
   /\.ctx-anchor\s+\.ctx-pop\s*\{[^}]*right:\s*0/.test(css));
 check('前端订阅服务端 context 事件',
-  /case 'context':\s*\n\s*renderCtxUsage\(/.test(uiSrc));
+  /case 'context':[\s\S]{0,220}?renderCtxUsage\(ev\)/.test(uiSrc));
 check('点击进度条主动拉取最新占用', uiSrc.indexOf("type: 'context', session_id: sessionID") > 0);
 check('条宽封顶 100%（超预算不越界）', /Math\.min\(100,\s*pct\)/.test(uiSrc));
 check('阈值与 CSS 类同步（70% 警告 / 90% 危险）',
@@ -556,17 +565,17 @@ check('等待文案为「等待模型响应」',
 check('用户发送后立即显示等待提示',
   /addUser\(p\.display\);[\s\S]{0,260}?showThinking\(\)/.test(uiSrc));
 check('busy 事件显示等待提示',
-  /case 'busy':[\s\S]{0,350}?showThinking\(\)/.test(uiSrc));
+  /case 'busy':[\s\S]{0,600}?showThinking\(\)/.test(uiSrc));
 check('tool_result 后模型再次等待时显示提示',
   /case 'tool_result':[\s\S]{0,350}?if \(running\) showThinking\(\)/.test(uiSrc));
 check('reasoning/text/tool_call 到来时移除等待提示',
-  /case 'reasoning':[\s\S]{0,100}?removeThinking\(\)/.test(uiSrc) &&
-  /case 'text':[\s\S]{0,100}?removeThinking\(\)/.test(uiSrc) &&
-  /case 'tool_call':[\s\S]{0,120}?removeThinking\(\)/.test(uiSrc));
+  uiCase('reasoning').includes('removeThinking()') &&
+  uiCase('text').includes('removeThinking()') &&
+  uiCase('tool_call').includes('removeThinking()'));
 check('idle/error/hitl 结束或暂停时移除等待提示',
-  /case 'idle':[\s\S]{0,100}?removeThinking\(\)/.test(uiSrc) &&
-  /case 'error':[\s\S]{0,100}?removeThinking\(\)/.test(uiSrc) &&
-  /case 'hitl_request':[\s\S]{0,100}?removeThinking\(\)/.test(uiSrc));
+  uiCase('idle').includes('removeThinking()') &&
+  uiCase('error').includes('removeThinking()') &&
+  uiCase('hitl_request').includes('removeThinking()'));
 
 // ---------- 10. ＋ 更多菜单：添加文件 / Skills（右展） ----------
 // 点 ＋ → 图标变 ✕ + 上拉菜单；「添加文件」按平台分流（Windows 资源管理器 / 其他内置选择器），
@@ -739,6 +748,64 @@ check('编辑未动密钥时不提交 key_value（不删除已存 key）',
   /editingIndex >= 0 && !keyTouched/.test(uiSrc) &&
   /keyTouched = false; \/\/ 刚回填的表单没有改过密钥/.test(uiSrc) &&
   /keyTouched = true/.test(uiSrc));
+
+// ---------------------------------------------------------------------------
+// 运行中体验：思考过程自动贴底 / 允许切换会话 + 运行中会话转圈 / 事件按会话路由
+// 历史事故：思考超过 10 行被限高后，新内容全在「页内页」视口外，看起来像卡住。
+group('运行中体验：思考滚动 / 会话切换 / 运行标记');
+check('思考过程限高盒自动贴底（用户上翻时不打扰）',
+  /let reasonPinned = false/.test(uiSrc) &&
+  /if \(!reasonPinned\) body\.scrollTop = body\.scrollHeight;/.test(uiSrc) &&
+  /body\.addEventListener\('wheel', function \(\) \{ reasonPinned = true; \}/.test(uiSrc));
+check('运行中允许切换会话（点击不再被 running 挡住）',
+  /if \(s\.id === sessionID\) return;\s*\n\s*loadSession\(s\.id\); \/\/ 运行中也允许切换/.test(uiSrc));
+check('正在运行的会话带转圈标记',
+  /function addRunBadge\(li\)/.test(uiSrc) &&
+  /function syncRunBadges\(\)/.test(uiSrc) &&
+  /if \(running && s\.id === runSessionID\) addRunBadge\(li\)/.test(uiSrc) &&
+  /#session-list\s+li\.session-item\s+>\s*\.session-spin\s*\{[^}]*animation:\s*toolSpin/.test(css));
+check('后台事件不画进当前视图（runAway 路由）',
+  /function runAway\(\)/.test(uiSrc) &&
+  /runReason \+= ev\.text \|\| '';\s*\n\s*if \(runAway\(\)\) break;/.test(uiSrc) &&
+  /runText \+= ev\.text \|\| '';\s*\n\s*if \(runAway\(\)\) \{ foldReason\(\); break; \}/.test(uiSrc));
+check('切回运行中会话补渲染未落盘片段',
+  /if \(runReason\) appendReason\(runReason\);/.test(uiSrc) &&
+  /if \(runText\) appendText\(runText\);/.test(uiSrc) &&
+  /runReason = ''; runText = '';/.test(uiSrc));
+check('idle 复位运行态并撤销转圈',
+  /runSessionID = '';/.test(uiSrc) && /syncRunBadges\(\);/.test(uiSrc) &&
+  /running = false;\s*\n\s*runSessionID = '';/.test(uiSrc));
+// HITL 审批可能来自用户切走的后台会话：服务端必须带上 session_id，前端要标注来源。
+const wsHandlerSrc = fs.readFileSync(
+  path.join(__dirname, '..', '..', 'pkg', 'server', 'ws_handler.go'), 'utf8');
+check('HITL 审批带会话来源（服务端下发 + 前端标注）',
+  /"session_id":\s*a\.currentSession\(\)/.test(wsHandlerSrc) &&
+  /c\.approver\.setSession\(sessionID\)/.test(wsHandlerSrc) &&
+  /const fromOther = !!req\.session_id && req\.session_id !== sessionID;/.test(uiSrc) &&
+  /\.msg-approval\.from-other\s*\{/.test(css));
+
+// ---------------------------------------------------------------------------
+// 思考强度拉条：关闭档 + 按协议记忆（localStorage）
+// 关闭档 = 直接不发上游参数，兼容不支持 reasoning_effort / thinking 的模型。
+group('思考强度：关闭档 / 按协议记忆');
+check('后端规格含关闭档（openai 首档 none / anthropic Min=0）',
+  /OffThinkingValue\s*=\s*"none"/.test(fs.readFileSync(
+    path.join(__dirname, '..', '..', 'pkg', 'llm', 'thinking.go'), 'utf8')) &&
+  /isOffThinking\(v\)/.test(fs.readFileSync(
+    path.join(__dirname, '..', '..', 'pkg', 'llm', 'thinking.go'), 'utf8')));
+check('档位按协议记忆（cf_thinking_<mode>）',
+  /function thinkingStorageKey\(spec\) \{ return 'cf_thinking_' \+/.test(uiSrc) &&
+  /function pickThinking\(spec\)/.test(uiSrc) &&
+  /function saveThinking\(\)/.test(uiSrc));
+check('加载 / 切模型时恢复记忆档位（不再一律吃默认值）',
+  /thinkingVal = pickThinking\(thinkingSpec\);/.test(uiSrc) &&
+  !/thinkingVal = thinkingSpec\.default \|\| '';/.test(uiSrc));
+check('拖拽 / 点档后落盘记忆',
+  (uiSrc.match(/saveThinking\(\);/g) || []).length >= 2 &&
+  /saveThinking\(\);\s*\n\s*syncLevelUI\(\);/.test(uiSrc));
+check('关闭档显示为「关闭」',
+  /if \(thinkingVal === 'none'\) return '关闭';/.test(uiSrc) &&
+  /if \(!v \|\| v === '0' \|\| v === 'none'\) return '关闭';/.test(uiSrc));
 
 // ---------- 归档页：项目级恢复（与侧栏「归档」对称） ----------
 // 侧栏 ⋯ 的「归档」一次点掉整组会话；归档页必须能一次恢复整组，

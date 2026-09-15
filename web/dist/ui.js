@@ -125,12 +125,18 @@
 
   // ---------- 皮肤（最高思考强度特效）----------
   let skin = localStorage.getItem('cf_skin') === 'forge' ? 'forge' : 'meteor';
-  let sparkTimer = null; // forge 火花随机位置刷新器
 
-  // 强度颜色：随皮肤取不同色相带（meteor 蓝→粉；forge 金→橙红）
+  // 强度颜色：随皮肤取不同色相带（meteor 蓝→粉紫；forge 金→橙红，升温感）
   function intensityColor(ratio) {
-    const hue = skin === 'forge' ? 45 - ratio * 30 : 207 + ratio * (330 - 207);
+    const hue = skin === 'forge' ? 45 - ratio * 33 : 207 + ratio * (330 - 207);
     return 'hsl(' + hue.toFixed(0) + ' 85% 60%)';
+  }
+  // 填充渐变：左端深、右端（滑块处）亮，像视频里发热的一端
+  function fillGradient(ratio) {
+    const c = intensityColor(ratio);
+    return skin === 'forge'
+      ? 'linear-gradient(90deg, hsl(12 78% 46%), ' + c + ')'
+      : 'linear-gradient(90deg, hsl(207 88% 58%), ' + c + ')';
   }
 
   // ---------- 模型选择 ----------
@@ -146,6 +152,30 @@
   const modelPop = $('#model-pop');
   const modelList = $('#model-list');
   const levelList = $('#level-list');
+
+  // 思考档位按协议记忆（steps / range 各存一份）：刷新页面、重启、切模型后自动恢复。
+  // 旧值在新规格里不合法（例如从 OpenAI 换成 Anthropic）时回落到规格默认档。
+  function thinkingStorageKey(spec) { return 'cf_thinking_' + ((spec && spec.mode) || 'none'); }
+  function pickThinking(spec) {
+    if (!spec || spec.mode === 'none') return '';
+    let saved = '';
+    try { saved = localStorage.getItem(thinkingStorageKey(spec)) || ''; } catch (_) { saved = ''; }
+    if (spec.mode === 'steps') {
+      const ok = (spec.steps || []).some(function (st) { return st.value === saved; });
+      return ok ? saved : (spec.default || '');
+    }
+    if (saved === 'none') return 'none';
+    if (/^\d+$/.test(saved)) {
+      const n = Number(saved);
+      if (n <= 0) return 'none';
+      if (n >= (spec.min || 0) && n <= (spec.max || 0)) return saved;
+    }
+    return spec.default || '';
+  }
+  function saveThinking() {
+    if (!thinkingSpec || thinkingSpec.mode === 'none' || !thinkingVal) return;
+    try { localStorage.setItem(thinkingStorageKey(thinkingSpec), thinkingVal); } catch (_) { /* 隐私模式等：忽略 */ }
+  }
 
   // 拉取模型库快照：失败时保留上一次结果，不打断当前生效配置的加载。
   // 新增 / 删除 / 切换模型后由调用方置 modelsLoaded=false 再走 loadModels 刷新。
@@ -171,7 +201,7 @@
         modelName = (cfg.display_name || cfg.model_display_name || '').trim(); // 预留显示名字段
         modelInLib = cfg.model_in_library !== false; // 缺省 true 兼容旧后端
         thinkingSpec = cfg.thinking || { mode: 'none' };
-        thinkingVal = thinkingSpec.default || '';
+        thinkingVal = pickThinking(thinkingSpec);
       }
     } catch (_) { /* 拉取失败按无模型处理 */ }
     await fetchModelChoices();
@@ -180,14 +210,18 @@
     renderModelPop();
   }
 
-  // 思考档位显示名：直接用上游参数原值（minimal/low/…；range 为 token 数）
+  // 思考档位显示名：枚举档直接用原值（minimal/low/…），range 为 token 数，关闭档显示「关闭」
   function thinkingLabel() {
     if (!thinkingSpec) return 'medium';
     if (thinkingSpec.mode === 'steps') {
+      if (thinkingVal === 'none') return '关闭';
       const hit = (thinkingSpec.steps || []).find(function (s) { return s.value === thinkingVal; });
       return hit ? hit.value : thinkingVal;
     }
-    if (thinkingSpec.mode === 'range') return thinkingVal + ' tokens';
+    if (thinkingSpec.mode === 'range') {
+      if (!thinkingVal || thinkingVal === 'none' || thinkingVal === '0') return '关闭';
+      return thinkingVal + ' tokens';
+    }
     return 'medium';
   }
 
@@ -250,7 +284,7 @@
       modelName = (cfg.display_name || cfg.model_display_name || '').trim();
       modelInLib = cfg.model_in_library !== false;
       thinkingSpec = cfg.thinking || { mode: 'none' };
-      thinkingVal = thinkingSpec.default || '';
+      thinkingVal = pickThinking(thinkingSpec); // 按协议恢复上次选择的档位（含「关闭」）
       modelsLoaded = false; // 强制重拉，保证弹层选中态与思考分级是服务端的最新值
       loadModels();
       const mEl = document.getElementById('settings-model');
@@ -274,32 +308,32 @@
     const n = spec.mode === 'steps' ? (spec.steps || []).length : 9; // range 用 9 个刻度点示意
     let dots = '';
     for (let i = 0; i < n; i++) dots += '<div class="fs-dot" data-i="' + i + '"></div>';
-    // 最高强度特效元素：meteor=流星群（track 内）/ forge=锻火星溅（槽底随机位置崩出）
-    let fxTrack = '';
-    let fx = '';
-    if (skin === 'forge') {
-      for (let i = 0; i < 8; i++) {
-        const left = (8 + Math.random() * 84).toFixed(1);          // 全槽随机位置
-        const dx = (Math.random() * 26 - 13).toFixed(1);           // 水平散布 ±13px
-        const dy = (12 + Math.random() * 12).toFixed(1);           // 崩落深度
-        const delay = (Math.random() * 0.85).toFixed(2);
-        fx += '<span class="fs-spark" style="left:' + left + '%;--dx:' + dx + 'px;--dy:' + dy + 'px;animation-delay:' + delay + 's"></span>';
-      }
-    } else {
-      fxTrack =
-        '<span class="fs-meteor" style="top:35%;animation-delay:0s"></span>' +
-        '<span class="fs-meteor" style="top:50%;animation-delay:.45s"></span>' +
-        '<span class="fs-meteor" style="top:65%;animation-delay:.9s"></span>';
+    // 星尘粒子群（复刻 effort 滑杆填充内的流动光尘，持续向左漂移）：
+    // dot=光点缓慢漂移 / streak=流星拖尾快速掠过，位置与节奏全部随机错开
+    let dust = '';
+    for (let i = 0; i < 16; i++) {
+      dust += '<span class="fs-p dot" style="--x:' + (4 + Math.random() * 92).toFixed(1) +
+        '%;--y:' + (3 + Math.random() * 12).toFixed(1) +
+        'px;--s:' + (2 + Math.random() * 2).toFixed(1) +
+        'px;--d:' + (1.6 + Math.random() * 2.2).toFixed(2) +
+        's;--dl:' + (Math.random() * 2.5).toFixed(2) +
+        's;--tv:' + (40 + Math.random() * 70).toFixed(0) + 'px"></span>';
+    }
+    for (let i = 0; i < 5; i++) {
+      dust += '<span class="fs-p streak" style="--x:' + (10 + Math.random() * 88).toFixed(1) +
+        '%;--y:' + (4 + Math.random() * 11).toFixed(1) +
+        'px;--len:' + (18 + Math.random() * 20).toFixed(0) +
+        'px;--d:' + (0.9 + Math.random() * 1.1).toFixed(2) +
+        's;--dl:' + (Math.random() * 1.8).toFixed(2) +
+        's;--tv:' + (70 + Math.random() * 60).toFixed(0) + 'px"></span>';
     }
     levelList.innerHTML =
       '<div class="level-slider-wrap">' +
       '<div class="fancy-slider' + (skin === 'forge' ? ' skin-forge' : '') + '" id="level-slider">' +
-      '<div class="fs-track"><div class="fs-fill"></div>' + dots + fxTrack + '</div>' +
-      fx +
+      '<div class="fs-track"><div class="fs-fill">' + dust + '</div>' + dots + '</div>' +
       '<div class="fs-thumb"><span class="fs-tip"></span></div>' +
       '</div></div>';
     slider = levelList.querySelector('#level-slider');
-    if (sparkTimer) { clearInterval(sparkTimer); sparkTimer = null; } // 重建时清旧刷新器
     const fill = slider.querySelector('.fs-fill');
     const thumb = slider.querySelector('.fs-thumb');
     const tip = slider.querySelector('.fs-tip');
@@ -321,13 +355,14 @@
       const pct = valToPct(thinkingVal);
       const ratio = pct / 100;
       const color = intensityColor(ratio);
-      // 小球保持在槽内：中心活动范围 = [半径, 100%-半径]（thumb 22px → 半径 11px）
-      const r = 11;
+      // 小球保持在槽内：中心活动范围 = [半径, 100%-半径]（thumb 24px → 半径 12px）
+      const r = 12;
       thumb.style.left = 'calc(' + pct + '% + ' + (r - ratio * 2 * r).toFixed(2) + 'px)';
       fill.style.width = 'calc(' + pct + '% + ' + (r - ratio * 2 * r).toFixed(2) + 'px)';
-      thumb.style.borderColor = color;
-      thumb.style.boxShadow = '0 1px 5px rgba(31,36,48,.28), 0 0 ' + (4 + ratio * 10).toFixed(0) + 'px ' + color;
-      fill.style.background = 'linear-gradient(90deg, hsl(207 85% 68%), ' + color + ')';
+      slider.style.setProperty('--glow', color);
+      slider.style.setProperty('--fxo', (0.45 + ratio * 0.55).toFixed(2)); // 强度越高星尘越亮
+      thumb.style.boxShadow = '0 2px 8px rgba(0,0,0,.35), 0 0 ' + (6 + ratio * 14).toFixed(0) + 'px ' + (2 + ratio * 3).toFixed(0) + 'px ' + color;
+      fill.style.background = fillGradient(ratio);
       tip.textContent = thinkingLabel();
       dotsEls.forEach(function (d, i) {
         const dp = spec.mode === 'steps'
@@ -335,32 +370,13 @@
           : i / (dotsEls.length - 1) * 100;
         d.classList.toggle('active', Math.abs(dp - pct) < 1.5);
       });
-      // 最高强度：流星/火花特效
-      const isMax = ratio >= 0.995;
-      slider.classList.toggle('max', isMax);
-      // forge：max 期间持续随机刷新火星崩落位置（覆盖整条槽底）
-      if (skin === 'forge') {
-        if (isMax && !sparkTimer) {
-          sparkTimer = setInterval(function () {
-            if (!slider || !slider.classList.contains('max')) return;
-            slider.querySelectorAll('.fs-spark').forEach(function (sp) {
-              if (Math.random() < 0.6) {
-                sp.style.left = (5 + Math.random() * 90).toFixed(1) + '%';
-                sp.style.setProperty('--dx', (Math.random() * 26 - 13).toFixed(1) + 'px');
-                sp.style.setProperty('--dy', (12 + Math.random() * 12).toFixed(1) + 'px');
-              }
-            });
-          }, 500);
-        }
-        if (!isMax && sparkTimer) {
-          clearInterval(sparkTimer);
-          sparkTimer = null;
-        }
-      }
+      // 最高强度：粒子加速 + 滑块呼吸光晕
+      slider.classList.toggle('max', ratio >= 0.995);
     };
-    // 拖动中预览档位名
+    // 拖动中预览档位名（关闭档统一显示「关闭」，range 的 0 就是关闭）
     function previewLabel(v) {
-      if (spec.mode === 'steps') return v;
+      if (spec.mode === 'steps') return v === 'none' ? '关闭' : v;
+      if (!v || v === '0' || v === 'none') return '关闭';
       return v + ' tokens';
     }
     // 指针位置 → 最近档位原值（steps 取最近档；range 对齐步进）
@@ -379,12 +395,13 @@
     // 拖动预览：滑块线性跟随 + 实时变色（保持槽内）
     function previewAt(ratio) {
       const color = intensityColor(ratio);
-      const r = 11;
+      const r = 12;
       thumb.style.left = 'calc(' + ratio * 100 + '% + ' + (r - ratio * 2 * r).toFixed(2) + 'px)';
       fill.style.width = 'calc(' + ratio * 100 + '% + ' + (r - ratio * 2 * r).toFixed(2) + 'px)';
-      thumb.style.borderColor = color;
-      thumb.style.boxShadow = '0 1px 5px rgba(31,36,48,.28), 0 0 ' + (4 + ratio * 10).toFixed(0) + 'px ' + color;
-      fill.style.background = 'linear-gradient(90deg, hsl(207 85% 68%), ' + color + ')';
+      slider.style.setProperty('--glow', color);
+      slider.style.setProperty('--fxo', (0.45 + ratio * 0.55).toFixed(2));
+      thumb.style.boxShadow = '0 2px 8px rgba(0,0,0,.35), 0 0 ' + (6 + ratio * 14).toFixed(0) + 'px ' + (2 + ratio * 3).toFixed(0) + 'px ' + color;
+      fill.style.background = fillGradient(ratio);
     }
     slider.addEventListener('pointerdown', function (e) {
       e.preventDefault();
@@ -398,6 +415,7 @@
         } else {
           thinkingVal = String(Math.round((spec.min + dp * (spec.max - spec.min)) / spec.step) * spec.step);
         }
+        saveThinking();
         syncLevelUI();
         renderModelBtn();
         return;
@@ -423,6 +441,7 @@
       // 松手：吸附最近档位（动画过渡），不关闭弹层
       const hit = nearestValue(e.clientX);
       thinkingVal = hit.v;
+      saveThinking();
       syncLevelUI();
       renderModelBtn();
     });
@@ -874,7 +893,15 @@
     wrap.className = 'msg-approval';
     const label = document.createElement('div');
     label.className = 'approval-text';
-    label.textContent = '需要审批：' + toolPhrase(req.tool);
+    // 审批可能来自后台运行的另一个会话：显式标注来源，避免被误认为当前会话的操作。
+    const fromOther = !!req.session_id && req.session_id !== sessionID;
+    if (fromOther) {
+      const meta = sessionsCache.find(function (s) { return s.id === req.session_id; });
+      label.textContent = '需要审批（来自会话「' + ((meta && meta.title) || req.session_id) + '」）：' + toolPhrase(req.tool);
+      wrap.classList.add('from-other');
+    } else {
+      label.textContent = '需要审批：' + toolPhrase(req.tool);
+    }
     const tip = [req.reason, req.action ? '目标：' + req.action : ''].filter(Boolean).join('\n');
     if (tip) label.title = tip;
     const btns = document.createElement('div');
@@ -905,8 +932,21 @@
   let thinkingEl = null;      // 「等待模型响应」提示
   let reasonEl = null;        // 当前思考过程折叠块
   let reasonBuffer = '';
+  let reasonPinned = false;   // 用户是否手动上翻了思考过程（上翻时不自动贴底）
   let lastReply = '';         // 本轮回复全文（供复制/操作栏）
   let lastUserText = '';      // 最近一次用户消息（供重新生成）
+  // 后台运行：一个连接同时只跑一个任务（服务端 c.run 会先停旧任务），
+  // runSessionID 记录这一轮属于哪个会话；用户切走后事件继续到达，但不能画进当前视图。
+  let runSessionID = '';
+  // 后台运行会话「已流出但尚未落盘」的思考/正文片段：不随视图切换重置，
+  // 切回该会话时补渲染。落盘点与正常流程一致（正文开始弃思考、工具调用清正文）。
+  let runReason = '';
+  let runText = '';
+
+  // 本轮任务不在当前视图（用户切到别的会话去了）
+  function runAway() {
+    return running && runSessionID && runSessionID !== sessionID;
+  }
 
   function wsSend(obj) {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
@@ -1041,9 +1081,19 @@
       summary.textContent = '思考过程';
       const body = document.createElement('div');
       body.className = 'reason-body';
+      // 贴底跟随：只有「用户主动滚动」才停（wheel/触摸/按住），滚回底部自动恢复。
+      // 不能用 scroll 事件置位 —— 限高生效、内容增长等布局变化也会触发 scroll，
+      // 那样一超过 10 行就会误判成「用户上翻」，从此不再自动滚动（历史 BUG）。
+      body.addEventListener('wheel', function () { reasonPinned = true; }, { passive: true });
+      body.addEventListener('touchmove', function () { reasonPinned = true; }, { passive: true });
+      body.addEventListener('mousedown', function () { reasonPinned = true; });
+      body.addEventListener('scroll', function () {
+        if (body.scrollHeight - body.scrollTop - body.clientHeight <= 24) reasonPinned = false;
+      }, { passive: true });
       reasonEl.appendChild(summary);
       reasonEl.appendChild(body);
       ensureCol().appendChild(reasonEl);
+      reasonPinned = false;
     }
     return reasonEl.querySelector('.reason-body');
   }
@@ -1053,6 +1103,8 @@
     body.textContent = reasonBuffer;
     // 思考过程过长（>10 行）时收进「页内页」：限高 + 内部滚动，不撑长聊天列。
     body.classList.toggle('scroll', countLines(reasonBuffer) > 10);
+    // 限高后必须让「页内页」自己贴底，否则新内容都在视口下方，看起来像卡住不动。
+    if (!reasonPinned) body.scrollTop = body.scrollHeight;
     scrollBottom();
   }
   // 统计字符串行数（按 \n；最后一行无换行也算 1 行）。
@@ -1070,6 +1122,7 @@
       reasonEl = null;
     }
     reasonBuffer = '';
+    reasonPinned = false;
   }
   function closeText() {
     currentTextEl = null;
@@ -1284,15 +1337,38 @@
             ]);
           });
           li.appendChild(sdots);
+          if (running && s.id === runSessionID) addRunBadge(li); // 正在运行的会话：转圈提示
           li.addEventListener('click', function () {
-            if (running || s.id === sessionID) return;
-            loadSession(s.id);
+            if (s.id === sessionID) return;
+            loadSession(s.id); // 运行中也允许切换：后台继续跑，只切视图
           });
           ul.appendChild(li);
         });
         group.appendChild(ul);
       }
       sessionListEl.appendChild(group);
+    });
+  }
+
+  // 会话列表运行标记：正在运行的会话左侧加转圈；随 busy/idle 与列表重绘同步。
+  function addRunBadge(li) {
+    if (!li || li.querySelector('.session-spin')) return;
+    const sp = document.createElement('span');
+    sp.className = 'session-spin';
+    sp.title = '正在运行';
+    li.insertBefore(sp, li.firstChild);
+    li.classList.add('running');
+  }
+  function syncRunBadges() {
+    sessionListEl.querySelectorAll('.session-item').forEach(function (li) {
+      const on = running && !!runSessionID && li.dataset.id === runSessionID;
+      if (on) {
+        addRunBadge(li);
+      } else {
+        li.classList.remove('running');
+        const sp = li.querySelector('.session-spin');
+        if (sp) sp.remove();
+      }
     });
   }
 
@@ -1762,8 +1838,12 @@
       .then(function (d) { renderSessions(d.items || []); });
   }
 
-  // 切换会话：请求服务端回放历史
+  // 切换会话：请求服务端回放历史。
+  // 运行中也允许切换：任务继续在后台跑，只换视图；未落盘片段由 runReason/runText
+  // 跨视图保留，replayHistory 渲染完历史后自动补上。
   function loadSession(id) {
+    if (!id || id === sessionID) return;
+    if (running) sendBtn.title = '点击打断' + (id === runSessionID ? '' : '（正在运行的会话）');
     wsSend({ type: 'load_session', session_id: id });
   }
 
@@ -1772,7 +1852,12 @@
   function replayHistory(ev) {
     messagesEl.innerHTML = '';
     msgCol = null; currentTextEl = null; textBuffer = '';
-    reasonEl = null; reasonBuffer = ''; lastReply = ''; lastUserText = '';
+    reasonEl = null; reasonBuffer = ''; reasonPinned = false;
+    // 视图重建 = 旧 DOM 全部作废：这些「当前元素」引用必须一起清空，
+    // 否则后续事件会去找已经不在文档里的节点（切走→切回最容易触发）。
+    thinkingEl = null; activeToolEl = null; retryEl = null;
+    subagentCards.clear();
+    lastReply = ''; lastUserText = '';
     sessionID = ev.session_id || '';
 
     (ev.messages || []).forEach(function (m) {
@@ -1798,7 +1883,14 @@
     });
     settleActiveTool();
     closeText();
-    if (lastReply) addActions(lastReply);
+    // 切回「正在后台运行」的会话：补上已流出但尚未落盘的思考/正文片段。
+    // 运行中不挂操作栏（与正常流式输出期间一致，idle 时再出现）。
+    const runningHere = running && !!runSessionID && ev.session_id === runSessionID;
+    if (runningHere) {
+      if (runReason) appendReason(runReason);
+      if (runText) appendText(runText);
+    }
+    if (lastReply && !runningHere) addActions(lastReply);
     scrollBottom();
     syncComposerMode(); // 空会话回放 → 居中；有历史 → 下放底部
     renderSessions(sessionsCache); // 高亮切换后的 active
@@ -2114,6 +2206,11 @@
       try { ev = JSON.parse(e.data); } catch (_) { return; }
       switch (ev.type) {
         case 'ready':
+          // 断线重连：旧任务已随连接关闭被服务端取消，复位运行态避免按钮卡在 ▶
+          running = false; runSessionID = ''; runReason = ''; runText = '';
+          sendBtn.classList.remove('running');
+          sendBtn.textContent = '↑';
+          sendBtn.title = '发送';
           renderSessions(ev.sessions || []);
           // 刷新/重启自动恢复：回放该工作区最近一次会话
           if (!sessionID && sessionsCache.length) {
@@ -2128,13 +2225,19 @@
           replayHistory(ev);
           break;
         case 'session':
-          if (ev.session_id) sessionID = ev.session_id;
+          // 任务运行中不接受 session 事件改视图（那是别的会话的启动回报）
+          if (ev.session_id && (!running || !runSessionID || ev.session_id === runSessionID)) {
+            sessionID = ev.session_id;
+          }
           break;
         case 'context':
-          renderCtxUsage(ev);
+          // 上下文占用只画当前视图会话的（后台会话结束也会下发它自己的 context）
+          if (!ev.session_id || ev.session_id === sessionID) renderCtxUsage(ev);
           break;
         case 'busy':
           running = true;
+          runSessionID = sessionID; // 本轮属于当前视图的会话；之后用户切走也能凭它识别
+          runReason = ''; runText = ''; // 新一轮：未落盘片段从零开始
           lastReply = '';        // 新一轮开始：清空回复累积
           removeRetry();
           resetSubagentCards(); // 新一轮：重置子智能体卡片缓存
@@ -2142,14 +2245,17 @@
           sendBtn.textContent = '▶';
           sendBtn.title = '点击打断';
           showThinking();
+          syncRunBadges();
           break;
         case 'retry':
+          if (runAway()) break; // 后台会话的重试提示不画进当前视图
           removeThinking();
           addRetry(ev.error || '');
           break;
         case 'compress':
           // 上下文越过压缩线，服务端已自动压缩。这一段是「无声发生」的关键动作，
           // 必须告诉用户：否则他会以为历史丢了（实际完整保留，只是送模内容变了）。
+          if (runAway()) break;
           (function () {
             const ci = ev.compress || {};
             if (ci.degraded) {
@@ -2165,12 +2271,17 @@
           })();
           break;
         case 'reasoning':
+          runReason += ev.text || '';
+          if (runAway()) break; // 只累积（runReason），切回时补渲染
           removeThinking();
           removeRetry(); // 重试成功：撤掉提示
           settleActiveTool(); // 工具执行完进入下一段思考：撤掉 spinner
           appendReason(ev.text || '');
           break;
         case 'text':
+          runReason = ''; // 正文开始，思考段结束（与 foldReason 同步）
+          runText += ev.text || '';
+          if (runAway()) { foldReason(); break; }
           removeThinking();
           removeRetry(); // 重试成功：撤掉提示
           foldReason();
@@ -2178,6 +2289,9 @@
           appendText(ev.text || '');
           break;
         case 'tool_call': {
+          // 该段内容此刻已写入会话消息：思考丢弃、正文交给历史回放，不再算未落盘
+          runReason = ''; runText = '';
+          if (runAway()) { foldReason(); closeText(); break; }
           removeThinking();
           removeRetry();
           foldReason();
@@ -2190,6 +2304,8 @@
         }
         case 'subagent': {
           // 子智能体实时进度：每个子任务一张卡片，status 驱动样式
+          runReason = ''; runText = '';
+          if (runAway()) { foldReason(); closeText(); break; }
           removeThinking();
           foldReason();
           closeText();
@@ -2197,6 +2313,7 @@
           break;
         }
         case 'tool_result':
+          if (runAway()) break;
           removeThinking();
           settleActiveTool(); // 工具已返回：撤掉 spinner
           closeText();
@@ -2209,9 +2326,15 @@
           settleActiveTool(); // 等待审批不算运行：撤掉 spinner
           foldReason();
           closeText();
-          addApproval(ev);
+          addApproval(ev); // 后台会话的审批会带 session_id，卡片上标注来源
           break;
-        case 'error':
+        case 'error': {
+          if (runAway()) {
+            // 后台会话出错：在当前视图标注来源，不能静默吞掉
+            const emeta = sessionsCache.find(function (s) { return s.id === runSessionID; });
+            addError('后台会话「' + ((emeta && emeta.title) || runSessionID) + '」出错：' + (ev.error || '未知错误'));
+            break;
+          }
           removeThinking();
           removeRetry();
           settleActiveTool();
@@ -2219,18 +2342,24 @@
           closeText();
           addError('出错了：' + (ev.error || '未知错误'));
           break;
-        case 'idle':
+        }
+        case 'idle': {
+          const backHome = !runAway();
           removeThinking();
           removeRetry();
           settleActiveTool();
           foldReason();
           closeText();
-          if (lastReply) addActions(lastReply); // 回复结束：显示复制/模型/重新生成
+          if (backHome && lastReply) addActions(lastReply); // 回复结束：显示复制/模型/重新生成
           running = false;
+          runSessionID = '';
+          runReason = ''; runText = '';
           sendBtn.classList.remove('running');
           sendBtn.textContent = '↑';
           sendBtn.title = '发送';
+          syncRunBadges();
           break;
+        }
       }
     });
   }
@@ -2442,7 +2571,12 @@
 
   form.addEventListener('submit', function (e) {
     e.preventDefault();
-    if (running) { wsSend({ type: 'cancel' }); return; } // ▶ 运行中点击 = 打断当前任务
+    if (running) {
+      // 运行中按发送 = 打断；若正在看别的会话，说明打断的是后台任务
+      if (runAway()) addInfo('已请求打断正在后台运行的任务');
+      wsSend({ type: 'cancel' });
+      return;
+    }
     const raw = input.value.trim();
     if (!raw) return;
     if (!wsReady) { addError('未连接到服务，请稍候重试'); return; }

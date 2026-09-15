@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>slider preview</title>
+<link rel="stylesheet" href="../dist/app.css">
+<style>
+  body { background: #1b1b1f; padding: 40px 60px; display: grid; gap: 28px; }
+  .lbl { color: #aaa; font: 12px/1.6 system-ui; margin-bottom: -16px; }
+</style>
+</head>
+<body>
+<div class="lbl">meteor · mid (ratio .55)</div><div id="m1"></div>
+<div class="lbl">meteor · max</div><div id="m2"></div>
+<div class="lbl">forge · mid (ratio .55)</div><div id="f1"></div>
+<div class="lbl">forge · max</div><div id="f2"></div>
+<script>
+function hue(skin, ratio) {
+  const h = skin === 'forge' ? 45 - ratio * 33 : 207 + ratio * (330 - 207);
+  return 'hsl(' + h.toFixed(0) + ' 85% 60%)';
+}
+function grad(skin, ratio) {
+  const c = hue(skin, ratio);
+  return skin === 'forge'
+    ? 'linear-gradient(90deg, hsl(12 78% 46%), ' + c + ')'
+    : 'linear-gradient(90deg, hsl(207 88% 58%), ' + c + ')';
+}
+function dust() {
+  let d = '';
+  for (let i = 0; i < 16; i++) {
+    d += '<span class="fs-p dot" style="--x:' + (4 + Math.random() * 92).toFixed(1) +
+      '%;--y:' + (3 + Math.random() * 12).toFixed(1) +
+      'px;--s:' + (2 + Math.random() * 2).toFixed(1) +
+      'px;--d:' + (1.6 + Math.random() * 2.2).toFixed(2) +
+      's;--dl:' + (Math.random() * 2.5).toFixed(2) +
+      's;--tv:' + (40 + Math.random() * 70).toFixed(0) + 'px"></span>';
+  }
+  for (let i = 0; i < 5; i++) {
+    d += '<span class="fs-p streak" style="--x:' + (10 + Math.random() * 88).toFixed(1) +
+      '%;--y:' + (4 + Math.random() * 11).toFixed(1) +
+      'px;--len:' + (18 + Math.random() * 20).toFixed(0) +
+      'px;--d:' + (0.9 + Math.random() * 1.1).toFixed(2) +
+      's;--dl:' + (Math.random() * 1.8).toFixed(2) +
+      's;--tv:' + (70 + Math.random() * 60).toFixed(0) + 'px"></span>';
+  }
+  return d;
+}
+function build(id, skin, ratio) {
+  const dots = [];
+  for (let i = 0; i < 5; i++) {
+    const dp = i / 4 * 100;
+    dots.push('<div class="fs-dot' + (Math.abs(dp - ratio * 100) < 1.5 ? ' active' : '') +
+      '" style="left:' + dp + '%"></div>');
+  }
+  const color = hue(skin, ratio);
+  const r = 12;
+  const off = (r - ratio * 2 * r).toFixed(2);
+  document.getElementById(id).innerHTML =
+    '<div class="fancy-slider' + (skin === 'forge' ? ' skin-forge' : '') +
+    (ratio >= 0.995 ? ' max' : '') + '" style="--glow:' + color + ';--fxo:' +
+    (0.45 + ratio * 0.55).toFixed(2) + '">' +
+    '<div class="fs-track"><div class="fs-fill" style="width:calc(' + ratio * 100 +
+    '% + ' + off + 'px);background:' + grad(skin, ratio) + '">' + dust() + '</div>' +
+    dots.join('') + '</div>' +
+    '<div class="fs-thumb" style="left:calc(' + ratio * 100 + '% + ' + off +
+    'px);box-shadow:0 2px 8px rgba(0,0,0,.35),0 0 ' + (6 + ratio * 14).toFixed(0) + 'px ' +
+    (2 + ratio * 3).toFixed(0) + 'px ' + color + '"></div></div>';
+}
+build('m1', 'meteor', 0.55);
+build('m2', 'meteor', 1);
+build('f1', 'forge', 0.55);
+build('f2', 'forge', 1);
+</script>
+</body>
+</html>
