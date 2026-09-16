@@ -82,10 +82,40 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			Model       string   `json:"model"`
 			MaxTokens   int      `json:"max_tokens"`
 			Temperature *float64 `json:"temperature"`
+			// 重试策略：<=0 / 空值表示「不改」（保持原配置）。
+			RetryMaxAttempts *int    `json:"retry_max_attempts"`
+			RetryMode        *string `json:"retry_mode"`
+			RetryIntervalSec *int    `json:"retry_interval_sec"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体解析失败: " + err.Error()})
 			return
+		}
+
+		// 重试间隔模式只接受 fixed / backoff，其余直接拒绝（避免脏值落库）。
+		if body.RetryMode != nil {
+			mode := strings.ToLower(strings.TrimSpace(*body.RetryMode))
+			if mode != "fixed" && mode != "backoff" {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "无效的重试间隔模式: " + *body.RetryMode})
+				return
+			}
+			s.cfg.LLM.RetryMode = mode
+		}
+		if body.RetryMaxAttempts != nil {
+			n := *body.RetryMaxAttempts
+			if n < 1 || n > 15 {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "重试次数需在 1~15 之间"})
+				return
+			}
+			s.cfg.LLM.MaxAttempts = n
+		}
+		if body.RetryIntervalSec != nil {
+			n := *body.RetryIntervalSec
+			if n < 1 || n > 60 {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "重试间隔需在 1~60 秒之间"})
+				return
+			}
+			s.cfg.LLM.RetryBackoffMs = n * 1000
 		}
 
 		if strings.TrimSpace(body.Provider) != "" {
@@ -129,18 +159,22 @@ func (s *Server) configView() map[string]any {
 		workDir = s.fs.Root()
 	}
 	return map[string]any{
-		"provider":       s.cfg.LLM.Provider,
-		"permission":     s.executor.Policy().Mode(),
-		"base_url":       s.cfg.LLM.BaseURL,
-		"model":          s.cfg.LLM.Model,
-		"display_name":   s.cfg.LLM.DisplayName,
-		"max_tokens":     s.cfg.LLM.MaxTokens,
-		"temperature":    s.cfg.LLM.Temperature,
-		"api_key_set":    s.cfg.LLM.APIKey != "",
-		"api_key_masked": s.cfg.MaskedAPIKey(),
-		"platform":       platformName(),
-		"work_dir":       workDir,
-		"tools":          s.registry.Names(),
+		"provider":     s.cfg.LLM.Provider,
+		"permission":   s.executor.Policy().Mode(),
+		"base_url":     s.cfg.LLM.BaseURL,
+		"model":        s.cfg.LLM.Model,
+		"display_name": s.cfg.LLM.DisplayName,
+		"max_tokens":   s.cfg.LLM.MaxTokens,
+		"temperature":  s.cfg.LLM.Temperature,
+		// 重试策略：前端设置页可调（次数 / 间隔模式 / 基础间隔）。
+		"retry_max_attempts": s.cfg.LLM.MaxAttempts,
+		"retry_mode":         s.cfg.LLM.RetryMode,
+		"retry_interval_sec": s.cfg.LLM.RetryBackoffMs / 1000,
+		"api_key_set":        s.cfg.LLM.APIKey != "",
+		"api_key_masked":     s.cfg.MaskedAPIKey(),
+		"platform":           platformName(),
+		"work_dir":           workDir,
+		"tools":              s.registry.Names(),
 		// 当前生效模型是否仍在模型库中：删除模型库最后一条后 local.yaml 的
 		// 生效配置仍在（对话可用），但界面应提示「库已空、去设置里添加」，
 		// 而不是照常显示模型名。

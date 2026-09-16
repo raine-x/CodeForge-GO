@@ -128,6 +128,92 @@ func TestMaskedAPIKey(t *testing.T) {
 	}
 }
 
+// TestDefaultPluginsBuiltin 验证内嵌的默认插件随二进制自带：
+// 裸 exe 分发时无需 config 目录，Parallel Search 也应默认启用。
+func TestDefaultPluginsBuiltin(t *testing.T) {
+	plugins := DefaultPlugins()
+	if len(plugins) == 0 {
+		t.Fatal("内建插件列表为空 —— go:embed 的 plugins.yaml 未生效")
+	}
+	var parallel *PluginConfig
+	for i := range plugins {
+		if plugins[i].Name == "parallel_search" {
+			parallel = &plugins[i]
+		}
+	}
+	if parallel == nil {
+		t.Fatalf("内建列表缺少 parallel_search，实际: %v", pluginNames(plugins))
+	}
+	if !parallel.Enabled {
+		t.Error("parallel_search 应默认启用（充当默认联网来源）")
+	}
+	if parallel.Type != "mcp-http" || parallel.Endpoint != "https://search.parallel.ai/mcp" {
+		t.Errorf("parallel_search 配置不对: type=%q endpoint=%q", parallel.Type, parallel.Endpoint)
+	}
+}
+
+// TestLoadMergesBuiltinPlugins 验证本地 plugins.yaml 与内建列表的合并语义：
+// 同名以用户为准（可停用内建、改端点），内建保留，用户新增追加。
+func TestLoadMergesBuiltinPlugins(t *testing.T) {
+	dir := t.TempDir()
+	user := "plugins:\n" +
+		"  - name: parallel_search\n" +
+		"    type: mcp-http\n" +
+		"    enabled: false\n" + // 停用内建
+		"    endpoint: https://search.parallel.ai/mcp\n" +
+		"  - name: my_tool\n" + // 追加新插件
+		"    type: mcp\n" +
+		"    enabled: true\n" +
+		"    command: my-server\n"
+	if err := os.WriteFile(filepath.Join(dir, "plugins.yaml"), []byte(user), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	byName := map[string]PluginConfig{}
+	for _, p := range cfg.Plugins {
+		byName[p.Name] = p
+	}
+	if p, ok := byName["parallel_search"]; !ok {
+		t.Fatal("合并后应保留内建的 parallel_search")
+	} else if p.Enabled {
+		t.Error("用户的 enabled:false 应覆盖内建的默认启用")
+	}
+	if p, ok := byName["my_tool"]; !ok {
+		t.Fatal("用户新增的 my_tool 应被追加")
+	} else if !p.Enabled || p.Command != "my-server" {
+		t.Errorf("my_tool 合并不对: %+v", p)
+	}
+	if _, ok := byName["exa_search"]; !ok {
+		t.Error("未被子目录覆盖的内建条目（exa_search）应保留")
+	}
+}
+
+// TestLoadWithoutPluginsYamlUsesBuiltin 裸 exe 场景：配置目录没有 plugins.yaml，
+// 插件列表应完整来自内嵌默认（不报错、不缺 Parallel）。
+func TestLoadWithoutPluginsYamlUsesBuiltin(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("无 plugins.yaml 时 Load 不应报错: %v", err)
+	}
+	if len(cfg.Plugins) != len(DefaultPlugins()) {
+		t.Errorf("无本地文件时应使用全部内建插件，实际 %d 条，期望 %d 条",
+			len(cfg.Plugins), len(DefaultPlugins()))
+	}
+}
+
+func pluginNames(ps []PluginConfig) []string {
+	out := make([]string, 0, len(ps))
+	for _, p := range ps {
+		out = append(out, p.Name)
+	}
+	return out
+}
+
 func unsetAll(keys []string) {
 	for _, k := range keys {
 		_ = os.Unsetenv(k)

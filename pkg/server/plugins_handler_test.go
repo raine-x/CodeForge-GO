@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"codeforge/config"
 	"codeforge/pkg/security"
 	"codeforge/pkg/tools/plugins"
 )
@@ -204,8 +205,16 @@ func TestPluginsAddValidation(t *testing.T) {
 		}
 	}
 
-	// 校验失败不应留下任何条目（避免半成品插件写进 plugins.yaml）。
-	if items := getPlugins(t, client, ts.URL); len(items) != 0 {
-		t.Errorf("校验失败不应写入插件，实际有 %d 条: %v", len(items), items)
+	// 校验失败不应留下任何用户添加的条目（避免半成品插件写进 plugins.yaml）。
+	// 内建插件（Parallel 等，随二进制 embed）不算用户添加，需排除后再断言。
+	builtin := map[string]bool{}
+	for _, p := range config.DefaultPlugins() {
+		builtin[p.Name] = true
+	}
+	items := getPlugins(t, client, ts.URL)
+	for _, it := range items {
+		if !builtin[it.Name] {
+			t.Errorf("校验失败不应写入用户插件，实际多出: %+v", it)
+		}
 	}
 }

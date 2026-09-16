@@ -189,6 +189,28 @@
               </label>
             </div>
           </div>
+          <div class="settings-card">
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">请求重试</div>
+                <div class="row-desc">上游限流（429）或瞬时故障时自动重试，4xx 客户端错误（如余额不足）不重试。退避模式：1→2→3→6 秒（之后封顶 6 秒）；固定模式：每次等待相同秒数</div>
+              </div>
+            </div>
+            <div class="form-grid">
+              <label class="f-field"><span>重试次数（含首次）</span><input id="retry-attempts" type="number" min="1" max="15" value="5"></label>
+              <label class="f-field"><span>间隔模式</span>
+                <select id="retry-mode">
+                  <option value="backoff">退避 1→2→3→6 秒</option>
+                  <option value="fixed">固定间隔</option>
+                </select>
+              </label>
+              <label class="f-field"><span>基础间隔（秒）</span><input id="retry-interval" type="number" min="1" max="60" value="1"></label>
+            </div>
+            <div class="ctx-row" style="margin-top:10px">
+              <button type="button" id="retry-save" class="primary">保存重试设置</button>
+              <span id="retry-result" class="mf-test-result"></span>
+            </div>
+          </div>
         </section>
         <section id="page-memory" class="settings-page">
           <h2>记忆</h2>

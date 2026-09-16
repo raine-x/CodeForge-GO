@@ -503,14 +503,15 @@ func (a *Agent) runLoopWithPersistence(ctx context.Context, sess *Session, emit 
 
 		stream, err := a.provider.Stream(hookCtx, req)
 		if err != nil {
-			emit(Event{Type: EventError, Error: err.Error()})
+			// 不在这里 emit：错误返回给调用方后，WS 层（ws_handler.run）会统一
+			// 下发一次 error 事件；这里再 emit 就会显示两遍（如 402 余额不足）。
 			a.save(sess, persist)
 			return err
 		}
 
 		turn, err := a.consumeStream(ctx, sess, stream, emit)
 		if err != nil {
-			emit(Event{Type: EventError, Error: err.Error()})
+			// 同上：由调用方统一 emit 一次。
 			a.save(sess, persist)
 			return err
 		}
@@ -627,12 +628,19 @@ func (a *Agent) consumeStream(ctx context.Context, sess *Session, stream <-chan 
 			}
 		case llm.EventError:
 			errMsg = ev.Error
-			emit(Event{Type: EventError, Error: ev.Error})
+			// 不在此 emit：致命错误返回给调用方（WS 层）会统一发一次，
+			// 在这发就会显示两遍。部分内容被截断的情况见函数末尾补一条。
 		}
 	}
 
 	if errMsg != "" && len(order) == 0 && turn.Text == "" {
 		return nil, fmt.Errorf("%s", errMsg)
+	}
+
+	// 流中途出错但已有部分内容（文本/工具调用）：内容保留执行，错误补一条
+	// 事件让用户知道本轮被上游截断（这条是唯一的一次 emit，不会重复）。
+	if errMsg != "" {
+		emit(Event{Type: EventError, Error: errMsg})
 	}
 
 	for _, id := range order {

@@ -3456,6 +3456,50 @@
         .then(function () { el.disabled = false; });
     });
   })();
+  // 「请求重试」卡片：回填服务端当前策略，保存时 POST /api/config（热生效 + 落盘）。
+  function refreshRetryForm() {
+    fetch('/api/config').then(function (r) { return r.json(); }).then(function (cfg) {
+      var a = document.getElementById('retry-attempts');
+      var m = document.getElementById('retry-mode');
+      var i = document.getElementById('retry-interval');
+      if (!a || !m || !i) return;
+      a.value = cfg.retry_max_attempts || 5;
+      m.value = cfg.retry_mode === 'fixed' ? 'fixed' : 'backoff';
+      i.value = cfg.retry_interval_sec > 0 ? cfg.retry_interval_sec : 1;
+    }).catch(function () { /* 读取失败保持默认 */ });
+  }
+  (function bindRetryForm() {
+    var btn = document.getElementById('retry-save');
+    if (!btn) return;
+    btn.addEventListener('click', function () {
+      var attempts = Math.max(1, Math.min(15, Number(document.getElementById('retry-attempts').value) || 5));
+      var interval = Math.max(1, Math.min(60, Number(document.getElementById('retry-interval').value) || 1));
+      var mode = document.getElementById('retry-mode').value;
+      var result = document.getElementById('retry-result');
+      btn.disabled = true;
+      if (result) { result.textContent = '保存中…'; result.style.color = ''; }
+      fetch('/api/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          retry_max_attempts: attempts,
+          retry_mode: mode,
+          retry_interval_sec: interval
+        })
+      }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+        .then(function (res) {
+          if (result) {
+            if (res.ok) { result.textContent = '已保存'; result.style.color = 'var(--accent, #4c9aff)'; }
+            else { result.textContent = res.d.error || '保存失败'; result.style.color = ''; }
+          }
+          if (!res.ok) addError('重试设置保存失败：' + (res.d.error || '未知错误'));
+        })
+        .catch(function () {
+          if (result) { result.textContent = '服务不可达'; result.style.color = ''; }
+          addError('重试设置保存失败（服务不可达）');
+        })
+        .then(function () { btn.disabled = false; });
+    });
+  })();
   openSettingsBtn.addEventListener('click', function () {
     refreshSkinSeg();
     // 常规页信息回填
@@ -3466,6 +3510,7 @@
     var mEl = document.getElementById('settings-model');
     if (mEl) { mEl.textContent = modelName || model || '--'; mEl.title = model || ''; }
     refreshNotifySwitch();
+    refreshRetryForm();
     settingsOverlay.classList.remove('leaving', 'hidden');
   });
   settingsOverlay.addEventListener('click', function (e) {

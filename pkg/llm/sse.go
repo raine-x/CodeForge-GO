@@ -55,18 +55,27 @@ func retryHookFrom(ctx context.Context) RetryHook {
 
 const (
 	defaultMaxAttempts  = 5
-	defaultRetryBackoff = 1500 * time.Millisecond
+	defaultRetryBackoff = 1000 * time.Millisecond
 	maxRetryAfter       = 30 * time.Second
 	maxErrorBodyBytes   = 8192
 	maxStreamLineBytes  = 8 << 20
 	streamReadBufBytes  = 64 * 1024
 )
 
+// backoffMultipliers 是常用退避序列：1×→2×→3×→6×（之后封顶 6×）。
+// 比纯指数（1→2→4→8）更平滑，前几次快速重试捞回瞬时抖动，后面留足时间
+// 让上游限流窗口恢复。
+var backoffMultipliers = []int{1, 2, 3, 6}
+
 // RetryPolicy 描述上游瞬时故障的重试策略。
 type RetryPolicy struct {
 	// MaxAttempts 是含首次请求在内的总尝试次数；<=0 时取默认值 5。
 	MaxAttempts int
-	// Backoff 是首次退避间隔，之后按 2 倍指数增长；<=0 时取默认值 1.5s。
+	// Mode 是间隔模式：fixed（每次等同样时长）或 backoff（1×→2×→3×→6× 序列，
+	// 封顶 6×）；空值按 backoff。
+	Mode string
+	// Backoff 是基础间隔：fixed 模式即每次等待时长；backoff 模式是序列基准
+	//（1000ms → 1s/2s/3s/6s）；<=0 时取默认值 1s。
 	Backoff time.Duration
 }
 
@@ -78,7 +87,29 @@ func (p RetryPolicy) normalize() RetryPolicy {
 	if p.Backoff <= 0 {
 		p.Backoff = defaultRetryBackoff
 	}
+	// 只认 fixed / backoff，其余（含大小写脏值）一律按 backoff。
+	mode := strings.ToLower(strings.TrimSpace(p.Mode))
+	if mode != "fixed" && mode != "backoff" {
+		mode = "backoff"
+	}
+	p.Mode = mode
 	return p
+}
+
+// attemptDelay 返回第 attempt 次（>=2，即首次重试）请求前的等待时长。
+// 上游给了 Retry-After 时由调用方覆盖。
+func (p RetryPolicy) attemptDelay(attempt int) time.Duration {
+	if p.Mode == "fixed" {
+		return p.Backoff
+	}
+	idx := attempt - 2
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(backoffMultipliers) {
+		idx = len(backoffMultipliers) - 1
+	}
+	return p.Backoff * time.Duration(backoffMultipliers[idx])
 }
 
 // postJSON 发送 JSON POST 请求并返回响应流；对上游瞬时故障自动指数退避重试。
@@ -99,17 +130,23 @@ func postJSON(
 		return nil, fmt.Errorf("序列化请求体失败: %w", err)
 	}
 
-	delay := policy.Backoff
 	var lastErr error
+	var overrideDelay time.Duration // 上游 Retry-After 指定的下一次等待，优先于本地序列
 
 	for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
 		if attempt > 1 {
+			// 等待时长：上游给了 Retry-After 就听上游的，否则按模式算
+			//（fixed 每次相同；backoff 为 1×→2×→3×→6× 序列）。
+			delay := overrideDelay
+			if delay <= 0 {
+				delay = policy.attemptDelay(attempt)
+			}
+			overrideDelay = 0
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-time.After(delay):
 			}
-			delay *= 2
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
@@ -153,14 +190,16 @@ func postJSON(
 		if !transientStatus[resp.StatusCode] || attempt >= policy.MaxAttempts {
 			return nil, apiErr
 		}
+		nextDelay := policy.attemptDelay(attempt + 1)
 		if retryAfter > 0 {
-			delay = retryAfter
+			overrideDelay = retryAfter
+			nextDelay = retryAfter
 		}
 		if hook := retryHookFrom(ctx); hook != nil {
 			hook(attempt+1, policy.MaxAttempts, apiErr.Error())
 		}
 		log.Printf("[llm] 上游返回 %d，第 %d/%d 次尝试，%.1fs 后重试",
-			resp.StatusCode, attempt, policy.MaxAttempts, delay.Seconds())
+			resp.StatusCode, attempt, policy.MaxAttempts, nextDelay.Seconds())
 	}
 
 	if lastErr == nil {

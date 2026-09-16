@@ -216,6 +216,7 @@ func reasoningEffort(level string) string {
 func retryPolicyFromConfig(cfg config.LLMConfig) RetryPolicy {
 	return RetryPolicy{
 		MaxAttempts: cfg.MaxAttempts,
+		Mode:        cfg.RetryMode,
 		Backoff:     time.Duration(cfg.RetryBackoffMs) * time.Millisecond,
 	}
 }

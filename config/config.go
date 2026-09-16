@@ -8,6 +8,7 @@
 package config
 
 import (
+	_ "embed"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +17,14 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+// builtinPluginsYAML 是内建的默认插件配置（与仓库 config/plugins.yaml 同源），
+// 通过 go:embed 打进二进制 —— 裸 exe 分发时无需携带 config 目录，
+// 也能自带 Parallel Search 等 MCP 服务；用户本地 plugins.yaml 存在时
+// 按名称覆盖同名内建条目（启停/改配置）并追加新条目（见 mergePlugins）。
+//
+//go:embed plugins.yaml
+var builtinPluginsYAML []byte
 
 // ServerConfig 描述 Web 服务监听参数。
 type ServerConfig struct {
@@ -36,7 +45,11 @@ type LLMConfig struct {
 
 	// MaxAttempts 是含首次请求在内的总尝试次数（针对上游 429/5xx 等瞬时故障），默认 5。
 	MaxAttempts int `yaml:"max_attempts"`
-	// RetryBackoffMs 是首次退避间隔（毫秒），之后按 2 倍指数增长，默认 1500。
+	// RetryMode 是重试间隔模式：fixed（每次等同样的间隔）或 backoff（1×→2×→3×→6×
+	// 常用退避序列，之后封顶 6×）。空值按 backoff 处理（见 normalize）。
+	RetryMode string `yaml:"retry_mode"`
+	// RetryBackoffMs 是基础间隔（毫秒）：fixed 模式即每次等待时长；
+	// backoff 模式是序列基准（1000ms → 1s/2s/3s/6s），默认 1000。
 	RetryBackoffMs int `yaml:"retry_backoff_ms"`
 }
 
@@ -282,17 +295,58 @@ func Load(configDir string) (*Config, error) {
 		return nil, err
 	}
 
-	plugins, err := LoadPlugins(filepath.Join(configDir, "plugins.yaml"))
-	if err != nil {
+	// 插件配置：内建默认（embed 进二进制，裸 exe 自带 Parallel Search 等 MCP
+	// 服务）+ 用户本地 plugins.yaml 覆盖同名条目并追加新条目。
+	plugins := DefaultPlugins()
+	if external, err := LoadPlugins(filepath.Join(configDir, "plugins.yaml")); err != nil {
 		return nil, err
+	} else if len(external) > 0 {
+		plugins = mergePlugins(plugins, external)
 	}
-	if len(plugins) > 0 {
-		cfg.Plugins = plugins
-	}
+	cfg.Plugins = plugins
 
 	applyEnvFallback(cfg)
 	normalize(cfg)
 	return cfg, nil
+}
+
+// DefaultPlugins 返回内建的默认插件配置（解析自内嵌的 plugins.yaml）。
+// Parallel Search 默认启用（免费无 Key，充当默认联网来源），其余默认停用。
+func DefaultPlugins() []PluginConfig {
+	plugins, _ := parsePlugins(builtinPluginsYAML) // 内嵌资源，编译期已定，忽略错误
+	return plugins
+}
+
+// parsePlugins 解析 plugins.yaml 格式的插件列表（内嵌与磁盘文件共用）。
+func parsePlugins(data []byte) ([]PluginConfig, error) {
+	var wrapper struct {
+		Plugins []PluginConfig `yaml:"plugins"`
+	}
+	if err := yaml.Unmarshal(data, &wrapper); err != nil {
+		return nil, err
+	}
+	return wrapper.Plugins, nil
+}
+
+// mergePlugins 把用户条目合并进内建列表：同名条目以用户为准（可启停/改配置），
+// 内建独有的保留，用户新增的追加。名称匹配不区分大小写（与 API 判重一致）。
+func mergePlugins(builtin, user []PluginConfig) []PluginConfig {
+	out := make([]PluginConfig, 0, len(builtin)+len(user))
+	out = append(out, builtin...)
+	for _, u := range user {
+		replaced := false
+		for i := range out {
+			if strings.EqualFold(out[i].Name, u.Name) {
+				out[i] = u
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			out = append(out, u)
+		}
+	}
+	return out
 }
 
 // LoadPlugins 从 plugins.yaml 加载插件配置；文件不存在时返回空切片。
@@ -304,13 +358,11 @@ func LoadPlugins(path string) ([]PluginConfig, error) {
 		}
 		return nil, fmt.Errorf("读取插件配置失败: %w", err)
 	}
-	var wrapper struct {
-		Plugins []PluginConfig `yaml:"plugins"`
-	}
-	if err := yaml.Unmarshal(data, &wrapper); err != nil {
+	plugins, err := parsePlugins(data)
+	if err != nil {
 		return nil, fmt.Errorf("解析插件配置失败: %w", err)
 	}
-	return wrapper.Plugins, nil
+	return plugins, nil
 }
 
 // SavePlugins 把插件配置写回 plugins.yaml（0600，与 local.yaml 同级权限）。
@@ -397,6 +449,12 @@ func normalize(cfg *Config) {
 	if cfg.LLM.MaxTokens <= 0 {
 		cfg.LLM.MaxTokens = 8192
 	}
+	// 重试间隔模式只认 fixed / backoff，其余一律按 backoff（1→2→3→6 序列）。
+	mode := strings.ToLower(strings.TrimSpace(cfg.LLM.RetryMode))
+	if mode != "fixed" && mode != "backoff" {
+		mode = "backoff"
+	}
+	cfg.LLM.RetryMode = mode
 	if cfg.DataDir == "" {
 		cfg.DataDir = ".codeforge"
 	}

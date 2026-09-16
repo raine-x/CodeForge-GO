@@ -16,9 +16,10 @@ llm:
   model: "claude-sonnet-4-20250514"
   max_tokens: 8192
   temperature: 0.2
-  # 上游瞬时故障（429/500/502/503/504）自动指数退避重试；4xx 客户端错误不重试
-  max_attempts: 5          # 含首次请求在内的总尝试次数
-  retry_backoff_ms: 1500   # 首次退避间隔（毫秒），之后按 2 倍增长
+  # 上游瞬时故障（429/500/502/503/504）自动重试；4xx 客户端错误不重试
+  max_attempts: 5          # 含首次请求在内的总尝试次数（设置页可调）
+  retry_mode: "backoff"    # fixed=每次等同样间隔；backoff=1×→2×→3×→6× 常用退避序列（之后封顶 6×）
+  retry_backoff_ms: 1000   # 基础间隔（毫秒）：fixed 即每次等待时长；backoff 为序列基准（→ 1s/2s/3s/6s）
 
 agent:
   max_steps: 25            # ReAct 最大迭代步数
