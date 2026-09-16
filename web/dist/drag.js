@@ -9,6 +9,12 @@
 
   const MAX = () => Math.max(MIN, Math.floor(window.innerWidth * 0.4));
 
+  // #app 带 10px 内缩（app.css），侧栏左缘不在 x=0；clientX 减去内边距才是侧栏宽度。
+  const appPad = () => {
+    const el = document.getElementById('app');
+    return el ? (parseFloat(getComputedStyle(el).paddingLeft) || 0) : 0;
+  };
+
   let dragging = false;
 
   function setActive(on) {
@@ -17,7 +23,7 @@
   }
 
   function moveTo(clientX) {
-    const w = Math.max(MIN, Math.min(clientX, MAX()));
+    const w = Math.max(MIN, Math.min(clientX - appPad(), MAX()));
     sidebar.style.width = w + 'px';
   }
 

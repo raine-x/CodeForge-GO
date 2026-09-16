@@ -101,10 +101,11 @@ func (d *wasmDriver) Tools(ctx context.Context) ([]tools.Tool, error) {
 			schema = genericSchema()
 		}
 		out = append(out, &RemoteTool{
-			name:     t.Name,
-			desc:     t.Description,
-			schema:   schema,
-			invokeFn: d.invoke,
+			name:       t.Name,
+			remoteName: t.Name,
+			desc:       t.Description,
+			schema:     schema,
+			invokeFn:   d.invoke,
 		})
 	}
 	return out, nil
@@ -116,10 +117,11 @@ func (d *wasmDriver) singleTool() *RemoteTool {
 		desc = "WASM 沙盒插件：" + d.cfg.Name
 	}
 	return &RemoteTool{
-		name:     d.cfg.Name,
-		desc:     desc,
-		schema:   genericSchema(),
-		invokeFn: d.invoke,
+		name:       d.cfg.Name,
+		remoteName: d.cfg.Name,
+		desc:       desc,
+		schema:     genericSchema(),
+		invokeFn:   d.invoke,
 	}
 }
 

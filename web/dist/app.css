@@ -26,7 +26,12 @@ html, body {
 }
 
 /* ---------- 左右分栏：左栏可拖拽调宽，右栏占满剩余 ---------- */
-#app { display: flex; height: 100vh; overflow: hidden; }
+/* 两块面板略微内缩 + 弧边：窗口边缘与分栏接缝都带圆角，呈两张并排的卡片 */
+#app {
+  display: flex; height: 100vh; overflow: hidden;
+  background: var(--bg-elev-2);  /* 内缩留白处的底色，衬出面板的弧边 */
+  padding: 6px;
+}
 
 #sidebar {
   flex: 0 0 auto;              /* 不随 flex 伸缩，宽度由 JS 控制 */
@@ -34,7 +39,8 @@ html, body {
   min-width: 200px;            /* 左边最窄值 */
   max-width: 40vw;             /* 最大值 4:6（左最多 40%） */
   background: var(--bg-elev);
-  border-right: 1px solid var(--border);
+  border: 1px solid var(--border);
+  border-radius: 12px;         /* 略微弧边：分栏接缝侧也一样圆 */
   display: flex;
   flex-direction: column;
   padding: 14px 12px;
@@ -659,6 +665,21 @@ html, body {
 .mf-test-result.ok { color: var(--ok); }
 .mf-test-result.fail { color: var(--danger); }
 
+/* 设置 → MCP 服务：上方分栏切换（已注册服务 / 添加服务） */
+.mcp-tabs { display: flex; gap: 8px; margin: 0 0 14px; }
+.mcp-tab {
+  flex: 1; padding: 9px 12px; font-size: 13px; font-weight: 600;
+  font-family: inherit; cursor: pointer;
+  background: var(--bg-elev); color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 9px;
+}
+.mcp-tab:hover { border-color: var(--text-dim); color: var(--text); }
+.mcp-tab.active {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+.mcp-pane { display: none; }
+.mcp-pane.active { display: block; }
+
 /* 模型 id + 「获取模型列表」按钮同行 */
 .id-row { display: flex; gap: 8px; align-items: center; }
 .id-row input { flex: 1; min-width: 0; }
@@ -773,6 +794,9 @@ body.resizing { cursor: col-resize; user-select: none; }
   display: flex;
   flex-direction: column;
   background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;         /* 与左栏同弧度：接缝两侧对称圆角 */
+  overflow: hidden;            /* 圆角裁掉消息流/输入框的直角溢出 */
 }
 
 /* ---------- 对话面板 ---------- */
@@ -938,13 +962,25 @@ body.resizing { cursor: col-resize; user-select: none; }
 }
 .msg-tool:hover { background: var(--bg-elev-2); color: var(--text); }
 /* 自动重试提示：样式同工具条目，文字用警示色；点击展开错误原因 */
-.msg-tool.retry { color: #b45309; }
+.msg-tool.retry { color: #b45309; cursor: pointer; }
 .msg-tool.retry:hover { background: var(--bg-elev-2); color: #92400e; }
+/* 「详情」小标签：让「可点击展开」这件事本身可见（原先只有悬停才猜得到） */
+.retry-more {
+  margin-left: 6px;
+  font-size: 11px;
+  padding: 0 5px;
+  border-radius: 5px;
+  border: 1px solid currentColor;
+  opacity: .65;
+  white-space: nowrap;
+}
+.msg-tool.retry:hover .retry-more { opacity: 1; }
 .retry-reason {
   display: none;              /* 默认隐藏，点击展开 */
   color: var(--text);
   margin-left: 6px;
   font-size: 12px;
+  word-break: break-all;
 }
 .retry-reason.show { display: inline; }
 /* 编辑类工具的行数统计：绿增红减 */

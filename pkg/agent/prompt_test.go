@@ -87,6 +87,12 @@ func TestSystemPromptLeaksNoToolIDs(t *testing.T) {
 	if !strings.Contains(p, "中文功能名") {
 		t.Error("应保留「对用户用中文功能名」的沟通纪律")
 	}
+	// 全覆盖纪律必须还在：只覆盖「描述动作 / 被问能力」两种场景是不够的 ——
+	// 实测模型会在计划、步骤说明里复述工具名（"我该调用 xxx"）。
+	// 这条断言钉住「凡用户能看到的文字都不得出现工具 ID」这句，防止以后精简提示词时被删掉。
+	if !strings.Contains(p, "都不得出现任何工具 ID") {
+		t.Error("应保留「凡用户能看到的文字都不得出现工具 ID」的全覆盖披露纪律")
+	}
 	// 联网小节标题用中文功能名
 	if !strings.Contains(p, "## 联网（读取网页 / 搜索网页）") {
 		t.Error("联网小节标题应为中文功能名")

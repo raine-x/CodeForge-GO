@@ -88,7 +88,7 @@ type PluginSecurityPolicy struct {
 // PluginConfig 描述一个插件的加载配置。
 type PluginConfig struct {
 	Name           string               `yaml:"name"`
-	Type           string               `yaml:"type"` // mcp | http | wasm | native
+	Type           string               `yaml:"type"` // mcp | mcp-http | http | wasm | native
 	Enabled        bool                 `yaml:"enabled"`
 	Description    string               `yaml:"description"`
 	Command        string               `yaml:"command"`

@@ -33,18 +33,20 @@ const (
 
 // Event 是 Agent 推送给前端的统一事件。
 type Event struct {
-	Type       string            `json:"type"`
-	Step       int               `json:"step,omitempty"`
-	Text       string            `json:"text,omitempty"`
-	ToolCallID string            `json:"tool_call_id,omitempty"`
-	ToolName   string            `json:"tool_name,omitempty"`
-	ToolInput  json.RawMessage   `json:"tool_input,omitempty"`
-	Decision   string            `json:"decision,omitempty"`
-	Reason     string            `json:"reason,omitempty"`
-	Result     *tools.ToolResult `json:"result,omitempty"`
-	Error      string            `json:"error,omitempty"`
-	DiffStats  *DiffStats        `json:"diff_stats,omitempty"` // 编辑类工具的 +/- 行数（供前端绿增红减展示）
-	Compress   *CompressInfo     `json:"compress,omitempty"`   // 上下文压缩明细（仅 EventCompress 携带）
+	Type        string            `json:"type"`
+	Step        int               `json:"step,omitempty"`
+	Text        string            `json:"text,omitempty"`
+	ToolCallID  string            `json:"tool_call_id,omitempty"`
+	ToolName    string            `json:"tool_name,omitempty"`
+	ToolInput   json.RawMessage   `json:"tool_input,omitempty"`
+	Decision    string            `json:"decision,omitempty"`
+	Reason      string            `json:"reason,omitempty"`
+	Result      *tools.ToolResult `json:"result,omitempty"`
+	Error       string            `json:"error,omitempty"`
+	Attempt     int               `json:"attempt,omitempty"`      // 重试类事件：即将进行的第几次尝试（1-based）
+	MaxAttempts int               `json:"max_attempts,omitempty"` // 重试类事件：含首次请求在内的总尝试次数
+	DiffStats   *DiffStats        `json:"diff_stats,omitempty"`   // 编辑类工具的 +/- 行数（供前端绿增红减展示）
+	Compress    *CompressInfo     `json:"compress,omitempty"`     // 上下文压缩明细（仅 EventCompress 携带）
 }
 
 // DiffStats 是一次文件编辑的行数统计。
@@ -493,8 +495,10 @@ func (a *Agent) runLoopWithPersistence(ctx context.Context, sess *Session, emit 
 		}
 
 		// 注入重试通知：上游瞬时故障自动重试时，向前端透出「请求失败，正在重试…」。
-		hookCtx := llm.WithRetryHook(ctx, func(attempt int, reason string) {
-			emit(Event{Type: EventRetry, Error: reason})
+		// 连「第几次 / 共几次」一起带上 —— 只给一句笼统的「正在重试」，用户无法判断
+		// 是偶发抖动还是上游持续故障（实测 429 会连撞满 5 次，界面上必须看得出进度）。
+		hookCtx := llm.WithRetryHook(ctx, func(attempt, maxAttempts int, reason string) {
+			emit(Event{Type: EventRetry, Error: reason, Attempt: attempt, MaxAttempts: maxAttempts})
 		})
 
 		stream, err := a.provider.Stream(hookCtx, req)

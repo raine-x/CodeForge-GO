@@ -303,33 +303,49 @@
 
         <section id="page-mcp" class="settings-page">
           <h2>MCP 服务</h2>
+          <!-- 上方分栏切换：已注册服务（查看/启停/删除）｜ 添加服务（新增表单） -->
+          <div class="mcp-tabs" role="tablist">
+            <button type="button" class="mcp-tab active" data-pane="mcp-pane-list" role="tab">已注册服务</button>
+            <button type="button" class="mcp-tab" data-pane="mcp-pane-add" role="tab">添加服务</button>
+          </div>
           <div class="settings-card">
-            <!-- 新增表单置顶：始终最先可见 -->
-            <div class="row">
-              <div class="row-main">
-                <div class="row-title">新增 MCP 服务</div>
-                <div class="row-desc">通过 stdio JSON-RPC 连接外部 MCP Server（如 npx 启动的官方服务）；启用立即热加载，配置持久化到 config/plugins.yaml</div>
+            <!-- 面板：已注册服务 -->
+            <div id="mcp-pane-list" class="mcp-pane active">
+              <div class="row">
+                <div class="row-main">
+                  <div class="row-title">已安装</div>
+                  <div class="row-desc">MCP（stdio）/ 远程 MCP（Streamable HTTP）/ HTTP / WASM 插件统一在此查看与管理</div>
+                </div>
+              </div>
+              <div id="mcp-items"></div>
+            </div>
+            <!-- 面板：添加服务 -->
+            <div id="mcp-pane-add" class="mcp-pane">
+              <div class="row">
+                <div class="row-main">
+                  <div class="row-title">新增 MCP 服务</div>
+                  <div class="row-desc">本地（stdio，命令启动，如 npx 的官方服务）或远程（Streamable HTTP，填 URL 端点，如 Parallel Search / Exa）；启用立即热加载，配置持久化到 config/plugins.yaml</div>
+                </div>
+              </div>
+              <div class="form-grid">
+                <label class="f-field"><span>名称</span><input id="mcp-f-name" type="text" placeholder="如 filesystem / parallel_search"></label>
+                <label class="f-field"><span>类型</span>
+                  <select id="mcp-f-type">
+                    <option value="mcp">本地（stdio · 命令启动）</option>
+                    <option value="mcp-http">远程（Streamable HTTP · URL 端点）</option>
+                  </select>
+                </label>
+                <label class="f-field" id="mcp-f-cmd-field"><span>启动命令</span><input id="mcp-f-cmd" type="text" placeholder="如 npx / python"></label>
+                <label class="f-field" id="mcp-f-args-field"><span>参数</span><input id="mcp-f-args" type="text" placeholder="空格分隔，如 -y @modelcontextprotocol/server-filesystem C:\path"></label>
+                <label class="f-field hidden" id="mcp-f-endpoint-field"><span>端点 URL</span><input id="mcp-f-endpoint" type="text" placeholder="如 https://search.parallel.ai/mcp"></label>
+                <label class="f-field" id="mcp-f-env-field"><span>环境变量</span><input id="mcp-f-env" type="text" placeholder="可选，KEY=VALUE 空格分隔"></label>
+                <label class="f-field"><span>描述</span><input id="mcp-f-desc" type="text" placeholder="可选"></label>
+              </div>
+              <div class="mf-actions">
+                <span id="mcp-f-result" class="mf-test-result"></span>
+                <button type="button" id="mcp-f-add" class="primary">＋ 新建 MCP 服务器</button>
               </div>
             </div>
-            <div class="form-grid">
-              <label class="f-field"><span>名称</span><input id="mcp-f-name" type="text" placeholder="如 filesystem"></label>
-              <label class="f-field"><span>启动命令</span><input id="mcp-f-cmd" type="text" placeholder="如 npx / python"></label>
-              <label class="f-field"><span>参数</span><input id="mcp-f-args" type="text" placeholder="空格分隔，如 -y @modelcontextprotocol/server-filesystem C:\path"></label>
-              <label class="f-field"><span>环境变量</span><input id="mcp-f-env" type="text" placeholder="可选，KEY=VALUE 空格分隔"></label>
-              <label class="f-field"><span>描述</span><input id="mcp-f-desc" type="text" placeholder="可选"></label>
-            </div>
-            <div class="mf-actions">
-              <span id="mcp-f-result" class="mf-test-result"></span>
-              <button type="button" id="mcp-f-add" class="primary">＋ 新建 MCP 服务器</button>
-            </div>
-
-            <div class="row" style="margin-top:16px; padding-top:14px; border-top:1px solid var(--border)">
-              <div class="row-main">
-                <div class="row-title">已安装</div>
-                <div class="row-desc">MCP（stdio）/ HTTP / WASM 插件统一在此查看与管理</div>
-              </div>
-            </div>
-            <div id="mcp-items"></div>
           </div>
         </section>
 

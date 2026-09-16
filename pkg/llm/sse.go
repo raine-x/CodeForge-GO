@@ -35,8 +35,8 @@ var transientStatus = map[int]bool{
 func IsTransientStatus(code int) bool { return transientStatus[code] }
 
 // RetryHook 在每次自动重试前被调用，用于向前端透出「正在重试」与原因。
-// attempt 是即将进行的第几次尝试（1-based）。
-type RetryHook func(attempt int, reason string)
+// attempt 是即将进行的第几次尝试（1-based），maxAttempts 是含首次请求在内的总尝试次数。
+type RetryHook func(attempt, maxAttempts int, reason string)
 
 type retryHookCtxKey struct{}
 
@@ -134,7 +134,7 @@ func postJSON(
 			if attempt < policy.MaxAttempts {
 				log.Printf("[llm] 请求异常，准备第 %d 次重试: %v", attempt+1, err)
 				if hook := retryHookFrom(ctx); hook != nil {
-					hook(attempt+1, lastErr.Error())
+					hook(attempt+1, policy.MaxAttempts, lastErr.Error())
 				}
 			}
 			continue
@@ -157,7 +157,7 @@ func postJSON(
 			delay = retryAfter
 		}
 		if hook := retryHookFrom(ctx); hook != nil {
-			hook(attempt+1, apiErr.Error())
+			hook(attempt+1, policy.MaxAttempts, apiErr.Error())
 		}
 		log.Printf("[llm] 上游返回 %d，第 %d/%d 次尝试，%.1fs 后重试",
 			resp.StatusCode, attempt, policy.MaxAttempts, delay.Seconds())

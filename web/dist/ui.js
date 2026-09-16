@@ -36,6 +36,12 @@
     document.querySelectorAll('.popup').forEach(function (p) {
       if (p !== except) hideWithAnim(p);
     });
+    // 关闭弹层时若正处于滑块拖动中（Esc / 点击外部），复位拖动状态，
+    // 否则下次 pointerup 会误吸附一次档位。
+    if (slider && slider.classList.contains('dragging')) {
+      slider.classList.remove('dragging');
+      dragRatio = null;
+    }
   }
 
   // 点击空白处关闭全部弹层
@@ -298,7 +304,12 @@
 
   // ---------- 思考强度滑条（按上游分级动态构建） ----------
   let slider = null;
+  let dragRatio = null; // 拖动中的连续位置（线性跟随）；模块级供 closeAllPops 复位
+  // document 级拖动监听的清理句柄：buildSlider 每次重建时先移除旧监听，
+  // 避免模型切换等重建场景下重复挂载、旧闭包误触发。
+  let detachSliderDrag = null;
   function buildSlider() {
+    if (detachSliderDrag) { detachSliderDrag(); detachSliderDrag = null; }
     const spec = thinkingSpec || { mode: 'none' };
     if (spec.mode === 'none') {
       levelList.innerHTML = '<div class="pop-tip">当前模型不支持思考强度</div>';
@@ -391,7 +402,7 @@
       }
       return { v: v, ratio: ratio };
     }
-    let dragRatio = null; // 拖动中的连续位置（线性跟随）
+    dragRatio = null; // 拖动中的连续位置（线性跟随）
     // 拖动预览：滑块线性跟随 + 实时变色（保持槽内）
     function previewAt(ratio) {
       const color = intensityColor(ratio);
@@ -405,7 +416,8 @@
     }
     slider.addEventListener('pointerdown', function (e) {
       e.preventDefault();
-      // 命中刻度点：直接跳档（preventDefault 会拦截 click，须在此处理）
+      // 命中刻度点：先跳档，再进入拖动（不再 return —— 否则按在刻度点上会拖不动：
+      // 既没 setPointerCapture 也没 dragging，按下后移动鼠标无响应，须移走重按才恢复）
       const dot = e.target.closest ? e.target.closest('.fs-dot') : null;
       if (dot) {
         const i = Number(dot.dataset.i);
@@ -418,8 +430,9 @@
         saveThinking();
         syncLevelUI();
         renderModelBtn();
-        return;
       }
+      // 无论命中刻度点与否都进入拖动：指针捕获失败时（指针移出弹层/元素被替换），
+      // 全局 pointermove/pointerup 仍能收到事件，拖动不中断。
       try { slider.setPointerCapture(e.pointerId); } catch (_) { /* 合成事件/指针已释放时忽略 */ }
       slider.classList.add('dragging');
       const hit = nearestValue(e.clientX);
@@ -427,14 +440,26 @@
       previewAt(dragRatio); // 线性跟随，不吸附
       tip.textContent = hit.v === thinkingVal ? thinkingLabel() : previewLabel(hit.v);
     });
-    slider.addEventListener('pointermove', function (e) {
+    // 拖动中的 pointermove / pointerup / pointercancel 挂在 document：
+    // slider 的 setPointerCapture 可能失败（指针移出弹层、元素重建等），此时事件
+    // 按指针所在元素派发，绑在 slider 上会收不到 → 表现为「拖一下卡住，移走重按才好」。
+    // document 级监听无论指针在哪都能收到（拖动不要求指针始终在滑块内）。
+    document.addEventListener('pointermove', onSliderMove);
+    document.addEventListener('pointerup', onSliderUp);
+    document.addEventListener('pointercancel', onSliderCancel);
+    detachSliderDrag = function () {
+      document.removeEventListener('pointermove', onSliderMove);
+      document.removeEventListener('pointerup', onSliderUp);
+      document.removeEventListener('pointercancel', onSliderCancel);
+    };
+    function onSliderMove(e) {
       if (!slider.classList.contains('dragging')) return;
       const hit = nearestValue(e.clientX);
       dragRatio = hit.ratio;
       previewAt(dragRatio);
       tip.textContent = previewLabel(hit.v);
-    });
-    slider.addEventListener('pointerup', function (e) {
+    }
+    function onSliderUp(e) {
       if (!slider.classList.contains('dragging')) return;
       slider.classList.remove('dragging');
       dragRatio = null;
@@ -444,12 +469,12 @@
       saveThinking();
       syncLevelUI();
       renderModelBtn();
-    });
-    slider.addEventListener('pointercancel', function () {
+    }
+    function onSliderCancel() {
       slider.classList.remove('dragging');
       dragRatio = null;
       syncLevelUI();
-    });
+    }
   }
   function syncLevelUI() {} // spec 加载后由 buildSlider 覆盖
   modelBtn.addEventListener('click', function (e) {
@@ -722,12 +747,15 @@
     delegate_subagents: 'Multi-Agent 插件',
   };
   function toolPhrase(name) {
-    return toolPhrases[name] || ('调用 ' + name);
+    // 与 toolLabel 同一套规则：插件工具（插件名.工具名）按去前缀的本名查表，
+    // 兜底也只给中文描述 —— 任何情况下都不把工具 ID 显示给用户。
+    const local = name.indexOf('.') > 0 ? name.slice(name.indexOf('.') + 1) : name;
+    return toolPhrases[name] || toolPhrases[local] || '外部能力';
   }
 
   // 工具卡片文案：中文短语 + 目标（文件名 / 命令）。
   // 只取路径最后一段，避免长路径把卡片撑宽；完整参数仍在 title 悬浮提示里。
-  // 未识别的工具回退成「调用了 <name>」，新增内置工具或插件工具时不会显示空白。
+  // ⚠️ 未识别的工具**绝不显示工具 ID**（那是系统内部标识），只给中文兜底文案。
   function toolLabel(name, input) {
     let arg = '';
     if (input && typeof input === 'object') {
@@ -743,7 +771,14 @@
     const named = base.length > 60 ? base.slice(0, 60) + '…' : base;
     const shown = arg.length > 80 ? arg.slice(0, 80) + '…' : arg;
 
-    switch (name) {
+    // 插件工具名形如「插件名.工具名」（如 parallel_search.web_search）：
+    // 按去前缀后的本名匹配文案，否则默认分支会把生硬的限定名直接摊给用户。
+    let local = name.indexOf('.') > 0 ? name.slice(name.indexOf('.') + 1) : name;
+    // 同族工具用前缀匹配：Exa 给的是 web_search_exa / web_fetch_exa，
+    // 精确匹配会落到默认分支、把工具 ID 显示给用户。
+    if (local.indexOf('web_search') === 0) local = 'web_search';
+    else if (local.indexOf('web_fetch') === 0) local = 'web_fetch';
+    switch (local) {
       case 'read_file':    return named ? '读取了文件 ' + named : '读取了文件';
       case 'list_dir':     return '查看项目';
       case 'search_files': return '搜索项目';
@@ -764,16 +799,28 @@
       case 'save_memory': return '保存了记忆';
       case 'todo_write':  return '更新了任务清单';
       case 'web_fetch': {
-        const shown = (input && typeof input === 'object' && input.url) ? String(input.url) : '';
+        // 内置 web_fetch 用 {url}；远程 MCP（Parallel）用 {urls:[…]}，两者都取首个地址
+        let shown = '';
+        if (input && typeof input === 'object') {
+          if (input.url) shown = String(input.url);
+          else if (Array.isArray(input.urls) && input.urls.length) shown = String(input.urls[0]);
+        }
         const sliced = shown.length > 80 ? shown.slice(0, 80) + '…' : shown;
         return sliced ? '读取了网页 ' + sliced : '读取了网页';
       }
       case 'web_search': {
-        const shown = (input && typeof input === 'object' && input.query) ? String(input.query) : '';
+        // 内置 web_search 用 {query}；远程 MCP（Parallel）用 {objective, search_queries}
+        let shown = '';
+        if (input && typeof input === 'object') {
+          if (input.query) shown = String(input.query);
+          else if (input.objective) shown = String(input.objective);
+          else if (Array.isArray(input.search_queries) && input.search_queries.length) shown = String(input.search_queries[0]);
+        }
         const sliced = shown.length > 60 ? shown.slice(0, 60) + '…' : shown;
         return sliced ? '搜索了 ' + sliced : '搜索了网页';
       }
-      default:             return '调用了 ' + name;
+      // 兜底也不能吐工具 ID：工具名是系统内部标识，界面上只给中文能力描述
+      default:             return '调用了外部能力';
     }
   }
 
@@ -868,25 +915,66 @@
     subagentCards.clear();
   }
 
-  // 上游瞬时故障自动重试提示：样式同「编辑文件」类文字条目，点击展开/收起错误原因。
+  // 把后端原始错误串压成一句人话：用户第一眼要的是「为什么失败」，不是 HTTP 报文。
+  // 例：'LLM 请求失败 (429): {"error":{"code":"1305","message":"该模型当前访问量过大，请您稍后再试"}}'
+  //     → '上游限流：该模型当前访问量过大，请您稍后再试'
+  function retryReasonBrief(reason) {
+    const s = String(reason == null ? '' : reason).trim();
+    if (!s) return '未知原因';
+    let brief;
+    const m = s.match(/\((\d{3})\)/);
+    if (m) {
+      const code = Number(m[1]);
+      if (code === 429) brief = '上游限流';
+      else if (code === 503) brief = '上游过载';
+      else if (code === 502 || code === 504) brief = '上游网关异常';
+      else if (code >= 500) brief = '上游服务异常';
+      else if (code >= 400) brief = '请求被上游拒绝';
+      else brief = '上游返回 ' + code;
+    } else if (/timeout|timed out|超时/i.test(s)) {
+      brief = '请求超时';
+    } else if (/EOF|connection reset|refused|no such host|Bad Gateway|dial tcp/i.test(s)) {
+      brief = '网络连接异常';
+    } else {
+      brief = '网络异常';
+    }
+    // 上游错误体里常带一句现成的人话（如「该模型当前访问量过大，请您稍后再试」），尽量带出来
+    const msg = s.match(/"message"\s*:\s*"([^"\\]{1,80})"/);
+    return msg ? brief + '：' + msg[1] : brief;
+  }
+
+  // 上游瞬时故障自动重试提示：样式同「编辑文件」类文字条目，点击展开/收起完整错误原因。
   let retryEl = null;
-  function addRetry(reason) {
+  function addRetry(reason, attempt, maxAttempts) {
+    const brief = retryReasonBrief(reason);
+    // 次数信息直接写进主文案：只给一句笼统的「正在重试」，用户分不清偶发抖动与持续故障
+    const times = attempt > 0
+      ? '（第 ' + attempt + (maxAttempts > 0 ? '/' + maxAttempts : '') + ' 次 · ' + brief + '）'
+      : '（' + brief + '）';
     if (!retryEl) {
       retryEl = document.createElement('div');
       retryEl.className = 'msg-tool retry';
+      retryEl.title = '点击展开/收起完整错误信息';
       const label = document.createElement('span');
-      label.textContent = '请求失败，正在重试…';
+      label.className = 'retry-label';
+      const more = document.createElement('span');
+      more.className = 'retry-more';
+      more.textContent = '详情';
       const detail = document.createElement('span');
       detail.className = 'retry-reason';
       retryEl.appendChild(label);
+      retryEl.appendChild(more);
       retryEl.appendChild(detail);
-      // 点击切换显示/隐藏错误原因
+      // 点击切换显示/隐藏完整错误原因
       retryEl.addEventListener('click', function () {
         detail.classList.toggle('show');
+        more.textContent = detail.classList.contains('show') ? '收起' : '详情';
       });
       ensureCol().appendChild(retryEl);
       scrollBottom();
     }
+    // 主文案每轮重试都刷新（次数与原因都会变），完整原因留给点击展开
+    retryEl.querySelector('.retry-label').textContent = '请求失败，正在重试…' + times;
     retryEl.querySelector('.retry-reason').textContent = '原因：' + (reason || '未知错误');
   }
   function removeRetry() {
@@ -2118,13 +2206,13 @@
   }
 
   // ---------- MCP 入口（仅查看；新增/启停/删除在 设置 → MCP 服务） ----------
-  // 只展示 type=mcp 且已启用的插件（plugins.yaml 里的示例模板 enabled=false 不显示）。
+  // 展示 type=mcp（stdio）与 type=mcp-http（远程 Streamable HTTP）且已启用的插件。
   function renderMcpList() {
     const list = document.getElementById('mcp-list');
     list.innerHTML = '';
     fetch('/api/plugins').then(function (r) { return r.json(); }).then(function (d) {
       const items = (d.items || []).filter(function (p) {
-        return p.type === 'mcp' && p.configured;
+        return (p.type === 'mcp' || p.type === 'mcp-http') && p.configured;
       });
       if (!items.length) {
         list.innerHTML = '<li class="mcp-empty" style="cursor:default">尚未添加，见 设置 → MCP 服务</li>';
@@ -2136,10 +2224,11 @@
         const dot = document.createElement('span');
         dot.className = 'dot';
         dot.title = p.enabled ? '运行中'
-          : '已启用，但进程未运行（加载失败：请到 设置 → MCP 服务 检查启动命令）';
+          : '已启用，但连接未建立（加载失败：请到 设置 → MCP 服务 检查端点/启动命令）';
         const nm = document.createElement('span');
         nm.textContent = p.name + (p.enabled ? '' : '（加载失败）');
-        nm.title = (p.description || p.name) + (p.command ? '：' + p.command + ' ' + (p.args || []).join(' ') : '') +
+        nm.title = (p.description || p.name) +
+          (p.endpoint ? '：' + p.endpoint : (p.command ? '：' + p.command + ' ' + (p.args || []).join(' ') : '')) +
           (p.enabled ? '（运行中）' : '（已启用但加载失败）');
         li.appendChild(dot);
         li.appendChild(nm);
@@ -2175,7 +2264,7 @@
       const items = d.items || [];
       box.innerHTML = '';
       if (!items.length) {
-        box.innerHTML = '<div class="mi-empty">还没有插件，用下方表单添加一个 MCP 服务</div>';
+        box.innerHTML = '<div class="mi-empty">还没有 MCP 服务，切到「添加服务」新建一个</div>';
         return;
       }
       items.forEach(function (p) {
@@ -2226,14 +2315,42 @@
     });
   }
   // 新增表单
+  // 类型切换：stdio 要「启动命令 + 参数 + 环境变量」，远程只要「端点 URL」。
+  // 用 .hidden 类而非 hidden 属性——.f-field 是 display:flex，属性会被样式覆盖。
+  const mcpTypeSel = document.getElementById('mcp-f-type');
+  function syncMcpFormByType() {
+    const remote = mcpTypeSel && mcpTypeSel.value === 'mcp-http';
+    function toggle(id, show) {
+      const el = document.getElementById(id);
+      if (el) el.classList.toggle('hidden', !show);
+    }
+    toggle('mcp-f-cmd-field', !remote);
+    toggle('mcp-f-args-field', !remote);
+    toggle('mcp-f-env-field', !remote);
+    toggle('mcp-f-endpoint-field', remote);
+  }
+  if (mcpTypeSel) {
+    mcpTypeSel.addEventListener('change', syncMcpFormByType);
+    syncMcpFormByType();
+  }
   document.getElementById('mcp-f-add').addEventListener('click', function () {
     const result = document.getElementById('mcp-f-result');
+    function fail(msg) { result.className = 'mf-test-result fail'; result.textContent = msg; }
     const name = document.getElementById('mcp-f-name').value.trim();
+    const type = mcpTypeSel ? mcpTypeSel.value : 'mcp';
+    const remote = type === 'mcp-http';
     const cmd = document.getElementById('mcp-f-cmd').value.trim();
+    const endpoint = document.getElementById('mcp-f-endpoint').value.trim();
     const args = document.getElementById('mcp-f-args').value.trim();
     const envRaw = document.getElementById('mcp-f-env').value.trim();
     const desc = document.getElementById('mcp-f-desc').value.trim();
-    if (!name || !cmd) { result.className = 'mf-test-result fail'; result.textContent = '名称和启动命令不能为空'; return; }
+    if (!name) { fail('名称不能为空'); return; }
+    // 校验与服务端同源（handlePlugins POST），前端先拦一遍给出即时反馈
+    if (remote) {
+      if (!/^https?:\/\/\S+$/i.test(endpoint)) { fail('端点必须是以 http:// 或 https:// 开头的完整 URL'); return; }
+    } else if (!cmd) {
+      fail('本地（stdio）类型必须填写启动命令'); return;
+    }
     const env = {};
     envRaw.split(/\s+/).forEach(function (kv) {
       const i = kv.indexOf('=');
@@ -2243,11 +2360,18 @@
     result.textContent = '添加中…';
     fetch('/api/plugins', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: name, command: cmd, args: args ? args.split(/\s+/) : [], description: desc || 'MCP 服务', env: env })
+      body: JSON.stringify({
+        name: name, type: type,
+        command: cmd, endpoint: endpoint,
+        args: args ? args.split(/\s+/) : [],
+        description: desc || (remote ? '远程 MCP 服务' : 'MCP 服务'),
+        env: env
+      })
     }).then(function (r) { return r.json(); }).then(function (d) {
       if (d.ok) {
         document.getElementById('mcp-f-name').value = '';
         document.getElementById('mcp-f-cmd').value = '';
+        document.getElementById('mcp-f-endpoint').value = '';
         document.getElementById('mcp-f-args').value = '';
         document.getElementById('mcp-f-env').value = '';
         document.getElementById('mcp-f-desc').value = '';
@@ -2255,12 +2379,29 @@
         result.textContent = d.warning || '已添加并热加载';
         renderMcpSettings();
         renderMcpList();
+        // 添加成功后跳回「已注册服务」，新条目就在列表顶部
+        setMcpPane('mcp-pane-list');
       } else {
-        result.className = 'mf-test-result fail';
-        result.textContent = d.error || '添加失败';
+        fail(d.error || '添加失败');
       }
     });
   });
+  // 分栏切换：已注册服务 / 添加服务。切到列表时刷新一次（停用/删除后状态可能已过期）。
+  function setMcpPane(paneId) {
+    const page = document.getElementById('page-mcp');
+    if (!page) return;
+    page.querySelectorAll('.mcp-tab').forEach(function (t) {
+      t.classList.toggle('active', t.dataset.pane === paneId);
+    });
+    page.querySelectorAll('.mcp-pane').forEach(function (p) {
+      p.classList.toggle('active', p.id === paneId);
+    });
+    if (paneId === 'mcp-pane-list') renderMcpSettings();
+  }
+  document.querySelectorAll('#page-mcp .mcp-tab').forEach(function (t) {
+    t.addEventListener('click', function () { setMcpPane(t.dataset.pane); });
+  });
+
   // 进入设置 MCP 页时刷新（绑定放在 settingsOverlay 声明之后，见下方设置区）
 
   // ---------- 左侧对话导航条（贴分栏拖动条，以它为中心竖向扩展） ----------
@@ -2475,7 +2616,7 @@
         case 'retry':
           if (runAway()) break; // 后台会话的重试提示不画进当前视图
           removeThinking();
-          addRetry(ev.error || '');
+          addRetry(ev.error || '', Number(ev.attempt) || 0, Number(ev.max_attempts) || 0);
           break;
         case 'compress':
           // 上下文越过压缩线，服务端已自动压缩。这一段是「无声发生」的关键动作，

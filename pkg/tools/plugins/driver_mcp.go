@@ -195,9 +195,10 @@ func (d *mcpDriver) Tools(ctx context.Context) ([]tools.Tool, error) {
 			schema = genericSchema()
 		}
 		out = append(out, &RemoteTool{
-			name:   t.Name,
-			desc:   t.Description,
-			schema: schema,
+			name:       t.Name,
+			remoteName: t.Name,
+			desc:       t.Description,
+			schema:     schema,
 			invokeFn: func(ctx context.Context, callName string, args json.RawMessage) (*tools.ToolResult, error) {
 				return d.callTool(ctx, callName, args)
 			},

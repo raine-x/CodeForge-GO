@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -514,7 +515,8 @@ func (s *Server) pluginsPath() string {
 }
 
 // handlePlugins MCP/插件管理：列表 / 添加（热加载）/ 启停 / 删除。
-// 侧栏 MCP 入口只展示 type=mcp 的条目；列表接口仍返回全部类型。
+// 侧栏 MCP 入口只展示 type=mcp（stdio）与 mcp-http（远程 Streamable HTTP）的条目；
+// 列表接口仍返回全部类型（含 endpoint，供前端展示远程端点）。
 func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -538,6 +540,8 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
 				"type":        p.Type,
 				"command":     p.Command,
 				"args":        p.Args,
+				"endpoint":    p.Endpoint,
+				"path":        p.Path,
 				"enabled":     p.Enabled && isLoaded,
 				"configured":  p.Enabled,
 			})
@@ -545,11 +549,14 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"items": out})
 
 	case http.MethodPost:
-		// 添加一个 MCP 插件：{"name","command","args","description","env"}，默认启用。
+		// 添加一个 MCP 插件：stdio（type=mcp，需启动命令）或远程 Streamable HTTP
+		// （type=mcp-http，需 http/https 绝对 URL 端点），默认启用。
 		var body struct {
 			Name        string            `json:"name"`
+			Type        string            `json:"type"`
 			Command     string            `json:"command"`
 			Args        []string          `json:"args"`
+			Endpoint    string            `json:"endpoint"`
 			Description string            `json:"description"`
 			Env         map[string]string `json:"env"`
 		}
@@ -558,9 +565,29 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		body.Name = strings.TrimSpace(body.Name)
+		body.Type = strings.TrimSpace(body.Type)
+		if body.Type == "" {
+			body.Type = "mcp" // 兼容旧前端：不传类型即 stdio
+		}
 		body.Command = strings.TrimSpace(body.Command)
-		if body.Name == "" || body.Command == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "名称和启动命令不能为空"})
+		body.Endpoint = strings.TrimSpace(body.Endpoint)
+		if body.Name == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "名称不能为空"})
+			return
+		}
+		switch body.Type {
+		case "mcp":
+			if body.Command == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "stdio 类型必须填写启动命令"})
+				return
+			}
+		case "mcp-http":
+			if err := validateMCPEndpoint(body.Endpoint); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "不支持的类型: " + body.Type + "（可选 mcp / mcp-http）"})
 			return
 		}
 		// 名称唯一性：与现有条目（无论启用与否）判重
@@ -570,13 +597,18 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		desc := strings.TrimSpace(body.Description)
+		if desc == "" {
+			desc = "MCP 服务"
+		}
 		p := config.PluginConfig{
 			Name:        body.Name,
-			Type:        "mcp",
+			Type:        body.Type,
 			Enabled:     true,
-			Description: strings.TrimSpace(body.Description),
+			Description: desc,
 			Command:     body.Command,
 			Args:        body.Args,
+			Endpoint:    body.Endpoint,
 			Env:         body.Env,
 		}
 		if err := s.savePlugin(p); err != nil {
@@ -647,6 +679,25 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+// validateMCPEndpoint 校验远程 MCP（Streamable HTTP）端点：必须是 http/https 绝对 URL。
+// 相对路径或缺少 scheme 会在驱动层以难以理解的传输错误失败，这里提前拦下并给出可读提示。
+func validateMCPEndpoint(raw string) error {
+	if raw == "" {
+		return fmt.Errorf("远程 MCP 必须填写端点 URL")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("端点 URL 无效: %v", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("端点必须是以 http:// 或 https:// 开头的完整 URL")
+	}
+	if u.Host == "" {
+		return fmt.Errorf("端点 URL 缺少主机名")
+	}
+	return nil
 }
 
 // savePlugin 追加一个插件到 plugins.yaml 并更新内存配置。

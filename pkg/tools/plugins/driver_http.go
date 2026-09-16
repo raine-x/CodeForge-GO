@@ -38,10 +38,11 @@ func (d *httpDriver) Tools(_ context.Context) ([]tools.Tool, error) {
 		desc = "HTTP Webhook 插件：" + d.cfg.Name
 	}
 	return []tools.Tool{&RemoteTool{
-		name:     d.cfg.Name,
-		desc:     desc,
-		schema:   genericSchema(),
-		invokeFn: d.invoke,
+		name:       d.cfg.Name,
+		remoteName: d.cfg.Name,
+		desc:       desc,
+		schema:     genericSchema(),
+		invokeFn:   d.invoke,
 	}}, nil
 }
 

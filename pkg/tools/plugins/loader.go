@@ -19,12 +19,18 @@ type Driver interface {
 }
 
 // RemoteTool 将插件能力适配为本地 tools.Tool。
+//
+// name 是本地限定名（插件名.工具名），用于注册表路由与权限判定；
+// remoteName 是发现时的原始工具名，调用远端时必须用它 —— 插件管理器加载时
+// 会把 name 改成限定名，若把限定名发给远端服务，远端不认识就会报
+// 「Unknown tool: 插件名.工具名」（Parallel Search 的实际故障）。
 type RemoteTool struct {
-	plugin   string
-	name     string
-	desc     string
-	schema   json.RawMessage
-	invokeFn func(ctx context.Context, name string, args json.RawMessage) (*tools.ToolResult, error)
+	plugin     string
+	name       string
+	remoteName string
+	desc       string
+	schema     json.RawMessage
+	invokeFn   func(ctx context.Context, name string, args json.RawMessage) (*tools.ToolResult, error)
 }
 
 // Name 实现 tools.Tool。
@@ -36,9 +42,9 @@ func (t *RemoteTool) Description() string { return t.desc }
 // InputSchema 实现 tools.Tool。
 func (t *RemoteTool) InputSchema() json.RawMessage { return t.schema }
 
-// Execute 实现 tools.Tool。
+// Execute 实现 tools.Tool：用发现时的原始工具名调用远端，不用本地限定名。
 func (t *RemoteTool) Execute(ctx context.Context, args json.RawMessage) (*tools.ToolResult, error) {
-	return t.invokeFn(ctx, t.name, args)
+	return t.invokeFn(ctx, t.remoteName, args)
 }
 
 // Plugin 返回该工具所属的插件名。
@@ -49,6 +55,9 @@ func buildDriver(cfg config.PluginConfig) (Driver, error) {
 	switch cfg.Type {
 	case "mcp":
 		return newMCPDriver(cfg)
+	case "mcp-http":
+		// 远程 MCP：Streamable HTTP（一次性 JSON 或 SSE 回复），如 Parallel.ai / Exa。
+		return newMCPHTTPDriver(cfg)
 	case "http":
 		return newHTTPDriver(cfg)
 	case "wasm":

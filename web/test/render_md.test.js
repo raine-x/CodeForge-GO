@@ -54,7 +54,8 @@ function loadRenderer() {
     extractFunction(src, 'countLines'),
     extractFunction(src, 'fmtTokens'),
     extractFunction(src, 'wsDisplayName'),
-    'module.exports = { renderMD: renderMD, toolLabel: toolLabel, countLines: countLines, fmtTokens: fmtTokens, wsDisplayName: wsDisplayName };',
+    extractFunction(src, 'retryReasonBrief'),
+    'module.exports = { renderMD: renderMD, toolLabel: toolLabel, countLines: countLines, fmtTokens: fmtTokens, wsDisplayName: wsDisplayName, retryReasonBrief: retryReasonBrief };',
   ].join('\n');
   return new Function('module', code + '\nreturn module.exports;')({});
 }
@@ -81,7 +82,7 @@ function check(name, cond) {
 // ---------------------------------------------------------------------------
 // 开始
 // ---------------------------------------------------------------------------
-let renderMD, toolLabel, countLines, fmtTokens, wsDisplayName;
+let renderMD, toolLabel, countLines, fmtTokens, wsDisplayName, retryReasonBrief;
 try {
   const api = loadRenderer();
   renderMD = api.renderMD;
@@ -89,6 +90,7 @@ try {
   countLines = api.countLines;
   fmtTokens = api.fmtTokens;
   wsDisplayName = api.wsDisplayName;
+  retryReasonBrief = api.retryReasonBrief;
 } catch (err) {
   console.error('无法从 ui.js 加载 renderMD：' + err.message);
   process.exit(1);
@@ -182,8 +184,9 @@ check('delete_file 删除了文件', toolLabel('delete_file', { path: 'old.log' 
 check('run_command 运行命令原文', toolLabel('run_command', { command: 'go build ./...' }) === '运行 go build ./...');
 check('缺参数时降级为纯短语', toolLabel('write_file', {}) === '创建了文件' &&
                               toolLabel('run_command', {}) === '运行了命令');
-check('未知工具回退为「调用了 <name>」',
-  toolLabel('some_plugin_tool', {}) === '调用了 some_plugin_tool');
+check('未知工具兜底也不显示工具 ID（只给中文描述）',
+  toolLabel('some_plugin_tool', {}) === '调用了外部能力' &&
+  toolLabel('some_unknown_thing', { path: 'a' }) === '调用了外部能力');
 check('delegate_subagents 显示插件名与数量',
   toolLabel('delegate_subagents', { tasks: [{}, {}, {}] }) === '使用插件 Multi-Agent：并行委派 3 个子智能体');
 check('delegate_subagents 缺任务数组时仍可用',
@@ -192,6 +195,25 @@ check('save_memory 文案', toolLabel('save_memory', {}) === '保存了记忆');
 check('todo_write 文案', toolLabel('todo_write', {}) === '更新了任务清单');
 check('web_fetch 文案带 URL', toolLabel('web_fetch', { url: 'https://example.com/p' }) === '读取了网页 https://example.com/p');
 check('web_search 文案带 query', toolLabel('web_search', { query: 'codeforge' }) === '搜索了 codeforge');
+// 远程 MCP 工具名带插件前缀（parallel_search.web_search），按去前缀后的本名匹配文案，
+// 且要认 Parallel 的入参形状（objective / urls[]）。
+check('插件限定名按本名匹配文案',
+  toolLabel('parallel_search.web_search', { objective: 'Go MCP' }) === '搜索了 Go MCP');
+check('插件限定名 web_fetch 认 urls 数组',
+  toolLabel('parallel_search.web_fetch', { urls: ['https://a.com'] }) === '读取了网页 https://a.com');
+// 工具 ID 绝不能出现在用户可见文案里（含兜底分支）—— 与后端 System Prompt 的
+// 「不得出现工具 ID」是同一条产品纪律，两侧都要钉住。
+check('未知插件工具也不吐限定名',
+  toolLabel('parallel_search.whatever', {}) === '调用了外部能力');
+check('Exa 同族工具按前缀匹配到中文文案（不落到兜底）',
+  toolLabel('exa_search.web_search_exa', { query: 'codeforge' }) === '搜索了 codeforge' &&
+  toolLabel('exa_search.web_fetch_exa', { urls: ['https://a.com'] }) === '读取了网页 https://a.com');
+check('全量兜底扫描：任何工具 ID 都不出现在文案里',
+  ['parallel_search.web_search', 'parallel_search.web_fetch', 'exa_search.web_search_exa',
+   'exa_search.web_fetch_exa', 'unknown.plugin_tool_x'].every(function (n) {
+    const out = toolLabel(n, {});
+    return out.indexOf('.') < 0 && !/^调用了 [a-z_]+$/.test(out);
+  }));
 check('字符串形式的 tool_input 也能解析',
   toolLabel('read_file', '{"path":"a/b.js"}') === '读取了文件 b.js');
 check('超长命令被截断', toolLabel('run_command', { command: 'x'.repeat(200) }).length <= 90);
@@ -844,6 +866,53 @@ check('单条会话仍可单独恢复',
 check('样式契约：组头 / 项目名 / 计数 / 恢复按钮',
   /\.arch-group-head\s*\{/.test(css) && /\.arch-group-name\s*\{/.test(css) &&
   /\.arch-group-count\s*\{/.test(css) && /\.arch-group-restore\s*\{/.test(css));
+
+// ---------------------------------------------------------------------------
+group('工具 ID 不外泄（前后端同一条纪律）');
+check('审批文案（toolPhrase）兜底不吐工具 ID',
+  /toolPhrases\[name\] \|\| toolPhrases\[local\] \|\| '外部能力'/.test(uiSrc));
+check('源码里不存在「调用 <name>」式兜底',
+  !/'调用 ' \+ name/.test(uiSrc) && !/'调用了 ' \+ name/.test(uiSrc));
+check('后端 System Prompt 显式禁止在正文/计划/步骤里出现工具代号',
+  (function () {
+    const p = require('node:fs').readFileSync(
+      require('node:path').join(__dirname, '..', '..', 'pkg', 'agent', 'prompt.go'), 'utf8');
+    return p.indexOf('都不得出现任何工具 ID、函数名、调用代号') >= 0;
+  })());
+
+// ---------------------------------------------------------------------------
+group('重试提示文案（retryReasonBrief）');
+// 用户第一眼要「为什么失败」，不能只给一句笼统的「正在重试」
+check('429 归类为上游限流',
+  retryReasonBrief('LLM 请求失败 (429): {"error":{"code":"1305"}}') === '上游限流');
+check('503 归类为上游过载',
+  retryReasonBrief('LLM 请求失败 (503): busy') === '上游过载');
+check('502/504 归类为上游网关异常',
+  retryReasonBrief('LLM 请求失败 (502): bad gateway') === '上游网关异常' &&
+  retryReasonBrief('LLM 请求失败 (504): timeout') === '上游网关异常');
+check('4xx 归类为被上游拒绝',
+  retryReasonBrief('LLM 请求失败 (401): unauthorized') === '请求被上游拒绝');
+check('网络层错误归类为网络连接异常',
+  retryReasonBrief('LLM 请求失败: Post "https://x/v1": EOF') === '网络连接异常' &&
+  retryReasonBrief('LLM 请求失败: dial tcp: connection refused') === '网络连接异常');
+check('上游错误体里的人话被带出来',
+  retryReasonBrief('LLM 请求失败 (429): {"error":{"code":"1305","message":"该模型当前访问量过大，请您稍后再试"}}')
+    === '上游限流：该模型当前访问量过大，请您稍后再试');
+check('空/缺失原因降级为「未知原因」',
+  retryReasonBrief('') === '未知原因' && retryReasonBrief(null) === '未知原因' &&
+  retryReasonBrief(undefined) === '未知原因');
+// 契约：主文案必须把「第几次/共几次」摆出来，且完整原因仍可点击展开
+check('重试文案带次数与原因摘要',
+  /'请求失败，正在重试…' \+ times/.test(uiSrc) &&
+  /第 ' \+ attempt/.test(uiSrc) &&
+  /maxAttempts > 0/.test(uiSrc) &&
+  /次 · ' \+ brief/.test(uiSrc));
+check('完整原因保留在可展开的详情里',
+  /classList\.toggle\('show'\)/.test(uiSrc) && /'原因：' \+ \(reason \|\| '未知错误'\)/.test(uiSrc));
+check('重试事件把 attempt/max_attempts 透传给 addRetry',
+  /addRetry\(ev\.error \|\| '', Number\(ev\.attempt\) \|\| 0, Number\(ev\.max_attempts\) \|\| 0\)/.test(uiSrc));
+check('样式契约：详情小标签 + 可点击手型',
+  /\.retry-more\s*\{/.test(css) && /\.msg-tool\.retry\s*\{[^}]*cursor:\s*pointer/.test(css));
 
 // ---------------------------------------------------------------------------
 console.log('\n' + '-'.repeat(52));

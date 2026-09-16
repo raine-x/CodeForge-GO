@@ -1,4 +1,28 @@
 plugins:
+    - name: parallel_search
+      type: mcp-http
+      enabled: true
+      description: Parallel Search MCP（无需注册/API Key）：web_search 返回压缩摘录、web_fetch 抓取网页 Markdown；默认联网搜索来源
+      command: ""
+      args: []
+      env: {}
+      endpoint: https://search.parallel.ai/mcp
+      path: ""
+      security_policy:
+        requires_approval: false
+        allowed_actions: []
+    - name: exa_search
+      type: mcp-http
+      enabled: false
+      description: Exa MCP（免费，无需 Key）：语义搜索，工具 web_search_exa / web_fetch_exa，适合「找相似内容」而非精确事实查询；与 parallel_search 二选一或并用（https://mcp.exa.ai/mcp）
+      command: ""
+      args: []
+      env: {}
+      endpoint: https://mcp.exa.ai/mcp
+      path: ""
+      security_policy:
+        requires_approval: false
+        allowed_actions: []
     - name: github_tools
       type: mcp
       enabled: false
