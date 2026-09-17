@@ -95,6 +95,10 @@ func EstimateTokens(msgs []llm.Message) int {
 	wide, narrow := 0, 0
 	for _, m := range msgs {
 		for _, b := range m.Content {
+			if b.Type == llm.BlockImage {
+				wide += 4096
+				continue
+			}
 			wide, narrow = countRunes(b.Text, wide, narrow)
 			wide, narrow = countRunes(b.Content, wide, narrow)
 			wide, narrow = countRunes(string(b.Input), wide, narrow)
@@ -172,6 +176,17 @@ func Compress(msgs []llm.Message, budget int) []llm.Message {
 	}
 
 	out := cloneMessages(msgs)
+	lastUser := lastPlainUserIndex(out)
+	for i := range out {
+		if lastUser >= 0 && i >= lastUser {
+			break
+		}
+		for j := range out[i].Content {
+			if out[i].Content[j].Type == llm.BlockImage {
+				out[i].Content[j] = llm.ContentBlock{Type: llm.BlockText, Text: "（历史图像已省略）"}
+			}
+		}
+	}
 
 	for i := 0; i < len(out)-compressKeepTail; i++ {
 		placeholderToolResults(&out[i], compressResultRunes)
@@ -181,7 +196,11 @@ func Compress(msgs []llm.Message, budget int) []llm.Message {
 	}
 
 	if len(out) > compressKeepRecent {
-		out = out[len(out)-compressKeepRecent:]
+		start := len(out) - compressKeepRecent
+		if lastUser >= 0 && start > lastUser {
+			start = lastUser
+		}
+		out = out[start:]
 	}
 	out = dropLeadingToolResults(out)
 
@@ -261,18 +280,20 @@ func isPlainUserText(m llm.Message) bool {
 	if m.Role != llm.RoleUser {
 		return false
 	}
-	hasText := false
+	hasContent := false
 	for _, b := range m.Content {
 		switch b.Type {
-		case llm.BlockToolResult:
+		case llm.BlockToolResult, llm.BlockToolUse:
 			return false
+		case llm.BlockImage:
+			hasContent = true
 		case llm.BlockText:
 			if strings.TrimSpace(b.Text) != "" {
-				hasText = true
+				hasContent = true
 			}
 		}
 	}
-	return hasText
+	return hasContent
 }
 
 // lastPlainUserIndex 返回最后一条「用户纯文本发言」的下标，无则 -1。
@@ -335,6 +356,8 @@ func renderMessage(m llm.Message) string {
 				continue
 			}
 			fmt.Fprintf(&sb, "[%s] %s\n", m.Role, clipRunes(b.Text, transcriptBlockRunes))
+		case llm.BlockImage:
+			fmt.Fprintf(&sb, "[%s] （图像内容已省略）\n", m.Role)
 		case llm.BlockToolUse:
 			fmt.Fprintf(&sb, "[%s 调用工具] %s %s\n", m.Role, b.Name, clipRunes(string(b.Input), toolArgsRunes))
 		case llm.BlockToolResult:

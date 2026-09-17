@@ -263,7 +263,7 @@ func Default() *Config {
 			RetryBackoffMs: 1500,
 		},
 		Agent: AgentConfig{
-			MaxSteps:             25,
+			MaxSteps:             500,
 			ContextTokenBudget:   120000,
 			ContextCompressRatio: 0.95,
 		},
@@ -436,7 +436,7 @@ func normalize(cfg *Config) {
 		cfg.Server.Host = "127.0.0.1"
 	}
 	if cfg.Agent.MaxSteps <= 0 {
-		cfg.Agent.MaxSteps = 25
+		cfg.Agent.MaxSteps = 500
 	}
 	if cfg.Agent.ContextTokenBudget <= 0 {
 		cfg.Agent.ContextTokenBudget = 120000

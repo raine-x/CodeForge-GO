@@ -162,6 +162,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/pick_folder", s.requireAuth(s.handlePickFolder))
 	mux.HandleFunc("/api/pick_file", s.requireAuth(s.handlePickFile))
 	mux.HandleFunc("/api/stage_file", s.requireAuth(s.handleStageFile))
+	mux.HandleFunc("/api/upload_file", s.requireAuth(s.handleUploadFile))
 	mux.HandleFunc("/api/termux/tools", s.requireAuth(s.handleTermuxTools))
 	mux.HandleFunc("/api/models/test", s.requireAuth(s.handleModelTest))
 	mux.HandleFunc("/api/models/discover", s.requireAuth(s.handleModelDiscover))

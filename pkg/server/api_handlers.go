@@ -76,12 +76,13 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPost:
 		var body struct {
-			Provider    string   `json:"provider"`
-			BaseURL     *string  `json:"base_url"`
-			APIKey      string   `json:"api_key"`
-			Model       string   `json:"model"`
-			MaxTokens   int      `json:"max_tokens"`
-			Temperature *float64 `json:"temperature"`
+			Provider    string          `json:"provider"`
+			BaseURL     *string         `json:"base_url"`
+			APIKey      string          `json:"api_key"`
+			Model       string          `json:"model"`
+			MaxTokens   int             `json:"max_tokens"`
+			Temperature *float64        `json:"temperature"`
+			MaxSteps    json.RawMessage `json:"max_steps"`
 			// 重试策略：<=0 / 空值表示「不改」（保持原配置）。
 			RetryMaxAttempts *int    `json:"retry_max_attempts"`
 			RetryMode        *string `json:"retry_mode"`
@@ -92,14 +93,23 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// 重试间隔模式只接受 fixed / backoff，其余直接拒绝（避免脏值落库）。
+		next := *s.cfg
+		if body.MaxSteps != nil {
+			var n int
+			if err := json.Unmarshal(body.MaxSteps, &n); err != nil || n < 1 {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "max_steps 必须是正整数"})
+				return
+			}
+			next.Agent.MaxSteps = n
+		}
+
 		if body.RetryMode != nil {
 			mode := strings.ToLower(strings.TrimSpace(*body.RetryMode))
 			if mode != "fixed" && mode != "backoff" {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "无效的重试间隔模式: " + *body.RetryMode})
 				return
 			}
-			s.cfg.LLM.RetryMode = mode
+			next.LLM.RetryMode = mode
 		}
 		if body.RetryMaxAttempts != nil {
 			n := *body.RetryMaxAttempts
@@ -107,7 +117,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "重试次数需在 1~15 之间"})
 				return
 			}
-			s.cfg.LLM.MaxAttempts = n
+			next.LLM.MaxAttempts = n
 		}
 		if body.RetryIntervalSec != nil {
 			n := *body.RetryIntervalSec
@@ -115,35 +125,52 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "重试间隔需在 1~60 秒之间"})
 				return
 			}
-			s.cfg.LLM.RetryBackoffMs = n * 1000
+			next.LLM.RetryBackoffMs = n * 1000
 		}
 
 		if strings.TrimSpace(body.Provider) != "" {
-			s.cfg.LLM.Provider = strings.TrimSpace(body.Provider)
+			next.LLM.Provider = strings.TrimSpace(body.Provider)
 		}
 		if body.BaseURL != nil {
-			s.cfg.LLM.BaseURL = strings.TrimSpace(*body.BaseURL)
+			next.LLM.BaseURL = strings.TrimSpace(*body.BaseURL)
 		}
-		// 空 api_key 表示「保持不变」，避免前端回填掩码值覆盖真实 Key。
 		if strings.TrimSpace(body.APIKey) != "" {
-			s.cfg.LLM.APIKey = strings.TrimSpace(body.APIKey)
+			next.LLM.APIKey = strings.TrimSpace(body.APIKey)
 		}
 		if strings.TrimSpace(body.Model) != "" {
-			s.cfg.LLM.Model = strings.TrimSpace(body.Model)
+			next.LLM.Model = strings.TrimSpace(body.Model)
 		}
 		if body.MaxTokens > 0 {
-			s.cfg.LLM.MaxTokens = body.MaxTokens
+			next.LLM.MaxTokens = body.MaxTokens
 		}
 		if body.Temperature != nil {
-			s.cfg.LLM.Temperature = *body.Temperature
+			next.LLM.Temperature = *body.Temperature
 		}
 
-		if err := s.rebuildProvider(); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
+		var provider llm.Provider
+		if next.LLM != s.cfg.LLM {
+			var err error
+			provider, err = llm.NewProvider(next.LLM)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
 		}
-		if dir := s.cfg.ConfigDir(); dir != "" {
-			_ = s.cfg.Save(filepath.Join(dir, "local.yaml"))
+		if dir := next.ConfigDir(); dir != "" {
+			if err := next.Save(filepath.Join(dir, "local.yaml")); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "保存配置失败: " + err.Error()})
+				return
+			}
+		}
+		s.cfg.LLM = next.LLM
+		if body.MaxSteps != nil {
+			s.cfg.Agent.MaxSteps = next.Agent.MaxSteps
+			s.agent.SetMaxSteps(next.Agent.MaxSteps)
+		}
+		if provider != nil {
+			s.agent.SetProvider(provider)
+			s.agent.SetLLMConfig(next.LLM)
+			s.SyncContextWindow()
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "config": s.configView()})
 
@@ -165,6 +192,7 @@ func (s *Server) configView() map[string]any {
 		"model":        s.cfg.LLM.Model,
 		"display_name": s.cfg.LLM.DisplayName,
 		"max_tokens":   s.cfg.LLM.MaxTokens,
+		"max_steps":    s.cfg.Agent.MaxSteps,
 		"temperature":  s.cfg.LLM.Temperature,
 		// 重试策略：前端设置页可调（次数 / 间隔模式 / 基础间隔）。
 		"retry_max_attempts": s.cfg.LLM.MaxAttempts,

@@ -22,6 +22,7 @@ const (
 	EventUser        = "user"
 	EventStep        = "step"
 	EventText        = "text"
+	EventToolPending = "tool_pending" // 工具调用参数流式生成中（尚未执行）
 	EventToolCall    = "tool_call"
 	EventToolResult  = "tool_result"
 	EventHitlRequest = "hitl_request"
@@ -101,6 +102,7 @@ type Emitter func(Event)
 // Agent 是 ReAct 主循环引擎。
 type Agent struct {
 	cfg           config.AgentConfig
+	maxSteps      atomic.Int64
 	provider      llm.Provider
 	executor      *tools.Executor
 	registry      *tools.Registry
@@ -136,7 +138,7 @@ type Agent struct {
 // New 构造 Agent 引擎。llmCfg 提供请求级参数（MaxTokens/Temperature），
 // 与 AgentConfig（循环行为）分开传：前者随「应用/保存」模型热切换更新。
 func New(cfg config.AgentConfig, llmCfg config.LLMConfig, provider llm.Provider, executor *tools.Executor, history *History, workDir string) *Agent {
-	return &Agent{
+	a := &Agent{
 		cfg:      cfg,
 		llmCfg:   llmCfg,
 		provider: provider,
@@ -145,7 +147,13 @@ func New(cfg config.AgentConfig, llmCfg config.LLMConfig, provider llm.Provider,
 		history:  history,
 		workDir:  workDir,
 	}
+	a.SetMaxSteps(cfg.MaxSteps)
+	return a
 }
+
+func (a *Agent) SetMaxSteps(n int) { a.maxSteps.Store(int64(n)) }
+
+func (a *Agent) MaxSteps() int { return int(a.maxSteps.Load()) }
 
 // SetLLMConfig 热更新请求参数（MaxTokens/Temperature 等，随模型应用/保存切换）。
 func (a *Agent) SetLLMConfig(c config.LLMConfig) { a.llmCfg = c }
@@ -440,39 +448,52 @@ func (a *Agent) systemPrompt() string {
 
 // Run 执行一轮完整的用户交互（含 ReAct 迭代）：追加用户消息后进入循环。
 func (a *Agent) Run(ctx context.Context, sessionID, input string, emit Emitter) error {
+	return a.RunWithImages(ctx, sessionID, input, nil, emit)
+}
+
+func (a *Agent) RunWithImages(ctx context.Context, sessionID, input string, images []llm.ContentBlock, emit Emitter) error {
+	limit := a.MaxSteps()
 	sess, ok := a.history.Get(sessionID)
 	if !ok {
 		return fmt.Errorf("会话不存在: %s", sessionID)
 	}
 
-	sess.Messages = append(sess.Messages, llm.TextMessage(llm.RoleUser, input))
+	message := llm.TextMessage(llm.RoleUser, input)
+	message.Content = append(message.Content, images...)
+	sess.Messages = append(sess.Messages, message)
 	emit(Event{Type: EventUser, Text: input})
 	a.lastUserInput = input // 供 systemPrompt 里技能触发词匹配
 
-	return a.runLoop(ctx, sess, emit)
+	return a.runLoopWithLimit(ctx, sess, emit, true, limit)
 }
 
 // Regenerate 重新生成最后一轮回复：把会话回退到最近一条用户消息
 // （丢弃其后的助手回复与工具结果），随后基于同一条提问重跑循环。
 func (a *Agent) Regenerate(ctx context.Context, sessionID string, emit Emitter) error {
+	limit := a.MaxSteps()
 	sess, ok := a.history.Get(sessionID)
 	if !ok {
 		return fmt.Errorf("会话不存在: %s", sessionID)
 	}
 
-	idx := -1
-	for i := len(sess.Messages) - 1; i >= 0; i-- {
-		if sess.Messages[i].Role == llm.RoleUser {
-			idx = i
-			break
-		}
-	}
+	idx := lastPlainUserIndex(sess.Messages)
 	if idx < 0 {
 		return fmt.Errorf("没有可重新生成的用户消息")
 	}
 	sess.Messages = sess.Messages[:idx+1]
+	if sess.compressedUpTo > idx {
+		sess.compressedUpTo = 0
+		sess.summaryText = ""
+	}
+	var input strings.Builder
+	for _, block := range sess.Messages[idx].Content {
+		if block.Type == llm.BlockText {
+			input.WriteString(block.Text)
+		}
+	}
+	a.lastUserInput = input.String()
 
-	return a.runLoop(ctx, sess, emit)
+	return a.runLoopWithLimit(ctx, sess, emit, true, limit)
 }
 
 // runLoop 执行 ReAct 主循环（不追加用户消息，由调用方准备会话上下文）。
@@ -486,7 +507,15 @@ func (a *Agent) runLoopEphemeral(ctx context.Context, sess *Session, emit Emitte
 }
 
 func (a *Agent) runLoopWithPersistence(ctx context.Context, sess *Session, emit Emitter, persist bool) error {
-	for step := 1; step <= a.cfg.MaxSteps; step++ {
+	return a.runLoopWithLimit(ctx, sess, emit, persist, a.MaxSteps())
+}
+
+func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitter, persist bool, limit int) error {
+	for step := 1; step <= limit; step++ {
+		if err := ctx.Err(); err != nil {
+			a.save(sess, persist)
+			return err
+		}
 		emit(Event{Type: EventStep, Step: step})
 		system := a.systemPromptFor(sess)
 		definitions := a.registry.DefinitionsFor(a.exposureFn())
@@ -594,13 +623,19 @@ func (a *Agent) runLoopWithPersistence(ctx context.Context, sess *Session, emit 
 			emit(Event{Type: EventToolResult, ToolCallID: tc.ID, ToolName: tc.Name, Result: res})
 
 			sess.Messages = append(sess.Messages, llm.ToolResultMessage(tc.ID, renderToolResult(res), !res.Success))
+			if err := ctx.Err(); err != nil {
+				a.save(sess, persist)
+				return err
+			}
 		}
 		a.save(sess, persist)
 	}
 
-	emit(Event{Type: EventDone})
 	a.save(sess, persist)
-	return nil
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return fmt.Errorf("已达到工具调用轮数上限（%d 轮），任务尚未完成；可在设置 > 常规中调整 max_steps 后重试", limit)
 }
 
 // save 持久化会话（persist=false 的临时子智能体会话直接跳过）。
@@ -629,9 +664,20 @@ func (a *Agent) consumeStream(ctx context.Context, sess *Session, stream <-chan 
 	order := make([]string, 0, 4)
 	var errMsg string
 
-	for ev := range stream {
-		if ctx.Err() != nil {
-			break
+streamLoop:
+	for {
+		var ev llm.StreamEvent
+		select {
+		case <-ctx.Done():
+			return turn, ctx.Err()
+		case next, ok := <-stream:
+			if !ok {
+				break streamLoop
+			}
+			ev = next
+		}
+		if err := ctx.Err(); err != nil {
+			return turn, err
 		}
 		switch ev.Type {
 		case llm.EventTextDelta:
@@ -649,6 +695,12 @@ func (a *Agent) consumeStream(ctx context.Context, sess *Session, stream <-chan 
 				order = append(order, ev.ToolUseID)
 			} else if ev.ToolName != "" {
 				parts[ev.ToolUseID].name = ev.ToolName
+			}
+			// 工具调用参数开始生成：立刻通知前端（大参数如整页写入要生成
+			// 数十 KB，期间若只靠 tool_call 事件，界面会几分钟毫无反馈）。
+			// 只在首个工具开始时发一次，避免多工具并行时重复打扰。
+			if len(order) == 1 {
+				emit(Event{Type: EventToolPending, ToolName: ev.ToolName})
 			}
 		case llm.EventToolUseDelta:
 			if p, ok := parts[ev.ToolUseID]; ok {

@@ -192,6 +192,21 @@
           <div class="settings-card">
             <div class="row">
               <div class="row-main">
+                <div class="row-title">工具调用轮数</div>
+                <div class="row-desc">单次对话中 Agent 连续调用工具的最大迭代次数；任务复杂时调大，耗尽后本轮会明确提示并停止</div>
+              </div>
+            </div>
+            <div class="form-grid">
+              <label class="f-field"><span>最大轮数</span><input id="max-steps" type="number" min="1" value="500"></label>
+            </div>
+            <div class="ctx-row" style="margin-top:10px">
+              <button type="button" id="max-steps-save" class="btn primary">保存轮数设置</button>
+              <span id="max-steps-result" class="mf-test-result"></span>
+            </div>
+          </div>
+          <div class="settings-card">
+            <div class="row">
+              <div class="row-main">
                 <div class="row-title">请求重试</div>
                 <div class="row-desc">上游限流（429）或瞬时故障时自动重试，4xx 客户端错误（如余额不足）不重试。退避模式：1→2→3→6 秒（之后封顶 6 秒）；固定模式：每次等待相同秒数</div>
               </div>

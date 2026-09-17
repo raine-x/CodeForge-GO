@@ -33,14 +33,15 @@ var upgrader = websocket.Upgrader{
 
 // wsMessage 是客户端上行消息。
 type wsMessage struct {
-	Type       string `json:"type"`
-	SessionID  string `json:"session_id"`
-	Text       string `json:"text"`
-	Title      string `json:"title"`
-	ApprovalID string `json:"approval_id"`
-	Approved   bool   `json:"approved"`
-	Thinking   string `json:"thinking"` // 思考强度：low/medium/high
-	Hidden     bool   `json:"hidden"`   // 页面是否不可见（visibility 消息携带）
+	Attachments []string `json:"attachments"`
+	Type        string   `json:"type"`
+	SessionID   string   `json:"session_id"`
+	Text        string   `json:"text"`
+	Title       string   `json:"title"`
+	ApprovalID  string   `json:"approval_id"`
+	Approved    bool     `json:"approved"`
+	Thinking    string   `json:"thinking"` // 思考强度：low/medium/high
+	Hidden      bool     `json:"hidden"`   // 页面是否不可见（visibility 消息携带）
 }
 
 // wsClient 表示一个浏览器 WebSocket 连接。
@@ -105,7 +106,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 	ws := c.srv.agent.WorkDir() // 会话/记忆按工作区隔离
 	switch msg.Type {
 	case "user_message":
-		if strings.TrimSpace(msg.Text) == "" {
+		if strings.TrimSpace(msg.Text) == "" && len(msg.Attachments) == 0 {
 			return
 		}
 		sessionID := msg.SessionID
@@ -118,7 +119,11 @@ func (c *wsClient) dispatch(msg wsMessage) {
 			sessionID = sess.ID
 		}
 		go c.run(sessionID, msg.Thinking, "用户消息", msg.Text, func(ctx context.Context, emit func(agent.Event)) error {
-			return c.srv.agent.Run(ctx, sessionID, msg.Text, emit)
+			images, err := readAttachmentImages(ws, msg.Attachments)
+			if err != nil {
+				return err
+			}
+			return c.srv.agent.RunWithImages(ctx, sessionID, msg.Text, images, emit)
 		})
 
 	case "regenerate":

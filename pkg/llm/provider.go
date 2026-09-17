@@ -25,6 +25,7 @@ const (
 
 // 内容块类型。
 const (
+	BlockImage      = "image"
 	BlockText       = "text"
 	BlockToolUse    = "tool_use"
 	BlockToolResult = "tool_result"
@@ -34,6 +35,8 @@ const (
 type ContentBlock struct {
 	Type      string          `json:"type"`
 	Text      string          `json:"text,omitempty"`
+	MediaType string          `json:"media_type,omitempty"`
+	Data      string          `json:"data,omitempty"`
 	ID        string          `json:"id,omitempty"`          // tool_use id
 	Name      string          `json:"name,omitempty"`        // tool_use name
 	Input     json.RawMessage `json:"input,omitempty"`       // tool_use 参数
@@ -149,8 +152,8 @@ type ToolCall struct {
 
 // AssistantTurn 是模型一轮回复的汇总。
 type AssistantTurn struct {
-	Text      string     `json:"text"`
-	ToolCalls []ToolCall `json:"tool_calls"`
+	Text      string         `json:"text"`
+	ToolCalls []ToolCall     `json:"tool_calls"`
 	Blocks    []ContentBlock `json:"blocks"`
 }
 

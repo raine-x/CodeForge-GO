@@ -129,7 +129,8 @@ func cloneForCompare(msgs []llm.Message) []llm.Message {
 func blockEqual(a, b llm.ContentBlock) bool {
 	return a.Type == b.Type && a.Text == b.Text && a.ID == b.ID &&
 		a.Name == b.Name && string(a.Input) == string(b.Input) &&
-		a.ToolUseID == b.ToolUseID && a.Content == b.Content && a.IsError == b.IsError
+		a.ToolUseID == b.ToolUseID && a.Content == b.Content && a.IsError == b.IsError &&
+		a.MediaType == b.MediaType && a.Data == b.Data
 }
 
 // assertHistoryUnchanged 断言「压缩没有写穿会话历史」——

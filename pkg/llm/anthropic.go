@@ -133,6 +133,15 @@ func convertAnthropicBlocks(m Message) []map[string]any {
 				continue
 			}
 			blocks = append(blocks, map[string]any{"type": "text", "text": b.Text})
+		case BlockImage:
+			blocks = append(blocks, map[string]any{
+				"type": "image",
+				"source": map[string]any{
+					"type":       "base64",
+					"media_type": b.MediaType,
+					"data":       b.Data,
+				},
+			})
 		case BlockToolUse:
 			input := b.Input
 			if len(input) == 0 {
@@ -169,6 +178,7 @@ type anthropicEvent struct {
 		Text        string `json:"text"`
 		Thinking    string `json:"thinking"`
 		PartialJSON string `json:"partial_json"`
+		StopReason  string `json:"stop_reason"` // message_delta 携带：end_turn/max_tokens/tool_use/…
 	} `json:"delta"`
 	// message_start 的 message.usage 携带输入用量（含缓存三段）
 	Message struct {
@@ -192,6 +202,8 @@ type anthropicUsage struct {
 func (p *AnthropicProvider) consume(ctx context.Context, r io.Reader, out chan<- StreamEvent) {
 	toolIndex := map[int]string{}
 	var usage *Usage // message_start 建立输入侧，message_delta 补输出侧
+	var stopReason string
+	failed := false
 
 	err := scanSSE(r, func(_ string, data string) {
 		if data == "" {
@@ -242,22 +254,39 @@ func (p *AnthropicProvider) consume(ctx context.Context, r io.Reader, out chan<-
 				delete(toolIndex, ev.Index)
 			}
 		case "message_delta":
-			// 输出用量随流递增，只取最后一次的值
+			// 输出用量随流递增，只取最后一次的值；stop_reason 记录结束原因
 			if ev.Usage != nil && usage != nil {
 				usage.OutputTokens = ev.Usage.OutputTokens
 			}
+			if ev.Delta.StopReason != "" {
+				stopReason = ev.Delta.StopReason
+			}
 		case "error":
 			if ev.Error != nil {
+				failed = true
 				send(ctx, out, StreamEvent{Type: EventError, Error: ev.Error.Message})
 			}
 		}
 	})
-	if err != nil {
+	if err != nil && !failed {
+		failed = true
 		send(ctx, out, StreamEvent{Type: EventError, Error: err.Error()})
+	}
+	// max_tokens 截断：不报错会被上层当作正常完成，表现为「思考/回答到一半就停了」
+	if !failed && stopReason == "max_tokens" {
+		failed = true
+		send(ctx, out, StreamEvent{Type: EventError, Error: "输出因达到 max_tokens 上限被截断（思考与回答共享该预算），请在设置中调大模型条目的「输出上限」后重新应用"})
+	}
+	// 没收到 message_delta（如连接被掐断）时不能伪装成正常结束
+	if !failed && stopReason == "" {
+		failed = true
+		send(ctx, out, StreamEvent{Type: EventError, Error: "上游流提前结束：未收到 message_delta（stop_reason）"})
 	}
 	// 用量在流结束时统一上报（message_stop 之前），上层按会话累计
 	if usage != nil {
 		send(ctx, out, StreamEvent{Type: EventUsage, Usage: usage})
 	}
-	send(ctx, out, StreamEvent{Type: EventMessageStop})
+	if !failed {
+		send(ctx, out, StreamEvent{Type: EventMessageStop})
+	}
 }

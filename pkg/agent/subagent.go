@@ -171,6 +171,7 @@ func (a *Agent) newSubagent(mode string) *Agent {
 	policy := a.executor.Policy()
 	executor := tools.NewExecutor(registry, policy, nil, nil, 120*time.Second, 32*1024)
 	cfg := a.cfg
+	cfg.MaxSteps = a.MaxSteps()
 	if cfg.MaxSteps > 8 || cfg.MaxSteps <= 0 {
 		cfg.MaxSteps = 8
 	}

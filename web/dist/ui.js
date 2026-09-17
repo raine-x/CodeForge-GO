@@ -728,6 +728,7 @@
     ensureCol().appendChild(d);
     scrollBottom();
     syncComposerMode();
+    return d;
   }
   // 工具中文名映射（内置工具 + 内置插件工具）：审批条等只显示短语、不暴露参数的场景使用。
   // 未识别的工具（MCP 插件等）回退显示原始工具名。
@@ -827,6 +828,7 @@
   // activeToolEl：最近一条工具条目（运行中带 spinner；收到结果或开始下一段
   // 思考/正文时移除 spinner，让用户知道工具正在执行而不是卡死）。
   let activeToolEl = null;
+  let pendingToolEl = null; // 「正在生成工具调用参数…」占位（tool_call 到达后移除）
   function settleActiveTool() {
     if (activeToolEl) {
       activeToolEl.classList.remove('running');
@@ -1106,6 +1108,7 @@
     // 面板触发的文本，不是输入框内容。为了复用展开链路，先临时借用 input。
     if (!input) return;
     const keep = input.value;
+    sending = false;
     input.value = text;
     form.requestSubmit();
     input.value = keep;
@@ -1236,6 +1239,13 @@
   let ws = null;
   let wsReady = false;
   let sessionID = '';
+  let composerEpoch = 0;
+  let sessionChanging = false;
+  let workspaceChanging = false;
+  let pendingUploads = 0;
+  let uploadQueue = Promise.resolve();
+  let sending = false;
+  const uploadAliasWorkspace = new Map();
   let currentTextEl = null;   // 当前流式输出的助手段落
   let textBuffer = '';        // 当前段落的原始 markdown
   let thinkingEl = null;      // 「等待模型响应」提示
@@ -1258,7 +1268,9 @@
   }
 
   function wsSend(obj) {
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify(obj));
+    return true;
   }
   // 上报页面可见性：窗口在前台可见（用户正看着）时，任务完成不弹系统通知。
   // 连接建立时上报一次，之后每次切换标签页/最小化/回到前台都上报。
@@ -1325,12 +1337,16 @@
     const d = ctxUsage;
     const pct = Math.max(0, Number(d.percent) || 0);
     const summarized = Number(d.summarized) || 0;
+    const hit = Number(d.cache_hit) || 0;
+    const miss = Number(d.cache_miss) || 0;
+    const hitRate = (hit + miss) > 0 ? (hit / (hit + miss) * 100).toFixed(1) + '%' : '—';
     const rows = [
       ['模型名称', d.model || d.model_id || '—'],
       ['上下文长度', d.window ? fmtTokens(d.window) + ' tokens' : '—'],
       ['已使用总 tokens', fmtTokens(d.total_tokens) + ' tokens'],
-      ['缓存命中', fmtTokens(d.cache_hit) + ' tokens'],
-      ['缓存未命中', fmtTokens(d.cache_miss) + ' tokens'],
+      ['缓存命中', fmtTokens(hit) + ' tokens'],
+      ['缓存未命中', fmtTokens(miss) + ' tokens'],
+      ['平均缓存命中率', hitRate],
     ];
     rows.forEach(function (r) { ctxPop.appendChild(ctxRow(r[0], r[1])); });
 
@@ -1347,7 +1363,6 @@
       tip.textContent = '占比 = 送模占用 / 压缩线（模型窗口扣除输出预留后的 95%）。' +
         '达 100% 时自动调用模型把较早历史压成详细摘要。';
     }
-    tip.textContent += '用量与缓存统计自服务启动后累计（重启重新计数）。';
     ctxPop.appendChild(tip);
   }
 
@@ -1705,7 +1720,10 @@
     }
   }
   function doNewSession() {
-    wsSend({ type: 'new_session', title: '' });
+    if (sending || workspaceChanging || sessionChanging) { addInfo('正在发送或切换，请稍候'); return; }
+    if (!wsSend({ type: 'new_session', title: '' })) return;
+    composerEpoch++;
+    sessionChanging = true;
     messagesEl.innerHTML = '';
     msgCol = null; currentTextEl = null; textBuffer = '';
     reasonEl = null; reasonBuffer = ''; lastReply = ''; lastUserText = '';
@@ -1834,6 +1852,10 @@
 
   function confirmNewProject() {
     if (npEl('np-create').disabled) return;
+    if (pendingUploads || sending || workspaceChanging || sessionChanging) {
+      setNpError('文件上传、发送或切换尚未完成，请稍候');
+      return;
+    }
     const name = npEl('np-name').value.trim();
     npEl('np-create').disabled = true;
     setNpError('');
@@ -2123,7 +2145,13 @@
   }
   // 删除整个项目（含其全部会话）；若删除的是当前运行项目，清空对话区回到未选择项目
   function deleteWorkspace(ws) {
-    fetch('/api/workspaces?workspace=' + encodeURIComponent(ws || ''), { method: 'DELETE' })
+    if (pendingUploads || sending || workspaceChanging || sessionChanging) {
+      addInfo('文件上传、发送或切换尚未完成，请稍候再删除项目');
+      return;
+    }
+    workspaceChanging = true;
+    composerEpoch++;
+    return fetch('/api/workspaces?workspace=' + encodeURIComponent(ws || ''), { method: 'DELETE' })
       .then(function () {
         if ((ws || '') === (workspaceRoot || '')) {
           workspaceRoot = '';
@@ -2133,7 +2161,8 @@
           reasonEl = null; reasonBuffer = ''; lastReply = '';
         }
         loadSessionList();
-      });
+      }).catch(function (err) { addError('删除项目失败：' + err.message); })
+      .finally(function () { workspaceChanging = false; });
   }
   // 当前工作区状态（侧栏分组 / 发消息挂靠都用它；入口只剩「新建项目」弹窗与项目组 ＋）
   let workspaceRoot = '';
@@ -2156,6 +2185,10 @@
   // 跨视图保留，replayHistory 渲染完历史后自动补上。
   function loadSession(id) {
     if (!id || id === sessionID) return;
+    if (sending || workspaceChanging || sessionChanging) { addInfo('正在发送或切换，请稍候'); return; }
+    if (!wsReady) return;
+    composerEpoch++;
+    sessionChanging = true;
     if (running) sendBtn.title = '点击打断' + (id === runSessionID ? '' : '（正在运行的会话）');
     wsSend({ type: 'load_session', session_id: id });
   }
@@ -2163,12 +2196,14 @@
   // 回放历史消息：服务端 history 事件 → 用渲染原语重建聊天列。
   // 审批条与 spinner 不重建（历史是既成事实）；末条助手回复带操作栏。
   function replayHistory(ev) {
+    composerEpoch++;
+    sessionChanging = false;
     messagesEl.innerHTML = '';
     msgCol = null; currentTextEl = null; textBuffer = '';
     reasonEl = null; reasonBuffer = ''; reasonPinned = false;
     // 视图重建 = 旧 DOM 全部作废：这些「当前元素」引用必须一起清空，
     // 否则后续事件会去找已经不在文档里的节点（切走→切回最容易触发）。
-    thinkingEl = null; activeToolEl = null; retryEl = null;
+    thinkingEl = null; activeToolEl = null; retryEl = null; pendingToolEl = null;
     subagentCards.clear();
     lastReply = ''; lastUserText = '';
     sessionID = ev.session_id || '';
@@ -2565,6 +2600,9 @@
     });
     ws.addEventListener('close', function () {
       wsReady = false;
+      sending = false;
+      sessionChanging = false;
+      composerEpoch++;
       setTimeout(connectWS, 2000); // 断线重连
     });
     ws.addEventListener('message', function (e) {
@@ -2593,7 +2631,9 @@
         case 'session':
           // 任务运行中不接受 session 事件改视图（那是别的会话的启动回报）
           if (ev.session_id && (!running || !runSessionID || ev.session_id === runSessionID)) {
+            if (sessionID !== ev.session_id) composerEpoch++;
             sessionID = ev.session_id;
+            sessionChanging = false;
           }
           break;
         case 'todo':
@@ -2605,6 +2645,7 @@
           if (!ev.session_id || ev.session_id === sessionID) renderCtxUsage(ev);
           break;
         case 'busy':
+          sending = false;
           running = true;
           runSessionID = sessionID; // 本轮属于当前视图的会话；之后用户切走也能凭它识别
           runReason = ''; runText = ''; // 新一轮：未落盘片段从零开始
@@ -2658,7 +2699,21 @@
           settleActiveTool(); // 进入正文输出：撤掉 spinner
           appendText(ev.text || '');
           break;
+        case 'tool_pending': {
+          // 工具调用参数正在流式生成（大参数要生成几十 KB）：立即给出反馈，
+          // 不然这几分钟界面看起来像卡死。真正的 tool_call 卡片到达后替换。
+          runReason = ''; runText = '';
+          if (runAway()) { foldReason(); closeText(); break; }
+          removeThinking();
+          removeRetry();
+          foldReason();
+          closeText();
+          if (pendingToolEl) pendingToolEl.remove();
+          pendingToolEl = addInfo('正在生成工具调用参数…');
+          break;
+        }
         case 'tool_call': {
+          if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
           // 该段内容此刻已写入会话消息：思考丢弃、正文交给历史回放，不再算未落盘
           runReason = ''; runText = '';
           if (runAway()) { foldReason(); closeText(); break; }
@@ -2684,6 +2739,7 @@
         }
         case 'tool_result':
           if (runAway()) break;
+          if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
           removeThinking();
           settleActiveTool(); // 工具已返回：撤掉 spinner
           closeText();
@@ -2699,6 +2755,8 @@
           addApproval(ev); // 后台会话的审批会带 session_id，卡片上标注来源
           break;
         case 'error': {
+          sending = false;
+          sessionChanging = false;
           if (runAway()) {
             // 后台会话出错：在当前视图标注来源，不能静默吞掉
             const emeta = sessionsCache.find(function (s) { return s.id === runSessionID; });
@@ -2708,16 +2766,19 @@
           removeThinking();
           removeRetry();
           settleActiveTool();
+          if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
           foldReason();
           closeText();
           addError('出错了：' + (ev.error || '未知错误'));
           break;
         }
         case 'idle': {
+          sending = false;
           const backHome = !runAway();
           removeThinking();
           removeRetry();
           settleActiveTool();
+          if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
           foldReason();
           closeText();
           if (backHome && lastReply) addActions(lastReply); // 回复结束：显示复制/模型/重新生成
@@ -2743,6 +2804,12 @@
   }).catch(function () {});
 
   function setWorkspace(path) {
+    if (pendingUploads || sending || workspaceChanging || sessionChanging) {
+      return Promise.resolve({ ok: false, error: '文件上传、发送或切换尚未完成，请稍候再切换工作区' });
+    }
+    const previous = workspaceRoot;
+    workspaceChanging = true;
+    composerEpoch++;
     workspaceRoot = path || '';
     // 返回 Promise：需要「先切工作区、再新建会话」的调用方必须等它，否则 new_session 会
     // 抢在清空请求前面到达服务端，新会话被挂到上一个项目下（见「新建项目」按钮）。
@@ -2770,8 +2837,12 @@
           }).then(function () { loadSessionList(); });
         }
       }
+      if (!res.ok) workspaceRoot = previous;
       return res;
-    });
+    }).catch(function (err) {
+      workspaceRoot = previous;
+      return { ok: false, error: err.message || '无法切换工作区' };
+    }).finally(function () { workspaceChanging = false; });
     return done;
   }
   // 内置目录浏览选择器（Linux/macOS 等）；startPath 为服务端给出的默认起始目录
@@ -2891,74 +2962,164 @@
   input.addEventListener('scroll', syncInputMirror);
   syncInputMirror();
 
-  // 提取文本里的 @文件路径 提及（含分隔符/盘符的才算文件；@技能名 忽略）。
-  // 与渲染共用 MENTION_SPLIT，因此 `@"C:\a b\c.txt"` 这种带空白的写法也能取到。
+  function pasteFiles(e) {
+    const clipboard = e.clipboardData;
+    if (!clipboard) return;
+    let files = Array.from(clipboard.files || []);
+    if (!files.length) {
+      files = Array.from(clipboard.items || []).map(function (item) {
+        return item.kind === 'file' && typeof item.getAsFile === 'function' ? item.getAsFile() : null;
+      }).filter(Boolean);
+    }
+    if (!files.length) return;
+    e.preventDefault();
+    if (!workspaceRoot) { addError('还没有选择工作区，请先选择工作区再粘贴文件'); return; }
+    if (workspaceChanging || sessionChanging || sending) { addInfo('正在发送或切换，请稍候再粘贴文件'); return; }
+    const snap = composerSnapshot();
+    const text = clipboard.getData ? clipboard.getData('text/plain') : '';
+    if (text) insertIntoInput(text);
+    pendingUploads += files.length;
+    uploadQueue = uploadQueue.then(async function () {
+      for (const file of files) {
+        try {
+          if (!sameComposer(snap)) continue;
+          if (file.size > 20 * 1024 * 1024) throw new Error('单文件不能超过20MiB');
+          const body = new FormData();
+          body.append('file', file);
+          const res = await fetch('/api/upload_file', { method: 'POST', body: body });
+          const d = await res.json();
+          if (!sameComposer(snap)) continue;
+          if (!res.ok || !d.ok || typeof d.staged_path !== 'string' || !d.staged_path) {
+            throw new Error(d.error || '上传未返回有效附件路径');
+          }
+          insertUploadedFile(file.name || d.name || 'image.png', d.staged_path, snap.workspace);
+        } catch (err) {
+          if (sameComposer(snap)) addError('文件 ' + file.name + ' 上传失败：' + (err.message || '服务不可达'));
+        } finally {
+          pendingUploads--;
+        }
+      }
+    });
+    return uploadQueue;
+  }
+  input.addEventListener('paste', pasteFiles);
+
+  function insertUploadedFile(name, path, workspace) {
+    const base = String(name).replace(/["\r\n]/g, '_');
+    const dot = base.lastIndexOf('.');
+    const stem = dot > 0 ? base.slice(0, dot) : base;
+    const ext = dot > 0 ? base.slice(dot) : '';
+    const occupied = new Set(String(input.value).split(MENTION_SPLIT));
+    let token = mentionToken(base), n = 2;
+    while (fileAlias.has(token) || occupied.has(token)) {
+      token = mentionToken(stem + ' (' + n++ + ')' + ext);
+    }
+    fileAlias.set(token, path);
+    uploadAliasWorkspace.set(token, workspace);
+    insertIntoInput(token);
+  }
+
+  function composerSnapshot() {
+    return { epoch: composerEpoch, session: sessionID, workspace: workspaceRoot };
+  }
+
+  function sameComposer(snap) {
+    return snap.epoch === composerEpoch && snap.session === sessionID &&
+      snap.workspace === workspaceRoot && !workspaceChanging && !sessionChanging;
+  }
+
   function fileMentions(text) {
     const out = [];
-    String(text).split(MENTION_SPLIT).forEach(function (p) {
-      if (!p || p.charAt(0) !== '@' || p.length < 2) return;
+    String(text).split(MENTION_SPLIT).forEach(function (p, i) {
+      if (i % 2 !== 1 || !p || p.length < 2) return;
       const body = mentionBody(p);
-      if (/[\\/]/.test(body)) out.push(body);
+      if (/[\\/]/.test(body) || /[^.\s]\.[A-Za-z0-9]{1,16}$/.test(body)) out.push(body);
     });
     return out;
   }
 
-  // 发送前的处理链：把 @区外文件 stage 成工作区副本。
-  //   text    —— 真正发出去、给模型看的文本（别名已展开成真实路径）
-  //   display —— 消息气泡里展示的文本（= 用户原本输入的样子，@文件名 保持蓝色）
-  // 两者刻意分开：模型要能读到路径，用户要看自己写的东西。
-  // staging 失败的文件保持原样（模型看不到，但至少消息可发；会附带提示）。
+  function attachmentKey(path) {
+    let p = String(path).replace(/\\/g, '/');
+    if (/^[A-Za-z]:/.test(workspaceRoot)) p = p.toLowerCase();
+    let root = workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '');
+    if (/^[A-Za-z]:/.test(root)) root = root.toLowerCase();
+    if (p.indexOf(root + '/') === 0) p = p.slice(root.length + 1);
+    return p.replace(/\/+/g, '/').replace(/(^|\/)\.\//g, '$1');
+  }
+
   async function prepareMentions(text, display) {
-    const notes = [];
-    for (const f of fileMentions(text)) {
-      if (insideWorkspace(f)) continue;
-      try {
+    const snap = composerSnapshot();
+    const notes = [], attachments = [], seen = new Set(), staged = new Map();
+    const files = fileMentions(text);
+    if (files.length && !workspaceRoot) throw new Error('还没有选择工作区，请先选择工作区');
+    for (const f of files) {
+      if (!sameComposer(snap)) throw new Error('会话或工作区已切换，请重新发送');
+      const key = attachmentKey(f);
+      let path = staged.get(key) || f;
+      const relative = !/^(?:[\\/]|[A-Za-z]:)/.test(f) && !f.split(/[\\/]/).includes('..');
+      if (!staged.has(key) && !insideWorkspace(f) && !relative) {
         const res = await fetch('/api/stage_file', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: f })
         });
         const d = await res.json();
-        if (res.ok && d.ok && d.staged_path) {
-          // 按 token 粒度整体替换（含 @、含可能的引号），换成模型可直接用的路径
-          text = text.split(MENTION_SPLIT).map(function (part) {
-            return (part && part.charAt(0) === '@' && mentionBody(part) === f) ? d.staged_path : part;
-          }).join('');
-          // ⚠️ inside=true 表示它本来就在工作区内、**没有复制** —— 别说「已复制到 attachments/」。
-          // （前端自己的 insideWorkspace 是词法判断，手打的相对路径会被它误判成区外，
-          //   于是走到这里；以服务端的 inside 为准才不会弹假提示。）
-          if (!d.inside) {
-            notes.push('已把 ' + d.name + ' 复制到工作区 attachments/，模型将通过副本访问');
-          }
-        } else {
-          notes.push('文件 ' + f + ' 在工作区外且副本创建失败：' + (d.error || '未知错误'));
+        if (!sameComposer(snap)) throw new Error('会话或工作区已切换，请重新发送');
+        if (!res.ok || !d.ok || typeof d.staged_path !== 'string' || !d.staged_path) {
+          throw new Error('文件暂存失败：' + (d.error || '无有效附件路径'));
         }
-      } catch (_) {
-        notes.push('文件 ' + f + ' 暂存失败（服务不可达）');
+        path = d.staged_path;
+        staged.set(key, path);
+        if (!d.inside) {
+          notes.push('已把 ' + d.name + ' 复制到工作区 attachments/，模型将通过副本访问');
+        }
       }
+      if (path !== f) {
+        text = text.split(MENTION_SPLIT).map(function (part, i) {
+          return (i % 2 === 1 && mentionBody(part) === f) ? mentionToken(path) : part;
+        }).join('');
+      }
+      const finalKey = attachmentKey(path);
+      if (!seen.has(finalKey)) { seen.add(finalKey); attachments.push(path); }
     }
-    return { text: text, display: display === undefined ? text : display, notes: notes };
+    return { text: text, display: display === undefined ? text : display, notes: notes, attachments: attachments };
   }
 
-  form.addEventListener('submit', function (e) {
+  async function submitMessage(e, override) {
     e.preventDefault();
+    if (pendingUploads) { addInfo('文件正在上传，请等待上传完成后发送'); return; }
+    if (sending) { addInfo('消息正在发送，请勿重复提交'); return; }
+    if (workspaceChanging || sessionChanging) { addInfo('正在切换会话或工作区，请稍候'); return; }
     if (running) {
       // 运行中按发送 = 打断；若正在看别的会话，说明打断的是后台任务
       if (runAway()) addInfo('已请求打断正在后台运行的任务');
       wsSend({ type: 'cancel' });
       return;
     }
-    const raw = input.value.trim();
+    const raw = String(override === undefined ? input.value : override).trim();
     if (!raw) return;
     if (!wsReady) { addError('未连接到服务，请稍候重试'); return; }
-    // ⚠️ 顺序要紧：别名展开必须在清空输入框**之前**。syncInputMirror() 会按当前内容
-    // 清理「@文件名」别名表，先清空就等于把别名全删了，expandFileAliases 只能原样返回。
-    const outgoing = expandFileAliases(raw);
-    input.value = '';
-    syncInputMirror();
-    // 再把区外文件 stage 成工作区副本（attachments/），最后发出去。
-    // 第二个参数 = 气泡要显示的原文（raw），与发出去的 outgoing 分开。
-    prepareMentions(outgoing, raw).then(function (p) {
+    const snap = composerSnapshot();
+    const original = input.value;
+    const socket = ws;
+    sending = true;
+    try {
+      const outgoing = expandFileAliases(raw);
+      const p = await prepareMentions(outgoing, raw);
+      if (!sameComposer(snap)) throw new Error('会话或工作区已切换，请重新发送');
+      if (override === undefined && input.value !== original) throw new Error('输入已更改，请确认后重新发送');
+      if (!wsReady || socket !== ws) throw new Error('连接已更改，请重新发送');
+      if (!wsSend({
+        type: 'user_message',
+        session_id: snap.session,
+        text: p.text,
+        attachments: p.attachments,
+        thinking: thinkingVal
+      })) throw new Error('未连接到服务，请稍候重试');
+      if (override === undefined) {
+        input.value = '';
+        syncInputMirror();
+      }
       lastUserText = p.text; // 记录供「重新生成」（用发送文本，可直接重放）
       resetPlanActions(); // 新用户消息发出：下一条 @plan 回复完成后可再次弹出选择面板
       composerSnap = false; // 用户主动发出第一句：位置切换要有下放动画
@@ -2968,14 +3129,12 @@
       p.notes.forEach(function (n) { addInfo(n); });
       // 不等服务端 busy 往返：用户消息发出后，模型尚未回复的空窗立即显示提示。
       showThinking();
-      wsSend({
-        type: 'user_message',
-        session_id: sessionID,
-        text: p.text,
-        thinking: thinkingVal // 上游参数原值：枚举（minimal/low/…）或 budget 数字
-      });
-    });
-  });
+    } catch (err) {
+      sending = false;
+      addError('发送失败：' + (err.message || '服务不可达'));
+    }
+  }
+  form.addEventListener('submit', submitMessage);
 
   // 快捷键：Enter 换行（textarea 默认行为），Shift+Enter 发送
   input.addEventListener('keydown', function (e) {
@@ -3235,10 +3394,12 @@
   function pruneFileAliases(text) {
     if (!fileAlias.size) return;
     const alive = new Set(String(text).split(MENTION_SPLIT));
-    fileAlias.forEach(function (_, tok) { if (!alive.has(tok)) fileAlias.delete(tok); });
+    fileAlias.forEach(function (_, tok) {
+      if (!alive.has(tok)) { fileAlias.delete(tok); uploadAliasWorkspace.delete(tok); }
+    });
   }
   function mentionToken(name) {
-    return /[\s"]/.test(name) ? '@"' + name + '"' : '@' + name;
+    return /[\s"@]/.test(name) ? '@"' + name + '"' : '@' + name;
   }
   // 把输入框里的「@文件名」别名展开成真实路径；没有别名的 token 原样保留
   //（例如用户手打的 @技能名 / @完整路径）。
@@ -3248,6 +3409,9 @@
   function expandFileAliases(text) {
     if (!fileAlias.size) return text;
     return String(text).split(MENTION_SPLIT).map(function (part) {
+      if (uploadAliasWorkspace.has(part) && uploadAliasWorkspace.get(part) !== workspaceRoot) {
+        throw new Error('附件属于其他工作区，请重新粘贴文件');
+      }
       const real = fileAlias.get(part);
       return real ? mentionToken(real) : part;
     }).join('');
@@ -3460,6 +3624,39 @@
         .then(function () { el.disabled = false; });
     });
   })();
+  // 「工具调用轮数」卡片：回填服务端当前值，保存时 POST /api/config（热生效 + 落盘）。
+  function refreshMaxStepsForm() {
+    fetch('/api/config').then(function (r) { return r.json(); }).then(function (cfg) {
+      var el = document.getElementById('max-steps');
+      if (el) { el.value = cfg.max_steps > 0 ? cfg.max_steps : 500; }
+    }).catch(function () { /* 读取失败保持默认 */ });
+  }
+  (function bindMaxStepsForm() {
+    var btn = document.getElementById('max-steps-save');
+    if (!btn) return;
+    btn.addEventListener('click', function () {
+      var v = Math.max(1, Number(document.getElementById('max-steps').value) || 500);
+      var result = document.getElementById('max-steps-result');
+      btn.disabled = true;
+      if (result) { result.textContent = '保存中…'; result.style.color = ''; }
+      fetch('/api/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ max_steps: v })
+      }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+        .then(function (res) {
+          if (result) {
+            if (res.ok) { result.textContent = '已保存'; result.style.color = 'var(--accent, #4c9aff)'; }
+            else { result.textContent = res.d.error || '保存失败'; result.style.color = ''; }
+          }
+          if (!res.ok) addError('轮数设置保存失败：' + (res.d.error || '未知错误'));
+        })
+        .catch(function () {
+          if (result) { result.textContent = '服务不可达'; result.style.color = ''; }
+          addError('轮数设置保存失败（服务不可达）');
+        })
+        .then(function () { btn.disabled = false; });
+    });
+  })();
   // 「请求重试」卡片：回填服务端当前策略，保存时 POST /api/config（热生效 + 落盘）。
   function refreshRetryForm() {
     fetch('/api/config').then(function (r) { return r.json(); }).then(function (cfg) {
@@ -3515,6 +3712,7 @@
     if (mEl) { mEl.textContent = modelName || model || '--'; mEl.title = model || ''; }
     refreshNotifySwitch();
     refreshRetryForm();
+    refreshMaxStepsForm();
     settingsOverlay.classList.remove('leaving', 'hidden');
   });
   settingsOverlay.addEventListener('click', function (e) {
@@ -3551,6 +3749,22 @@
       renderModelPop();
     });
   });
+
+  // ---------- 液态玻璃（设置→外观开关；localStorage 记忆，默认关闭） ----------
+  function applyLiquidGlass(on) {
+    document.body.classList.toggle('liquid-glass', !!on);
+    const el = document.getElementById('opt-liquid-glass');
+    if (el) el.checked = !!on;
+  }
+  (function initLiquidGlass() {
+    const el = document.getElementById('opt-liquid-glass');
+    if (!el) return;
+    applyLiquidGlass(localStorage.getItem('cf_liquid_glass') === '1'); // 默认关闭
+    el.addEventListener('change', function () {
+      localStorage.setItem('cf_liquid_glass', el.checked ? '1' : '0');
+      applyLiquidGlass(el.checked);
+    });
+  })();
 
   // ---------- 外观：对话框宽度/高度滑条（CSS 变量即时生效，localStorage 记忆） ----------
   function applyComposerSize(w, h) {
@@ -4070,17 +4284,29 @@
           showPage('models');
           showMTab('config');
         }));
-        acts.appendChild(mkBtn('删除', '', function () {
-          if (!confirm('从模型库删除「' + (m.name || m.id) + '」？')) return;
-          fetch('/api/models/delete', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: m.id })
-          }).then(function (r) { return r.json(); }).then(function () {
-            renderModelItems();
-            modelsLoaded = false; // 删除的可能是当前模型，刷新主界面模型显示
-            loadModels().then(function () { renderModelBtn(); });
+        const delBtn = mkBtn('删除', '', function () {
+          delBtn.classList.add('confirming');
+          delBtn.textContent = '确认删除';
+          const confirmBtn = mkBtn('确认删除', 'confirming', function () {
+            fetch('/api/models/delete', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ model: m.id })
+            }).then(function (r) { return r.json(); }).then(function () {
+              renderModelItems();
+              modelsLoaded = false; // 删除的可能是当前模型，刷新主界面模型显示
+              loadModels().then(function () { renderModelBtn(); });
+            });
           });
-        }));
+          const cancelBtn = mkBtn('取消', '', function () {
+            acts.removeChild(confirmBtn);
+            delBtn.classList.remove('confirming');
+            delBtn.textContent = '删除';
+            acts.appendChild(delBtn);
+          });
+          acts.replaceChild(confirmBtn, delBtn);
+          acts.appendChild(cancelBtn);
+        });
+        acts.appendChild(delBtn);
         row.appendChild(main); row.appendChild(badge); row.appendChild(acts);
         box.appendChild(row);
       });

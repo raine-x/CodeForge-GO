@@ -71,7 +71,7 @@ type oaiToolCall struct {
 
 type oaiMessage struct {
 	Role       string        `json:"role"`
-	Content    string        `json:"content,omitempty"`
+	Content    any           `json:"content,omitempty"`
 	ToolCalls  []oaiToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string        `json:"tool_call_id,omitempty"`
 }
@@ -123,6 +123,8 @@ func (p *OpenAIProvider) buildPayload(req Request) map[string]any {
 // convertOAIMessages 将统一消息转换为 OpenAI 消息序列。
 func convertOAIMessages(m Message) []oaiMessage {
 	var text strings.Builder
+	var parts []map[string]any
+	hasImages := false
 	var toolCalls []oaiToolCall
 	var toolResults []oaiMessage
 
@@ -130,6 +132,17 @@ func convertOAIMessages(m Message) []oaiMessage {
 		switch b.Type {
 		case BlockText:
 			text.WriteString(b.Text)
+			if b.Text != "" {
+				parts = append(parts, map[string]any{"type": "text", "text": b.Text})
+			}
+		case BlockImage:
+			hasImages = true
+			parts = append(parts, map[string]any{
+				"type": "image_url",
+				"image_url": map[string]any{
+					"url": "data:" + b.MediaType + ";base64," + b.Data,
+				},
+			})
 		case BlockToolUse:
 			args := string(b.Input)
 			if strings.TrimSpace(args) == "" {
@@ -157,9 +170,15 @@ func convertOAIMessages(m Message) []oaiMessage {
 		role = "user"
 	}
 
+	var content any
+	if hasImages {
+		content = parts
+	} else if text.Len() > 0 {
+		content = text.String()
+	}
 	var out []oaiMessage
-	if text.Len() > 0 || len(toolCalls) > 0 {
-		out = append(out, oaiMessage{Role: role, Content: text.String(), ToolCalls: toolCalls})
+	if content != nil || len(toolCalls) > 0 {
+		out = append(out, oaiMessage{Role: role, Content: content, ToolCalls: toolCalls})
 	}
 	out = append(out, toolResults...)
 	return out
@@ -278,8 +297,14 @@ func (p *OpenAIProvider) consume(ctx context.Context, r io.Reader, out chan<- St
 	}
 	// max_tokens 预算（思考 + 回答共享）被耗尽时上游会以 length 结束且无报错，
 	// 不显式上报会被上层当作正常完成，表现为「思考到一半就停了」。
+	// content_filter 同理：上游认为命中内容过滤而截断，不报错就会被当成正常完成。
+	// 两者都置 failed：错误后不再补发正常 MessageStop，上层按异常结束处理。
 	if finish == "length" {
+		failed = true
 		send(ctx, out, StreamEvent{Type: EventError, Error: "输出因达到 max_tokens 上限被截断（思考与回答共享该预算），请在设置中调大模型条目的「输出上限」后重新应用"})
+	} else if finish == "content_filter" {
+		failed = true
+		send(ctx, out, StreamEvent{Type: EventError, Error: "输出被上游内容过滤截断（content_filter），本轮未正常完成"})
 	}
 	// 用量在流结束时统一上报（message_stop 之前），上层按会话累计
 	if usage != nil {

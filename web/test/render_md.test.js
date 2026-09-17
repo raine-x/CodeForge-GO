@@ -532,11 +532,17 @@ check('同名文件不互相顶掉（token 冲突时逐级多带父目录）',
   /const token = mentionTokenFor\(p\)/.test(uiSrc));
 check('气泡显示用户输入原文（p.display），发送用展开后的 p.text',
   /addUser\(p\.display\)/.test(uiSrc) && /lastUserText = p\.text/.test(uiSrc));
-check('别名展开必须早于清空输入框（否则 prune 先把别名删光，展开拿不到）',
-  /const outgoing = expandFileAliases\(raw\);[\s\S]{0,200}?input\.value = '';[\s\S]{0,200}?prepareMentions\(outgoing, raw\)/.test(uiSrc));
+check('别名展开、附件准备与 WS 发送成功后才清空输入框', (function () {
+  const submit = extractFunction(uiSrc, 'submitMessage');
+  const expand = submit.indexOf('expandFileAliases(raw)');
+  const prepare = submit.indexOf('await prepareMentions(outgoing, raw)');
+  const send = submit.indexOf('if (!wsSend({');
+  const clear = submit.indexOf("input.value = '';");
+  return expand >= 0 && expand < prepare && prepare < send && send < clear;
+})());
 check('prepareMentions 显式分开「发送文本」与「气泡显示文本」',
   /async function prepareMentions\(text, display\)/.test(uiSrc) &&
-  /return \{ text: text, display: display === undefined \? text : display, notes: notes \}/.test(uiSrc));
+  /return \{ text: text, display: display === undefined \? text : display, notes: notes, attachments: attachments \}/.test(uiSrc));
 check('别名展开后重新加引号（路径含空白时不被切断）',
   /const real = fileAlias\.get\(part\);\s*\n\s*return real \? mentionToken\(real\) : part;/.test(uiSrc));
 check('气泡去掉引号、镜像层逐字原样（否则与 textarea 错位）',
@@ -918,6 +924,17 @@ check('样式契约：详情小标签 + 可点击手型',
 check('保存重试设置使用统一主按钮样式',
   /id="retry-save" class="btn primary"/.test(fs.readFileSync(path.join(DIST, 'index.html'), 'utf8')));
 
+group('工具调用轮数（max_steps）');
+{
+  const html = fs.readFileSync(path.join(DIST, 'index.html'), 'utf8');
+  check('常规页有「工具调用轮数」卡片与保存按钮',
+    html.includes('工具调用轮数') && /id="max-steps-save" class="btn primary"/.test(html));
+  check('输入框不设上限（min=1，无 max 属性）——用户要求不限制轮数',
+    /id="max-steps" type="number" min="1"/.test(html) && !/id="max-steps"[^>]*max=/.test(html));
+  check('前端接线：打开设置时回填、保存时 POST max_steps',
+    uiSrc.includes('refreshMaxStepsForm') && /\{ max_steps: v \}/.test(uiSrc));
+}
+
 group('外观设置：液态玻璃开关');
 {
   const html = fs.readFileSync(path.join(DIST, 'index.html'), 'utf8');
@@ -927,6 +944,25 @@ group('外观设置：液态玻璃开关');
   check('开关复用系统通知同款 switch 结构',
     /<label class="switch">\s*<input type="checkbox" id="opt-liquid-glass">/.test(appearance) &&
     appearance.includes('switch-track') && appearance.includes('switch-knob'));
+  // 玻璃效果契约：body 类开关 + 四个切换组件 + 技能参数移植
+  check('CSS 以 body.liquid-glass 为开关，默认关闭时不生效',
+    css.includes('body.liquid-glass .settings-nav') && !/\:root[^{]*liquid/.test(css));
+  check('玻璃效果覆盖四个切换组件（左导航/皮肤分段/模型tab/MCP tab）',
+    css.includes('body.liquid-glass .settings-nav .nav-item.active') &&
+    css.includes('body.liquid-glass .skin-seg button.active') &&
+    css.includes('body.liquid-glass .models-tab.active') &&
+    css.includes('body.liquid-glass .mcp-tab.active'));
+  check('透镜参数来自 liquid-glass-button 技能（磨砂 blur18 / 白渐变 / 辉光）',
+    css.includes('backdrop-filter: blur(18px)') &&
+    css.includes('linear-gradient(135deg, rgba(255,255,255,.82)') &&
+    css.includes('rgba(67,115,245,.20)'));
+  // JS 接线：localStorage 记忆 + 动态切换 + 默认关闭
+  check('开关接线：toggle body 类并写 localStorage（cf_liquid_glass）',
+    uiSrc.includes("classList.toggle('liquid-glass', !!on)") &&
+    uiSrc.includes("localStorage.getItem('cf_liquid_glass') === '1'") &&
+    uiSrc.includes("localStorage.setItem('cf_liquid_glass', el.checked ? '1' : '0')"));
+  check('默认关闭：非 "1" 一律按关闭处理',
+    uiSrc.includes('applyLiquidGlass(localStorage.getItem(\'cf_liquid_glass\') === \'1\'); // 默认关闭'));
 }
 
 group('移动端触摸高亮');
@@ -984,6 +1020,38 @@ group('删除菜单原位确认');
   check('项目和会话删除不调用浏览器确认框', !/\bconfirm\(/.test(sidebar +
     extractFunction(uiSrc, 'deleteSession') + extractFunction(uiSrc, 'deleteWorkspace')));
 }
+
+group('工具调用生成中的实时反馈（tool_pending）');
+check('前端处理 tool_pending 事件并显示占位提示',
+  uiSrc.includes("case 'tool_pending':") && uiSrc.includes('正在生成工具调用参数…'));
+check('占位提示声明与终态清理齐全（tool_call/tool_result/error/idle/回放）',
+  /let pendingToolEl = null/.test(uiSrc) &&
+  (uiSrc.match(/pendingToolEl\.remove\(\); pendingToolEl = null;/g) || []).length >= 4 &&
+  uiSrc.includes('thinkingEl = null; activeToolEl = null; retryEl = null; pendingToolEl = null;'));
+check('占位提示只提示状态，不泄露工具 ID',
+  !/正在生成工具调用参数[^']*(read_file|write_file|edit_file|run_command)/.test(uiSrc));
+
+group('模型删除原位确认（不弹浏览器框）');
+{
+  const render = extractFunction(uiSrc, 'renderModelItems');
+  check('删除为按钮级原位确认：首次点「删除」变「确认删除」，配「取消」按钮',
+    render.includes("mkBtn('删除'") && render.includes("delBtn.textContent = '确认删除'") &&
+    render.includes("mkBtn('确认删除', 'confirming'") &&
+    render.includes("mkBtn('取消'"));
+  check('「确认删除」再次点击才执行，取消按钮恢复原删除按钮',
+    render.includes("acts.removeChild(confirmBtn)") && render.includes("delBtn.textContent = '删除'"));
+  check('模型删除不再调用浏览器 confirm 确认框',
+    !/\bconfirm\('从模型库删除/.test(uiSrc));
+  const css = fs.readFileSync(path.join(DIST, 'app.css'), 'utf8');
+  check('「确认删除」态有红色危险样式',
+    /\.mi-actions button\.confirming \{ [^}]*color: var\(--danger\)/.test(css));
+}
+
+group('上下文占用说明');
+check('新增平均缓存命中率行（hit/(hit+miss)）',
+  uiSrc.includes("'平均缓存命中率'") && uiSrc.includes("hit / (hit + miss) * 100"));
+check('移除「自服务启动累计（重启重新计数）」说明',
+  !uiSrc.includes('用量与缓存统计自服务启动后累计'));
 
 console.log('\n' + '-'.repeat(52));
 if (failures.length) {
