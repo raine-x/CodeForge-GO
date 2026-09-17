@@ -108,6 +108,18 @@ func EstimateTokens(msgs []llm.Message) int {
 }
 
 // countRunes 按「宽字符（CJK）1 字 1 token、窄字符 4 字 1 token」累计计数。
+func requestOverhead(system string, definitions []llm.ToolDef) int {
+	var messages []llm.Message
+	if system != "" {
+		messages = append(messages, llm.TextMessage(llm.RoleSystem, system))
+	}
+	for _, definition := range definitions {
+		data, _ := json.Marshal(definition)
+		messages = append(messages, llm.TextMessage(llm.RoleSystem, string(data)))
+	}
+	return EstimateTokens(messages)
+}
+
 func countRunes(s string, wide, narrow int) (int, int) {
 	for _, r := range s {
 		if isWideRune(r) {

@@ -320,7 +320,10 @@ func (a *Agent) ContextStat(sess *Session) ContextStat {
 // 压缩只影响「送模视图」。这样用户回看、Regenerate、界面回放都拿到完整对话，
 // 不会再出现「发一次请求就少一段历史」。
 func (a *Agent) prepareMessages(ctx context.Context, sess *Session, emit Emitter) []llm.Message {
-	budget := a.compressBudget()
+	return a.prepareMessagesBudget(ctx, sess, emit, a.compressBudget())
+}
+
+func (a *Agent) prepareMessagesBudget(ctx context.Context, sess *Session, emit Emitter, budget int) []llm.Message {
 
 	// 会话历史可能被回退（Regenerate 截断）或被整体替换，先自愈压缩状态。
 	sess.normalizeCompression()
@@ -485,12 +488,35 @@ func (a *Agent) runLoopEphemeral(ctx context.Context, sess *Session, emit Emitte
 func (a *Agent) runLoopWithPersistence(ctx context.Context, sess *Session, emit Emitter, persist bool) error {
 	for step := 1; step <= a.cfg.MaxSteps; step++ {
 		emit(Event{Type: EventStep, Step: step})
+		system := a.systemPromptFor(sess)
+		definitions := a.registry.DefinitionsFor(a.exposureFn())
+		overhead := requestOverhead(system, definitions)
+		budget := a.compressBudget() - overhead
+		if budget <= 0 {
+			a.save(sess, persist)
+			return fmt.Errorf("系统提示词和工具定义已占满上下文预算，请减少提示词或工具数量")
+		}
+		messages := a.prepareMessagesBudget(ctx, sess, func(ev Event) {
+			if ev.Compress != nil {
+				ev.Compress.Before += overhead
+				ev.Compress.After += overhead
+				ev.Compress.Budget += overhead
+			}
+			emit(ev)
+		}, budget)
+		if EstimateTokens(messages) > budget {
+			messages = a.degradedCompress(sess, messages, EstimateTokens(messages), budget, sess.compressedUpTo, emit)
+		}
+		if EstimateTokens(messages) > budget {
+			a.save(sess, persist)
+			return fmt.Errorf("压缩后仍超过上下文预算，请缩短输入或减少工具定义")
+		}
 		req := llm.Request{
-			System:      a.systemPromptFor(sess),                   // 含会话任务清单（todo 段随进度实时更新）
-			Messages:    a.prepareMessages(ctx, sess, emit),        // 超阈值时自动摘要压缩（历史本身不改）
-			Tools:       a.registry.DefinitionsFor(a.exposureFn()), // Exposure 层：工具可见面过滤（nil=全量）
-			MaxTokens:   a.llmCfg.MaxTokens,                        // 来自模型条目「输出上限」/配置，不再硬编码
-			Temperature: a.llmCfg.Temperature,                      // 同上
+			System:      system,
+			Messages:    messages,
+			Tools:       definitions,
+			MaxTokens:   a.llmCfg.MaxTokens,   // 来自模型条目「输出上限」/配置，不再硬编码
+			Temperature: a.llmCfg.Temperature, // 同上
 			Thinking:    ThinkingFromCtx(ctx),
 		}
 
@@ -511,7 +537,9 @@ func (a *Agent) runLoopWithPersistence(ctx context.Context, sess *Session, emit 
 
 		turn, err := a.consumeStream(ctx, sess, stream, emit)
 		if err != nil {
-			// 同上：由调用方统一 emit 一次。
+			if turn != nil && turn.Text != "" {
+				sess.Messages = append(sess.Messages, llm.TextMessage(llm.RoleAssistant, turn.Text))
+			}
 			a.save(sess, persist)
 			return err
 		}
@@ -633,14 +661,11 @@ func (a *Agent) consumeStream(ctx context.Context, sess *Session, stream <-chan 
 		}
 	}
 
-	if errMsg != "" && len(order) == 0 && turn.Text == "" {
-		return nil, fmt.Errorf("%s", errMsg)
+	if err := ctx.Err(); err != nil {
+		return turn, err
 	}
-
-	// 流中途出错但已有部分内容（文本/工具调用）：内容保留执行，错误补一条
-	// 事件让用户知道本轮被上游截断（这条是唯一的一次 emit，不会重复）。
 	if errMsg != "" {
-		emit(Event{Type: EventError, Error: errMsg})
+		return turn, fmt.Errorf("%s", errMsg)
 	}
 
 	for _, id := range order {

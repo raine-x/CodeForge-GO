@@ -113,11 +113,12 @@ func (p *Policy) Mode() string {
 }
 
 // SetMode 热切换权限模式：
-//   - readonly：默认 Deny，仅只读工具放行；跳过配置规则，防止 Allow/Ask 规则绕过锁定；
-//   - auto：默认 Allow，配置规则里的 Ask 升级为 Allow（Deny 规则与黑名单仍生效）；
+//   - readonly：默认 Deny，仅只读工具放行（含声明 IsReadOnly 的工具）；
+//     跳过配置规则与插件强制审批，防止 Allow/Ask 规则绕过锁定；
+//   - auto：默认 Allow，除黑名单外全部自动通过，不弹任何审批；
 //   - ask（默认）：按配置文件的原始 default_decision 与规则执行。
 //
-// 黑名单与插件强制审批在任何模式下都生效。
+// 黑名单在任何模式下都生效。
 func (p *Policy) SetMode(mode string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -157,27 +158,30 @@ func (p *Policy) Evaluate(toolName, action, payload string) (Decision, string) {
 	approvalRequired := p.approvalRequired
 	p.mu.RUnlock()
 
-	// 1) 黑名单强制 Deny（优先级最高）
+	// 1) 黑名单强制 Deny（优先级最高，任何模式都不放行）
+
 	for _, re := range denyPatterns {
 		if re.MatchString(subject) || re.MatchString(payload) {
 			return Deny, "命中危险操作黑名单：" + re.String()
 		}
 	}
 
-	// 2) 插件声明的强制审批工具
+	// 2) 自主模式：除黑名单外全部自动通过 —— 不走规则、不问插件强制审批、
+	// 不弹人工审批（越界的放行判定由执行器按模式处理，见 executor.escalate）。
+	if mode == ModeAuto {
+		return Allow, "自主模式自动放行：" + toolName
+	}
+
+	// 3) 插件声明的强制审批工具
 	if approvalRequired[strings.ToLower(toolName)] {
 		return Ask, "插件安全策略要求人工审批"
 	}
 
-	// 3) 有序规则匹配
-	// 自主模式：规则要求的 Ask 升级为 Allow（Deny 规则与黑名单仍然生效）；
+	// 4) 有序规则匹配
 	// 只读模式：跳过规则，防止配置里的 Allow/Ask 规则绕过锁定。
 	if mode != ModeReadOnly {
 		for _, r := range rules {
 			if matchAny(r.Tools, toolName) && matchAny(r.Actions, subject) {
-				if mode == ModeAuto && r.Decision == Ask {
-					return Allow, "自主模式放行（规则原判定 ask）：" + toolName
-				}
 				return r.Decision, "命中规则：" + toolName
 			}
 		}

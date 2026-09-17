@@ -1488,7 +1488,13 @@
       b.type = 'button';
       b.textContent = it.label;
       if (it.danger) b.className = 'danger';
+      let confirmed = false;
       b.addEventListener('click', function () {
+        if (it.confirmDelete && !confirmed) {
+          confirmed = true;
+          b.textContent = '确认删除';
+          return;
+        }
         closeInlineMenu();
         it.fn();
       });
@@ -1601,10 +1607,8 @@
           items.push({ label: '恢复默认名', fn: function () { clearWorkspaceName(ws); } });
         }
         items.push({ label: '归档', fn: function () { archiveWorkspace(ws); } });
-        items.push({ label: '删除项目', danger: true, fn: function () {
-          if (confirm('删除项目「' + groupName + '」及其全部会话？此操作不可恢复。')) {
-            deleteWorkspace(ws);
-          }
+        items.push({ label: '删除项目', danger: true, confirmDelete: true, fn: function () {
+          deleteWorkspace(ws);
         } });
         showInlineMenu(dots, items);
       });
@@ -1642,7 +1646,7 @@
             showInlineMenu(sdots, [
               { label: '重命名', fn: function () { renameSessionInline(sdots, s); } },
               { label: '归档', fn: function () { archiveSession(s); } },
-              { label: '永久删除', danger: true, fn: function () { deleteSession(s); } },
+              { label: '永久删除', danger: true, confirmDelete: true, fn: function () { deleteSession(s); } },
             ]);
           });
           li.appendChild(sdots);

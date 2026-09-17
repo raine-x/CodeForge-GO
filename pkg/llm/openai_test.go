@@ -43,6 +43,38 @@ func TestOpenAIConsumeReportsLengthTruncation(t *testing.T) {
 	}
 }
 
+func TestOpenAIConsumeEOF(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		tail      string
+		wantError bool
+	}{
+		{name: "incomplete", wantError: true},
+		{name: "finish_without_done", tail: "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"},
+		{name: "done_without_finish", tail: "data: [DONE]\n\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := runConsume(t, "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"+tc.tail)
+			var errors, stops int
+			for _, ev := range events {
+				if ev.Type == EventError {
+					errors++
+				}
+				if ev.Type == EventMessageStop {
+					stops++
+				}
+			}
+			if tc.wantError {
+				if errors != 1 || stops != 0 {
+					t.Fatalf("incomplete stream: errors=%d stops=%d", errors, stops)
+				}
+			} else if errors != 0 || stops != 1 {
+				t.Fatalf("complete stream: errors=%d stops=%d", errors, stops)
+			}
+		})
+	}
+}
+
 // 正常结束（stop）不应误报。
 func TestOpenAIConsumeNormalStopNoError(t *testing.T) {
 	body := strings.Join([]string{

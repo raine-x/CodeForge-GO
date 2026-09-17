@@ -121,53 +121,25 @@ func TestCommandTouchesOutside(t *testing.T) {
 	}
 }
 
-// TestAutoModeOutsideRequiresApproval 自主模式下越界调用必须先人工审批：
-// 未审批不得执行、不得泄露区外内容；批准后放行执行。
+// TestAutoModeOutsideRequiresApproval 自主模式下全部自动通过：越界不弹审批、
+// 直接执行（黑名单与工作区内部围栏仍兜底）。
 func TestAutoModeOutsideRequiresApproval(t *testing.T) {
 	reg, _, _ := newFenceFixture(t)
 
-	// 无审批通道：越界调用不得执行
+	// 无审批通道也直接放行：自主模式不请求审批
 	exec := newFenceExecutor(t, reg, security.ModeAuto, nil)
-	res := runTool(t, exec, "run_command", map[string]string{
-		"command": "cat ../b/secret.txt",
-	})
-	if res.Success {
-		t.Fatalf("auto 模式下越界命令未经审批就执行成功: %v", res.Data)
-	}
-	if !strings.Contains(res.Error, "审批") {
-		t.Fatalf("越界命令应被升级为人工审批，实际错误: %q", res.Error)
+	res := runTool(t, exec, "read_file", map[string]string{"path": "../b/secret.txt"})
+	if !res.Success || !strings.Contains(showRes(res), "TOPSECRET") {
+		t.Fatalf("auto 模式越界 read_file 应自动放行，实际: %v", showRes(res))
 	}
 
-	res = runTool(t, exec, "read_file", map[string]string{"path": "../b/secret.txt"})
-	if res.Success || strings.Contains(showRes(res), "TOPSECRET") {
-		t.Fatalf("auto 模式下 read_file 越界未经审批就放行: %v", showRes(res))
-	}
-
-	// 判定层面：越界一律 ask，即使策略默认放行
-	if d := exec.Evaluate("run_command", mustJSON(t, map[string]string{"command": "cat ../b/secret.txt"})); d.Decision != security.Ask {
-		t.Fatalf("auto 模式越界判定应为 ask，实际 %s（%s）", d.Decision, d.Reason)
+	// 判定层面：越界也是 allow，不产生 ask
+	if d := exec.Evaluate("run_command", mustJSON(t, map[string]string{"command": "cat ../b/secret.txt"})); d.Decision != security.Allow {
+		t.Fatalf("auto 模式越界判定应为 allow，实际 %s（%s）", d.Decision, d.Reason)
 	}
 	// 区内命令不受影响，仍自动放行
 	if d := exec.Evaluate("run_command", mustJSON(t, map[string]string{"command": "echo hi"})); d.Decision != security.Allow {
 		t.Fatalf("auto 模式区内命令应放行，实际 %s（%s）", d.Decision, d.Reason)
-	}
-
-	// 批准后：越界调用放行执行（人工担责）
-	exec2 := newFenceExecutor(t, reg, security.ModeAuto, fenceApprover{approved: true})
-	res = runTool(t, exec2, "read_file", map[string]string{"path": "../b/secret.txt"})
-	if !res.Success || !strings.Contains(showRes(res), "TOPSECRET") {
-		t.Fatalf("越界调用经人工批准后应执行成功: %v", showRes(res))
-	}
-	res = runTool(t, exec2, "run_command", map[string]string{"command": "cat ../b/secret.txt"})
-	if !res.Success || !strings.Contains(showRes(res), "TOPSECRET") {
-		t.Fatalf("越界命令经人工批准后应执行成功: %v", showRes(res))
-	}
-
-	// 拒绝后：不得执行
-	exec3 := newFenceExecutor(t, reg, security.ModeAuto, fenceApprover{approved: false})
-	res = runTool(t, exec3, "read_file", map[string]string{"path": "../b/secret.txt"})
-	if res.Success || strings.Contains(showRes(res), "TOPSECRET") {
-		t.Fatalf("越界调用被拒绝后不得执行: %v", showRes(res))
 	}
 }
 
@@ -188,19 +160,26 @@ func TestAskModeOutsideRequiresApproval(t *testing.T) {
 	}
 }
 
-// TestReadOnlyModeOutsideFence 只读模式：区外只读工具需审批，区外写/命令保持拒绝。
+// TestReadOnlyModeOutsideFence 只读模式：只允许探索与搜索等读取操作 ——
+// 区外只读工具放行（不弹审批），区外写/命令维持拒绝。
 func TestReadOnlyModeOutsideFence(t *testing.T) {
 	reg, _, _ := newFenceFixture(t)
 	exec := newFenceExecutor(t, reg, security.ModeReadOnly, fenceApprover{approved: true})
 
-	if d := exec.Evaluate("read_file", mustJSON(t, map[string]string{"path": "../b/secret.txt"})); d.Decision != security.Ask {
-		t.Fatalf("readonly 模式越界 read_file 判定应为 ask，实际 %s", d.Decision)
+	// 越界只读工具（read_file）：放行，不再要求审批
+	if d := exec.Evaluate("read_file", mustJSON(t, map[string]string{"path": "../b/secret.txt"})); d.Decision != security.Allow {
+		t.Fatalf("readonly 模式越界 read_file 应放行（只读工具），实际 %s（%s）", d.Decision, d.Reason)
 	}
+	res := runTool(t, exec, "read_file", map[string]string{"path": "../b/secret.txt"})
+	if !res.Success || !strings.Contains(showRes(res), "TOPSECRET") {
+		t.Fatalf("readonly 模式越界只读工具应能读取，实际: %v", showRes(res))
+	}
+	// 越界命令（非只读）：维持拒绝
 	if d := exec.Evaluate("run_command", mustJSON(t, map[string]string{"command": "cat ../b/secret.txt"})); d.Decision != security.Deny {
 		t.Fatalf("readonly 模式越界 run_command 应维持 deny，实际 %s", d.Decision)
 	}
-	// 只读且区内：照常自动放行
-	res := runTool(t, exec, "read_file", map[string]string{"path": "inside.txt"})
+	// 区内只读：照常自动放行
+	res = runTool(t, exec, "read_file", map[string]string{"path": "inside.txt"})
 	if !res.Success {
 		t.Fatalf("readonly 模式区内只读应放行: %s", res.Error)
 	}

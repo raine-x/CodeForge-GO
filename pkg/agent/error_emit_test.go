@@ -79,8 +79,6 @@ func TestRunLoopFatalErrorEmitsOnce(t *testing.T) {
 	}
 }
 
-// 部分内容后上游截断：保留已到内容，错误只 emit 一次，且不返回错误
-// （本轮照常收尾，不能让截断的错误再被 WS 层重复下发）。
 func TestRunLoopPartialErrorEmitsOnce(t *testing.T) {
 	upstream := errors.New("上游截断")
 	a := newEmitTestAgent(t, &partialProvider{err: upstream})
@@ -88,10 +86,18 @@ func TestRunLoopPartialErrorEmitsOnce(t *testing.T) {
 		llm.TextMessage(llm.RoleUser, "写个网页"),
 	}}
 	counter := &countEmitter{}
-	if err := a.runLoopWithPersistence(context.Background(), sess, counter.emit, false); err != nil {
-		t.Fatalf("部分截断不应返回错误（内容保留收尾），实际: %v", err)
+	var done bool
+	err := a.runLoopWithPersistence(context.Background(), sess, func(ev Event) {
+		counter.emit(ev)
+		done = done || ev.Type == EventDone
+	}, false)
+	if err == nil || err.Error() != upstream.Error() {
+		t.Fatalf("expected upstream error, got %v", err)
 	}
-	if n := counter.errors.Load(); n != 1 {
-		t.Errorf("部分截断的错误应只 emit 一次，实际 %d 次", n)
+	if n := counter.errors.Load(); n != 0 || done {
+		t.Fatalf("error must be returned without success or duplicate emission: errors=%d done=%v", n, done)
+	}
+	if len(sess.Messages) != 2 || sess.Messages[1].Content[0].Text != "半句话" {
+		t.Fatalf("partial text was not preserved: %v", sess.Messages)
 	}
 }

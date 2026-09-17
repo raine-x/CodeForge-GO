@@ -1,4 +1,5 @@
-// scope.go 定义工作区围栏的执行器侧联动：越界调用在任何权限模式下都必须人工审批。
+// scope.go 定义工作区围栏的执行器侧联动：ask 模式下越界必须人工审批；
+// auto 模式全部自动通过；readonly 模式只放行只读工具。
 package tools
 
 import (
@@ -8,9 +9,9 @@ import (
 
 // ScopeChecker 由具备工作区围栏的工具实现：报告一次调用是否试图访问工作区之外。
 //
-// 执行器在策略判定为 Allow 之前先询问本接口；一旦越界，判定强制升级为 Ask
-// （人工审批），使「自主模式静默越界」成为不可能。工具内部的原生围栏
-// （如 FS.ResolveChecked）保持不变，作为审批通过后的最终防线。
+// 执行器在策略判定为 Allow 之后询问本接口并按权限模式分流：ask 模式强制
+// 升级为 Ask（人工审批），auto 模式自动放行，readonly 模式仅放行只读工具。
+// 工具内部的原生围栏（如 FS.ResolveChecked）保持不变，作为最终防线。
 type ScopeChecker interface {
 	// OutsideScope 判断本次调用参数是否指向工作区之外。实现应保守：
 	// 无法确认在区内时返回 true，宁可多弹一次审批。

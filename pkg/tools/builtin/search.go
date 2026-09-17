@@ -27,7 +27,7 @@ func (t *SearchTool) Name() string { return "search_files" }
 
 // Description 实现 tools.Tool。
 func (t *SearchTool) Description() string {
-	return "在指定目录下按关键字检索文件内容，返回 文件:行号:内容 列表。默认跳过 .git / node_modules / dist / vendor 等目录。"
+	return "在指定目录下按关键字检索文件**内容**（grep 语义，返回 文件:行号:内容），不是按文件名查找。默认跳过 .git / node_modules / dist / vendor 等目录。按文件名找文件请用 find_files。"
 }
 
 // InputSchema 实现 tools.Tool。
@@ -148,7 +148,95 @@ func (t *SearchTool) Execute(ctx context.Context, args json.RawMessage) (*tools.
 	}), nil
 }
 
+// FindFilesTool 按文件名模式查找文件（非内容检索）。
+type FindFilesTool struct{ fs *FS }
+
+func NewFindFilesTool(fs *FS) *FindFilesTool { return &FindFilesTool{fs: fs} }
+
+func (t *FindFilesTool) Name() string { return "find_files" }
+
+func (t *FindFilesTool) Description() string {
+	return "在指定目录下按文件名模式查找文件（如 *.py、8.py、test_*.go），返回相对路径列表。默认跳过 .git / node_modules / dist / vendor 等目录。内容检索请用 search_files。"
+}
+
+func (t *FindFilesTool) InputSchema() json.RawMessage {
+	return tools.NewSchema().
+		Str("pattern", "文件名模式（glob，如 *.py、8.py、test_*.go）", true).
+		Str("path", "检索起始目录（必须位于工作区内），留空使用工作区根目录", false).
+		Int("max_results", "最大返回条数，默认 200", false).
+		Build()
+}
+
+func (t *FindFilesTool) IsReadOnly() bool { return true }
+
+func (t *FindFilesTool) OutsideScope(args json.RawMessage) bool { return t.fs.OutsideScopePath(args) }
+
+type findItem struct {
+	Path string `json:"path"`
+}
+
+func (t *FindFilesTool) Execute(ctx context.Context, args json.RawMessage) (*tools.ToolResult, error) {
+	if r := t.fs.noWorkspace(); r != nil {
+		return r, nil
+	}
+	var p struct {
+		Pattern    string `json:"pattern"`
+		Path       string `json:"path"`
+		MaxResults int    `json:"max_results"`
+	}
+	if err := json.Unmarshal(args, &p); err != nil {
+		return tools.Err("参数解析失败: %v", err), nil
+	}
+	if strings.TrimSpace(p.Pattern) == "" {
+		return tools.Err("pattern 不能为空"), nil
+	}
+	maxResults := p.MaxResults
+	if maxResults <= 0 {
+		maxResults = searchDefaultMax
+	}
+
+	root, err := t.fs.ResolveCheckedCtx(ctx, p.Path)
+	if err != nil {
+		return tools.Err("%v", err), nil
+	}
+
+	matches := make([]findItem, 0, maxResults)
+	scanned := 0
+
+	walkErr := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			if path != root && skipDir(info.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if len(matches) >= maxResults {
+			return filepath.SkipAll
+		}
+		if ok, _ := filepath.Match(p.Pattern, info.Name()); ok {
+			rel, _ := filepath.Rel(root, path)
+			matches = append(matches, findItem{Path: rel})
+		}
+		scanned++
+		return nil
+	})
+	if walkErr != nil && walkErr != filepath.SkipAll {
+		return tools.Err("查找失败: %v", walkErr), nil
+	}
+
+	return tools.OkMeta(matches, map[string]any{
+		"root":    root,
+		"pattern": p.Pattern,
+		"count":   len(matches),
+		"scanned": scanned,
+	}), nil
+}
+
 // RegisterSearch 将检索工具注册到注册中心。
 func RegisterSearch(reg *tools.Registry, fs *FS) {
 	reg.Register(NewSearchTool(fs))
+	reg.Register(NewFindFilesTool(fs))
 }

@@ -201,10 +201,16 @@ func (p *OpenAIProvider) consume(ctx context.Context, r io.Reader, out chan<- St
 	ids := map[int]string{}
 	names := map[int]string{}
 	finish := ""
+	done := false
+	failed := false
 	var usage *Usage // 部分兼容网关会在多个块带 usage，取最后一次
 
 	err := scanSSE(r, func(_ string, data string) {
-		if data == "" || data == "[DONE]" {
+		if data == "[DONE]" {
+			done = true
+			return
+		}
+		if data == "" || done || failed {
 			return
 		}
 		var chunk oaiChunk
@@ -212,6 +218,7 @@ func (p *OpenAIProvider) consume(ctx context.Context, r io.Reader, out chan<- St
 			return
 		}
 		if chunk.Error != nil {
+			failed = true
 			send(ctx, out, StreamEvent{Type: EventError, Error: chunk.Error.Message})
 			return
 		}
@@ -261,8 +268,13 @@ func (p *OpenAIProvider) consume(ctx context.Context, r io.Reader, out chan<- St
 			}
 		}
 	})
-	if err != nil {
+	if err != nil && !failed {
+		failed = true
 		send(ctx, out, StreamEvent{Type: EventError, Error: err.Error()})
+	}
+	if !failed && finish == "" && !done {
+		failed = true
+		send(ctx, out, StreamEvent{Type: EventError, Error: "上游流提前结束：未收到 finish_reason 或 [DONE]"})
 	}
 	// max_tokens 预算（思考 + 回答共享）被耗尽时上游会以 length 结束且无报错，
 	// 不显式上报会被上层当作正常完成，表现为「思考到一半就停了」。
@@ -273,5 +285,7 @@ func (p *OpenAIProvider) consume(ctx context.Context, r io.Reader, out chan<- St
 	if usage != nil {
 		send(ctx, out, StreamEvent{Type: EventUsage, Usage: usage})
 	}
-	send(ctx, out, StreamEvent{Type: EventMessageStop})
+	if !failed {
+		send(ctx, out, StreamEvent{Type: EventMessageStop})
+	}
 }

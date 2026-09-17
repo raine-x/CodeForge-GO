@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -248,6 +249,69 @@ func TestWebSocketAgentFlow(t *testing.T) {
 	}
 	if gotText.String() != "你好，我是 CodeForge。" {
 		t.Errorf("流式文本拼接不正确，实际: %q", gotText.String())
+	}
+}
+
+func TestWebSocketIncompleteUpstream(t *testing.T) {
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, text := range []string{"我直接", "列目录找"} {
+			chunk, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"delta": map[string]string{"content": text}}}})
+			t.Logf("SSE chunk: %s", chunk)
+			fmt.Fprintf(w, "data: %s\n\n", chunk)
+			w.(http.Flusher).Flush()
+		}
+		t.Log("SSE EOF without finish_reason or [DONE]")
+	}))
+	defer gateway.Close()
+	defer gateway.CloseClientConnections()
+
+	deps := newTestDepsAtProvider(t, "", llm.NewOpenAI(config.LLMConfig{
+		BaseURL: gateway.URL, Model: "stalled-test", MaxTokens: 256,
+	}))
+	ts := httptest.NewServer(deps.newServer().Routes())
+	defer ts.Close()
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar, Timeout: time.Second}
+	resp, err := client.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	dialer := websocket.Dialer{Jar: jar, HandshakeTimeout: time.Second}
+	conn, _, err := dialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http")+"/ws", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	conn.SetReadDeadline(deadline)
+	conn.SetWriteDeadline(deadline)
+	var ready map[string]any
+	if err := conn.ReadJSON(&ready); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteJSON(map[string]any{"type": "user_message", "text": "继续"}); err != nil {
+		t.Fatal(err)
+	}
+	var text strings.Builder
+	for {
+		var ev map[string]any
+		if err := conn.ReadJSON(&ev); err != nil {
+			t.Fatalf("upstream stalled after %q without a terminal error: %v", text.String(), err)
+		}
+		t.Logf("WS type=%v text=%v error=%v", ev["type"], ev["text"], ev["error"])
+		switch ev["type"] {
+		case "text":
+			text.WriteString(asString(ev["text"]))
+		case "done", "idle":
+			t.Fatalf("incomplete upstream reported success: %v", ev)
+		case "error":
+			if text.String() != "我直接列目录找" || asString(ev["error"]) == "" {
+				t.Fatalf("missing partial text or explicit error: text=%q event=%v", text.String(), ev)
+			}
+			return
+		}
 	}
 }
 

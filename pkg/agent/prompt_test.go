@@ -99,6 +99,22 @@ func TestSystemPromptLeaksNoToolIDs(t *testing.T) {
 	}
 }
 
+// 任务工作流必须在场：探索→规划→编写→验证→修复复验→完成门槛的全流程纪律。
+func TestDefaultSystemPromptHasTaskWorkflow(t *testing.T) {
+	p := DefaultSystemPrompt("/tmp/proj")
+	for _, want := range []string{
+		"## 任务工作流",
+		"探索", "规划", "编写", "验证",
+		"清单未全部完成前不要结束回合", // todo 不做完不收尾（Cursor 任务纪律）
+		"修复后复验", // 修完必须重跑失败的那条验证
+		"拿到证据",  // 验证是拿证据，不是走过场
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("任务工作流缺少 %q", want)
+		}
+	}
+}
+
 // 体积上限：System Prompt 每一轮都注入，膨胀会直接吃上下文预算。
 func TestDefaultSystemPromptSizeBudget(t *testing.T) {
 	p := DefaultSystemPrompt("/tmp/proj")

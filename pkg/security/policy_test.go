@@ -76,12 +76,23 @@ func TestPolicyModeAutoOverridesAskRules(t *testing.T) {
 	}
 
 	p.SetMode(ModeAuto)
+	// 自主模式：写操作不弹审批（Ask 规则不再生效）
 	if d, _ := p.Evaluate("edit_file", "a.html", `{"path":"a.html"}`); d != Allow {
-		t.Errorf("自主模式下 Ask 规则应升级为 Allow，实际 %s", d)
+		t.Errorf("自主模式下写操作应自动放行，实际 %s", d)
+	}
+	// 插件强制审批在自主模式下也不再拦截
+	p.RequireApproval("some_plugin.tool")
+	if d, _ := p.Evaluate("some_plugin.tool", "", `{}`); d != Allow {
+		t.Errorf("自主模式下插件强制审批应被跳过，实际 %s", d)
 	}
 	// 黑名单在自主模式下依然生效
 	if d, _ := p.Evaluate("run_command", "shutdown -h now", `{"command":"shutdown -h now"}`); d != Deny {
 		t.Errorf("自主模式下黑名单期望 Deny，实际 %s", d)
+	}
+	// 切回 ask 模式后插件强制审批恢复生效
+	p.SetMode(ModeAsk)
+	if d, _ := p.Evaluate("some_plugin.tool", "", `{}`); d != Ask {
+		t.Errorf("切回 ask 模式后插件强制审批应恢复，实际 %s", d)
 	}
 }
 

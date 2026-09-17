@@ -915,6 +915,76 @@ check('样式契约：详情小标签 + 可点击手型',
   /\.retry-more\s*\{/.test(css) && /\.msg-tool\.retry\s*\{[^}]*cursor:\s*pointer/.test(css));
 
 // ---------------------------------------------------------------------------
+check('保存重试设置使用统一主按钮样式',
+  /id="retry-save" class="btn primary"/.test(fs.readFileSync(path.join(DIST, 'index.html'), 'utf8')));
+
+group('外观设置：液态玻璃开关');
+{
+  const html = fs.readFileSync(path.join(DIST, 'index.html'), 'utf8');
+  const appearance = html.slice(html.indexOf('id="page-appearance"'), html.indexOf('id="page-models"'));
+  check('外观页有「启用液态玻璃效果」开关行',
+    appearance.includes('启用液态玻璃效果') && /id="opt-liquid-glass"/.test(appearance));
+  check('开关复用系统通知同款 switch 结构',
+    /<label class="switch">\s*<input type="checkbox" id="opt-liquid-glass">/.test(appearance) &&
+    appearance.includes('switch-track') && appearance.includes('switch-knob'));
+}
+
+group('移动端触摸高亮');
+check('禁用 WebView 默认点击遮罩，不改动全局焦点轮廓',
+  /\*\s*\{[^}]*-webkit-tap-highlight-color:\s*transparent\s*;/.test(css) &&
+  !/\*\s*\{[^}]*outline\s*:/.test(css));
+
+group('删除菜单原位确认');
+{
+  const menus = [];
+  const document = {
+    createElement: function () {
+      return {
+        children: [], style: {}, offsetWidth: 100,
+        appendChild: function (child) { this.children.push(child); },
+        addEventListener: function (type, fn) { this[type] = fn; },
+        remove: function () { this.removed = true; },
+      };
+    },
+  };
+  const anchor = {
+    closest: function () { return { appendChild: function (menu) { menus.push(menu); } }; },
+    getBoundingClientRect: function () { return { right: 200, bottom: 40 }; },
+  };
+  const api = new Function('document', 'let openMenu = null;\n' +
+    extractFunction(uiSrc, 'closeInlineMenu') + '\n' +
+    extractFunction(uiSrc, 'showInlineMenu') + '\nreturn {show: showInlineMenu, close: closeInlineMenu};')(document);
+  ['永久删除', '删除项目'].forEach(function (label) {
+    let calls = 0;
+    const items = [{ label: label, danger: true, confirmDelete: true, fn: function () { calls++; } }];
+    api.show(anchor, items);
+    const menu = menus[menus.length - 1];
+    const button = menu.children[0];
+    button.click();
+    check(label + '首次点击只在原按钮显示确认删除', calls === 0 && button.textContent === '确认删除' && !menu.removed);
+    button.click();
+    check(label + '第二次点击执行删除并关闭菜单', calls === 1 && menu.removed);
+    api.show(anchor, items);
+    menus[menus.length - 1].children[0].click();
+    api.close();
+    api.show(anchor, items);
+    const reopened = menus[menus.length - 1].children[0];
+    check(label + '关闭后重新打开重置确认状态', reopened.textContent === label);
+    reopened.click();
+    check(label + '重新打开后仍需二次确认', calls === 1);
+  });
+  let calls = 0;
+  api.show(anchor, [{ label: '归档', fn: function () { calls++; } }]);
+  menus[menus.length - 1].children[0].click();
+  check('其他菜单操作仍单击执行', calls === 1);
+  const sidebar = extractFunction(uiSrc, 'renderSessions');
+  check('项目和会话删除均启用原位确认',
+    /label: '删除项目', danger: true, confirmDelete: true/.test(sidebar) &&
+    /label: '永久删除', danger: true, confirmDelete: true/.test(sidebar));
+  check('项目和会话删除不调用浏览器确认框', !/\bconfirm\(/.test(sidebar +
+    extractFunction(uiSrc, 'deleteSession') + extractFunction(uiSrc, 'deleteWorkspace')));
+}
+
 console.log('\n' + '-'.repeat(52));
 if (failures.length) {
   console.log('失败 ' + failures.length + ' 项 / 通过 ' + passed + ' 项：');

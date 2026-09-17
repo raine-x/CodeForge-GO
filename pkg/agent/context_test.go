@@ -318,6 +318,25 @@ func TestChooseSplitNoCandidate(t *testing.T) {
 //   - 会话历史原文一条不少（用户仍能回看完整对话）；
 //   - 送模视图 = 摘要 + 保留段，且显著变小；
 //   - 产出 compress 事件供前端提示。
+func TestRunLoopCompressesRequestOverhead(t *testing.T) {
+	p := &ctxStubProvider{reply: "摘要"}
+	a := newEmitTestAgent(t, p)
+	messages := buildTurns(5, 200)
+	messages = append(messages, llm.TextMessage(llm.RoleUser, "继续"))
+	sess := &Session{ID: "overhead", Messages: messages}
+	a.cfg.ContextTokenBudget = EstimateTokens(messages) + 100
+	var compressed bool
+	err := a.runLoopWithPersistence(context.Background(), sess, func(ev Event) {
+		compressed = compressed || ev.Type == EventCompress
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !compressed {
+		t.Fatal("system prompt overhead did not trigger compression")
+	}
+}
+
 func TestPrepareMessagesSummarizes(t *testing.T) {
 	cfg := config.AgentConfig{ContextTokenBudget: 2000, ContextCompressRatio: 0.95}
 	prov := &ctxStubProvider{reply: "## 已完成的改动\n- 读取了 a.go"}
