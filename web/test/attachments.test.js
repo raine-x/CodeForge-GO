@@ -39,7 +39,7 @@ function harness() {
     sendBtn: { classList: { add() {}, remove() {} } },
     sessionsCache: [], loadSessionList() {}, messagesEl: {}, subagentCards: new Map(),
     syncComposerMode() {}, renderSessions() {}, scrollBottom() {},
-    removeThinking() {}, removeRetry() {}, settleActiveTool() {}, foldReason() {}, closeText() {},
+    removeThinking() {}, removeRetry() {}, removeRetryRing() {}, showRetryRing() {}, settleActiveTool() {}, foldReason() {}, closeText() {},
     resetSubagentCards() {}, syncRunBadges() {}, maybeShowPlanActions() {},
     setTimeout() {},
     thinkingVal: 'high', composerSnap: false, lastUserText: '', lastReply: '',

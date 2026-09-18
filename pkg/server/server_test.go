@@ -106,6 +106,9 @@ func newTestDepsAtProvider(t *testing.T, configDir string, provider llm.Provider
 		t.Fatalf("创建会话失败: %v", err)
 	}
 	ag := agent.New(cfg.Agent, cfg.LLM, provider, executor, history, dir)
+	// 与生产一致（main.go）：记忆/检查点与 History 共用同一个 SQLite 库。
+	// 不注入的话检查点无处落库，回滚类接口会以「存储未就绪」失败。
+	ag.SetMemoryStore(st)
 
 	return &testDeps{
 		cfg:      cfg,

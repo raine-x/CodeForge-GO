@@ -518,6 +518,47 @@ func (s *Server) handleUndo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleRewind 返回会话的检查点列表，或把工作区文件回滚到某个步骤之前。
+//
+//	GET  /api/sessions/rewind?id=xxx            → 列出回滚点（按步骤聚合）
+//	POST /api/sessions/rewind {id, to_step}     → 回滚文件到 to_step 之前
+//
+// 与 WS 的 rewind/checkpoints 消息同源（共用 agent 层实现）：
+// REST 供设置页/脚本这类非实时的入口使用，WS 供聊天界面即时交互。
+func (s *Server) handleRewind(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "缺少 id"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"steps":     s.agent.CheckpointSteps(id),
+			"editables": s.agent.EditableUserMessages(id, 3),
+		})
+
+	case http.MethodPost:
+		var body struct {
+			ID     string `json:"id"`
+			ToStep int    `json:"to_step"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "缺少 id"})
+			return
+		}
+		res, err := s.agent.RewindFiles(body.ID, body.ToStep)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": res})
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
 // handleMemory 用户记忆的列举 / 新增 / 更新 / 删除（按当前工作区隔离）。
 func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {

@@ -1,0 +1,214 @@
+// checkpoints.go 实现「检查点 / 回滚」：把写工具执行前的文件快照按
+// (会话, 步骤, 路径) 记入 SQLite，并支持按步骤把文件恢复到当时的样子。
+//
+// 为什么需要它：会话历史可以截断重来（Regenerate / 编辑重发），但磁盘上被
+// 改过的文件不会自己回去。没有这一层，「重新生成」之后模型看到的代码与它
+// 以为的上下文就对不上了 —— 越是多步写入的任务，错得越离谱。
+package agent
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"codeforge/pkg/store"
+	"codeforge/pkg/tools"
+)
+
+// CheckpointStep 是一个回滚点（供前端列表展示）。
+type CheckpointStep struct {
+	Step   int    `json:"step"`   // 步骤号
+	Files  int    `json:"files"`  // 该步骤改动的文件数
+	At     int64  `json:"at"`     // 最近一次改动时间（unix 秒）
+	Sample string `json:"sample"` // 首个被改动文件的路径
+}
+
+// RewindResult 是一次回滚的结果。
+type RewindResult struct {
+	ToStep   int      `json:"to_step"`  // 回滚到哪一步之前
+	Restored int      `json:"restored"` // 成功写回的文件数
+	Deleted  int      `json:"deleted"`  // 成功删除的文件数（回滚前并不存在）
+	Failed   int      `json:"failed"`   // 失败数
+	Paths    []string `json:"paths"`    // 涉及的文件路径（含失败项）
+	Errors   []string `json:"errors,omitempty"`
+}
+
+// recordCheckpoint 把一次文件写入前的快照落库（由 runLoop 注入的 sink 调用）。
+//
+// 去重交给数据库主键（session_id, step, path）+ INSERT OR IGNORE：
+// 同一步内反复写同一个文件只保留第一次的旧内容，那才是「这一步之前」的样子。
+// 落库失败只记日志不打断工具执行 —— 检查点是增强能力，不该让写入本身失败。
+func (a *Agent) recordCheckpoint(sessionID string, step int, ev tools.CheckpointEvent) {
+	if a.memoryStore == nil || strings.TrimSpace(ev.Path) == "" {
+		return
+	}
+	err := a.memoryStore.InsertCheckpoint(sessionID, store.CheckpointRow{
+		Step:       step,
+		Path:       ev.Path,
+		Existed:    ev.Existed,
+		OldContent: ev.OldContent,
+	})
+	if err != nil {
+		log.Printf("[checkpoint] 会话=%s 步骤=%d 记录失败（路径=%s）：%v", sessionID, step, ev.Path, err)
+	}
+}
+
+// RecordCheckpoint 公开版本的检查点记录（供测试与外部显式造点使用）。
+// 生产链路走 recordCheckpoint（由 runLoop 注入的 sink 调用），语义完全一致。
+func (a *Agent) RecordCheckpoint(sessionID string, step int, path string, existed bool, oldContent string) {
+	a.recordCheckpoint(sessionID, step, tools.CheckpointEvent{
+		Path:       path,
+		Existed:    existed,
+		OldContent: oldContent,
+	})
+}
+
+// CheckpointSteps 返回会话的全部回滚点（步骤倒序）。
+func (a *Agent) CheckpointSteps(sessionID string) []CheckpointStep {
+	if a.memoryStore == nil {
+		return nil
+	}
+	rows, err := a.memoryStore.ListCheckpointSteps(sessionID)
+	if err != nil {
+		return nil
+	}
+	out := make([]CheckpointStep, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, CheckpointStep{
+			Step:   r.Step,
+			Files:  r.Files,
+			At:     r.At.Unix(),
+			Sample: r.Sample,
+		})
+	}
+	return out
+}
+
+// RewindFiles 把工作区文件恢复到「第 toStep 步开始之前」的样子。
+//
+// 逐条按步骤倒序恢复，而不是「每个路径取最早的快照写一次」：
+// 同一个文件可能在多步里被改写，倒序逐条回放才能保证最终落到最早的旧内容，
+// 中途若某一步失败，前面已恢复的部分仍是对的（幂等，可重试）。
+//
+// 成功恢复后，toStep 及之后的检查点会被删除 —— 它们描述的是已被撤销的写入，
+// 留着会让下一次回滚把刚还原的文件又写回旧内容。
+func (a *Agent) RewindFiles(sessionID string, toStep int) (*RewindResult, error) {
+	if a.memoryStore == nil {
+		return nil, fmt.Errorf("存储未就绪，无法回滚")
+	}
+	rows, err := a.memoryStore.CheckpointsFrom(sessionID, toStep)
+	if err != nil {
+		return nil, fmt.Errorf("读取检查点失败: %w", err)
+	}
+
+	res := &RewindResult{ToStep: toStep, Paths: []string{}}
+	seen := map[string]bool{}
+	for _, r := range rows {
+		if !seen[r.Path] {
+			seen[r.Path] = true
+			res.Paths = append(res.Paths, r.Path)
+		}
+		if err := restoreFile(r); err != nil {
+			res.Failed++
+			res.Errors = append(res.Errors, fmt.Sprintf("%s: %v", r.Path, err))
+			continue
+		}
+		if r.Existed {
+			res.Restored++
+		} else {
+			res.Deleted++
+		}
+	}
+	sort.Strings(res.Paths)
+
+	// 全部成功才清理检查点：有失败项时保留，方便用户修正后重试。
+	if res.Failed == 0 && len(res.Paths) > 0 {
+		if _, err := a.memoryStore.DeleteCheckpointsFrom(sessionID, toStep); err != nil {
+			log.Printf("[checkpoint] 会话=%s 回滚后清理检查点失败：%v", sessionID, err)
+		}
+	}
+	return res, nil
+}
+
+// restoreFile 把单个文件恢复到快照状态。
+func restoreFile(r store.CheckpointRow) error {
+	if r.Existed {
+		if dir := filepath.Dir(r.Path); dir != "" {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return fmt.Errorf("创建目录失败: %w", err)
+			}
+		}
+		if err := os.WriteFile(r.Path, []byte(r.OldContent), 0o644); err != nil {
+			return fmt.Errorf("写回失败: %w", err)
+		}
+		return nil
+	}
+	// 写入前并不存在 ⇒ 回滚 = 删掉它。文件已经不在了（用户手动删过）也算成功。
+	if err := os.Remove(r.Path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("删除失败: %w", err)
+	}
+	return nil
+}
+
+// lastCheckpointStep 返回会话已记录的最大步骤号（无检查点返回 0）。
+// 「回退某条用户消息之后的所有更改」用它划出要回滚的步骤区间。
+func (a *Agent) lastCheckpointStep(sessionID string) int {
+	steps := a.CheckpointSteps(sessionID)
+	if len(steps) == 0 {
+		return 0
+	}
+	max := 0
+	for _, s := range steps {
+		if s.Step > max {
+			max = s.Step
+		}
+	}
+	return max
+}
+
+// RewindAfterEdit 在「编辑重发」时回退被编辑消息之后的文件改动。
+//
+// 步骤归属的推定：检查点只记了「第几轮 ReAct 步骤」，消息只记了顺序，两者没有
+// 直接映射。这里用一条经验规则把它们接起来 —— 会话里的消息顺序是
+// 「提问 → (助手回复 + 工具调用/结果)* 」，所以第 k 条用户消息之后的内容，
+// 与「该消息之前已经产生过多少条消息」大致同构。
+//
+// 保守起见取**最大**匹配：只要历史被截断到 idx，就把 idx 之后（含）可能产生的
+// 全部改动回退掉。宁可多退（用户能重跑）也不要少退（留下与上下文矛盾的半成品）。
+//
+// 无法定位目标消息（back 越界）时返回 (nil, nil)：只截断对话，不动文件。
+func (a *Agent) RewindAfterEdit(sessionID string, back int) (*RewindResult, error) {
+	sess, ok := a.history.Get(sessionID)
+	if !ok {
+		return nil, fmt.Errorf("会话不存在: %s", sessionID)
+	}
+	if back < 0 {
+		back = 0
+	}
+	idx := nthLastPlainUserIndex(sess.Messages, back)
+	if idx < 0 {
+		return nil, nil // 定位不到：跳过文件回滚
+	}
+
+	// 该用户消息之后被丢弃的消息条数 → 换算成要回退的步骤区间。
+	// 一轮 ReAct 的每个「助手回复 + 工具结果」对大致对应一步，取上界即可。
+	dropped := len(sess.Messages) - (idx + 1)
+	if dropped <= 0 {
+		return nil, nil // 目标消息就是最后一条，其后没有改动
+	}
+	maxStep := a.lastCheckpointStep(sessionID)
+	if maxStep <= 0 {
+		return nil, nil // 从未记录过写操作
+	}
+	// 该消息本身所属的轮次也要算进去：它自己就可能带着工具调用（如 write_file）。
+	// 回退区间 = 从「截断点之后第一条消息」所在的步骤起算，用下界估算：
+	// 每 2 条被丢弃的消息 ≈ 1 步，再向上取整，且至少回退 1 步。
+	from := maxStep - (dropped+1)/2
+	if from < 1 {
+		from = 1
+	}
+	return a.RewindFiles(sessionID, from)
+}

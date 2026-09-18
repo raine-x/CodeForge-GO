@@ -250,8 +250,15 @@ func (f *FS) OutsideScopePath(args json.RawMessage) bool {
 	return f.outsidePath(p.Path)
 }
 
-// snapshot 在写入前记录文件快照。
-func (f *FS) snapshot(path string) {
+// snapshot 在写入前记录文件快照，并（可选）上报给会话级检查点槽。
+//
+// 两条路径的分工：
+//   - 内存 undo 栈：进程内「撤销上一步」，会话结束即失效；
+//   - 检查点槽（ctx）：按 (会话, 步骤, 路径) 落库，支持跨重启、按步回滚，
+//     是「回退回某条用户消息之前」的基础（Plan.md #4）。
+//
+// 上报必须发生在写入之前：sink 拿到的是读出的旧内容，晚一步就只能读到新内容。
+func (f *FS) snapshot(ctx context.Context, path string) {
 	data, err := os.ReadFile(path)
 	snap := Snapshot{Path: path, Time: time.Now()}
 	if err == nil {
@@ -259,10 +266,21 @@ func (f *FS) snapshot(path string) {
 		snap.Content = data
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.undo = append(f.undo, snap)
 	if len(f.undo) > f.maxUndo {
 		f.undo = f.undo[len(f.undo)-f.maxUndo:]
+	}
+	f.mu.Unlock()
+
+	if ctx == nil {
+		return
+	}
+	if sink, ok := tools.CheckpointSinkFrom(ctx); ok {
+		sink(tools.CheckpointEvent{
+			Path:       path,
+			Existed:    snap.Existed,
+			OldContent: string(data), // 文件不存在时 data 为 nil，转成空串
+		})
 	}
 }
 
@@ -537,7 +555,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (*too
 	if err != nil {
 		return tools.Err("%v", err), nil
 	}
-	t.fs.snapshot(path)
+	t.fs.snapshot(ctx, path)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return tools.Err("创建目录失败: %v", err), nil
 	}
@@ -630,7 +648,7 @@ func (t *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (*tool
 	if err != nil {
 		return tools.Err("%v", err), nil
 	}
-	t.fs.snapshot(path)
+	t.fs.snapshot(ctx, path)
 	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
 		return tools.Err("写入文件失败: %v", err), nil
 	}
@@ -708,7 +726,7 @@ func (t *DeleteFileTool) Execute(ctx context.Context, args json.RawMessage) (*to
 	if info.IsDir() {
 		return tools.Err("delete_file 不支持删除目录: %s", path), nil
 	}
-	t.fs.snapshot(path)
+	t.fs.snapshot(ctx, path)
 	if err := os.Remove(path); err != nil {
 		return tools.Err("删除失败: %v", err), nil
 	}

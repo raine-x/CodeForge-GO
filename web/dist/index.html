@@ -50,12 +50,45 @@
     <main id="main">
       <!-- 对话消息流 -->
       <div id="messages"></div>
+      <!-- 右下角「回到底部」浮动箭头：不在底部时出现（显隐由 JS 切 .show）。
+           绝对定位在 #main 右下角，不占布局、不影响滚动。 -->
+      <button type="button" id="to-bottom" class="to-bottom" title="回到底部" aria-label="回到底部">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>
+      </button>
       <!-- 卡片式输入框 -->
       <div id="composer-wrap">
+        <!-- 任务清单面板：贴在输入卡片**上方**、随输入卡片一起浮动。
+            刻意放在 #composer 之外、#composer-wrap 之内：
+              · 在 #composer 之外 → 它不参与输入卡片的 transform 折叠/居中，
+                输入卡片向上收起或空态居中时，清单留在原地始终可见；
+              · 在 #composer-wrap 之内 → 随输入卡片一起上下移动，宽度与它对齐。
+            DOM 顺序在 #composer 之前是刻意的（不用 order 反转）：这样浏览器、
+            读屏器、以及我们的前端断言看到的顺序都是「清单在上、输入在下」。
+            内容由 renderTodoBar() 填充，空列表时也保留面板并显示占位文案。 -->
+        <div id="todo-bar" class="todo-bar">
+          <div class="todo-head" id="todo-head" role="button" tabindex="0"
+               aria-expanded="true" aria-controls="todo-body" title="点击折叠 / 展开">
+            <span class="todo-title">任务清单</span>
+            <span class="todo-count"></span>
+          </div>
+          <div class="todo-body" id="todo-body"></div>
+        </div>
         <form id="composer">
           <!-- 可复用操作选择面板（输入框上方）：多选项 / 用户输入 / 多页。
                当前由 @plan 计划书回复完成后弹出「直接发送 / 取消」。 -->
           <div id="action-panel"></div>
+          <!-- 编辑重发提示条：点某条用户消息的编辑按钮后出现，说明「发送会丢弃其后的对话
+               与文件改动」，并提供发送 / 取消。发送仍走输入框的内容（用户可继续改）。 -->
+          <div id="edit-bar" class="edit-bar hidden">
+            <div class="edit-bar-text">
+              <span class="edit-bar-title">正在编辑这条消息</span>
+              <span class="edit-bar-hint">发送将丢弃其后的对话与文件改动</span>
+            </div>
+            <div class="edit-bar-actions">
+              <button type="button" id="edit-cancel" class="edit-bar-btn">取消</button>
+              <button type="button" id="edit-send" class="edit-bar-btn primary">发送</button>
+            </div>
+          </div>
           <!-- 输入框高亮镜像层：textarea 自身没法局部着色，于是垫一层排版参数完全一致的
                文字层在它下面，只把 @提及 染成蓝色；textarea 的文字设为 transparent，
                只留光标。两层必须严格重合，参数改动要同步（见 app.css 的 .input-mirror）。 -->
@@ -108,7 +141,10 @@
                   <div id="level-list"></div>
                 </div>
               </div>
-              <button type="submit" id="send-btn" aria-label="发送">↑</button>
+              <button type="submit" id="send-btn" aria-label="发送">
+                <svg class="send-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+                <svg class="stop-icon" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+              </button>
             </div>
           </div>
         </form>
@@ -434,13 +470,43 @@
             </div>
             <div class="row">
               <div class="row-main">
-                <div class="row-title">启用液态玻璃效果</div>
-                <div class="row-desc">面板与弹层呈现半透明磨砂质感</div>
+                <div class="row-title">新外观</div>
+                <div class="row-desc">侧栏与面板呈现玻璃质感的新界面风格</div>
               </div>
               <label class="switch">
                 <input type="checkbox" id="opt-liquid-glass">
                 <span class="switch-track"><span class="switch-knob"></span></span>
               </label>
+            </div>
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">自定义背景图</div>
+                <div class="row-desc">位于最底层，不遮挡任何文字与按钮（Windows / 安卓弹系统选择器，Linux 用内置选择器）</div>
+              </div>
+              <div class="bg-actions">
+                <button type="button" id="bg-pick" class="primary">选择图片</button>
+                <button type="button" id="bg-clear">清除</button>
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">背景模糊值</div>
+                <div class="row-desc">0 为不模糊</div>
+              </div>
+              <div class="appear-slider">
+                <input type="range" id="opt-bg-blur" min="0" max="40" step="1">
+                <span id="opt-bg-blur-val" class="appear-val"></span>
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">背景亮度</div>
+                <div class="row-desc">调暗背景让前景更清晰</div>
+              </div>
+              <div class="appear-slider">
+                <input type="range" id="opt-bg-bright" min="20" max="100" step="1">
+                <span id="opt-bg-bright-val" class="appear-val"></span>
+              </div>
             </div>
           </div>
         </section>

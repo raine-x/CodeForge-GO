@@ -111,6 +111,22 @@ func (s *Store) migrate() error {
 			FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_todos_session ON session_todos(session_id, sort)`,
+		// 检查点：写工具执行前的文件快照，按 (会话, 步骤, 路径) 唯一。
+		//
+		// 一个路径在同一步骤内被多次写入时只保留**最早**那份（第一次写入前的内容），
+		// 因为回滚只关心「这一步开始前文件长什么样」；用 INSERT OR IGNORE
+		// 配合主键天然实现去重，无需在 Go 侧做状态维护。
+		`CREATE TABLE IF NOT EXISTS checkpoints (
+			session_id  TEXT NOT NULL,
+			step        INTEGER NOT NULL,
+			path        TEXT NOT NULL,
+			existed     INTEGER NOT NULL DEFAULT 0,
+			old_content TEXT NOT NULL DEFAULT '',
+			created_at  INTEGER NOT NULL,
+			PRIMARY KEY (session_id, step, path),
+			FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id, step DESC)`,
 	}
 	for _, q := range stmts {
 		if _, err := s.db.Exec(q); err != nil {

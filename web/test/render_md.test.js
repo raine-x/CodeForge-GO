@@ -55,7 +55,8 @@ function loadRenderer() {
     extractFunction(src, 'fmtTokens'),
     extractFunction(src, 'wsDisplayName'),
     extractFunction(src, 'retryReasonBrief'),
-    'module.exports = { renderMD: renderMD, toolLabel: toolLabel, countLines: countLines, fmtTokens: fmtTokens, wsDisplayName: wsDisplayName, retryReasonBrief: retryReasonBrief };',
+    extractFunction(src, 'describeLLMError'),
+    'module.exports = { renderMD: renderMD, toolLabel: toolLabel, countLines: countLines, fmtTokens: fmtTokens, wsDisplayName: wsDisplayName, retryReasonBrief: retryReasonBrief, describeLLMError: describeLLMError };',
   ].join('\n');
   return new Function('module', code + '\nreturn module.exports;')({});
 }
@@ -82,7 +83,7 @@ function check(name, cond) {
 // ---------------------------------------------------------------------------
 // 开始
 // ---------------------------------------------------------------------------
-let renderMD, toolLabel, countLines, fmtTokens, wsDisplayName, retryReasonBrief;
+let renderMD, toolLabel, countLines, fmtTokens, wsDisplayName, retryReasonBrief, describeLLMError;
 try {
   const api = loadRenderer();
   renderMD = api.renderMD;
@@ -91,6 +92,7 @@ try {
   fmtTokens = api.fmtTokens;
   wsDisplayName = api.wsDisplayName;
   retryReasonBrief = api.retryReasonBrief;
+  describeLLMError = api.describeLLMError;
 } catch (err) {
   console.error('无法从 ui.js 加载 renderMD：' + err.message);
   process.exit(1);
@@ -363,17 +365,34 @@ check('样式契约：压缩态有独立标记（.ctx-meter.compressed）',
 
 // ---------- 6.2b 任务清单（todo）----------
 // 服务端 load_session / new_session / todo_write 完成后推 {type:'todo', todos}；
-// 前端只在会话匹配时渲染；空清单隐藏。
+// 前端只在会话匹配时渲染。
+//
+// ⚠️ 面板位置是回归重点：必须常驻在输入卡片**上方**（#composer-wrap 内、#composer 外），
+// 不能像早先那样 messagesEl.prepend() 塞进滚动容器顶部——那样用户往上一滚就再也看不见，
+// 表现成「模型说更新了任务清单，但界面上什么都没有」。
 group('任务清单 todo');
 check('前端订阅 todo 事件且按会话过滤',
   /case 'todo':[\s\S]{0,220}?renderTodoBar\(ev\.todos \|\| \[\]\)/.test(uiSrc) &&
   /ev\.session_id === sessionID/.test(uiSrc));
 check('清单栏渲染 4 种状态图标（○/◐/✓/✕）',
   /pending: '○', in_progress: '◐', completed: '✓', cancelled: '✕'/.test(uiSrc));
-check('空清单自动隐藏',
-  /if \(!list\.length\) \{[\s\S]{0,80}?todoBar\.classList\.add\('hidden'\);/.test(uiSrc));
+check('空清单不再整体隐藏，而是显示「暂无任务」占位',
+  /TODO_EMPTY_HINT\s*=\s*'暂无任务'/.test(uiSrc) &&
+  /empty\.textContent\s*=\s*TODO_EMPTY_HINT/.test(uiSrc) &&
+  !/todoBar\.classList\.add\('hidden'\)/.test(uiSrc));
+check('面板挂在输入卡片上方（#composer-wrap 内、#composer 之前），并常驻可见',
+  /<div id="todo-bar" class="todo-bar">[\s\S]*?<\/div>\s*<form id="composer">/.test(htmlSrc) &&
+  !/messagesEl\.prepend\(todoBar\)/.test(uiSrc));
+check('点表头折叠/展开，状态持久化到 localStorage',
+  /TODO_COLLAPSE_KEY\s*=\s*'cf_todo_collapsed'/.test(uiSrc) &&
+  /localStorage\.setItem\(TODO_COLLAPSE_KEY/.test(uiSrc));
 check('样式契约：todo 栏存在且有完成态删除线',
   /\.todo-bar\s*\{/.test(css) && /\.todo-text\.done\s*\{[^}]*line-through/.test(css));
+check('样式契约：面板宽度与输入卡片同口径（min(80%, --composer-max-w)）',
+  /\.todo-bar\s*\{[^}]*width:\s*min\(80%,\s*var\(--composer-max-w\)\)/.test(css));
+check('样式契约：条数多时列表内滚，不把输入卡片顶出屏幕',
+  /\.todo-bar\s*\{[^}]*max-height:\s*38vh/.test(css) &&
+  /\.todo-body\s*\{[^}]*overflow-y:\s*auto/.test(css));
 check('todo 文案进 toolPhrases（审批/卡片显示）',
   /todo_write:\s+'更新任务清单'/.test(uiSrc));
 
@@ -456,8 +475,14 @@ check('新建会话（doNewSession）后回到居中',
   extractFunction(uiSrc, 'doNewSession').includes('syncComposerMode()'));
 check('会话回放（replayHistory）后同步（空会话居中 / 有历史下放）',
   extractFunction(uiSrc, 'replayHistory').includes('syncComposerMode()'));
-check('居中态不参与滚动折叠（scroll 提前返回）',
-  /addEventListener\('scroll',\s*function[\s\S]{0,200}?if\s*\(composerCentered\)\s*return/.test(uiSrc));
+check('居中态不参与**折叠**（scroll 回调在折叠前提前返回）',
+  /addEventListener\('scroll',\s*function[\s\S]{0,420}?if\s*\(composerCentered\)\s*return/.test(uiSrc));
+check('但居中态仍要维护「跟随态 + 回到底部」判定（提前返回必须在它们之后）',
+  (function () {
+    const fn = uiSrc.slice(uiSrc.indexOf("addEventListener('scroll', function"));
+    const tail = fn.slice(0, fn.indexOf('if (composerCentered) return'));
+    return /followTail\s*=\s*isNearBottom\(\)/.test(tail) && /syncToBottomBtn\(\)/.test(tail);
+  })());
 check('页面加载自动回放历史时不做过渡（composer-no-anim）',
   /#composer-wrap\.composer-no-anim\s*\{\s*transition:\s*none/.test(css));
 check('ready 自动恢复前重新武装「直接落位」标记',
@@ -597,9 +622,9 @@ check('程序化改动也同步：@面板选中 / ＋菜单插入',
 
 // ---------- 9. 发送 / 打断按钮共色 ----------
 group('发送 / 打断按钮颜色');
-check('运行中的打断按钮与发送按钮共用 accent 色',
+check('运行中的打断按钮为危险色（区别于发送按钮的 accent）',
   /#send-btn\s*\{[^}]*background:\s*var\(--accent\)/.test(css) &&
-  /#send-btn\.running\s*\{[^}]*background:\s*var\(--accent\)/.test(css) &&
+  /#send-btn\.running\s*\{[^}]*background:\s*var\(--danger\)/.test(css) &&
   !/#send-btn\.running\s*\{[^}]*background:\s*var\(--text-dim\)/.test(css));
 
 // ---------- 10. 任务等待提示：模型响应前 / 工具返回后 ----------
@@ -907,6 +932,24 @@ check('上游错误体里的人话被带出来',
 check('空/缺失原因降级为「未知原因」',
   retryReasonBrief('') === '未知原因' && retryReasonBrief(null) === '未知原因' &&
   retryReasonBrief(undefined) === '未知原因');
+check('配额耗尽仍被识别为配额已用尽（而非限流）',
+  retryReasonBrief('LLM 请求失败 (429): {"error":{"code":"quota_exceeded"}}') === '模型配额已用尽');
+
+// ---------------------------------------------------------------------------
+group('错误显示（describeLLMError）');
+check('配额耗尽 → 明确提示去设置换模型/充值',
+  /模型配额已用尽/.test(describeLLMError('LLM 请求失败 (429): {"error":{"message":"quota exceeded","type":"quota_exceeded"}}')));
+check('401 → 提示检查密钥',
+  /API 密钥无效或未授权/.test(describeLLMError('LLM 请求失败 (401): unauthorized')));
+check('429 非配额 → 提示稍后再试',
+  /请求过于频繁/.test(describeLLMError('LLM 请求失败 (429): {"error":{"code":"1305"}}')));
+check('5xx → 提示上游服务异常',
+  /上游服务异常/.test(describeLLMError('LLM 请求失败 (503): busy')));
+check('带 message 人话时直接展示',
+  describeLLMError('LLM 请求失败 (429): {"error":{"message":"该模型当前访问量过大，请您稍后再试"}}')
+    === '该模型当前访问量过大，请您稍后再试');
+check('空值降级为「未知错误」',
+  describeLLMError('') === '未知错误' && describeLLMError(null) === '未知错误');
 // 契约：主文案必须把「第几次/共几次」摆出来，且完整原因仍可点击展开
 check('重试文案带次数与原因摘要',
   /'请求失败，正在重试…' \+ times/.test(uiSrc) &&
@@ -939,8 +982,8 @@ group('外观设置：液态玻璃开关');
 {
   const html = fs.readFileSync(path.join(DIST, 'index.html'), 'utf8');
   const appearance = html.slice(html.indexOf('id="page-appearance"'), html.indexOf('id="page-models"'));
-  check('外观页有「启用液态玻璃效果」开关行',
-    appearance.includes('启用液态玻璃效果') && /id="opt-liquid-glass"/.test(appearance));
+  check('外观页有「新外观」开关行',
+    appearance.includes('新外观') && /id="opt-liquid-glass"/.test(appearance));
   check('开关复用系统通知同款 switch 结构',
     /<label class="switch">\s*<input type="checkbox" id="opt-liquid-glass">/.test(appearance) &&
     appearance.includes('switch-track') && appearance.includes('switch-knob'));
@@ -1052,6 +1095,127 @@ check('新增平均缓存命中率行（hit/(hit+miss)）',
   uiSrc.includes("'平均缓存命中率'") && uiSrc.includes("hit / (hit + miss) * 100"));
 check('移除「自服务启动累计（重启重新计数）」说明',
   !uiSrc.includes('用量与缓存统计自服务启动后累计'));
+
+// ---------------------------------------------------------------------------
+// 编辑最近 N 条用户消息并重发（检查点 / 回滚的入口）
+// ---------------------------------------------------------------------------
+group('编辑并重发用户消息');
+
+check('用户消息渲染时把原文存进 dataset（编辑按钮靠它对号）',
+  /b\.dataset\.rawText = text;/.test(uiSrc));
+check('编辑按钮只对服务端下发的白名单显形（前端不自行推断）',
+  uiSrc.includes('editableByText') && uiSrc.includes('setEditables') &&
+  /const back = editableByText\.get\(raw\);/.test(uiSrc));
+check('运行中不给编辑入口（上下文正在被消费）',
+  /typeof back === 'number' && !running/.test(uiSrc));
+check('编辑按钮默认隐形、悬停整行显形（CSS 契约）',
+  /\.msg-user \.edit-btn \{[\s\S]*?opacity: 0;/.test(css) &&
+  /\.msg-user:hover \.edit-btn \{ opacity: 1; \}/.test(css));
+check('编辑按钮不遮挡气泡（order 归位到左侧）',
+  /\.msg-user \.edit-btn \{[\s\S]*?order: -1;/.test(css));
+
+check('编辑态把该条消息填入输入框并露出发送/取消',
+  uiSrc.includes('function startEditMessage') && uiSrc.includes('function exitEditMode') &&
+  /input\.value = text;/.test(uiSrc) && /editBar\.classList\.remove\('hidden'\)/.test(uiSrc));
+check('取消会清空输入框并收起编辑条（不留下残影）',
+  /function exitEditMode\(restore\)[\s\S]*?if \(restore\) \{[\s\S]*?input\.value = '';[\s\S]*?editBar\.classList\.add\('hidden'\)/.test(uiSrc));
+check('编辑态下按发送走编辑重发，而非普通新消息',
+  /if \(isEditing\(\) && override === undefined\) \{ submitEdit\(\); return; \}/.test(uiSrc));
+
+check('发送携带 back（距最后一条的距离）与 rollback_files',
+  /type: 'edit_user_message'/.test(uiSrc) &&
+  /back: back,/.test(uiSrc) &&
+  /rollback_files: true,/.test(uiSrc));
+check('发送前先清掉「该条之后」的界面内容（新回复覆盖下方）',
+  uiSrc.includes('function truncateAfterEditableMessage') &&
+  uiSrc.includes('truncateAfterEditableMessage(back);'));
+check('清空按 back 精确停在被编辑那条用户消息',
+  /let remaining = back \+ 1;/.test(uiSrc) &&
+  /if \(remaining <= 0\) break;/.test(uiSrc));
+check('服务端 edit 事件触发视图重建（只保留被编辑的那条）',
+  uiSrc.includes("case 'edit':") && uiSrc.includes('function beginEditedView') &&
+  /if \(text\) addUser\(text\);/.test(uiSrc));
+
+check('编辑条样式存在且与输入区同族',
+  /\.edit-bar \{/.test(css) && /\.edit-bar-btn\.primary \{/.test(css) &&
+  /\.edit-bar\.hidden \{ display: none; \}/.test(css));
+check('index.html 有编辑条 DOM（发送 / 取消两个按钮）',
+  /id="edit-bar"/.test(htmlSrc) && /id="edit-send"/.test(htmlSrc) && /id="edit-cancel"/.test(htmlSrc));
+
+group('检查点 / 回滚');
+
+check('处理 checkpoints 事件（白名单 + 回滚点）',
+  uiSrc.includes("case 'checkpoints':") && uiSrc.includes('setEditables(ev.editables || [])') &&
+  uiSrc.includes('checkpointSteps = ev.steps || []'));
+check('处理 rewind 事件并给出人话反馈',
+  uiSrc.includes("case 'rewind':") && uiSrc.includes('describeRewind'));
+check('回滚反馈区分还原 / 删除 / 失败三类计数',
+  /function describeRewind\(res\)[\s\S]*?res\.restored[\s\S]*?res\.deleted[\s\S]*?res\.failed/.test(uiSrc));
+check('无改动时不谎报「已回退」（明确说没有需要回退的内容）',
+  /if \(n === 0\) return '没有需要回退的文件改动';/.test(uiSrc));
+check('切会话时清掉上一个会话的白名单（避免挂错按钮）',
+  /editableByText = new Map\(\);\s*\n\s*syncUserEditButtons\(\);/.test(uiSrc));
+check('一轮结束（idle）后重新挂编辑按钮',
+  /case 'idle': \{[\s\S]*?syncUserEditButtons\(\);/.test(uiSrc));
+
+// ---------- 滚动：向上翻历史 + 回到底部 ----------
+// 故障：主 agentloop 期间无法向上滑动查看历史 —— 每次模型吐字/追加内容都把视口
+// 拽回底部。修法是引入 followTail：用户主动上滚即停止自动跟随，滚回底部附近恢复。
+// 另加右下角「回到底部」箭头，仅在不在底部时出现。
+group('滚动：跟随态与回到底部按钮');
+check('scrollBottom 在非跟随态不再强行滚底',
+  /function scrollBottom\(force\)[\s\S]{0,180}?if \(!force && !followTail\)/.test(uiSrc));
+check('scroll 回调据「是否贴近底部」判定跟随态（不靠滚动方向）',
+  /followTail\s*=\s*isNearBottom\(\);/.test(uiSrc) &&
+  /function isNearBottom\(\)[\s\S]{0,160}?scrollHeight - messagesEl\.scrollTop - messagesEl\.clientHeight <= FOLLOW_NEAR_BOTTOM/.test(uiSrc));
+check('用户重新发送消息即恢复跟随（否则发问后看不到回复）',
+  /followTail = true;[\s\S]{0,260}?addUser\(p\.display\)/.test(uiSrc));
+check('回放历史 / 编辑重建视图后恢复跟随',
+  extractFunction(uiSrc, 'replayHistory').includes('followTail = true') &&
+  extractFunction(uiSrc, 'beginEditedView').includes('followTail = true'));
+check('清空视图（新建/归档/删除）也回到跟随态',
+  /function syncComposerMode\(\)[\s\S]{0,320}?if \(empty\) \{[\s\S]{0,80}?followTail = true;/.test(uiSrc));
+check('右下角箭头只在不在底部时显示',
+  /function syncToBottomBtn\(\)[\s\S]{0,140}?classList\.toggle\('show', !isNearBottom\(\)\)/.test(uiSrc));
+check('点箭头回到底部并恢复跟随',
+  /toBottomBtn\.addEventListener\('click',[\s\S]{0,200}?followTail = true;[\s\S]{0,160}?scrollTo\(\{ top: messagesEl\.scrollHeight, behavior: 'smooth' \}\)/.test(uiSrc));
+check('箭头 DOM 存在且有 aria-label',
+  /<button type="button" id="to-bottom" class="to-bottom" title="回到底部" aria-label="回到底部">/.test(htmlSrc));
+check('样式契约：箭头绝对定位在右下、隐藏时不可点',
+  /\.to-bottom\s*\{[^}]*position:\s*absolute/.test(css) &&
+  /\.to-bottom\s*\{[^}]*bottom:\s*118px/.test(css) &&
+  /\.to-bottom\s*\{[^}]*pointer-events:\s*none/.test(css) &&
+  /\.to-bottom\.show\s*\{[^}]*pointer-events:\s*auto/.test(css));
+check('消息区底部留白改为按输入卡片实测高度动态计算（不再写死 200px）',
+  /#messages\s*\{[^}]*padding:\s*24px 32px var\(--composer-pad-bottom/.test(css) &&
+  !/#messages\s*\{[^}]*padding:[^;]*200px 44px/.test(css));
+check('留白随卡片尺寸变化（ResizeObserver）+ 折叠后重算',
+  /new ResizeObserver\(syncComposerPadding\)\.observe\(composerPadEl\)/.test(uiSrc) &&
+  /function applyTodoCollapsed\(\)[\s\S]{0,600}?requestAnimationFrame\(function \(\) \{ syncComposerPadding\(\); \}\)/.test(uiSrc));
+check('不用 CSS 平滑滚动（避免与跟随态滚底打架）',
+  /#messages\s*\{[^}]*scroll-behavior:\s*auto/.test(css));
+
+// ---------- 背景图：不透明底色必须在 html 上 ----------
+// 故障：选好图却看不见。#bg-layer 是 body 的子节点、靠 z-index:-1 沉底，
+// 但 html/body 都挂了不透明 background:var(--bg)，于是图层被永久遮住。
+// 修法：不透明底色只挂 html，body 透明 —— 图层排在 body 之上、内容之下，层级成立。
+group('自定义背景图可见性');
+check('不透明底色只挂在 html 上，body 透明',
+  /html\s*\{\s*background:\s*var\(--bg\);\s*\}/.test(css) &&
+  /body\s*\{\s*background:\s*transparent;\s*\}/.test(css));
+check('html,body 共用规则里不再有不透明底色（否则会盖住图层）',
+  !/html,\s*body\s*\{[^}]*background:\s*var\(--bg\)/.test(css));
+check('#bg-layer 不再依赖负 z-index（改用 DOM 顺序垫底）',
+  /#bg-layer\s*\{[^}]*z-index:\s*0;/.test(css) && !/#bg-layer\s*\{[^}]*z-index:\s*-/.test(css));
+check('图层仍是 fixed 满铺 + pointer-events:none（不遮挡交互）',
+  /#bg-layer\s*\{[^}]*position:\s*fixed;\s*inset:\s*0;/.test(css) &&
+  /#bg-layer\s*\{[^}]*pointer-events:\s*none;/.test(css));
+check('开启背景时主区透明化让图透出',
+  /body\.has-bg\s*\{\s*background:\s*transparent;\s*\}/.test(css) &&
+  /body\.has-bg #app\s*\{\s*background:\s*transparent;\s*\}/.test(css) &&
+  /body\.has-bg #main\s*\{\s*background:\s*transparent;\s*\}/.test(css));
+check('图层是 body 的首个子节点（DOM 顺序决定它垫在最下）',
+  /document\.body\.insertBefore\(el, document\.body\.firstChild\)/.test(uiSrc));
 
 console.log('\n' + '-'.repeat(52));
 if (failures.length) {

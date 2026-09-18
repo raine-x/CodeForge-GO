@@ -114,22 +114,33 @@ type PluginConfig struct {
 
 // Config 是全局配置聚合。
 type Config struct {
-	Server    ServerConfig   `yaml:"server"`
-	LLM       LLMConfig      `yaml:"llm"`
-	Agent     AgentConfig    `yaml:"agent"`
-	Security  SecurityConfig `yaml:"security"`
-	Notify    NotifyConfig   `yaml:"notify"`
-	Subagents SubagentConfig `yaml:"subagents"`
-	Web       WebConfig      `yaml:"web"`
-	Plugins   []PluginConfig `yaml:"plugins"`
-	DataDir   string         `yaml:"data_dir"`
-	AuditLog  string         `yaml:"audit_log"`
+	Server     ServerConfig   `yaml:"server"`
+	LLM        LLMConfig      `yaml:"llm"`
+	Agent      AgentConfig    `yaml:"agent"`
+	Security   SecurityConfig `yaml:"security"`
+	Notify     NotifyConfig   `yaml:"notify"`
+	Subagents  SubagentConfig `yaml:"subagents"`
+	Web        WebConfig      `yaml:"web"`
+	Plugins    []PluginConfig `yaml:"plugins"`
+	DataDir    string         `yaml:"data_dir"`
+	AuditLog   string         `yaml:"audit_log"`
+	Appearance AppearanceConf `yaml:"appearance"`
 
 	// 内置插件开关（增强能力，见 BuiltinPluginsConfig）。
 	BuiltinPlugins BuiltinPluginsConfig `yaml:"builtin_plugins"`
 
 	// configDir 记录配置目录，供 Save 使用。
 	configDir string `yaml:"-"`
+}
+
+// AppearanceConf 是「设置 → 外观 → 新外观」的自定义背景配置。
+type AppearanceConf struct {
+	// BackgroundPath 是背景图绝对路径（空 = 未设置）。由系统选择器选出的本地文件。
+	BackgroundPath string `yaml:"background_path"`
+	// BackgroundBlur 是背景模糊值（px，0~40），0 = 不模糊。
+	BackgroundBlur int `yaml:"background_blur"`
+	// BackgroundBrightness 是背景亮度（%，20~100），100 = 原始亮度。
+	BackgroundBrightness int `yaml:"background_brightness"`
 }
 
 // BuiltinPluginsConfig 是内置插件（进程内实现、可开关的增强能力）的开关集。
@@ -455,6 +466,17 @@ func normalize(cfg *Config) {
 		mode = "backoff"
 	}
 	cfg.LLM.RetryMode = mode
+	// 自定义背景：模糊夹到 0~40，亮度夹到 20~100（未设置时 0 = 不模糊 / 100 = 原亮度，
+	// 但 0 亮度会被当成「未配置」，所以亮度默认按 100 归一化）。
+	if cfg.Appearance.BackgroundBlur < 0 {
+		cfg.Appearance.BackgroundBlur = 0
+	}
+	if cfg.Appearance.BackgroundBlur > 40 {
+		cfg.Appearance.BackgroundBlur = 40
+	}
+	if cfg.Appearance.BackgroundBrightness <= 0 || cfg.Appearance.BackgroundBrightness > 100 {
+		cfg.Appearance.BackgroundBrightness = 100
+	}
 	if cfg.DataDir == "" {
 		cfg.DataDir = ".codeforge"
 	}

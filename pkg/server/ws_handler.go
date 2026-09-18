@@ -42,6 +42,16 @@ type wsMessage struct {
 	Approved    bool     `json:"approved"`
 	Thinking    string   `json:"thinking"` // 思考强度：low/medium/high
 	Hidden      bool     `json:"hidden"`   // 页面是否不可见（visibility 消息携带）
+
+	// ---- 编辑重发 / 回滚 ----
+	// Back 是「距最后一条用户消息的距离」（0 = 最后一条），仅 edit_user_message 使用。
+	// 用相对位置而非绝对下标：前端拿到的是渲染顺序，与服务端 Messages 下标不是一回事，
+	// 用相对距离可以避免两者错位时改错消息。
+	Back int `json:"back"`
+	// ToStep 是回滚目标步骤（rewind 使用：回退到该步**之前**）。
+	ToStep int `json:"to_step"`
+	// RollbackFiles 表示编辑重发时是否同时回退该消息之后的文件改动（缺省 true）。
+	RollbackFiles *bool `json:"rollback_files"`
 }
 
 // wsClient 表示一个浏览器 WebSocket 连接。
@@ -135,6 +145,52 @@ func (c *wsClient) dispatch(msg wsMessage) {
 			return c.srv.agent.Regenerate(ctx, msg.SessionID, emit)
 		})
 
+	case "edit_user_message":
+		// 编辑重发：截断到目标用户消息 → 回退压缩态 → 换文本重跑。
+		// 顺带（默认）把该消息之后的文件改动一并回退，否则模型上下文说「文件是 A」，
+		// 而磁盘上还留着 B —— 重新生成的回答必然建立在错误的现状上。
+		if msg.SessionID == "" || strings.TrimSpace(msg.Text) == "" {
+			return
+		}
+		go c.run(msg.SessionID, msg.Thinking, "编辑重发", msg.Text, func(ctx context.Context, emit func(agent.Event)) error {
+			rollback := msg.RollbackFiles == nil || *msg.RollbackFiles
+			if rollback {
+				// 检查点按「步骤」归属，而消息截断按「消息」归属，两者没有直接映射。
+				// 参见 agent.RewindAfterEdit：无法定位目标消息时返回 nil（跳过文件回滚，
+				// 只截断对话），可定位时按其保守口径回退。
+				res, err := c.srv.agent.RewindAfterEdit(msg.SessionID, msg.Back)
+				if err != nil {
+					log.Printf("[edit] 会话=%s 文件回退失败（已跳过，仅重跑对话）：%v", msg.SessionID, err)
+				} else if res != nil && len(res.Paths) > 0 {
+					emit(agent.Event{Type: agent.EventRewind, Text: "已回退文件改动", Rewind: res})
+				}
+			}
+			idx, err := c.srv.agent.EditAndResend(ctx, msg.SessionID, msg.Back, msg.Text, emit)
+			if err != nil {
+				return err
+			}
+			// 回放新视图：前端需要知道历史被截断到哪里，才能丢弃下方旧内容。
+			emit(agent.Event{Type: agent.EventEdit, Step: idx, Text: msg.Text})
+			return nil
+		})
+
+	case "rewind":
+		// 手动回滚：把工作区文件恢复到第 ToStep 步之前（不动对话历史）。
+		if msg.SessionID == "" {
+			return
+		}
+		res, err := c.srv.agent.RewindFiles(msg.SessionID, msg.ToStep)
+		if err != nil {
+			c.send(map[string]any{"type": "error", "error": err.Error()})
+			return
+		}
+		c.send(map[string]any{"type": "rewind", "session_id": msg.SessionID, "result": res})
+		c.send(c.srv.checkpointEvent(msg.SessionID))
+
+	case "checkpoints":
+		// 前端打开回滚菜单时拉一次最新检查点列表。
+		c.send(c.srv.checkpointEvent(msg.SessionID))
+
 	case "new_session":
 		sess, err := c.srv.agent.History().Create(ws, msg.Title)
 		if err != nil {
@@ -145,6 +201,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		c.send(map[string]any{"type": "sessions", "items": c.srv.agent.History().List("", false)})
 		c.send(c.srv.contextUsage(sess.ID))
 		c.send(c.srv.todoEvent(sess.ID)) // 新会话无清单：前端清空任务列
+		c.send(c.srv.checkpointEvent(sess.ID))
 
 	case "list_sessions":
 		c.send(map[string]any{"type": "sessions", "items": c.srv.agent.History().List("", false)})
@@ -160,6 +217,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		c.send(map[string]any{"type": "history", "session_id": sess.ID, "title": sess.Title, "messages": sess.Messages})
 		c.send(c.srv.contextUsage(sess.ID))
 		c.send(c.srv.todoEvent(sess.ID)) // 切会话：回放该会话的任务清单
+		c.send(c.srv.checkpointEvent(sess.ID)) // 回放可编辑白名单（编辑按钮的数据源）
 
 	case "hitl_decision":
 		c.approver.resolve(msg.ApprovalID, msg.Approved)
@@ -236,6 +294,8 @@ func (c *wsClient) run(sessionID, thinking, trigger, label string, agentFn func(
 	c.send(map[string]any{"type": "sessions", "items": c.srv.agent.History().List("", false)})
 	// 本轮结束后刷新上下文占用：进度条要跟着对话一起长。
 	c.send(c.srv.contextUsage(sessionID))
+	// 刷新可编辑白名单：又多了几条用户消息，编辑按钮该跟着往后挪。
+	c.send(c.srv.checkpointEvent(sessionID))
 
 	// 任务结束后发送系统通知。通知失败只记日志，不影响对话结果；主动取消不算完成通知。
 	if ctx.Err() == nil {
@@ -374,6 +434,22 @@ func (s *Server) todoEvent(sessionID string) map[string]any {
 		"todos":      s.agent.Todos(sessionID),
 	}
 }
+
+// checkpointEvent 构造推送给前端的「检查点列表」事件帧（回滚菜单的数据源）。
+// 列表按步骤聚合（时间 + 文件数），前端据此列出候选回滚点。
+func (s *Server) checkpointEvent(sessionID string) map[string]any {
+	return map[string]any{
+		"type":       "checkpoints",
+		"session_id": sessionID,
+		"steps":      s.agent.CheckpointSteps(sessionID),
+		"editables":  s.agent.EditableUserMessages(sessionID, editableUserMessageLimit),
+	}
+}
+
+// editableUserMessageLimit 是允许编辑的用户消息条数（最近 N 条）。
+// 限制范围是有意的：更早的历史可能已被摘要压缩掉，改它会让压缩摘要与实际
+// 历史对不上（摘要里还留着旧提问）。
+const editableUserMessageLimit = 3
 
 // clipText 按「字符」截断文本（避免把多字节汉字截成半个），超长时追加省略号。
 func clipText(s string, max int) string {

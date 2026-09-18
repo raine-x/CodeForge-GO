@@ -599,49 +599,61 @@
     }
     return msgCol;
   }
-  function scrollBottom() {
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+  // ---------- 任务清单面板（输入卡片上方，可折叠） ----------
+  // todo 事件驱动：○待办 / ◐进行中 / ✓完成 / ✕取消；点标题折叠/展开。
+  //
+  // ⚠️ 位置很要紧：面板在 #composer-wrap 内、#composer **外**（见 index.html），
+  //    所以它跟着输入卡片一起浮动，却不受输入卡片的折叠/居中 transform 影响。
+  //    早先的做法是 messagesEl.prepend()，把面板塞进滚动容器的最顶部 ——
+  //    一旦会话变长、用户往上翻了几屏，面板就跟着滚出可视区，
+  //    表现成「模型报『已更新任务列表』但界面什么都看不见」。
+  //    放进输入卡片上方后，它任何时候都在视野里，与滚动位置无关。
+  //
+  // 无条件渲染：列表为空时也保留面板，只显示「暂无任务」占位。
+  // 这样用户随时知道有没有清单，而不是在「有清单」和「面板消失」之间猜。
+  let todoBar = null;         // 运行时绑定到 #todo-bar（HTML 里已写好骨架）
+  const todoBarEl = $('#todo-bar');
+  const TODO_COLLAPSE_KEY = 'cf_todo_collapsed';
+  const TODO_EMPTY_HINT = '暂无任务';
+  // 折叠状态跨会话保留：用户收起过一次，就不该在每轮工具调用后被强行展开。
+  let todoCollapsed = false;
+  try { todoCollapsed = localStorage.getItem(TODO_COLLAPSE_KEY) === '1'; } catch (e) {}
+
+  function applyTodoCollapsed() {
+    todoBarEl.classList.toggle('collapsed', todoCollapsed);
+    const head = todoBarEl.querySelector('.todo-head');
+    if (head) head.setAttribute('aria-expanded', todoCollapsed ? 'false' : 'true');
+    // 折叠/展开改变了输入卡片的整体高度 → 消息区的底部留白要跟着重算，
+    // 否则折叠后最后几条消息会被多出来的空白顶离底部。下一帧量，等样式落定。
+    requestAnimationFrame(function () { syncComposerPadding(); });
   }
-  // ---------- 任务清单栏（会话顶部，可折叠） ----------
-  // todo 事件驱动：○待办 / ◐进行中 / ✓完成 / ✕取消；点标题折叠/展开；
-  // 会话切换/新建/清空时由 renderTodoBar([]) 收起为空。
-  let todoBar = null; // 复用 DOM
+  function toggleTodoBar() {
+    todoCollapsed = !todoCollapsed;
+    try { localStorage.setItem(TODO_COLLAPSE_KEY, todoCollapsed ? '1' : '0'); } catch (e) {}
+    applyTodoCollapsed();
+  }
+  // 折叠只改类，不重建内容 —— 早先的写法先 toggle 再整表重建，
+  // 纯粹是为了刷新标题里的 ▾/▸，现在箭头交给 CSS 的 ::before，不需要重建。
+  todoBarEl.querySelector('.todo-head').addEventListener('click', toggleTodoBar);
+  todoBarEl.querySelector('.todo-head').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleTodoBar(); }
+  });
+
   function renderTodoBar(todos) {
-    if (!todoBar) {
-      todoBar = document.createElement('div');
-      todoBar.className = 'todo-bar hidden';
-      const head = document.createElement('div');
-      head.className = 'todo-head';
-      const title = document.createElement('span');
-      title.className = 'todo-title';
-      title.textContent = '任务清单';
-      const badge = document.createElement('span');
-      badge.className = 'todo-count';
-      head.appendChild(title);
-      head.appendChild(badge);
-      head.addEventListener('click', function () {
-        todoBar.classList.toggle('collapsed');
-        renderTodoBar(todoBar.dataset.last ? JSON.parse(todoBar.dataset.last) : []);
-      });
-      const body = document.createElement('div');
-      body.className = 'todo-body';
-      todoBar.appendChild(head);
-      todoBar.appendChild(body);
-      messagesEl.prepend(todoBar); // 插在消息列最顶部
-    }
-    todoBar.dataset.last = JSON.stringify(todos || []);
-    const collapsed = todoBar.classList.contains('collapsed');
+    todoBar = todoBarEl;
     const list = todos || [];
     const done = list.filter(function (t) { return t.status === 'completed'; }).length;
     todoBar.querySelector('.todo-count').textContent = list.length ? (done + '/' + list.length) : '';
+    applyTodoCollapsed();      // 折叠类要在填内容前落好
     const body = todoBar.querySelector('.todo-body');
     body.innerHTML = '';
     if (!list.length) {
-      todoBar.classList.add('hidden');
+      const empty = document.createElement('div');
+      empty.className = 'todo-empty';
+      empty.textContent = TODO_EMPTY_HINT;
+      body.appendChild(empty);
       return;
     }
-    todoBar.classList.remove('hidden');
-    if (collapsed) return; // 折叠态只更新计数
     const icon = { pending: '○', in_progress: '◐', completed: '✓', cancelled: '✕' };
     list.forEach(function (t) {
       const row = document.createElement('div');
@@ -657,6 +669,38 @@
       body.appendChild(row);
     });
   }
+  // ---------- 右下角「回到底部」浮动箭头 ----------
+  // 会话变长、用户往上翻历史时出现；点击平滑回到底部并恢复自动跟随。
+  // 面板本体写在 index.html（#to-bottom），显隐只切 .show 类。
+  const toBottomBtn = $('#to-bottom');
+  const FOLLOW_NEAR_BOTTOM = 80;  // 距底多少像素内算「在底部」，与输入卡片折叠的阈值同量级
+  let followTail = true;          // 是否跟随最新内容（用户主动上滚即置 false）
+  function isNearBottom() {
+    return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight <= FOLLOW_NEAR_BOTTOM;
+  }
+  function syncToBottomBtn() {
+    if (!toBottomBtn) return;
+    toBottomBtn.classList.toggle('show', !isNearBottom());
+  }
+  // 内容追加时的滚底：只在「跟随态」执行。
+  // 早先 scrollBottom() 无条件滚底，是「翻不上去」的主要元凶之一 ——
+  // 模型流式吐字时每来一小段就把视口拽回底部，用户刚滚上去就被拉回。
+  function scrollBottom(force) {
+    if (!force && !followTail) {
+      syncToBottomBtn();
+      return;
+    }
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    followTail = true;
+    syncToBottomBtn();
+  }
+  if (toBottomBtn) {
+    toBottomBtn.addEventListener('click', function () {
+      followTail = true;
+      messagesEl.scrollTo({ top: messagesEl.scrollHeight, behavior: 'smooth' });
+      syncToBottomBtn();
+    });
+  }
   function addAssistant(text) {
     const d = document.createElement('div');
     d.className = 'msg-assistant';
@@ -664,6 +708,34 @@
     ensureCol().appendChild(d);
     scrollBottom();
   }
+  // ---------- 消息区底部留白 ≈ 浮动输入卡片的实际高度 ----------
+  // #messages 是滚动容器，输入卡片是**绝对定位浮在它上面**的，不占布局空间。
+  // 于是必须在滚动内容里留出等高的空白，否则最后几条消息会被卡片永久盖住 ——
+  // 滚到底也看不见，和「滚不下去」是同一个症状。
+  //
+  // 早先写死 padding-bottom:200px，而卡片高度是变数（任务清单展开/折叠、
+  // 输入框随打字长高、底栏换行、任务清单列表变长），常量必然对不上。
+  // 这里实测高度写进 CSS 变量，用 ResizeObserver 跟着卡片一起变。
+  //
+  // ⚠️ 这里自己取一次元素，不复用下面那个 `composerWrap`：那个 const 在文件
+  //    更靠下的位置声明，在它之前访问会撞 TDZ（const 没有变量提升）。
+  const composerPadEl = $('#composer-wrap');
+  let lastComposerPad = -1;
+  function syncComposerPadding() {
+    const h = composerPadEl.offsetHeight;
+    if (h <= 0) return;
+    // 卡片离底部还留了 5vh 的空档，多补一点让最后一条能滚到舒服的位置
+    const pad = Math.round(h + window.innerHeight * 0.07);
+    if (pad === lastComposerPad) return;   // 值没变就不写 DOM，避免 ResizeObserver 抖动
+    lastComposerPad = pad;
+    document.documentElement.style.setProperty('--composer-pad-bottom', pad + 'px');
+  }
+  syncComposerPadding();
+  if (typeof ResizeObserver === 'function') {
+    new ResizeObserver(syncComposerPadding).observe(composerPadEl);
+  }
+  window.addEventListener('resize', syncComposerPadding);
+
   // 提及 token 的统一切分规则：`@名字`（不含空白）或 `@"名字"`（名字含空白时用引号）。
   // ⚠️ 两条例外规矩：
   //   ① 只能有**一个**捕获组，且内部不许再嵌套分组 —— String.split 会把**所有**捕获组
@@ -715,11 +787,67 @@
     row.className = 'msg-user';
     const b = document.createElement('div');
     b.className = 'bubble';
+    // 原文存在 dataset 上：编辑按钮要靠它与服务端下发的白名单（按文本匹配）对上号。
+    // 用 textContent 的渲染结果反推是不行的 —— 提及高亮会把 @路径 缩成文件名。
+    b.dataset.rawText = text;
     renderUserText(b, text);
     row.appendChild(b);
     ensureCol().appendChild(row);
     scrollBottom();
     syncComposerMode(); // 用户发出第一句话：输入卡片下放回底部
+    syncUserEditButtons();
+  }
+
+  // 可编辑用户消息白名单：由服务端下发的 checkpoints 事件给出（back = 距最后一条的距离）。
+  // 前端不自己推断「哪几条能编辑」—— 白名单规则（最近 N 条、且必须是纯文本发言）
+  // 只有服务端知道，两边各算一份必然会漂。
+  let editableByText = new Map(); // 文本 → back（同一文本重复出现时取最近的一条）
+  function setEditables(list) {
+    editableByText = new Map();
+    (list || []).forEach(function (it) {
+      if (it && typeof it.text === 'string' && typeof it.back === 'number') {
+        editableByText.set(it.text, it.back);
+      }
+    });
+    syncUserEditButtons();
+  }
+
+  // 就地刷新每条用户消息上的编辑按钮显隐（历史回放、新消息、白名单更新都会走到这里）。
+  function syncUserEditButtons() {
+    // 只给当前正在查看的会话挂按钮：后台会话的历史不在视图里，也不该出现可点的编辑。
+    const rows = messagesEl.querySelectorAll('.msg-user');
+    rows.forEach(function (row) {
+      const bubble = row.querySelector('.bubble');
+      if (!bubble) return;
+      const btn = row.querySelector('.edit-btn');
+      const raw = bubble.dataset.rawText || '';
+      const back = editableByText.get(raw);
+      // 运行中不给编辑入口：这一轮的上下文正在被模型消费，就地改写会让事件与历史错位。
+      if (typeof back === 'number' && !running) {
+        if (btn) {
+          btn.dataset.back = String(back);
+        } else {
+          // 编辑按钮放在气泡**前面**（HTML 顺序），靠 CSS 的 order 决定视觉位置
+          row.insertBefore(makeEditButton(raw, back), bubble);
+        }
+      } else if (btn) {
+        btn.remove();
+      }
+    });
+  }
+
+  // 单条用户消息的「编辑」按钮（气泡左侧，hover 才显形）。
+  function makeEditButton(rawText, back) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'edit-btn';
+    btn.dataset.back = String(back);
+    btn.title = '编辑这条消息并重新发送';
+    btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
+    btn.addEventListener('click', function () {
+      startEditMessage(rawText, Number(btn.dataset.back) || 0);
+    });
+    return btn;
   }
   function addInfo(text) {
     const d = document.createElement('div');
@@ -917,6 +1045,33 @@
     subagentCards.clear();
   }
 
+  // 把后端抛出的 LLM 错误串分类成一句人话，供最终错误显示（「出错了」）使用。
+  // 与 retryReasonBrief 的区别：这里不只给「上游限流」这种标签，而是直接给可理解的原因，
+  // 优先识别配额耗尽这类永久性错误（重试无用，必须明确告诉用户去充值/换密钥）。
+  function describeLLMError(raw) {
+    const s = String(raw == null ? '' : raw).trim();
+    if (!s) return '未知错误';
+    const low = s.toLowerCase();
+    if (/quota_exceeded|quota exceeded|insufficient_quota|insufficient quota|balance|欠费|余额不足/.test(low)) {
+      return '模型配额已用尽（余额不足或额度用尽）。请在「设置 > 模型」中更换模型、充值或更换 API Key 后重试。';
+    }
+    // 模型不支持图片输入
+    if (/cannot read.*image|does not support image|image.*not support|unsupported image|image input.*not supported/i.test(s)) {
+      return '当前模型不支持图片输入。请在「设置 > 模型」中切换到支持多模态的模型（如 GPT-4o、Claude 3.5 Sonnet 等），或移除图片后重试。';
+    }
+    // 上游错误体里的 message 常是现成的人话（如「该模型当前访问量过大，请您稍后再试」），
+    // 优先带出来；没有才按 HTTP 状态码分类给通用提示。
+    const msg = s.match(/"message"\s*:\s*"([^"\\]{1,120})"/);
+    if (msg) return msg[1];
+    const m = s.match(/\((\d{3})\)/);
+    const code = m ? Number(m[1]) : 0;
+    if (code === 401) return 'API 密钥无效或未授权（401）。请在「设置 > 模型」中检查密钥。';
+    if (code === 403) return '当前密钥无权限访问该模型（403）。请在「设置 > 模型」中更换模型或密钥。';
+    if (code === 429) return '请求过于频繁（429），请稍后再试。';
+    if (code >= 500) return '上游服务异常（' + code + '），请稍后再试。';
+    return s;
+  }
+
   // 把后端原始错误串压成一句人话：用户第一眼要的是「为什么失败」，不是 HTTP 报文。
   // 例：'LLM 请求失败 (429): {"error":{"code":"1305","message":"该模型当前访问量过大，请您稍后再试"}}'
   //     → '上游限流：该模型当前访问量过大，请您稍后再试'
@@ -927,7 +1082,9 @@
     const m = s.match(/\((\d{3})\)/);
     if (m) {
       const code = Number(m[1]);
-      if (code === 429) brief = '上游限流';
+      if (/quota_exceeded|quota exceeded|insufficient_quota|insufficient quota/i.test(s)) {
+        brief = '模型配额已用尽';
+      } else if (code === 429) brief = '上游限流';
       else if (code === 503) brief = '上游过载';
       else if (code === 502 || code === 504) brief = '上游网关异常';
       else if (code >= 500) brief = '上游服务异常';
@@ -947,6 +1104,9 @@
 
   // 上游瞬时故障自动重试提示：样式同「编辑文件」类文字条目，点击展开/收起完整错误原因。
   let retryEl = null;
+  // 未回复打断的重试圆环：用户在模型未回复前点击打断，显示圆环，点击重新发送
+  let retryRingEl = null;
+  let hasModelReplied = false; // 标记模型是否已开始回复（收到 text/reasoning/tool_call）
   function addRetry(reason, attempt, maxAttempts) {
     const brief = retryReasonBrief(reason);
     // 次数信息直接写进主文案：只给一句笼统的「正在重试」，用户分不清偶发抖动与持续故障
@@ -981,6 +1141,25 @@
   }
   function removeRetry() {
     if (retryEl) { retryEl.remove(); retryEl = null; }
+  }
+  // 未回复打断的重试圆环
+  function showRetryRing() {
+    if (retryRingEl) return;
+    retryRingEl = document.createElement('button');
+    retryRingEl.type = 'button';
+    retryRingEl.className = 'retry-ring';
+    retryRingEl.title = '重新发送（保留上下文）';
+    retryRingEl.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 4v6h6M23 20v-6h-6"/></svg>';
+    retryRingEl.addEventListener('click', function () {
+      removeRetryRing();
+      // 重新发送：使用 lastUserText（保留上下文），走正常发送流程
+      form.requestSubmit();
+    });
+    ensureCol().appendChild(retryRingEl);
+    scrollBottom();
+  }
+  function removeRetryRing() {
+    if (retryRingEl) { retryRingEl.remove(); retryRingEl = null; }
   }
 
   // ---------- 可复用操作选择面板（ActionPanel）：输入框上方多选 / 用户输入 / 多页 ----------
@@ -1577,6 +1756,17 @@
       const folded = !!wsFolded[ws];
       if (folded) fold.classList.add('folded');
 
+      // 📂 文件夹图标（SVG 描边式，颜色随文字，黑白灰不抢眼）
+      const folder = document.createElement('span');
+      folder.className = 'ws-folder';
+      const fsvg = svgIcon('M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z', 14);
+      fsvg.setAttribute('stroke', 'currentColor');
+      fsvg.setAttribute('fill', 'none');
+      fsvg.setAttribute('stroke-width', '2');
+      fsvg.setAttribute('stroke-linecap', 'round');
+      fsvg.setAttribute('stroke-linejoin', 'round');
+      folder.appendChild(fsvg);
+
       const name = document.createElement('span');
       name.className = 'ws-name';
       name.textContent = groupName;
@@ -1629,6 +1819,7 @@
       });
 
       head.appendChild(fold);
+      head.appendChild(folder); // 📂 项目文件夹图标
       head.appendChild(name);
       head.appendChild(add);    // ＋：在此项目新建会话
       head.appendChild(dots);   // ⋯：项目操作（重命名 / 归档 / 删除），收在最右
@@ -2239,8 +2430,15 @@
       if (runText) appendText(runText);
     }
     if (lastReply && !runningHere) addActions(lastReply);
-    scrollBottom();
+    // 切会话/回放历史后一律回到「跟随最新」状态：用户对新会话的默认预期是看最新内容，
+    // 而不是继承上一个会话「当时翻到了中间」的跟随状态。
+    followTail = true;
+    scrollBottom(true);
     syncComposerMode(); // 空会话回放 → 居中；有历史 → 下放底部
+    // 切会话后旧白名单属于上一个会话：先清掉，等 checkpoints 事件到达再挂按钮。
+    // 各条消息的 dataset.rawText 也一并作废（气泡已被重建）。
+    editableByText = new Map();
+    syncUserEditButtons();
     renderSessions(sessionsCache); // 高亮切换后的 active
   }
 
@@ -2613,7 +2811,6 @@
           // 断线重连：旧任务已随连接关闭被服务端取消，复位运行态避免按钮卡在 ▶
           running = false; runSessionID = ''; runReason = ''; runText = '';
           sendBtn.classList.remove('running');
-          sendBtn.textContent = '↑';
           sendBtn.title = '发送';
           renderSessions(ev.sessions || []);
           // 刷新/重启自动恢复：回放该工作区最近一次会话
@@ -2638,25 +2835,48 @@
           break;
         case 'todo':
           // 任务清单只画当前视图会话的（load_session/new_session/工具写入都会带 session_id）
-          if (ev.session_id && ev.session_id === sessionID) renderTodoBar(ev.todos || []);
+          // 兼容 sessionID 尚未就绪（新建会话时）：允许空 sessionID 直接渲染
+          if (ev.session_id && (sessionID === '' || ev.session_id === sessionID)) renderTodoBar(ev.todos || []);
+          break;
+        case 'checkpoints':
+          // 服务端下发的可编辑白名单 + 回滚点（切会话、每轮结束、编辑后都会来）。
+          // 只认当前视图会话的：后台会话的白名单不该影响这一屏的按钮。
+          if (!ev.session_id || ev.session_id === sessionID) {
+            setEditables(ev.editables || []);
+            checkpointSteps = ev.steps || [];
+          }
+          break;
+        case 'edit':
+          // 历史已被截断到这条用户消息：把视图清到该点，重新流式渲染新回复。
+          // 服务端紧接着会发 busy + 新一轮事件，这里只需把「下方旧内容」清干净。
+          if (!ev.session_id || ev.session_id === sessionID) {
+            beginEditedView(ev.text || '');
+          }
+          break;
+        case 'rewind':
+          // 文件已按检查点回滚：给一条可见反馈（含还原/删除/失败计数）。
+          if (ev.result) addInfo(describeRewind(ev.result));
           break;
         case 'context':
           // 上下文占用只画当前视图会话的（后台会话结束也会下发它自己的 context）
           if (!ev.session_id || ev.session_id === sessionID) renderCtxUsage(ev);
           break;
-        case 'busy':
+case 'busy':
           sending = false;
           running = true;
-          runSessionID = sessionID; // 本轮属于当前视图的会话；之后用户切走也能凭它识别
-          runReason = ''; runText = ''; // 新一轮：未落盘片段从零开始
-          lastReply = '';        // 新一轮开始：清空回复累积
+          runSessionID = sessionID;
+          runReason = ''; runText = '';
+          lastReply = '';
+          hasModelReplied = false; // 新一轮开始：重置回复标记
           removeRetry();
-          resetSubagentCards(); // 新一轮：重置子智能体卡片缓存
+          removeRetryRing();
+          resetSubagentCards();
           sendBtn.classList.add('running');
-          sendBtn.textContent = '▶';
           sendBtn.title = '点击打断';
           showThinking();
           syncRunBadges();
+          // 运行中不给编辑入口（上下文正在被消费）：按钮在 syncUserEditButtons 里统一摘掉。
+          syncUserEditButtons();
           break;
         case 'retry':
           if (runAway()) break; // 后台会话的重试提示不画进当前视图
@@ -2682,21 +2902,25 @@
           })();
           break;
         case 'reasoning':
+          hasModelReplied = true;
+          removeRetryRing();
           runReason += ev.text || '';
-          if (runAway()) break; // 只累积（runReason），切回时补渲染
+          if (runAway()) break;
           removeThinking();
-          removeRetry(); // 重试成功：撤掉提示
-          settleActiveTool(); // 工具执行完进入下一段思考：撤掉 spinner
+          removeRetry();
+          settleActiveTool();
           appendReason(ev.text || '');
           break;
         case 'text':
-          runReason = ''; // 正文开始，思考段结束（与 foldReason 同步）
+          hasModelReplied = true;
+          removeRetryRing();
+          runReason = '';
           runText += ev.text || '';
           if (runAway()) { foldReason(); break; }
           removeThinking();
-          removeRetry(); // 重试成功：撤掉提示
+          removeRetry();
           foldReason();
-          settleActiveTool(); // 进入正文输出：撤掉 spinner
+          settleActiveTool();
           appendText(ev.text || '');
           break;
         case 'tool_pending': {
@@ -2713,6 +2937,7 @@
           break;
         }
         case 'tool_call': {
+          hasModelReplied = true;
           if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
           // 该段内容此刻已写入会话消息：思考丢弃、正文交给历史回放，不再算未落盘
           runReason = ''; runText = '';
@@ -2760,36 +2985,40 @@
           if (runAway()) {
             // 后台会话出错：在当前视图标注来源，不能静默吞掉
             const emeta = sessionsCache.find(function (s) { return s.id === runSessionID; });
-            addError('后台会话「' + ((emeta && emeta.title) || runSessionID) + '」出错：' + (ev.error || '未知错误'));
+            addError('后台会话「' + ((emeta && emeta.title) || runSessionID) + '」出错：' + describeLLMError(ev.error));
             break;
           }
           removeThinking();
           removeRetry();
+          removeRetryRing();
           settleActiveTool();
           if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
           foldReason();
           closeText();
-          addError('出错了：' + (ev.error || '未知错误'));
+          addError(describeLLMError(ev.error || '未知错误'));
           break;
         }
-        case 'idle': {
+case 'idle': {
           sending = false;
           const backHome = !runAway();
           removeThinking();
           removeRetry();
+          removeRetryRing();
           settleActiveTool();
           if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
           foldReason();
           closeText();
-          if (backHome && lastReply) addActions(lastReply); // 回复结束：显示复制/模型/重新生成
+          if (backHome && lastReply) addActions(lastReply);
           running = false;
           runSessionID = '';
           runReason = ''; runText = '';
+          hasModelReplied = false;
           sendBtn.classList.remove('running');
-          sendBtn.textContent = '↑';
           sendBtn.title = '发送';
           syncRunBadges();
-          maybeShowPlanActions(); // @plan 计划书回复完成后弹出选择面板（须在 running=false 之后，函数内以此判断空闲）
+          // 一轮结束：重新按白名单挂上编辑按钮（最近 N 条用户消息）。
+          syncUserEditButtons();
+          maybeShowPlanActions();
           break;
         }
       }
@@ -2944,6 +3173,137 @@
   const input = $('#input');
   let running = false;
 
+  // ---------- 编辑重发 ----------
+  // 进入编辑态：把该条用户消息的文字放回输入框，上方露出「发送 / 取消」。
+  // 发送时走 edit_user_message（而非普通 user_message），服务端会截断到那条消息、
+  // 回退压缩态并（默认）回滚其后的文件改动，然后重跑 —— 新回复覆盖下方旧内容。
+  const editBar = $('#edit-bar');
+  let editing = null; // { back:number, original:string } —— 非 null 即处于编辑态
+
+  function isEditing() { return !!editing; }
+
+  function startEditMessage(text, back) {
+    if (running) { addInfo('正在处理中，请稍后再试'); return; }
+    if (!wsReady) { addError('未连接到服务，请稍候重试'); return; }
+    if (editing) exitEditMode(false); // 已在编辑另一条：先复位再切过去
+    editing = { back: back, original: text };
+    input.value = text;
+    syncInputMirror();
+    if (editBar) editBar.classList.remove('hidden');
+    input.focus();
+    // 光标放到末尾，方便直接在原话上修改
+    try { input.setSelectionRange(text.length, text.length); } catch (_) {}
+  }
+
+  // 退出编辑态。restore=true 时把输入框恢复成进入编辑前的样子（取消按钮用）。
+  function exitEditMode(restore) {
+    if (!editing) return;
+    if (restore) {
+      input.value = '';
+      syncInputMirror();
+    }
+    editing = null;
+    if (editBar) editBar.classList.add('hidden');
+  }
+
+  // 编辑态下点「发送」：校验后走 edit_user_message。
+  function submitEdit() {
+    if (!editing) return;
+    const text = String(input.value).trim();
+    if (!text) { addError('编辑后的内容不能为空'); return; }
+    if (running) { addInfo('正在处理中，请稍后再试'); return; }
+    if (!wsReady) { addError('未连接到服务，请稍候重试'); return; }
+
+    const back = editing.back;
+    const snap = composerSnapshot();
+    sendEditRequest(back, text, snap);
+  }
+
+  function sendEditRequest(back, text, snap) {
+    sending = true;
+    // 先在前端把「被编辑消息之后」的内容删掉：既立刻给出反馈，也避免等
+    // 服务端事件回来之前旧内容仍在屏幕上与新回复混排。服务端随后还会重放历史。
+    truncateAfterEditableMessage(back);
+    if (!wsSend({
+      type: 'edit_user_message',
+      session_id: snap.session,
+      text: text,
+      back: back,
+      rollback_files: true,
+      thinking: thinkingVal
+    })) {
+      sending = false;
+      addError('未连接到服务，请稍候重试');
+      return;
+    }
+    lastUserText = text;
+    exitEditMode(true);
+    composerSnap = false;
+    showThinking();
+  }
+
+  // 删除界面中「被编辑那条用户消息之后」的全部节点（含那条消息自身的旧气泡，
+  // 因为重跑后服务端会把改过的消息重新推出来）。
+  // 从后往前扫，遇到第 (back+1) 条用户消息即停 —— 与 back 的语义一致。
+  function truncateAfterEditableMessage(back) {
+    const col = ensureCol();
+    let remaining = back + 1;
+    let node = col.lastChild;
+    while (node) {
+      const prev = node.previousSibling;
+      const isUserRow = node.classList && node.classList.contains('msg-user');
+      node.remove();
+      if (isUserRow) {
+        remaining--;
+        if (remaining <= 0) break;
+      }
+      node = prev;
+    }
+    // 清掉流式状态引用（它们指向已被删除的节点）
+    currentTextEl = null; textBuffer = '';
+    reasonEl = null; reasonBuffer = '';
+    lastReply = '';
+    scrollBottom();
+  }
+
+  if (editBar) {
+    const sendEditBtn = editBar.querySelector('#edit-send');
+    const cancelEditBtn = editBar.querySelector('#edit-cancel');
+    if (sendEditBtn) sendEditBtn.addEventListener('click', submitEdit);
+    if (cancelEditBtn) cancelEditBtn.addEventListener('click', function () { exitEditMode(true); });
+  }
+
+  // 最近一次收到的检查点列表（回滚菜单的数据源；空数组 = 没有可回滚的步骤）。
+  let checkpointSteps = [];
+
+  // 服务端确认历史已截断到被编辑的那条消息：把聊天列清空，只留这条消息，
+  // 后续的流式事件会把新回复画在它下面 —— 视觉上就是「覆盖掉下面的内容」。
+  function beginEditedView(text) {
+    composerEpoch++;
+    messagesEl.innerHTML = '';
+    msgCol = null; currentTextEl = null; textBuffer = '';
+    reasonEl = null; reasonBuffer = ''; reasonPinned = false;
+    thinkingEl = null; activeToolEl = null; retryEl = null; pendingToolEl = null;
+    subagentCards.clear();
+    lastReply = '';
+    if (text) addUser(text);
+    lastUserText = text;
+    followTail = true;   // 视图整体重建 = 从零开始看，回到跟随态
+    syncComposerMode();
+  }
+
+  // 把回滚结果转成一句人话（文件为空时说明「没有需要回退的改动」）。
+  function describeRewind(res) {
+    if (!res) return '已回滚';
+    const n = (res.paths || []).length;
+    if (n === 0) return '没有需要回退的文件改动';
+    let msg = '已回退 ' + n + ' 个文件的改动';
+    if (res.restored) msg += '（还原 ' + res.restored + '）';
+    if (res.deleted) msg += '（删除 ' + res.deleted + '）';
+    if (res.failed) msg += '，' + res.failed + ' 个失败';
+    return msg;
+  }
+
   // 输入框 @提及 蓝色高亮：textarea 自身无法局部着色，靠 .input-mirror 这层
   // 「镜像文字」画字（textarea 文字是 transparent，只留光标）。见 index.html 注释
   // 与 app.css 的「共享排版」块。内容或滚动位置一变就要同步，否则会和真实文字错位。
@@ -3087,6 +3447,8 @@
 
   async function submitMessage(e, override) {
     e.preventDefault();
+    // 编辑态下按发送（含 Shift+Enter / 发送按钮）走编辑重发，而不是普通新消息。
+    if (isEditing() && override === undefined) { submitEdit(); return; }
     if (pendingUploads) { addInfo('文件正在上传，请等待上传完成后发送'); return; }
     if (sending) { addInfo('消息正在发送，请勿重复提交'); return; }
     if (workspaceChanging || sessionChanging) { addInfo('正在切换会话或工作区，请稍候'); return; }
@@ -3094,6 +3456,8 @@
       // 运行中按发送 = 打断；若正在看别的会话，说明打断的是后台任务
       if (runAway()) addInfo('已请求打断正在后台运行的任务');
       wsSend({ type: 'cancel' });
+      // 未回复的打断：显示重试圆环，点击可从用户输入重新开始（保留上下文）
+      if (!hasModelReplied) showRetryRing();
       return;
     }
     const raw = String(override === undefined ? input.value : override).trim();
@@ -3123,6 +3487,9 @@
       lastUserText = p.text; // 记录供「重新生成」（用发送文本，可直接重放）
       resetPlanActions(); // 新用户消息发出：下一条 @plan 回复完成后可再次弹出选择面板
       composerSnap = false; // 用户主动发出第一句：位置切换要有下放动画
+      // 刚发出提问 = 明确想看接下来的回答：无论此前翻到哪，都回到跟随态。
+      // 否则用户上翻看完历史后发问，视口会停在原地、看不到任何回复，像是「没反应」。
+      followTail = true;
       // 气泡显示 p.display（= 用户原本输入的样子，@文件名 保持蓝色），
       // 模型拿到的仍是 p.text（真实路径 / attachments 暂存路径）——显示与发送分离。
       addUser(p.display);
@@ -3530,15 +3897,23 @@
   });
 
   // ---------- 滚动条向上翻历史 → 输入卡片折叠；向下回底部 → 弹回 ----------
+  // 同一个 scroll 回调里顺带维护两件与「当前位置」有关的事：
+  //   ① followTail：用户主动上滚就停止自动跟随，滚回底部附近就恢复。
+  //      没有这一条，「向上翻历史」会被不断追加的内容拽回底部 —— 翻不上去。
+  //   ② 右下角「回到底部」箭头的显隐。
   const composerWrap = $('#composer-wrap');
   let composerHide = 0;          // 当前下移像素（0 = 完全显示）
   let lastMsgScroll = messagesEl.scrollTop;
 
   messagesEl.addEventListener('scroll', function () {
-    if (composerCentered) return; // 居中态（无消息，无可滚动内容）不参与折叠
     const st = messagesEl.scrollTop;
     const delta = st - lastMsgScroll;
     lastMsgScroll = st;
+    // 是否仍在跟随最新内容：用「是否贴近底部」判定，而不是靠滚动方向。
+    // 方向判定会被「内容增长把 scrollTop 顶大」误认成用户在向下滚。
+    followTail = isNearBottom();
+    syncToBottomBtn();
+    if (composerCentered) return; // 居中态（无消息，无可滚动内容）不参与折叠
     // 最大位移 = 卡片自身高度 + 底部间隙（7vh），滑过即完全不可见
     const max = composerWrap.offsetHeight + window.innerHeight * 0.07 + 10;
     if (delta > 0 || messagesEl.scrollHeight - st - messagesEl.clientHeight < 80) {
@@ -3569,6 +3944,12 @@
   let composerSnap = true;   // 本次修正直接落位（无过渡）：页面加载后自动回放历史时用
   function syncComposerMode() {
     const empty = messagesEl.childElementCount === 0;
+    // 视图清空（新建会话 / 归档 / 删除 / 切回空会话）一律回到跟随态：
+    // 这里是最集中的一处，上面每个清空 messagesEl 的分支都会走到，不必逐个补。
+    if (empty) {
+      followTail = true;
+      syncToBottomBtn();
+    }
     if (empty === composerCentered) return;
     composerCentered = empty;
     const snap = composerSnap;
@@ -3794,6 +4175,102 @@
       hVal.textContent = h + 'px';
       applyComposerSize(w, h);
       localStorage.setItem('cf_composer_h', h);
+    });
+  })();
+
+  // ---------- 外观：自定义背景图（最底层 fixed 层，blur/亮度即时生效） ----------
+  const bgLayer = (function () {
+    const el = document.createElement('div');
+    el.id = 'bg-layer';
+    document.body.insertBefore(el, document.body.firstChild);
+    return el;
+  })();
+  let bgSaveTimer = null;
+
+  function applyBgFilters(blur, bright) {
+    bgLayer.style.filter = 'blur(' + blur + 'px) brightness(' + bright + '%)';
+  }
+  function applyBgImage(on) {
+    bgLayer.classList.toggle('on', !!on);
+    document.body.classList.toggle('has-bg', !!on);
+    if (on) bgLayer.style.backgroundImage = 'url(/api/appearance/background?t=' + Date.now() + ')';
+    else bgLayer.style.backgroundImage = '';
+  }
+  function saveBg(patch) {
+    fetch('/api/appearance', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch)
+    }).catch(function () {});
+  }
+  (function initBackground() {
+    const pickBtn = document.getElementById('bg-pick');
+    const clearBtn = document.getElementById('bg-clear');
+    const blurEl = document.getElementById('opt-bg-blur');
+    const brightEl = document.getElementById('opt-bg-bright');
+    if (!pickBtn || !blurEl || !brightEl) return;
+    const blurVal = document.getElementById('opt-bg-blur-val');
+    const brightVal = document.getElementById('opt-bg-bright-val');
+
+    // 回填：模糊/亮度优先 localStorage（即时），再以服务端为准
+    let blur = parseInt(localStorage.getItem('cf_bg_blur'), 10); if (isNaN(blur)) blur = 0;
+    let bright = parseInt(localStorage.getItem('cf_bg_bright'), 10); if (isNaN(bright)) bright = 100;
+    blurEl.value = blur; blurVal.textContent = blur + 'px';
+    brightEl.value = bright; brightVal.textContent = bright + '%';
+    applyBgFilters(blur, bright);
+
+    fetch('/api/appearance').then(function (r) { return r.json(); }).then(function (d) {
+      if (typeof d.blur === 'number' && !localStorage.getItem('cf_bg_blur_touched')) {
+        blur = d.blur; blurEl.value = blur; blurVal.textContent = blur + 'px'; applyBgFilters(blur, bright);
+      }
+      if (typeof d.brightness === 'number' && !localStorage.getItem('cf_bg_bright_touched')) {
+        bright = d.brightness; brightEl.value = bright; brightVal.textContent = bright + '%'; applyBgFilters(blur, bright);
+      }
+      if (d.background_set) applyBgImage(true);
+    }).catch(function () {});
+
+    blurEl.addEventListener('input', function () {
+      blur = +blurEl.value;
+      blurVal.textContent = blur + 'px';
+      localStorage.setItem('cf_bg_blur', blur);
+      localStorage.setItem('cf_bg_blur_touched', '1');
+      applyBgFilters(blur, bright);
+      clearTimeout(bgSaveTimer);
+      bgSaveTimer = setTimeout(function () { saveBg({ blur: blur }); }, 400);
+    });
+    brightEl.addEventListener('input', function () {
+      bright = +brightEl.value;
+      brightVal.textContent = bright + '%';
+      localStorage.setItem('cf_bg_bright', bright);
+      localStorage.setItem('cf_bg_bright_touched', '1');
+      applyBgFilters(blur, bright);
+      clearTimeout(bgSaveTimer);
+      bgSaveTimer = setTimeout(function () { saveBg({ brightness: bright }); }, 400);
+    });
+
+    clearBtn.addEventListener('click', function () {
+      applyBgImage(false);
+      saveBg({ clear: true });
+    });
+
+    pickBtn.addEventListener('click', function () {
+      pickBtn.disabled = true;
+      fetch('/api/appearance/pick', { method: 'POST' })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d.error) { addError(d.error); return; }
+          if (d.builtin) {
+            // Linux 桌面：内置选择器选图 → 把路径 POST 回服务端
+            openBuiltinPicker(d.start_path || '', 'file', function (path) {
+              if (!path) return;
+              saveBg({ background_path: path });
+              applyBgImage(true);
+            });
+            return;
+          }
+          if (d.ok && d.path) { applyBgImage(true); return; }  // Windows/安卓已由服务端落库
+        })
+        .catch(function (e) { addError('选择背景图失败：' + e); })
+        .then(function () { pickBtn.disabled = false; });
     });
   })();
 

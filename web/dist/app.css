@@ -22,11 +22,20 @@
 html, body {
   margin: 0;
   height: 100%;
-  background: var(--bg);
   color: var(--text);
   font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   font-size: 14px;
 }
+/* ⚠️ 不透明底色必须只挂在 <html> 上，不能挂 <body>。
+   背景图层 #bg-layer 是 <body> 的**子节点**、靠 z-index:-1 沉到最底：
+   它排在 <body> 自身的背景之上（CSS 绘制顺序 = 元素背景 → 负 z 后代 → …），
+   所以 body 一旦有不透明背景，图层就被永久遮住 —— 正是「选好图却看不见」的原因。
+   改挂 html 后：html 的背景画在最底（canvas 背景层），#bg-layer 在其上、
+   #app 等正常内容再在其上，层级自然成立，也无需 z-index 负值参与竞合。
+   注意不能给 html 加 `background: transparent` 来「让图透出」——那会连底色一起
+   丢给浏览器默认（白/透明），页面整体配色会变。 */
+html { background: var(--bg); }
+body { background: transparent; }
 
 /* ---------- 左右分栏：左栏可拖拽调宽，右栏占满剩余 ---------- */
 /* 两块面板略微内缩 + 弧边：窗口边缘与分栏接缝都带圆角，呈两张并排的卡片 */
@@ -147,6 +156,11 @@ html, body {
   padding: 4px 2px;
   color: var(--text-dim); font-size: 12px;
 }
+.ws-group-head .ws-folder {
+  flex: none; display: inline-flex; align-items: center;
+  color: var(--text-dim); /* SVG 描边跟随 currentColor：黑白灰，不抢眼 */
+}
+.ws-group-head .ws-folder svg { display: block; }
 .ws-group-head .ws-name {
   flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   cursor: pointer; user-select: none;
@@ -164,7 +178,7 @@ html, body {
 }
 .ws-group-head .label-btn { font-size: 13px; }
 .ws-group { margin-bottom: 6px; list-style: none; }
-.ws-group .session-list { margin-top: 2px; }
+.ws-group .session-list { margin-top: 2px; padding-left: 24px; } /* 会话相对项目标题缩进 */
 /* 三点菜单按钮（工作区行 / 会话行共用） */
 .dots-btn {
   border: none; background: transparent;
@@ -535,10 +549,58 @@ body.liquid-glass .settings-nav {
   -webkit-backdrop-filter: blur(18px) saturate(140%);
   box-shadow: 8px 0 20px rgba(0,0,0,.10);
 }
+/* 每个导航项 = preview.html 的玻璃气泡原配方整体转 90°：
+   顶部受光 → 左缘受光，光斑位置按顺时针 90° 重新映射，conic 环 from 180deg */
+body.liquid-glass .settings-nav .nav-item:not(.nav-back) {
+  position: relative;
+  overflow: hidden;
+  background:
+    radial-gradient(120% 120% at 45% 50%, rgba(30,40,70,.05), rgba(30,40,70,0) 60%),
+    linear-gradient(90deg, rgba(255,255,255,.55), rgba(255,255,255,.28));
+  border: 1px solid rgba(255,255,255,.60);
+  backdrop-filter: blur(12px) saturate(1.8) brightness(1.08);
+  -webkit-backdrop-filter: blur(12px) saturate(1.8) brightness(1.08);
+  box-shadow: 2px 0 10px rgba(20,35,80,.10), 0 0 6px rgba(255,255,255,.45), inset 1px 1px 1px rgba(255,255,255,.80);
+  transition: background .18s ease, box-shadow .18s ease;
+}
+/* ::before = 四个边缘光斑（在文字下层，screen 只提亮） */
+body.liquid-glass .settings-nav .nav-item:not(.nav-back)::before {
+  content: '';
+  position: absolute; inset: 0;
+  background:
+    radial-gradient(30% 55% at 0% 76%, rgba(255,255,255,1), rgba(255,255,255,0) 65%),
+    radial-gradient(18% 30% at 3% 14%, rgba(255,255,255,.8), rgba(255,255,255,0) 68%),
+    radial-gradient(16% 25% at 100% 22%, rgba(255,255,255,.7), rgba(255,255,255,0) 68%),
+    radial-gradient(18% 34% at 68% 100%, rgba(255,255,255,.55), rgba(255,255,255,0) 65%);
+  mix-blend-mode: screen;
+  pointer-events: none;
+}
+/* ::after = conic 反光环（mask 挖空只剩 3px 边缘环，不遮文字） */
+body.liquid-glass .settings-nav .nav-item:not(.nav-back)::after {
+  content: '';
+  position: absolute; inset: 0;
+  border-radius: 9px;
+  padding: 3px;
+  background: conic-gradient(from 180deg,
+    #fff, rgba(255,255,255,.18) 55deg, rgba(255,255,255,.45) 64deg,
+    rgba(255,255,255,.1) 100deg, rgba(255,255,255,.6) 126deg,
+    rgba(255,255,255,.68) 136deg, rgba(255,255,255,.14) 168deg,
+    rgba(255,255,255,.75) 196deg, rgba(255,255,255,.22) 236deg,
+    rgba(255,255,255,.08) 264deg, rgba(255,255,255,.95) 290deg,
+    rgba(255,255,255,.35) 318deg, #fff);
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+          mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+          mask-composite: exclude;
+  pointer-events: none;
+}
 body.liquid-glass .settings-nav .nav-item { transition: background .18s ease, box-shadow .18s ease; }
 body.liquid-glass .settings-nav .nav-item.active {
-  background: linear-gradient(135deg, rgba(255,255,255,.82), rgba(255,255,255,.22));
-  box-shadow: 0 0 18px rgba(67,115,245,.20), inset 0 1px 0 rgba(255,255,255,.85);
+  background:
+    radial-gradient(120% 120% at 45% 50%, rgba(30,40,70,.05), rgba(30,40,70,0) 60%),
+    linear-gradient(90deg, rgba(255,255,255,.85), rgba(255,255,255,.35));
+  border-color: rgba(255,255,255,.70);
+  box-shadow: 0 0 18px rgba(67,115,245,.20), inset 1px 1px 1px rgba(255,255,255,.90);
 }
 body.liquid-glass .skin-seg,
 body.liquid-glass .models-tabs {
@@ -589,6 +651,34 @@ body.liquid-glass .mcp-tab.active::before {
   background: linear-gradient(180deg, rgba(255,255,255,.85), rgba(255,255,255,0));
   pointer-events: none;
 }
+/* ---------- 自定义背景图（设置 → 外观）：最底层 fixed 层，绝不遮挡内容 ---------- */
+#bg-layer {
+  position: fixed; inset: 0;
+  z-index: 0;                /* 与 #app 同层：靠 DOM 顺序（它是 body 首个子节点）垫在下面 */
+  pointer-events: none;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  /* blur 会把边缘拉出透明带，用 1.1 倍放大补边；blur/brightness 由 JS 写入 */
+  transform: scale(1.1);
+  display: none;
+}
+#bg-layer.on { display: block; }
+.bg-actions { display: flex; gap: 8px; }
+.bg-actions button {
+  border: 1px solid var(--border); background: var(--bg-elev-2);
+  color: var(--text); font-size: 13px; font-family: inherit;
+  padding: 6px 14px; border-radius: 8px; cursor: pointer;
+}
+.bg-actions button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+/* 开启背景图时主区透明化让图透出；背景亮度可调暗保证文字可读。
+   侧栏/设置面板保留底色（上面全是文字按钮，保持可读）。
+   ⚠️ 这里**不需要**再给 html 加 transparent —— 图是 body 的子节点，
+   直接画在 html 背景之上，本就透得出来。 */
+body.has-bg { background: transparent; }
+body.has-bg #app { background: transparent; }
+body.has-bg #main { background: transparent; }
+
 /* 皮肤分段选择 */
 .skin-seg {
   display: inline-flex;
@@ -874,7 +964,14 @@ body.resizing { cursor: col-resize; user-select: none; }
 #messages {
   flex: 1;
   overflow-y: auto;
-  padding: 24px 32px 200px 44px; /* 左侧加宽给分界线竖条刻度；底部留白避开浮动输入框 */
+  /* 底部留白避开浮动输入卡片。数值由 JS 按 #composer-wrap 实测高度写入
+     （--composer-pad-bottom），因为卡片高度会变：任务清单展开/折叠、
+     输入框随打字长高、底栏换行……写死一个常量迟早对不上 ——
+     留白不足会让最后几条消息永远被卡片盖住，滚到底也看不见（曾是真实故障）。
+     兜底值 200px 供 JS 尚未执行时使用。 */
+  padding: 24px 32px var(--composer-pad-bottom, 200px) 44px;
+  /* 宽度会随窗口变化，容器查询式的高度计算交给 JS，这里只保证滚动顺畅 */
+  scroll-behavior: auto;       /* 不用 CSS 平滑滚动：会与 JS 的「跟随态滚底」打架 */
 }
 
 /* ---------- 左侧对话导航条（贴分栏拖动条、上下居中） ----------
@@ -947,24 +1044,32 @@ body.resizing { cursor: col-resize; user-select: none; }
   flex-direction: column;
   gap: 14px;
 }
-/* ---------- 任务清单栏（会话顶部，可折叠） ---------- */
+/* ---------- 任务清单面板（输入卡片上方，可折叠） ----------
+   注意它的**位置**：#composer-wrap 内、#composer 外（见 index.html）。
+   面板跟着输入卡片浮动，但不参与输入卡片的 transform，所以输入卡片
+   折叠上移或空态居中时，清单依然停在原地可见。
+   宽度与输入卡片同一口径：min(80%, --composer-max-w)，两者左右严丝合缝。 */
 .todo-bar {
-  max-width: 760px;
-  margin: 0 auto 2px;
-  width: 100%;
+  width: min(80%, var(--composer-max-w));
+  margin: 0 auto 8px;
   background: var(--bg-elev);
   border: 1px solid var(--border);
   border-radius: 12px;
   overflow: hidden;
+  /* 面板可能列很多条，自身限高并内部滚动，避免把输入卡片顶出屏幕 */
+  max-height: 38vh;
+  display: flex;
+  flex-direction: column;
 }
-.todo-bar.hidden { display: none; }
 .todo-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 8px 12px;
   cursor: pointer;
   user-select: none;
+  flex: 0 0 auto;              /* 折叠态只剩表头，表头不许被压缩 */
 }
 .todo-head:hover { background: var(--bg-elev-2); }
+.todo-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .todo-title {
   font-size: 12.5px;
   color: var(--text-dim);
@@ -980,7 +1085,12 @@ body.resizing { cursor: col-resize; user-select: none; }
   border-radius: 10px;
   padding: 1px 8px;
 }
-.todo-body { padding: 0 12px 8px; display: flex; flex-direction: column; gap: 4px; }
+.todo-body {
+  padding: 0 12px 8px;
+  display: flex; flex-direction: column; gap: 4px;
+  overflow-y: auto;            /* 条数多时列表内滚，输入卡片位置不动 */
+  min-height: 0;
+}
 .todo-bar.collapsed .todo-body { display: none; }
 .todo-row {
   display: flex; align-items: center; gap: 8px;
@@ -993,6 +1103,30 @@ body.resizing { cursor: col-resize; user-select: none; }
 .todo-icon.st-cancelled { color: var(--text-dim); }
 .todo-text { color: var(--text); word-break: break-word; }
 .todo-text.done { color: var(--text-dim); text-decoration: line-through; }
+.todo-empty { font-size: 12.5px; color: var(--text-dim); padding: 2px 0; }
+
+/* ---------- 右下角「回到底部」箭头 ---------- */
+.to-bottom {
+  position: absolute;
+  right: 18px;
+  bottom: 118px;               /* 让开浮动输入卡片的高度 */
+  z-index: 30;
+  width: 34px; height: 34px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-dim);
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(31, 36, 48, .14);
+  opacity: 0;
+  transform: translateY(6px);
+  pointer-events: none;        /* 隐藏时不可点，避免挡住下面的内容 */
+  transition: opacity .18s ease, transform .18s ease, color .15s ease, border-color .15s ease;
+}
+.to-bottom.show { opacity: 1; transform: translateY(0); pointer-events: auto; }
+.to-bottom:hover { color: var(--accent); border-color: var(--accent); }
+.to-bottom:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* 助手消息：纯文本段落 */
 .msg-assistant {
@@ -1003,7 +1137,7 @@ body.resizing { cursor: col-resize; user-select: none; }
   word-break: break-word;
 }
 /* 用户消息：右侧粉色胶囊气泡 */
-.msg-user { display: flex; justify-content: flex-end; }
+.msg-user { display: flex; justify-content: flex-end; align-items: center; gap: 4px; }
 .msg-user .bubble {
   max-width: 70%;
   background: #fbe3ec;
@@ -1015,6 +1149,22 @@ body.resizing { cursor: col-resize; user-select: none; }
   white-space: pre-wrap;
   word-break: break-word;
 }
+/* 用户消息上的「编辑」按钮：默认隐形，悬停整行才显形（避免长对话里一片小图标）。
+   放在气泡左侧（HTML 顺序在前 + order 归位），不挡住右侧气泡尾巴。 */
+.msg-user .edit-btn {
+  order: -1;
+  border: none; background: transparent;
+  color: var(--text-dim);
+  width: 24px; height: 24px;
+  border-radius: 7px;
+  cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  opacity: 0;
+  transition: opacity .15s, color .15s, background .15s;
+}
+.msg-user:hover .edit-btn { opacity: 1; }
+.msg-user .edit-btn:hover { background: var(--bg-elev-2); color: var(--text); }
+.msg-user .edit-btn:focus-visible { opacity: 1; outline: 2px solid var(--accent); outline-offset: 1px; }
 /* 提示行：如「上下文已自动压缩」（无图标） */
 .msg-info {
   font-size: 13px;
@@ -1081,6 +1231,25 @@ body.resizing { cursor: col-resize; user-select: none; }
   color: var(--accent);
   word-break: break-all; /* @长路径 不撑爆气泡 */
 }
+
+/* ---------- 重试圆环：未回复打断后显示，点击重新发送 ---------- */
+.retry-ring {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px; height: 28px;
+  border-radius: 50%;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  margin: 4px 0 0 8px;
+  opacity: 0.9;
+  transition: opacity .15s, transform .1s;
+}
+.retry-ring:hover { opacity: 1; transform: scale(1.1); }
+.retry-ring:active { transform: scale(0.95); }
+.retry-ring svg { width: 14px; height: 14px; }
 
 /* ---------- 子智能体进度卡片 ---------- */
 /* 每个子任务一行卡片：徽标（模式·ID）+ 标签 + 单行进度；终态变色 */
@@ -1466,6 +1635,38 @@ body.resizing { cursor: col-resize; user-select: none; }
   margin-top: 2px;
 }
 
+/* ---------- 编辑重发提示条（输入框上方，紧贴 action-panel 样式族） ---------- */
+.edit-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  background: var(--bg-elev-3);
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+  padding: 8px 12px;
+  margin-bottom: 6px;
+}
+.edit-bar.hidden { display: none; }
+.edit-bar-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.edit-bar-title { font-size: 13px; color: var(--text); }
+.edit-bar-hint { font-size: 12px; color: var(--text-dim); }
+.edit-bar-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.edit-bar-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  padding: 5px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background .15s, border-color .15s, color .15s;
+}
+.edit-bar-btn:hover { background: var(--bg-elev-2); }
+.edit-bar-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.edit-bar-btn.primary:hover { filter: brightness(1.06); }
+
 /* ---------- 输入框上方：可复用操作选择面板（ActionPanel） ----------
    由 @plan 等技能回复完成后弹出：多选项 / 用户输入 / 多页。
    结构：#action-panel > .ap-header（标题+关闭） .ap-body（页内容） .ap-foot（输入行） */
@@ -1801,20 +2002,29 @@ body.resizing { cursor: col-resize; user-select: none; }
   color: var(--text-dim);
 }
 
-/* ---------- 圆形发送按钮：空闲 ↑ / 运行中 ▶ ---------- */
+/* ---------- 发送按钮：空闲=纸飞机 / 运行中=方块停止 ---------- */
 #send-btn {
   flex: 0 0 auto;
   width: 36px; height: 36px;
   border: none;
-  border-radius: 50%;          /* 圆形 */
+  border-radius: 10px;        /* 圆角矩形，非圆形 */
   background: var(--accent); color: #fff;
   font-size: 18px; line-height: 1;
   cursor: pointer;
   display: flex; align-items: center; justify-content: center;
-  transition: filter .15s;
+  transition: filter .15s, transform .1s;
 }
 #send-btn:hover { filter: brightness(1.1); }
-#send-btn.running { font-size: 13px; background: var(--accent); }
+#send-btn:active { transform: scale(0.95); }
+#send-btn.running {
+  background: var(--danger);
+  border-radius: 8px;
+}
+#send-btn svg { width: 20px; height: 20px; }
+#send-btn .send-icon { display: block; }
+#send-btn.running .send-icon { display: none; }
+#send-btn .stop-icon { display: none; }
+#send-btn.running .stop-icon { display: block; }
 
 /* ---------- 左栏内部 ---------- */
 .brand {

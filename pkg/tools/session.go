@@ -52,6 +52,34 @@ func TaskSinkFrom(ctx context.Context) (TaskSink, bool) {
 	return v, ok && v != nil
 }
 
+// checkpointSinkKey 是 context 中「文件写入快照槽」的键类型。
+type checkpointSinkKey struct{}
+
+// CheckpointEvent 描述一次「写工具执行前」的文件快照（用于按步回滚）。
+//
+// 负载之所以带上 OldContent（而不是只给路径让实现方自己读文件），是因为
+// 上报发生在写入**之前**：实现方一旦延后读取，读到的就已经是被覆盖后的内容，
+// 快照失去意义。工具层不引入 store 依赖，落库与去重由 Agent 侧完成。
+type CheckpointEvent struct {
+	Path       string `json:"path"`        // 被写入文件的绝对路径
+	Existed    bool   `json:"existed"`     // 写入前是否存在（false ⇒ 回滚时删除该文件）
+	OldContent string `json:"old_content"` // 写入前的完整内容（Existed 时有效）
+}
+
+// CheckpointSink 接收文件写入前的快照（由 Agent 注入：按 (会话, 步骤, 路径) 去重后落库）。
+type CheckpointSink func(ev CheckpointEvent)
+
+// WithCheckpointSink 将文件快照槽注入 context；无 sink 时快照被丢弃（如子智能体临时循环）。
+func WithCheckpointSink(ctx context.Context, sink CheckpointSink) context.Context {
+	return context.WithValue(ctx, checkpointSinkKey{}, sink)
+}
+
+// CheckpointSinkFrom 取出文件快照槽；不存在时 ok=false。
+func CheckpointSinkFrom(ctx context.Context) (CheckpointSink, bool) {
+	v, ok := ctx.Value(checkpointSinkKey{}).(CheckpointSink)
+	return v, ok && v != nil
+}
+
 // todoSinkKey 是 context 中「任务清单刷新槽」的键类型。
 type todoSinkKey struct{}
 

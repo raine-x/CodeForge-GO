@@ -34,6 +34,19 @@ var transientStatus = map[int]bool{
 // IsTransientStatus 判断状态码是否属于可自动重试的瞬时故障（供测试连接等复用）。
 func IsTransientStatus(code int) bool { return transientStatus[code] }
 
+// isQuotaExceeded 判断错误体是否属于「配额耗尽」类永久性错误。
+// 这类 429 / 403 是账户余额或额度用尽，重试不会恢复（还会白耗次数和等待），
+// 须与「真正限流」（rate_limit）区分开：后者短暂，重试可恢复。
+func isQuotaExceeded(body []byte) bool {
+	s := strings.ToLower(string(body))
+	for _, frag := range []string{"quota_exceeded", "quota exceeded", "insufficient_quota", "insufficient quota"} {
+		if strings.Contains(s, frag) {
+			return true
+		}
+	}
+	return false
+}
+
 // RetryHook 在每次自动重试前被调用，用于向前端透出「正在重试」与原因。
 // attempt 是即将进行的第几次尝试（1-based），maxAttempts 是含首次请求在内的总尝试次数。
 type RetryHook func(attempt, maxAttempts int, reason string)
@@ -187,7 +200,7 @@ func postJSON(
 		apiErr := fmt.Errorf("LLM 请求失败 (%d): %s", resp.StatusCode, strings.TrimSpace(string(msg)))
 		lastErr = apiErr
 
-		if !transientStatus[resp.StatusCode] || attempt >= policy.MaxAttempts {
+		if !transientStatus[resp.StatusCode] || isQuotaExceeded(msg) || attempt >= policy.MaxAttempts {
 			return nil, apiErr
 		}
 		nextDelay := policy.attemptDelay(attempt + 1)

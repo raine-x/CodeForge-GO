@@ -28,6 +28,8 @@ const (
 	EventHitlRequest = "hitl_request"
 	EventRetry       = "retry"    // 上游瞬时故障自动重试中
 	EventCompress    = "compress" // 上下文超阈值，已自动摘要压缩
+	EventEdit        = "edit"     // 历史被编辑重发截断（前端据此丢弃下方旧内容）
+	EventRewind      = "rewind"   // 文件已按检查点回滚
 	EventDone        = "done"
 	EventError       = "error"
 )
@@ -48,6 +50,7 @@ type Event struct {
 	MaxAttempts int               `json:"max_attempts,omitempty"` // 重试类事件：含首次请求在内的总尝试次数
 	DiffStats   *DiffStats        `json:"diff_stats,omitempty"`   // 编辑类工具的 +/- 行数（供前端绿增红减展示）
 	Compress    *CompressInfo     `json:"compress,omitempty"`     // 上下文压缩明细（仅 EventCompress 携带）
+	Rewind      *RewindResult     `json:"rewind,omitempty"`       // 文件回滚结果（仅 EventRewind 携带）
 }
 
 // DiffStats 是一次文件编辑的行数统计。
@@ -496,6 +499,130 @@ func (a *Agent) Regenerate(ctx context.Context, sessionID string, emit Emitter) 
 	return a.runLoopWithLimit(ctx, sess, emit, true, limit)
 }
 
+// EditAndResend 编辑一条历史用户消息并重跑。
+//
+// 语义（与「重新生成」同族，但可指定目标消息并改写其内容）：
+//
+//  1. 在**最近的 msgs 条用户纯文本消息**范围内定位第 back 条（back=0 即最后一条），
+//     避免误改很早以前、上下文早已被摘要覆盖的历史；
+//  2. 把会话截断到该条用户消息（含），丢弃其后全部助手回复与工具结果；
+//  3. 内部回退上下文压缩态 —— compressedUpTo / summaryText 若越过截断点即复位，
+//     相当于把「送模视图」也一并退回。⚠️ 刻意**不动** usageIn/usageHit/usageOut：
+//     那是上游真实计费口径的累计量（左下角窗口统计的来源），回退历史并不等于
+//     这些 token 没花过，抹掉就是伪造账目；
+//  4. 用新文本替换该条消息（仅替换文本块，图片等其它块原样保留）；
+//  5. 重新跑循环，新回复自然追加在截断点之后 —— 界面上就是「覆盖掉下面的内容」。
+//
+// 返回被替换消息在历史中的下标与新文本，供 WS 层回报前端。
+func (a *Agent) EditAndResend(ctx context.Context, sessionID string, back int, newText string, emit Emitter) (int, error) {
+	limit := a.MaxSteps()
+	sess, ok := a.history.Get(sessionID)
+	if !ok {
+		return -1, fmt.Errorf("会话不存在: %s", sessionID)
+	}
+	if strings.TrimSpace(newText) == "" {
+		return -1, fmt.Errorf("编辑后的内容不能为空")
+	}
+	if back < 0 {
+		back = 0
+	}
+
+	idx := nthLastPlainUserIndex(sess.Messages, back)
+	if idx < 0 {
+		return -1, fmt.Errorf("找不到可编辑的用户消息（仅支持最近 %d 条纯文本提问）", back+1)
+	}
+
+	// 截断到该条用户消息：其后的一切（助手回复 / 工具调用与结果）全部丢弃。
+	sess.Messages = sess.Messages[:idx+1]
+
+	// 内部回退压缩态：游标落在截断点之外时整段复位（与 Regenerate 同一处理）。
+	sess.normalizeCompression()
+	if sess.compressedUpTo > idx {
+		sess.compressedUpTo = 0
+		sess.summaryText = ""
+	}
+
+	// 替换文本块：只改 text，图片等其它内容块保持不动。
+	msg := sess.Messages[idx]
+	replaced := false
+	for i, block := range msg.Content {
+		if block.Type != llm.BlockText {
+			continue
+		}
+		msg.Content[i].Text = newText
+		replaced = true
+		break
+	}
+	if !replaced {
+		msg.Content = append([]llm.ContentBlock{{Type: llm.BlockText, Text: newText}}, msg.Content...)
+	}
+	sess.Messages[idx] = msg
+
+	a.lastUserInput = newText
+	return idx, a.runLoopWithLimit(ctx, sess, emit, true, limit)
+}
+
+// UserMessageRef 描述一条「可编辑的用户消息」（供前端渲染编辑按钮）。
+type UserMessageRef struct {
+	Index int    `json:"index"` // 在 sess.Messages 中的下标
+	Back  int    `json:"back"`  // 距最后一条用户消息的距离（0 = 最后一条），编辑时回传它
+	Text  string `json:"text"`  // 纯文本内容
+}
+
+// EditableUserMessages 返回最近的 n 条「用户纯文本发言」，按**时间正序**排列
+// （最后一条在末尾）。前端只给最近 n 条挂编辑按钮，这里就是那份白名单。
+//
+// 只认纯文本发言（isPlainUserText）：带 tool_result 的 user 消息是工具回填，
+// 不是用户说的话，改它没有意义也会破坏消息序列的合法性。
+func (a *Agent) EditableUserMessages(sessionID string, n int) []UserMessageRef {
+	sess, ok := a.history.Get(sessionID)
+	if !ok {
+		return nil
+	}
+	if n <= 0 {
+		return nil
+	}
+	var out []UserMessageRef
+	back := 0
+	for i := len(sess.Messages) - 1; i >= 0 && len(out) < n; i-- {
+		if !isPlainUserText(sess.Messages[i]) {
+			continue
+		}
+		var sb strings.Builder
+		for _, b := range sess.Messages[i].Content {
+			if b.Type == llm.BlockText {
+				sb.WriteString(b.Text)
+			}
+		}
+		out = append(out, UserMessageRef{Index: i, Back: back, Text: sb.String()})
+		back++
+	}
+	// 倒序收集得到的是「由近及远」，翻回时间正序
+	for l, r := 0, len(out)-1; l < r; l, r = l+1, r-1 {
+		out[l], out[r] = out[r], out[l]
+	}
+	return out
+}
+
+// nthLastPlainUserIndex 返回倒数第 n 条「用户纯文本发言」的下标（n 从 0 起），
+// 越界返回 -1。n=0 等价于 lastPlainUserIndex。
+func nthLastPlainUserIndex(msgs []llm.Message, n int) int {
+	if n < 0 {
+		return -1
+	}
+	seen := 0
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if !isPlainUserText(msgs[i]) {
+			continue
+		}
+		if seen == n {
+			return i
+		}
+		seen++
+	}
+	return -1
+}
+
 // runLoop 执行 ReAct 主循环（不追加用户消息，由调用方准备会话上下文）。
 func (a *Agent) runLoop(ctx context.Context, sess *Session, emit Emitter) error {
 	return a.runLoopWithPersistence(ctx, sess, emit, true)
@@ -616,6 +743,14 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 			// 注入会话运行域：后台任务 / 检查点 / 任务清单等按会话归属的行为
 			// 依赖 sessionID 与 step（见 pkg/tools/session.go）。
 			toolCtx := tools.WithSession(ctx, tools.SessionScope{SessionID: sess.ID, Step: step})
+			// 注入检查点槽：写工具在动文件前把旧内容上报，按 (会话,步骤,路径) 落库，
+			// 使「回退到某一步之前」成为可能（Plan.md #4）。persist=false 的临时
+			// 子智能体循环不记录：它不落历史，回滚点也无从对应。
+			if persist {
+				toolCtx = tools.WithCheckpointSink(toolCtx, func(ev tools.CheckpointEvent) {
+					a.recordCheckpoint(sess.ID, step, ev)
+				})
+			}
 			res, _ := a.executor.Execute(toolCtx, tc.Name, tc.Input)
 			if res == nil {
 				res = tools.Err("工具无返回")
