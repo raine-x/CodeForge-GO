@@ -376,23 +376,33 @@ check('前端订阅 todo 事件且按会话过滤',
   /ev\.session_id === sessionID/.test(uiSrc));
 check('清单栏渲染 4 种状态图标（○/◐/✓/✕）',
   /pending: '○', in_progress: '◐', completed: '✓', cancelled: '✕'/.test(uiSrc));
-check('空清单不再整体隐藏，而是显示「暂无任务」占位',
-  /TODO_EMPTY_HINT\s*=\s*'暂无任务'/.test(uiSrc) &&
-  /empty\.textContent\s*=\s*TODO_EMPTY_HINT/.test(uiSrc) &&
-  !/todoBar\.classList\.add\('hidden'\)/.test(uiSrc));
-check('面板挂在输入卡片上方（#composer-wrap 内、#composer 之前），并常驻可见',
-  /<div id="todo-bar" class="todo-bar">[\s\S]*?<\/div>\s*<form id="composer">/.test(htmlSrc) &&
+check('默认关闭：空清单整个面板隐藏（无占位空壳）',
+  /if \(!list\.length\) \{[\s\S]{0,220}?todoBar\.classList\.add\('hidden'\);/.test(uiSrc) &&
+  !/TODO_EMPTY_HINT/.test(uiSrc) &&
+  !/todo-empty/.test(uiSrc + css));
+check('有清单时显形（去掉 hidden）',
+  /todoBar\.classList\.remove\('hidden'\);/.test(uiSrc));
+check('HTML 初始就带 hidden（避免 JS 执行前闪一下空壳）',
+  /<div id="todo-bar" class="todo-bar hidden">/.test(htmlSrc));
+check('面板挂在输入卡片上方（#composer-wrap 内、#composer 之前）',
+  /<div id="todo-bar" class="todo-bar hidden">[\s\S]*?<\/div>\s*<form id="composer">/.test(htmlSrc) &&
   !/messagesEl\.prepend\(todoBar\)/.test(uiSrc));
+check('显隐都会重算消息区底部留白（面板出现/消失改变卡片高度）',
+  /if \(!list\.length\) \{[\s\S]{0,300}?requestAnimationFrame\(function \(\) \{ syncComposerPadding\(\); \}\)/.test(uiSrc));
 check('点表头折叠/展开，状态持久化到 localStorage',
   /TODO_COLLAPSE_KEY\s*=\s*'cf_todo_collapsed'/.test(uiSrc) &&
   /localStorage\.setItem\(TODO_COLLAPSE_KEY/.test(uiSrc));
 check('样式契约：todo 栏存在且有完成态删除线',
   /\.todo-bar\s*\{/.test(css) && /\.todo-text\.done\s*\{[^}]*line-through/.test(css));
-check('样式契约：面板宽度与输入卡片同口径（min(80%, --composer-max-w)）',
-  /\.todo-bar\s*\{[^}]*width:\s*min\(80%,\s*var\(--composer-max-w\)\)/.test(css));
+check('样式契约：面板宽度 100%（撑满 #composer-wrap，与输入卡片等宽）',
+  /\.todo-bar\s*\{[^}]*width:\s*100%/.test(css) &&
+  // 不能再套一次 min(80%, --composer-max-w)：父级已是该宽度，子级再乘 80% 会窄一截
+  !/\.todo-bar\s*\{[^}]*width:\s*min\(80%/.test(css));
 check('样式契约：条数多时列表内滚，不把输入卡片顶出屏幕',
   /\.todo-bar\s*\{[^}]*max-height:\s*38vh/.test(css) &&
   /\.todo-body\s*\{[^}]*overflow-y:\s*auto/.test(css));
+check('样式契约：.todo-bar.hidden 彻底不占位（连 margin 一起收起）',
+  /\.todo-bar\.hidden\s*\{\s*display:\s*none;\s*\}/.test(css));
 check('todo 文案进 toolPhrases（审批/卡片显示）',
   /todo_write:\s+'更新任务清单'/.test(uiSrc));
 
@@ -623,7 +633,9 @@ check('程序化改动也同步：@面板选中 / ＋菜单插入',
 // ---------- 9. 发送 / 打断按钮共色 ----------
 group('发送 / 打断按钮颜色');
 check('运行中的打断按钮为危险色（区别于发送按钮的 accent）',
-  /#send-btn\s*\{[^}]*background:\s*var\(--accent\)/.test(css) &&
+  // 发送按钮是「实心 accent + 白字」→ 用 accent-solid（白字对比度才够）；
+  // 断言意图不变：它仍与 danger 区分开、也不该退化成 text-dim。
+  /#send-btn\s*\{[^}]*background:\s*var\(--accent-solid\)/.test(css) &&
   /#send-btn\.running\s*\{[^}]*background:\s*var\(--danger\)/.test(css) &&
   !/#send-btn\.running\s*\{[^}]*background:\s*var\(--text-dim\)/.test(css));
 
@@ -765,13 +777,20 @@ check('已在库的模型标记为已添加且不可选',
   /badge\.textContent = '已添加'/.test(uiSrc) &&
   /'disc-item' \+ \(m\.in_library \? ' added' : ''\)/.test(uiSrc) &&
   /\.disc-item\.added\s*\{/.test(css));
-check('「添加选中」把模型 id 填入表单（不再调 save_batch）',
-  /function fillSelectedDiscModel/.test(uiSrc) &&
-  /document\.getElementById\('mf-id'\)\.value = id/.test(uiSrc) &&
-  !/models\/save_batch/.test(uiSrc));
-check('上游列表单选（radio）',
-  /cb\.type = 'radio'/.test(uiSrc) &&
-  /discSelected = \{\}; discSelected\[m\.id\] = true;/.test(uiSrc));
+// 勾选后入库：**选了供应商就一次写入多个 id** —— 这是「同一个供应商下不必一个一个
+// 添加」的主路径；没选供应商（新建供应商态）才退回「填入单个 id 到表单」。
+check('勾选后批量入库：选了供应商就一次写入多个 id',
+  /function addSelectedDiscModels/.test(uiSrc) &&
+  /const ids = Object\.keys\(discSelected\)/.test(uiSrc) &&
+  /provider_id: pid/.test(uiSrc) &&
+  /models: ids\.map/.test(uiSrc) &&
+  /fetch\('\/api\/models\/save_batch'/.test(uiSrc));
+check('未选供应商时退回「填入单个模型 id」到表单',
+  /if \(!pid\) \{[\s\S]{0,420}?document\.getElementById\('mf-id'\)\.value = id/.test(uiSrc));
+check('上游列表多选（checkbox），勾选状态按 id 记录',
+  /cb\.type = 'checkbox'/.test(uiSrc) &&
+  /discSelected\[m\.id\] = true/.test(uiSrc) &&
+  /delete discSelected\[m\.id\]/.test(uiSrc));
 check('上游列表只保留筛选 + 收起，去掉全选/清空',
   /id="disc-filter"/.test(htmlSrc) &&
   /id="disc-close"/.test(htmlSrc) &&
@@ -779,7 +798,7 @@ check('上游列表只保留筛选 + 收起，去掉全选/清空',
   /document\.getElementById\('disc-filter'\)\.addEventListener\('input', renderDiscList\)/.test(uiSrc));
 check('填入后收起面板并提示补密钥保存',
   /setTestResult\(true, '已填入模型 id/.test(uiSrc) &&
-  /collapseDiscover\(\);\s*\n\s*\}/.test(uiSrc));
+  /collapseDiscover\(\);\s*\n\s*return;/.test(uiSrc));
 check('切换/保存模型时收起上游列表（防状态串味）',
   /collapseDiscover\(\); \/\/ 换了模型就收起上一次的上游列表/.test(uiSrc) &&
   /collapseDiscover\(\);\s*\n\s*showMTab\('list'\)/.test(uiSrc));
@@ -788,17 +807,32 @@ check('切换/保存模型时收起上游列表（防状态串味）',
 // 模型管理：子 Tab「添加模型」+ 列表「编辑」复用同款表单 + 保存后进入对话框模型选择
 // 需求链路：设置 → 模型 → 添加模型 → 保存 = 模型列表与对话框弹层同时出现新条目。
 group('模型管理：添加 / 编辑 / 对话框选择');
-check('子 Tab 文案为「模型列表 / 添加模型」',
-  /data-mtab="config">添加模型</.test(htmlSrc) && !htmlSrc.includes('模型配置'));
+check('子 Tab 文案为「模型列表 / 供应商管理 / 添加模型」',
+  /data-mtab="list">模型列表</.test(htmlSrc) &&
+  /data-mtab="prov">供应商管理</.test(htmlSrc) &&
+  /data-mtab="config">添加模型</.test(htmlSrc) &&
+  !htmlSrc.includes('模型配置'));
 check('表单标题区分添加 / 编辑（编辑复用同一表单）',
   /id="mf-title"/.test(htmlSrc) &&
   /editingIndex >= 0 \? '编辑模型' : '添加模型'/.test(uiSrc));
-check('列表「编辑」回填表单并切到添加模型面板',
-  /editingIndex = i;[\s\S]{0,160}?fillForm\(m\);[\s\S]{0,160}?showMTab\('config'\)/.test(uiSrc));
+check('列表「编辑」改为**就地展开**，不再跳去添加模型面板',
+  // 2026-09-20 改造：编辑不再复用「添加模型」那张表单（含供应商下拉/地址/密钥，太重），
+  // 改成在模型行下方就地展开一个只含模型自身字段的编辑区。
+  /acts\.appendChild\(domButton\('编辑', '', function \(\) \{ toggleEdit\(\); \}\)\)/.test(uiSrc) &&
+  /function buildModelEditor/.test(uiSrc) &&
+  !/showMTab\('config'\)[\s\S]{0,80}?fillForm/.test(uiSrc));
+check('「添加模型」tab 仍是独立的空白新建态（未被编辑复用）',
+  /name === 'config'\) \{[\s\S]{0,140}?loadLibrary\(\)\.then\(function \(\) \{ resetForm\(\); \}\)/.test(uiSrc) &&
+  /function resetForm/.test(uiSrc));
 check('点「添加模型」tab 回到空白新建态',
-  /t\.dataset\.mtab === 'config'\) resetForm\(\)/.test(uiSrc));
+  /name === 'config'\) \{[\s\S]{0,140}?loadLibrary\(\)\.then\(function \(\) \{ resetForm\(\); \}\)/.test(uiSrc));
+check('供应商 tab 切换时重新渲染供应商列表',
+  /name === 'prov'\) \{[\s\S]{0,80}?renderProviders\(\)/.test(uiSrc));
 check('对话框模型弹层列出模型库全部条目（不再只显示当前一个）',
-  /function renderModelPop[\s\S]{0,700}?modelChoices\.forEach/.test(uiSrc) &&
+  // 现在遍历的是「按当前供应商过滤后」的列表（modelChoices 的子集），
+  // 全部条目仍来自 modelChoices；切供应商时自动换列表。
+  /filtered\.forEach\(function \(m\)/.test(uiSrc) &&
+  /modelChoices\.filter\(function \(m\) \{[\s\S]{0,80}?m\.provider_id === curProvId/.test(uiSrc) &&
   /b\.dataset\.model = m\.id/.test(uiSrc) &&
   /fetchModelChoices[\s\S]{0,200}?fetch\('\/api\/models\/list'\)/.test(uiSrc));
 check('弹层点选即切换生效模型（/api/models/apply）',
@@ -806,7 +840,7 @@ check('弹层点选即切换生效模型（/api/models/apply）',
   /switchActiveModel\(m\.id\)/.test(uiSrc) &&
   /fetch\('\/api\/models\/apply'/.test(uiSrc));
 check('保存成功：刷新模型列表并用新快照刷新对话框选择',
-  /showMTab\('list'\);[\s\S]{0,220}?renderModelItems\(\);[\s\S]{0,260}?modelsLoaded = false;[\s\S]{0,80}?loadModels\(\)/.test(uiSrc));
+  /showMTab\('list'\);[\s\S]{0,240}?modelsLoaded = false;[\s\S]{0,140}?loadLibrary\(\)\.then\(function \(\) \{ renderModelItems\(\); loadModels\(\); \}\)/.test(uiSrc));
 check('样式契约：弹层列表限高滚动 + 表单标题',
   /#model-list\s*\{[^}]*max-height[^}]*overflow-y:\s*auto/.test(css) &&
   /\.mf-title\s*\{/.test(css));
@@ -1076,13 +1110,14 @@ check('占位提示只提示状态，不泄露工具 ID',
 
 group('模型删除原位确认（不弹浏览器框）');
 {
-  const render = extractFunction(uiSrc, 'renderModelItems');
+  // 删除按钮现在建在 modelRowEl()（逐行渲染）里，不在 renderModelItems()（分组装配）里。
+  const render = extractFunction(uiSrc, 'modelRowEl');
   check('删除为按钮级原位确认：首次点「删除」变「确认删除」，配「取消」按钮',
-    render.includes("mkBtn('删除'") && render.includes("delBtn.textContent = '确认删除'") &&
-    render.includes("mkBtn('确认删除', 'confirming'") &&
-    render.includes("mkBtn('取消'"));
+    render.includes("domButton('删除'") &&
+    render.includes("domButton('确认删除', 'confirming'") &&
+    render.includes("domButton('取消'"));
   check('「确认删除」再次点击才执行，取消按钮恢复原删除按钮',
-    render.includes("acts.removeChild(confirmBtn)") && render.includes("delBtn.textContent = '删除'"));
+    render.includes('acts.removeChild(confirmBtn)') && render.includes('acts.appendChild(delBtn)'));
   check('模型删除不再调用浏览器 confirm 确认框',
     !/\bconfirm\('从模型库删除/.test(uiSrc));
   const css = fs.readFileSync(path.join(DIST, 'app.css'), 'utf8');
@@ -1199,23 +1234,322 @@ check('不用 CSS 平滑滚动（避免与跟随态滚底打架）',
 // 故障：选好图却看不见。#bg-layer 是 body 的子节点、靠 z-index:-1 沉底，
 // 但 html/body 都挂了不透明 background:var(--bg)，于是图层被永久遮住。
 // 修法：不透明底色只挂 html，body 透明 —— 图层排在 body 之上、内容之下，层级成立。
+// 切会话时 replayHistory 一旦中途抛异常，末尾的 renderSessions 就跑不到，
+// 侧栏高亮会停在上一个会话（2026-09-19 实际故障：某个会话的历史里有 name 缺失的
+// tool_use 块，toolLabel 裸用 name.indexOf 直接抛 TypeError）。
+group('历史回放的健壮性（切会话不能丢侧栏高亮）');
+check('toolPhrase 先归一化 name（缺失时不崩）',
+  /function toolPhrase\(name\)\s*\{[\s\S]{0,900}?name = typeof name === 'string' \? name : ''/.test(uiSrc));
+check('toolLabel 先归一化 name（缺失时走 default 的中文兜底）',
+  /function toolLabel\(name, input\)\s*\{[\s\S]{0,300}?name = typeof name === 'string' \? name : ''/.test(uiSrc));
+check('回放时单块渲染失败被隔离（否则整次回放中断、高亮不更新）',
+  /\[replay\] 跳过无法渲染的历史块/.test(uiSrc) &&
+  /catch \(err\) \{\s*console\.warn\('\[replay\]/.test(uiSrc));
+check('renderSessions 仍挂在 replayHistory 末尾（高亮的落点）',
+  /renderSessions\(sessionsCache\); \/\/ 高亮切换后的 active/.test(uiSrc));
+
+// ---------- 模型 / 供应商管理（2026-09-20 改造）----------
+group('模型与供应商管理');
+check('「供应商机制」说明横幅已删除',
+  !/供应商机制/.test(htmlSrc) && !/只在供应商上维护一份/.test(htmlSrc));
+check('「添加供应商」用真值哨兵，不会被「自动选第一个」吃掉',
+  // 空串是假值，会被 renderProviders 开头的自动选择重置 → 点添加没反应
+  /const PROV_NEW = '__new__'/.test(uiSrc) &&
+  /provSelected = PROV_NEW; renderProviders\(\)/.test(uiSrc) &&
+  !/provSelected = ''; renderProviders\(\)/.test(uiSrc));
+check('详情区对哨兵值走「新建」分支（不会当成某个供应商）',
+  /provSelected !== PROV_NEW\) \? findProvider\(provSelected\) : null/.test(uiSrc));
+check('供应商详情里有「获取模型列表」，就地展开不弹窗',
+  /function fetchUpstream\(\)/.test(uiSrc) &&
+  /domButton\('获取模型列表'/.test(uiSrc) &&
+  /domEl\('div', 'pv-disc hidden'\)/.test(uiSrc));
+check('获取到的模型可勾选并批量入库（按供应商归类）',
+  /function commitPicked\(\)/.test(uiSrc) &&
+  /provider_id: p\.id/.test(uiSrc) &&
+  /\/api\/models\/save_batch/.test(uiSrc));
+check('模型列表：子模型有独立容器（供缩进）',
+  /const kids = domEl\('div', 'model-children'\)/.test(uiSrc) &&
+  /\.model-children\s*\{[^}]*margin-left/.test(css));
+check('模型列表：供应商分组可折叠，且折叠时不渲染子模型',
+  /modelGroupFolded/.test(uiSrc) && /mg-fold/.test(uiSrc) &&
+  /if \(folded\) return;/.test(uiSrc));
+check('编辑模型改为就地展开，不再复用「添加模型」表单',
+  /function buildModelEditor/.test(uiSrc) &&
+  !/function editModel/.test(uiSrc) &&
+  !/function editModel/.test(uiSrc));
+check('就地编辑不再提交密钥明文（列表是脱敏视图，提交会覆盖掉已存密钥）',
+  /body\.key_source = m\.key_source/.test(uiSrc) &&
+  !/key_value:/.test(uiSrc.slice(uiSrc.indexOf('function buildModelEditor'), uiSrc.indexOf('function buildModelEditor') + 3000)));
+
+// ---------- 上下文档位（2026-09-20）----------
+group('上下文长度预置档位');
+check('输入档 = 1M / 512K / 256K / 128K（按 1024 的二进制 K）',
+  /CTX_PRESETS_IN\s*=\s*\[1048576,\s*524288,\s*262144,\s*131072\]/.test(uiSrc));
+check('输出档 = 384K / 256K / 128K',
+  /CTX_PRESETS_OUT\s*=\s*\[393216,\s*262144,\s*131072\]/.test(uiSrc));
+check('档位标签按二进制 K 渲染（256K→262144、384K→393216）',
+  /function fmtCtxSlot\(n\)/.test(uiSrc) &&
+  /n % 1048576 === 0/.test(uiSrc) && /n % 1024 === 0/.test(uiSrc));
+check('保留数字输入框（非整档的既有值不会被静默改掉）',
+  /const num = domInput\('number', '', ''\)/.test(uiSrc) &&
+  /num\.value = String\(Number\(current\) \|\| fallback\)/.test(uiSrc));
+check('档位做成**直接点击**的按钮（不是下拉、不弹层）',
+  /domEl\('button', 'ctx-chip', fmtCtxSlot\(v\)\)/.test(uiSrc) &&
+  /b\.addEventListener\('click', function \(\) \{ num\.value = String\(v\); sync\(\); \}\)/.test(uiSrc) &&
+  !/CTX_CUSTOM/.test(uiSrc) &&
+  !/buildCtxPicker[\s\S]{0,900}?domEl\('select'\)/.test(uiSrc));
+check('输入值命中某档时该档高亮（否则看不出当前是哪个档）',
+  /function sync\(\)[\s\S]{0,200}?classList\.toggle\('on', Number\(b\.dataset\.v\) === v\)/.test(uiSrc) &&
+  /num\.addEventListener\('input', sync\)/.test(uiSrc));
+check('表单不再直接读写 mf-ctx-in / mf-ctx-out 的值（统一走控件）',
+  !/getElementById\('mf-ctx-in'\)\.value/.test(uiSrc) &&
+  !/getElementById\('mf-ctx-out'\)\.value/.test(uiSrc) &&
+  /ctxInPicker \? ctxInPicker\.value\(\) : 262144/.test(uiSrc) &&
+  /ctxOutPicker \? ctxOutPicker\.value\(\) : 131072/.test(uiSrc));
+check('回填走控件的 set（否则输入框不会更新）',
+  /ctxInPicker\.set\(m\.ctx_in \|\| 262144\)/.test(uiSrc) &&
+  /ctxOutPicker\.set\(m\.ctx_out \|\| 131072\)/.test(uiSrc));
+check('就地编辑模型也用同一套控件',
+  /const ctxIn = buildCtxPicker\(m\.ctx_in, CTX_PRESETS_IN, 262144\)/.test(uiSrc) &&
+  /const ctxOut = buildCtxPicker\(m\.ctx_out, CTX_PRESETS_OUT, 131072\)/.test(uiSrc));
+check('样式契约：整行铺开（输入组靠左、输出组靠右）',
+  /\.ctx-inputs\s*\{[^}]*justify-content:\s*space-between/.test(css));
+check('样式契约：档位按钮 + 命中态高亮',
+  /\.ctx-chip\s*\{/.test(css) && /\.ctx-chip\.on\s*\{/.test(css));
+
+// ---------- 供应商密钥回显 / 模型弹层两行 / 连不通的报错（2026-09-20）----------
+const modelsGoSrc = fs.readFileSync(path.join(__dirname, '..', '..', 'pkg', 'server', 'models.go'), 'utf8');
+const discoverGoSrc = fs.readFileSync(path.join(__dirname, '..', '..', 'pkg', 'server', 'model_discover.go'), 'utf8');
+const cfgModelsGoSrc = fs.readFileSync(path.join(__dirname, '..', '..', 'config', 'models.go'), 'utf8');
+
+group('供应商密钥回显 / 模型弹层 / 超时报错');
+check('每个供应商都回填 key_plain（不再只给当前生效模型所属那个）',
+  // 早先只回填 active 那个 → 切到别的供应商密钥框是空的，用户以为「保存的 key 丢了」
+  /for _, pv := range providers \{[\s\S]{0,260}?pv\["key_plain"\] = v/.test(modelsGoSrc) &&
+  !/if activeProvider != "" \{[\s\S]{0,300}?pv\["key_plain"\] = v/.test(modelsGoSrc));
+check('模型条目下发解析好的 provider_name（供弹层显示来源）',
+  /"provider_name":\s*provName/.test(cfgModelsGoSrc) &&
+  /if p, ok := ps\.Find\(raw\.ProviderID\); ok \{/.test(cfgModelsGoSrc));
+check('模型弹层按「供应商 ↓ 显示名称」两行渲染',
+  /const pv = document\.createElement\('span'\);\s*\n\s*pv\.className = 'pop-opt-prov'/.test(uiSrc) &&
+  /nm\.className = 'pop-opt-name'/.test(uiSrc) &&
+  /\.pop-opt-prov\s*\{/.test(css) && /\.pop-opt-name\s*\{/.test(css));
+check('模型弹层两段式：顶部**单独**的供应商选择器（不再「模型和供应商一起选中」）',
+  /let modelProvFilter = ''/.test(uiSrc) &&
+  /let provListOpen = false/.test(uiSrc) &&
+  /className = 'pop-prov-row'/.test(uiSrc) &&
+  /lbl\.textContent = '供应商'/.test(uiSrc) &&
+  // 点供应商项：切 filter 并收起列表
+  /item\.addEventListener\('click', function \(e\) \{\s*e\.stopPropagation\(\);\s*modelProvFilter = p\.id;\s*provListOpen = false/.test(uiSrc));
+check('模型列表只显示当前供应商下的条目（按 provider_id 过滤）',
+  /curProvId \|\| m\.provider_id === curProvId/.test(uiSrc));
+check('切换模型时把供应商过滤同步到该模型的供应商（上下两段始终一致）',
+  /const m = \(modelChoices \|\| \[\]\)\.find\(function \(x\) \{ return x\.id === id; \}\)/.test(uiSrc) &&
+  /if \(m && m\.provider_id\) \{[\s\S]{0,80}?modelProvFilter = m\.provider_id/.test(uiSrc));
+check('每次打开弹层复位供应商过滤（关掉再开重新跟随生效模型）',
+  // 否则上一次「切去别家浏览」的选择会一直留着，而生效模型可能已从设置页换成别家的，
+  // 顶上显示 A、实际生效 B —— 自相矛盾。浏览选择只在本次展开期间有效。
+  /modelProvFilter = '';\s*provListOpen = false;\s*loadModels\(\);/.test(uiSrc));
+check('⚠️ 弹层供应商列表从 modelChoices 推导，不依赖 providersCache',
+  // providersCache 只在**设置页** loadLibrary() 时填充，主界面从来没加载过它。
+  // 早先 renderModelPop 直接读它 → 顶段供应商行在主界面根本不渲染（实测拿到 null）。
+  // ⚠️ 先剥掉注释再检查 —— 上面那段注释里就写到了 providersCache 这个词
+  (function () {
+    const i = uiSrc.indexOf('function renderModelPop()');
+    const j = uiSrc.indexOf('\n  }', i);
+    const raw = i >= 0 && j > i ? uiSrc.slice(i, j) : '';
+    const body = raw.replace(/\/\/[^\n]*/g, '');
+    return body.indexOf('providersCache') < 0 && /seenProv\[key\]/.test(body);
+  })());
+check('「供应商行」与「供应商列表」两个新元素的样式',
+  /\.pop-prov-row\s*\{/.test(css) &&
+  /\.pop-prov-list\s*\{/.test(css) &&
+  /\.pop-prov-item\.selected\s*\{/.test(css));
+check('供应商名过长会截断（不把弹层撑宽）',
+  /\.pop-opt-prov\s*\{[^}]*text-overflow:\s*ellipsis/.test(css));
+check('模型弹层整体居中，且不波及权限弹层',
+  // 只作用于 #model-list —— 权限弹层共用 .pop-opt 类，那里要左对齐
+  /#model-list \.pop-opt\s*\{[^}]*text-align:\s*center/.test(css) &&
+  /#model-list \.pop-opt-prov\s*\{[^}]*margin-left:\s*auto/.test(css) &&
+  !/^\.pop-opt\s*\{[^}]*text-align:\s*center/m.test(css));
+check('超时报错能区分「连不通」与「上游慢」（别把人往错方向带）',
+  /未能连上 %s/.test(discoverGoSrc) && /未能连上 %s/.test(modelsGoSrc) &&
+  /域名能解析、但 TCP 连不上/.test(discoverGoSrc) &&
+  !/上游响应过慢/.test(discoverGoSrc) && !/上游响应过慢/.test(modelsGoSrc));
+check('超时时长取自 upstreamTimeout，不写死（写死会随超时调整而失真）',
+  /var upstreamTimeout = 30 \* time\.Second/.test(discoverGoSrc) &&
+  /WithTimeout\(r\.Context\(\), upstreamTimeout\)/.test(discoverGoSrc) &&
+  /WithTimeout\(r\.Context\(\), upstreamTimeout\)/.test(modelsGoSrc) &&
+  !/请求超时（30s）/.test(discoverGoSrc) && !/请求超时（30s）/.test(modelsGoSrc));
+
 group('自定义背景图可见性');
 check('不透明底色只挂在 html 上，body 透明',
   /html\s*\{\s*background:\s*var\(--bg\);\s*\}/.test(css) &&
   /body\s*\{\s*background:\s*transparent;\s*\}/.test(css));
 check('html,body 共用规则里不再有不透明底色（否则会盖住图层）',
   !/html,\s*body\s*\{[^}]*background:\s*var\(--bg\)/.test(css));
-check('#bg-layer 不再依赖负 z-index（改用 DOM 顺序垫底）',
-  /#bg-layer\s*\{[^}]*z-index:\s*0;/.test(css) && !/#bg-layer\s*\{[^}]*z-index:\s*-/.test(css));
+check('#bg-layer 用**负** z-index（画在在流块背景之下，否则会盖住侧栏底色）',
+  /#bg-layer\s*\{[^}]*z-index:\s*-1;/.test(css) &&
+  // 写成 0 会让它晚于在流块背景绘制 → 侧栏被背景图铺满（2026-09-19 实际踩到）
+  !/#bg-layer\s*\{[^}]*z-index:\s*0;/.test(css));
 check('图层仍是 fixed 满铺 + pointer-events:none（不遮挡交互）',
   /#bg-layer\s*\{[^}]*position:\s*fixed;\s*inset:\s*0;/.test(css) &&
   /#bg-layer\s*\{[^}]*pointer-events:\s*none;/.test(css));
-check('开启背景时主区透明化让图透出',
+check('开启背景时左右两块面板都透明化让图铺满（含侧栏）',
   /body\.has-bg\s*\{\s*background:\s*transparent;\s*\}/.test(css) &&
   /body\.has-bg #app\s*\{\s*background:\s*transparent;\s*\}/.test(css) &&
-  /body\.has-bg #main\s*\{\s*background:\s*transparent;\s*\}/.test(css));
+  /body\.has-bg #main\s*\{\s*background:\s*transparent;\s*\}/.test(css) &&
+  /body\.has-bg #sidebar\s*\{\s*background:\s*transparent;\s*\}/.test(css));
+check('透明靠「面板自己变透明」实现，而不是让图层去盖（z-index 必须为负）',
+  /#bg-layer\s*\{[^}]*z-index:\s*-1;/.test(css));
 check('图层是 body 的首个子节点（DOM 顺序决定它垫在最下）',
   /document\.body\.insertBefore\(el, document\.body\.firstChild\)/.test(uiSrc));
+
+// 「选完图啥也没有」的根因修复（2026-09-19）：
+// Windows 分支只回 path 不落库 → /api/appearance/background 永远 404。
+// 后端已修（pkg/server/appearance_test.go 锁住），前端再加一层兜底防复发。
+group('背景图选择：不信任「已落库」，拿不到确认就自己补保存');
+check('saveBg 返回 Promise（补保存要等它完成再应用）',
+  /function saveBg\(patch\) \{[\s\S]{0,200}?return fetch\('\/api\/appearance'/.test(uiSrc));
+check('服务端确认 background:true 时直接生效',
+  /if \(d\.background\) \{ applyBgImage\(true\); return; \}/.test(uiSrc));
+check('未确认时先补保存、**等它完成**再 applyBgImage（否则请求赶在落库前照样 404）',
+  /saveBg\(\{ background_path: d\.path \}\)\.then\(function \(\) \{ applyBgImage\(true\); \}\)/.test(uiSrc));
+check('内置选择器分支同样等保存完成再应用',
+  /openBuiltinPicker\([\s\S]{0,260}?saveBg\(\{ background_path: path \}\)\.then\(function \(\) \{ applyBgImage\(true\); \}\)/.test(uiSrc));
+
+// 模糊/亮度共用防抖定时器：两个 handler 各自 setTimeout 会互相取消，
+// 导致「拖完模糊紧接着拖亮度」时模糊值永远存不进服务端（2026-09-19 实测抓到）。
+group('背景模糊 / 亮度：共用防抖且提交完整状态');
+check('存在统一的 scheduleBgSave（单一防抖入口）',
+  /function scheduleBgSave\(\) \{[\s\S]{0,200}?clearTimeout\(bgSaveTimer\);[\s\S]{0,200}?setTimeout\(/.test(uiSrc));
+check('保存时提交完整状态（blur + brightness），不是各自的单字段',
+  /saveBg\(\{ blur: blur, brightness: bright \}\)/.test(uiSrc));
+check('两个滑条都走 scheduleBgSave（全页只有一个防抖 setTimeout）',
+  (uiSrc.match(/scheduleBgSave\(\);/g) || []).length === 2 &&
+  (uiSrc.match(/bgSaveTimer = setTimeout/g) || []).length === 1);
+check('不再有「只提交自己那个字段」的保存（正是它会被对方取消）',
+  !/saveBg\(\{ blur: blur \}\)/.test(uiSrc) && !/saveBg\(\{ brightness: bright \}\)/.test(uiSrc));
+
+// 深浅色自适应：背景图偏暗时文字必须转白，否则深色字压暗背景完全不可读。
+// 判据是「图片实际亮度 × 亮度系数」，不是滑条值本身 —— 亮图调暗后仍可能偏亮。
+group('深浅色自适应（文字永远清楚）');
+check('按「图片平均亮度 × 亮度系数」判定，而不是只看滑条值',
+  /BG_DARK_THRESHOLD\s*=\s*0\.4/.test(uiSrc) &&
+  /const effective = bgAvgLum \* \(bgBright \/ 100\)/.test(uiSrc) &&
+  /classList\.toggle\('bg-dark', effective < BG_DARK_THRESHOLD\)/.test(uiSrc));
+check('平均亮度按感知权重计算（0.2126/0.7152/0.0722）',
+  /0\.2126 \* d\[i\] \+ 0\.7152 \* d\[i \+ 1\] \+ 0\.0722 \* d\[i \+ 2\]/.test(uiSrc));
+check('亮度按图片 URL 缓存，拖动滑条不重复解码',
+  /if \(bgLumFor === url && bgAvgLum !== null\)/.test(uiSrc));
+check('没有背景图时清掉 bg-dark（不误伤默认浅色主题）',
+  /!bgLayer\.classList\.contains\('on'\) \|\| bgAvgLum === null[\s\S]{0,120}?classList\.remove\('bg-dark'\)/.test(uiSrc));
+check('量不出亮度时退回浅色主题（不让主题卡在半路）',
+  /catch \(e\) \{[\s\S]{0,80}?bgAvgLum = null;/.test(uiSrc));
+check('亮度一变立即重判深浅色',
+  /function applyBgFilters\(blur, bright\) \{[\s\S]{0,160}?syncBgTheme\(\)/.test(uiSrc));
+
+check('样式契约：body.bg-dark 覆盖整套配色变量（而非逐个组件补丁）',
+  /body\.bg-dark\s*\{[^}]*--bg:/.test(css) &&
+  /body\.bg-dark\s*\{[^}]*--bg-elev:/.test(css) &&
+  /body\.bg-dark\s*\{[^}]*--bg-elev-2:/.test(css) &&
+  /body\.bg-dark\s*\{[^}]*--border:/.test(css) &&
+  /body\.bg-dark\s*\{[^}]*--text:/.test(css) &&
+  /body\.bg-dark\s*\{[^}]*--text-dim:/.test(css));
+check('样式契约：深色下 --text 是浅色（这是「文字转白」的落点）',
+  (function () {
+    const m = css.match(/body\.bg-dark\s*\{[\s\S]*?\}/);
+    if (!m) return false;
+    const t = m[0].match(/--text:\s*#([0-9a-fA-F]{6})/);
+    if (!t) return false;
+    const r = parseInt(t[1].slice(0, 2), 16);
+    const g = parseInt(t[1].slice(2, 4), 16);
+    const b = parseInt(t[1].slice(4, 6), 16);
+    return r > 200 && g > 200 && b > 200;
+  })());
+check('样式契约：深色下用户气泡跟着翻（否则亮粉块在暗主题里刺眼）',
+  /body\.bg-dark \.msg-user \.bubble\s*\{/.test(css));
+check('样式契约：声明 color-scheme 让原生控件/滚动条也转深色',
+  /body\.bg-dark\s*\{[^}]*color-scheme:\s*dark/.test(css));
+check('样式契约：深色规则不得改动「透明」——背景图仍要透出来',
+  !/body\.bg-dark\s+[#.]?(app|sidebar|main)\s*\{[^}]*background:\s*(?!transparent)/.test(css));
+
+// 深色主题下有两处**必须不跟着变**：
+//   ① 固定浅底的代码类块 → 块内文字钉回深色（否则白字压浅底，整块一片纯白）
+//   ② 设置面板 → 整屏不透明层，不坐在背景图上，不该跟着背景亮度变黑
+group('深色主题的两处例外（不跟着变）');
+check('固定浅底的代码块在深色下把文字钉回深色',
+  /body\.bg-dark \.msg-assistant\.md pre[\s\S]{0,220}?color:\s*#1f2430/.test(css) &&
+  /body\.bg-dark \.tool-card pre/.test(css) &&
+  /body\.bg-dark \.diff/.test(css) &&
+  /body\.bg-dark \.code/.test(css));
+check('代码块底色保持写死的浅色（#f6f7f9 ×3）——用户要求不动',
+  (css.match(/background:\s*#f6f7f9/g) || []).length >= 3);
+check('设置面板与主界面一致：has-bg 下三层面板都透明（同步背景图）',
+  /body\.has-bg \.settings-shell,\s*body\.has-bg \.settings-nav,\s*body\.has-bg \.settings-card\s*\{\s*background:\s*transparent;\s*\}/.test(css));
+check('设置面板**不**单独覆盖配色变量（曾因此出现「白底 + 深色主题文字」的矛盾）',
+  !/body\.bg-dark #settings-overlay\s*\{/.test(css) &&
+  !/#settings-overlay\s*\{[^}]*--text:/.test(css) &&
+  !/#settings-overlay\s*\{[^}]*--bg:/.test(css));
+check('设置面板跟着 body.bg-dark 一起深浅自适应（不再有例外）',
+  /body\.bg-dark\s*\{[^}]*--text:\s*#eef0f6/.test(css) &&
+  !/body\.bg-dark[^{]*#settings-overlay[^{]*\{[^}]*--text/.test(css));
+// 设置是整屏层，开着背景图时透明 → 底下的主界面会透出来重叠，必须把主界面藏起来。
+check('打开设置时主界面被藏起来（否则透明的设置与主界面重叠）',
+  /#app:has\(~ #settings-overlay:not\(\.hidden\)\)\s*\{\s*visibility:\s*hidden;\s*\}/.test(css));
+check('藏主界面用 visibility 而非 display（保布局与滚动位置，且不接收点击）',
+  !/#app:has\([^)]*settings-overlay[^)]*\)\s*\{[^}]*display:\s*none/.test(css));
+check('#bg-layer 不在 #app 内（藏主界面后背景图仍铺满）',
+  /document\.body\.insertBefore\(el, document\.body\.firstChild\)/.test(uiSrc));
+
+// 实心主按钮：深色主题下 --accent 必须提亮才当得了文字，提亮后压白字就糊了
+// （白字对比度掉到 2.49）—— 两处需求相反，所以单独给一个填充变量。
+// ⚠️ 浅色主题下 --accent-solid 必须与 --accent **同值**：浅色外观保持原样，一点不改。
+group('实心主按钮（浅色外观不变，只有深色单独给填充色）');
+check('定义了 --accent-solid 与 --on-accent',
+  /:root\s*\{[^}]*--accent-solid:/.test(css) && /:root\s*\{[^}]*--on-accent:/.test(css));
+check('浅色主题下 --accent-solid 与 --accent 同值（浅色外观零改动）',
+  (function () {
+    const root = css.match(/:root\s*\{[\s\S]*?\}/);
+    if (!root) return false;
+    const g = (n) => {
+      const m = root[0].match(new RegExp('--' + n + ':\\s*(#[0-9a-fA-F]{6})'));
+      return m ? m[1].toLowerCase() : null;
+    };
+    const a = g('accent'), s = g('accent-solid');
+    return !!a && a === s;
+  })());
+check('深色主题单独给了更深的填充色（不跟着 --accent 一起提亮）',
+  /body\.bg-dark\s*\{[^}]*--accent-solid:/.test(css));
+check('实心按钮改用 accent-solid / on-accent',
+  (css.match(/background:\s*var\(--accent-solid\)/g) || []).length >= 8 &&
+  !/background:\s*var\(--accent\);\s*(border-color:\s*var\(--accent\);\s*)?color:\s*#fff/.test(css));
+
+// 思考强度指示器：浅色保持原色不动，只在深色主题里提亮。
+group('思考强度指示器');
+check('浅色主题保持原色 #d6336c（未改成变量、未改值）',
+  /#model-level\s*\{[^}]*color:\s*#d6336c/.test(css));
+check('深色主题单独提亮',
+  /body\.bg-dark #model-level\s*\{[^}]*color:\s*#/.test(css));
+
+// ⚠️ 用户明确要求：**不要动浅色主题的配色**。
+// 之前我擅自按 WCAG 把这几个值都压暗了，被要求全部撤回 —— 这组断言锁住原值。
+group('浅色主题配色保持原值（用户要求不得改动）');
+check('--text-dim / --accent / --accent-dim / --ok / --warn / --danger 均为原值',
+  (function () {
+    const root = css.match(/:root\s*\{[\s\S]*?\}/);
+    if (!root) return false;
+    const want = {
+      'text-dim': '#6b7280', 'accent': '#4373f5', 'accent-dim': '#e8eefc',
+      'ok': '#16a34a', 'warn': '#d97706', 'danger': '#dc2626',
+    };
+    return Object.keys(want).every((n) => {
+      const m = root[0].match(new RegExp('--' + n + ':\\s*(#[0-9a-fA-F]{6})'));
+      return m && m[1].toLowerCase() === want[n];
+    });
+  })());
+check('没有给文字加 text-shadow（会产生重影，用户明确否掉）',
+  !/text-shadow/.test(css));
 
 console.log('\n' + '-'.repeat(52));
 if (failures.length) {

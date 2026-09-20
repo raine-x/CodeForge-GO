@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -16,13 +17,18 @@ import (
 )
 
 // modelTestReq 是测试连接请求。
+//
+// 自供应商机制引入后，BaseURL / Protocol / Key* 都可以留空 —— 只要给了
+// ProviderID，服务端会从供应商补齐（见 applyProviderDefaults），
+// 前端因此不必把供应商上的地址和密钥再抄一遍。
 type modelTestReq struct {
-	Protocol string `json:"protocol"` // openai | anthropic
-	BaseURL  string `json:"base_url"`
-	Model    string `json:"model"`
-	KeySrc   string `json:"key_source"` // env | plain
-	KeyName  string `json:"key_name"`   // 环境变量名
-	KeyValue string `json:"key_value"`  // 明文 KEY
+	ProviderID string `json:"provider_id"` // 归属供应商；给了就不必重复填下面的连接信息
+	Protocol   string `json:"protocol"`    // openai | anthropic
+	BaseURL    string `json:"base_url"`
+	Model      string `json:"model"`
+	KeySrc     string `json:"key_source"` // env | plain
+	KeyName    string `json:"key_name"`   // 环境变量名
+	KeyValue   string `json:"key_value"`  // 明文 KEY
 }
 
 // resolveKey 依表单来源解析 API Key（env 变量 → 明文）。
@@ -47,6 +53,7 @@ func (s *Server) handleModelTest(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体解析失败"})
 		return
 	}
+	req = s.applyProviderDefaults(req) // 选定了供应商 → 地址/协议/密钥由它补齐
 
 	key := strings.TrimSpace(req.resolveKey())
 	if key == "" {
@@ -64,8 +71,8 @@ func (s *Server) handleModelTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 单次请求，30s 超时（覆盖慢网关首 token）。
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	// 单次请求，超时覆盖慢网关首 token（与模型列表拉取共用同一档，见 upstreamTimeout）。
+	ctx, cancel := context.WithTimeout(r.Context(), upstreamTimeout)
 	defer cancel()
 
 	// 与对话链路同走流式：推理型模型（如 glm-5.3）非流式要等完整生成才返回，
@@ -99,7 +106,11 @@ func (s *Server) handleModelTest(w http.ResponseWriter, r *http.Request) {
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
 		if ctx.Err() != nil {
-			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "请求超时（30s）：上游响应过慢，请稍后重试或检查网络"})
+			// 与 model_discover 同一口径：连不通和上游慢都会走到这里，别只报「上游慢」
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": fmt.Sprintf(
+				"请求超时（%s）：未能连上 %s。既可能是上游响应慢，也可能是当前网络到该地址不通"+
+					"（域名能解析、但 TCP 连不上，境外服务在部分网络下就是这样）。"+
+					"请先用浏览器或 curl 确认该地址可达，再重试", upstreamTimeout, httpReq.URL.Host)})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "请求失败：" + err.Error()})
@@ -176,41 +187,83 @@ type modelApplyReq struct {
 }
 
 // resolveEntryKey 解析一条模型配置的实际密钥：env 变量 → 明文 → 本次请求补充值。
+//
+// 先经供应商补齐：条目上留空即用供应商的密钥，这样「同一个供应商下换模型 id」
+// 完全不必碰密钥。
 func (s *Server) resolveEntryKey(m config.ModelEntry, supplied string) string {
-	if strings.EqualFold(m.KeySource, "env") && strings.TrimSpace(m.KeyName) != "" {
-		if v := strings.TrimSpace(os.Getenv(strings.TrimSpace(m.KeyName))); v != "" {
+	e := s.resolveModel(m)
+	if strings.EqualFold(e.KeySource, "env") && strings.TrimSpace(e.KeyName) != "" {
+		if v := strings.TrimSpace(os.Getenv(strings.TrimSpace(e.KeyName))); v != "" {
 			return v
 		}
 	}
-	if v := strings.TrimSpace(m.KeyValue); v != "" {
+	if v := strings.TrimSpace(e.KeyValue); v != "" {
 		return v
 	}
 	return strings.TrimSpace(supplied)
 }
 
-// handleModelList 返回脱敏后的模型库（明文 key 不下发，只有 key_set）。
-// 唯一例外：当前「已应用/生效」的模型会附带 key_plain 明文，便于设置页
-// 直接显示/查看正在使用的密钥（用户本就拥有该密钥）。
+// modelLibraryPayload 组装「模型库 + 供应商库」的脱敏视图。
+//
+// 模型条目的明文 key 不下发，只有 key_set 布尔。例外有两处（都是为了设置页能回显）：
+//   - 当前「已应用/生效」的模型附带 key_plain；
+//   - **每个供应商**都附带 key_plain —— 供应商页是用来核对/改密钥的地方，
+//     只给 active 那个回填的话，切到别的供应商密钥框就是空的，
+//     用户会以为「保存的 APIKEY 丢了」（2026-09-20 实际反馈）。
+//
+// /api/models/list 与 /api/providers/list 共用这一份载荷。两个入口曾经各拼一份，
+// 供应商那个漏掉了 active 与 key_plain —— 前端一旦改走那个入口，供应商页的
+// 「查看密钥」就会静默失效，且不报任何错。统一到这里，避免再次分叉。
+func (s *Server) modelLibraryPayload() map[string]any {
+	active := s.cfg.LLM.Model
+	ps := s.ProviderStore()
+	models := s.ModelStore().SanitizedResolved(ps)
+	providers := ps.Sanitized()
+
+	for _, m := range models {
+		id, _ := m["id"].(string)
+		if id != active {
+			continue
+		}
+		if entry, ok := s.ModelStore().Find(id); ok {
+			if v := s.resolveEntryKey(entry, ""); v != "" {
+				m["key_plain"] = v
+			}
+		}
+	}
+
+	// 供应商明文 key：**每个都回填**，不再只给「当前生效模型所属」那一个。
+	//
+	// 早先只回填 active 那一个，结果是：切到别的供应商，密钥框就是空的 ——
+	// 用户看到的现象是「已经保存的供应商，下次打开不显示 APIKEY 了」，以为没存上。
+	// 供应商页本来就是用来核对/修改密钥的地方，全部回填才符合预期。
+	//
+	// 暴露面没有变大：这份载荷只发给同源的本地页面，密钥框是 type=password
+	// （默认掩码，点眼睛才显示明文），所以截图里也不会直接露出密钥。
+	for _, pv := range providers {
+		id, _ := pv["id"].(string)
+		p, ok := ps.Find(id)
+		if !ok {
+			continue
+		}
+		if v := providerKey(p); v != "" {
+			pv["key_plain"] = v
+		}
+	}
+	return map[string]any{
+		"models":    models,
+		"providers": providers,
+		"active":    active,
+	}
+}
+
+// handleModelList 返回脱敏后的模型库与供应商库。
 func (s *Server) handleModelList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	active := s.cfg.LLM.Model
-	models := s.ModelStore().Sanitized()
-	for _, m := range models {
-		if id, _ := m["id"].(string); id == active {
-			if entry, ok := s.ModelStore().Find(id); ok {
-				if v := s.resolveEntryKey(entry, ""); v != "" {
-					m["key_plain"] = v
-				}
-			}
-		}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"models": models,
-		"active": active,
-	})
+	writeJSON(w, http.StatusOK, s.modelLibraryPayload())
 }
 
 // modelSaveReq 是保存模型的请求体。不复用 ModelEntry 直接解码：
@@ -218,10 +271,16 @@ func (s *Server) handleModelList(w http.ResponseWriter, r *http.Request) {
 type modelSaveReq struct {
 	config.ModelEntry
 	KeyValue string `json:"key_value"` // 明文 Key；编辑时留空 = 保持库中旧值
+	// InheritKey 为真表示「不要保留条目上原有的密钥覆盖，改用供应商的」。
+	// 前端在选定了供应商、且用户没碰过密钥输入框时置真 —— 否则条目上历史遗留的
+	// 自带密钥会一直压着供应商的密钥，用户永远摘不掉这个覆盖。
+	InheritKey bool `json:"inherit_key"`
 }
 
 // handleModelSave 新增 / 更新一条模型（按 id 判重）。
-// 编辑时 key_value 留空表示「保持库里已存的密钥不变」。
+//
+// 归属供应商（provider_id）非空时，base_url / protocol / 密钥三件套都可以留空，
+// 表示「继承供应商」—— 这正是「同一个供应商下加模型只填 id」的实现方式。
 func (s *Server) handleModelSave(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -235,16 +294,28 @@ func (s *Server) handleModelSave(w http.ResponseWriter, r *http.Request) {
 	m := req.ModelEntry
 	m.KeyValue = strings.TrimSpace(req.KeyValue)
 	m.ID = strings.TrimSpace(m.ID)
+	m.ProviderID = strings.TrimSpace(m.ProviderID)
 	// 入口先归一化协议（custom→openai 等）：热切换写 LLMConfig 用的是这里的 m，
-	// 不能依赖 Upsert（其内部归一化发生在副本上）。
-	m.Protocol = config.NormalizeModelProtocol(m.Protocol)
+	// 不能依赖 Upsert（其内部归一化发生在副本上）。留空 = 继承供应商，保持空。
+	if strings.TrimSpace(m.Protocol) != "" {
+		m.Protocol = config.NormalizeModelProtocol(m.Protocol)
+	}
 	if m.ID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "模型 id 不能为空"})
 		return
 	}
+	ps := s.ProviderStore()
+	// 归属供应商必须真实存在，否则条目会静默变成「没有地址也没有密钥」。
+	if m.ProviderID != "" {
+		if _, ok := ps.Find(m.ProviderID); !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "供应商不存在: " + m.ProviderID})
+			return
+		}
+	}
 	store := s.ModelStore()
 	// 编辑已有条目且本次未填明文 key → 保留库里的旧值（防止前端拿不到明文而清掉密钥）。
-	if strings.TrimSpace(m.KeyValue) == "" {
+	// 例外：本次声明「继承供应商密钥」时，条目上的覆盖值必须清掉。
+	if !req.InheritKey && strings.TrimSpace(m.KeyValue) == "" {
 		if old, ok := store.Find(m.ID); ok {
 			m.KeyValue = old.KeyValue
 		}
@@ -260,27 +331,16 @@ func (s *Server) handleModelSave(w http.ResponseWriter, r *http.Request) {
 	// 编辑的是当前生效模型 → 实时热切换（与「应用」等价），改动即刻生效，
 	// 免去用户再点一次「应用」。非当前模型只入库，待「应用」时再切换。
 	if m.ID == s.cfg.LLM.Model {
-		key := s.resolveEntryKey(m, m.KeyValue)
-		if key == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "该模型没有可用密钥（环境变量未设置且库里无明文），请先补填再保存"})
-			return
-		}
-		s.cfg.LLM.DisplayName = m.DisplayName()
-		s.cfg.LLM.BaseURL = strings.TrimSpace(m.BaseURL)
-		s.cfg.LLM.Provider = m.Protocol
-		s.cfg.LLM.APIKey = key
-		if m.CtxOut > 0 {
-			s.cfg.LLM.MaxTokens = m.CtxOut
-		}
-		if err := s.rebuildProvider(); err != nil {
+		if err := s.applyModelEntry(m, m.KeyValue); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
-		if dir := s.cfg.ConfigDir(); dir != "" {
-			_ = s.cfg.Save(filepath.Join(dir, "local.yaml"))
-		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": store.Sanitized()})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"models":    store.SanitizedResolved(ps),
+		"providers": ps.Sanitized(),
+	})
 }
 
 // handleModelDelete 从模型库删除一条；若删除的是当前生效模型，仅从列表移除，
@@ -306,7 +366,10 @@ func (s *Server) handleModelDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "保存模型库失败: " + err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": store.Sanitized()})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"models": store.SanitizedResolved(s.ProviderStore()),
+	})
 }
 
 // handleModelApply 把模型库中的某一条应用为「当前生效」配置并热切换 Provider。
@@ -335,19 +398,31 @@ func (s *Server) handleModelApply(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	key := s.resolveEntryKey(m, req.KeyValue)
-	if key == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": "该模型没有可用密钥（环境变量未设置且库里无明文），请在设置中补填",
-		})
+	if err := s.applyModelEntry(m, req.KeyValue); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "config": s.configView()})
+}
 
+// applyModelEntry 把一条**已入库**的模型条目设为「当前生效」配置并热切换 Provider。
+//
+// 流程：用供应商补齐连接信息 → 解析密钥（env/明文/本次补充）→ 覆写 s.cfg.LLM →
+// rebuildProvider → 写回 local.yaml。
+//
+// 供三处复用：点「应用」、编辑当前生效模型后保存、以及改供应商的地址/密钥后
+// 立即生效 —— 三条路径的语义必须完全一致，否则会出现「改完要重进一次设置」。
+func (s *Server) applyModelEntry(m config.ModelEntry, supplied string) error {
+	e := s.resolveModel(m)
+	key := s.resolveEntryKey(m, supplied)
+	if key == "" {
+		return fmt.Errorf("该模型没有可用密钥（环境变量未设置，供应商与条目上都没有明文），请在设置中补填")
+	}
 	llm := &s.cfg.LLM
 	llm.Model = m.ID
 	llm.DisplayName = m.DisplayName()
-	llm.BaseURL = strings.TrimSpace(m.BaseURL)
-	llm.Provider = m.Protocol
+	llm.BaseURL = strings.TrimSpace(e.BaseURL)
+	llm.Provider = e.Protocol
 	llm.APIKey = key
 	// 模型条目里设置的「输出上限」（tokens，无单位直填）落到实际请求的 max_tokens；
 	// 未设置（0）时保留现有配置值。
@@ -355,11 +430,10 @@ func (s *Server) handleModelApply(w http.ResponseWriter, r *http.Request) {
 		llm.MaxTokens = m.CtxOut
 	}
 	if err := s.rebuildProvider(); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
+		return err
 	}
 	if dir := s.cfg.ConfigDir(); dir != "" {
 		_ = s.cfg.Save(filepath.Join(dir, "local.yaml"))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "config": s.configView()})
+	return nil
 }

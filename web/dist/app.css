@@ -8,6 +8,12 @@
   --text-dim: #6b7280;
   --accent: #4373f5;
   --accent-dim: #e8eefc;
+  /* 实心主按钮的填充色 + 它上面的文字色。
+     浅色主题下 --accent-solid 与 --accent **同值**，所以浅色外观与原先完全一致。
+     只有深色主题需要单独给一个更深的填充：那里 --accent 必须提亮才当得了文字，
+     而提亮后压白字就糊了（实测白字对比度掉到 2.49）。两处需求相反，故拆开。 */
+  --accent-solid: #4373f5;
+  --on-accent: #ffffff;
   --ok: #16a34a;
   --warn: #d97706;
   --danger: #dc2626;
@@ -654,7 +660,15 @@ body.liquid-glass .mcp-tab.active::before {
 /* ---------- 自定义背景图（设置 → 外观）：最底层 fixed 层，绝不遮挡内容 ---------- */
 #bg-layer {
   position: fixed; inset: 0;
-  z-index: 0;                /* 与 #app 同层：靠 DOM 顺序（它是 body 首个子节点）垫在下面 */
+  /* ⚠️ 必须是**负** z-index。这里有两个独立的坑，缺一个都会出问题：
+     ① 负 z-index 让图层画在「非定位的在流块」的背景**之下**（#sidebar / #main 都属于这类）。
+        若写成 0，它就属于「z-index:0 的定位元素」，绘制顺序**晚于**在流块背景，
+        会把侧栏底色整个盖掉 —— 实测表现为侧栏被背景图铺满（2026-09-19 踩到）。
+        CSS 绘制顺序：根背景 → 负 z 层 → 在流块背景 → 浮动 → 行内 → z-index:0/auto 定位元素 → 正 z。
+     ② <html> 必须有不透明底色、且 <body> 保持透明（见文件顶部 html/body 规则）。
+        否则 body 自己的背景（绘制顺序在负 z 后代**之前**）会把图层永久遮住 —— 图根本看不见。
+     合起来才是正确层次：html 底色 → 背景图 → 各面板底色 → 内容。 */
+  z-index: -1;
   pointer-events: none;
   background-size: cover;
   background-position: center;
@@ -670,14 +684,101 @@ body.liquid-glass .mcp-tab.active::before {
   color: var(--text); font-size: 13px; font-family: inherit;
   padding: 6px 14px; border-radius: 8px; cursor: pointer;
 }
-.bg-actions button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-/* 开启背景图时主区透明化让图透出；背景亮度可调暗保证文字可读。
-   侧栏/设置面板保留底色（上面全是文字按钮，保持可读）。
-   ⚠️ 这里**不需要**再给 html 加 transparent —— 图是 body 的子节点，
-   直接画在 html 背景之上，本就透得出来。 */
+.bg-actions button.primary { background: var(--accent-solid); border-color: var(--accent-solid); color: var(--on-accent); }
+/* 开启背景图时，左右两块面板都透明化，让图整体铺满整个窗口（用户明确要求「侧栏也要透」）。
+   可读性靠「背景亮度」滑条压暗来保证，而不是靠面板底色。
+
+   ⚠️ 实现方式很关键：必须是**面板自己变透明**，而不是让 #bg-layer 去盖住面板。
+   后者（把 z-index 从 -1 改成 0）看似效果一样，实则会把面板内的文字也一起盖掉，
+   且会让后续任何新增面板都莫名被覆盖。让面板透明才是语义正确的做法。 */
 body.has-bg { background: transparent; }
 body.has-bg #app { background: transparent; }
+body.has-bg #sidebar { background: transparent; }
 body.has-bg #main { background: transparent; }
+
+/* ---------- 深浅色自适应（body.bg-dark）----------
+   背景图「有效亮度」偏低时，把整套配色翻成深色 —— 保证文字在任何图上都读得出来。
+   深色文字压在暗背景上是最典型的不可读组合，这一条专治它。
+
+   做法是**覆盖同一组 CSS 变量**，所以卡片 / 胶囊 / 边框 / 输入框会整体跟着翻，
+   不必逐个组件补 dark 规则（漏一个就会白底白字）。
+   ⚠️ 面板本身仍是 transparent（上面 body.has-bg 那几条），背景图照样透出来 ——
+   这里只换「文字与控件的颜色」，不改变「透不透」。
+   ⚠️ 只在有背景图时生效：没有图就没有「暗背景」问题，保持默认浅色主题。 */
+body.bg-dark {
+  --bg: #14161c;
+  --bg-elev: #1c1f28;
+  --bg-elev-2: #252935;
+  --border: #383e4c;
+  --text: #eef0f6;
+  --text-dim: #a6adbc;
+  --accent: #7aa2ff;
+  --accent-dim: #1e2b4d;
+  /* 按钮填充单独一个变量：它上面压的是白字，越亮对比度越差，
+     所以不能跟着 --accent 一起提亮（白字对比度 ≈ 4.8）。 */
+  --accent-solid: #4468e8;
+  --on-accent: #ffffff;
+  /* 语义色在深底上要提亮，否则绿/橙/红都发闷 */
+  --ok: #34d399;
+  --warn: #fbbf24;
+  --danger: #f87171;
+}
+/* 思考强度指示器在深色卡片上要提亮（浅色主题保持原样 #d6336c，不动） */
+body.bg-dark #model-level { color: #f06e9c; }
+/* 深色下用户气泡也要跟着翻：原本是浅粉底 + 深粉字，
+   在深色主题里那块亮粉会非常刺眼，改成低饱和深粉 + 浅粉字。 */
+body.bg-dark .msg-user .bubble {
+  background: #3a2230;
+  color: #f6b8ce;
+}
+/* 滚动条：Chrome 默认是浅色的，深色主题里会突兀 */
+body.bg-dark { color-scheme: dark; }
+
+/* ---------- 固定浅底的「代码类块」：块内文字必须钉回深色 ----------
+   这三处的底色是**写死的 #f6f7f9**（不跟主题走，用户要求保留不动）：
+     .msg-assistant.md pre   markdown 代码块
+     .tool-card pre          工具输出
+     .diff / .code           diff 与代码
+   深色主题把 --text 变成近白 (#eef0f6)，白字压这块浅底 → **整块看起来一片纯白**。
+   用户报的「目录结构纯白显示，里面显示黑色就可以了」就是 markdown 代码块渲染的目录树。
+
+   ⚠️ 只钉文字颜色，不动底色 —— 底色保持原样是用户明确要求的。 */
+body.bg-dark .msg-assistant.md pre,
+body.bg-dark .msg-assistant.md pre code,
+body.bg-dark .tool-card pre,
+body.bg-dark .diff,
+body.bg-dark .code {
+  color: #1f2430;
+}
+
+/* ---------- 设置面板与主界面保持一致（同步背景图）----------
+   用户要求：设置也同步背景图 —— 跟主界面同一套处理，不再单独搞一套：
+   ① 开着背景图时三层面板（整屏 / 左导航 / 卡片）全部透明，图透出来，
+      与主界面的 #sidebar / #main 行为一致
+      （.settings-overlay 自带的 .35 暗罩仍在，起分隔作用并把图压暗一点，文字更好读）
+   ② 跟着 body.bg-dark 一起深浅自适应，与主界面同一套变量
+
+   ⚠️ 曾试过「让设置保持浅色、不跟主题走」，结果是面板被刷成白的、文字却还是
+   深色主题的值，颜色自相矛盾（用户截图反馈「设置里的颜色又改了」）。
+   **不要再给设置单独覆盖配色变量，也不要让面板半透半不透** —— 要一致就整体一致。 */
+body.has-bg .settings-shell,
+body.has-bg .settings-nav,
+body.has-bg .settings-card { background: transparent; }
+
+/* ---------- 打开设置时把主界面藏起来 ----------
+   设置是整屏层，且开着背景图时它是透明的 —— 底下的主界面（侧栏 + 消息区）会透出来，
+   与设置内容**重叠**成一团。所以打开期间必须把主界面整个藏起来。
+
+   ⚠️ 用 visibility 而不是 display：
+     - display:none 会触发布局重排，并丢掉消息区的滚动位置（关掉设置就回不到原处）
+     - visibility:hidden 保留布局与滚动位置，同时元素不接收点击事件，正合适
+   ⚠️ #bg-layer 是 body 的直接子节点、**不在 #app 里**，所以背景图照样铺满，不受影响。
+
+   为什么用 :has() 而不是在 JS 的开/关点手动加 body 类：
+   关闭路径有 Esc、左导航「返回」、淡出动画等多条，手动同步必然漏掉一条；
+   :has() 直接跟随 overlay 的 .hidden 状态，天然覆盖所有路径，
+   连淡出动画期间也保持隐藏（.hidden 是动画结束后才加上的），不会闪一下主界面。 */
+#app:has(~ #settings-overlay:not(.hidden)) { visibility: hidden; }
 
 /* 皮肤分段选择 */
 .skin-seg {
@@ -770,6 +871,166 @@ body.has-bg #main { background: transparent; }
 .mi-actions button.confirming:hover { background: rgba(220, 38, 38, .08); color: var(--danger); }
 .mi-empty { padding: 18px; text-align: center; color: var(--text-dim); font-size: 13px; }
 
+/* ===== 设置导航分组（个人 / 扩展 / 数据） ===== */
+.nav-group {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  opacity: .8;
+  letter-spacing: .4px;
+  padding: 14px 12px 4px;
+}
+.nav-group:first-of-type { padding-top: 4px; }
+
+/* ===== 模型列表：按供应商分组 ===== */
+.model-group {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 12px 0 8px;
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+  font-size: 12px;
+}
+.model-items > .model-group:first-child { border-top: none; margin-top: 0; }
+.model-group .mg-name { font-size: 13px; font-weight: 600; }
+.model-group .mg-base { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); }
+.model-group .mg-sp { flex: 1; }
+.model-group .mi-badge { flex: none; }
+
+/* ===== 模型列表：折叠箭头 + 子模型缩进 ===== */
+/* 折叠箭头（与侧栏 label-btn 同源，组内更紧凑） */
+.model-group .mg-fold { flex: 0 0 auto; padding: 2px 4px; color: var(--text-dim); }
+.model-group .mg-fold:hover { color: var(--text); }
+.model-group .mg-fold svg { transition: transform .15s ease; }
+.model-group .mg-fold.folded svg { transform: rotate(-90deg); }
+
+/* 供应商下的子模型整体缩进一层，视觉上从属于上面的供应商 */
+.model-children {
+  margin-left: 16px;
+  padding-left: 12px;
+  border-left: 2px solid var(--border);
+}
+.model-children .model-item { padding: 10px 0; }
+
+/* ⚠️ 每行现在被 .model-wrap 包了一层，`.model-item + .model-item` 不再相邻，
+   分隔线要改挂在 wrap 上，否则模型之间会完全没有分隔线。 */
+.model-item + .model-item { border-top: none; }
+.model-wrap + .model-wrap > .model-item { border-top: 1px solid var(--border); }
+
+/* ===== 就地编辑模型（不再复用「添加模型」那张表单） ===== */
+.model-editor {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-elev);
+  padding: 14px 16px;
+  margin: 2px 0 12px;
+}
+.model-editor .form-grid { margin: 0; }
+.model-editor .me-inherit {
+  font-size: 12px; color: var(--text-dim);
+  font-family: var(--mono);
+  word-break: break-all;
+  padding-top: 4px;
+}
+.model-editor .me-foot {
+  display: flex; align-items: center; justify-content: flex-end; gap: 8px;
+  margin-top: 14px;
+}
+.model-editor .me-foot .mf-test-result { flex: 1; text-align: left; }
+.model-item.editing { background: var(--bg-elev); }
+
+/* ===== 供应商详情里的「获取模型列表」：就地展开，不弹窗 ===== */
+.pv-disc {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-elev);
+  margin: 10px 0;
+  overflow: hidden;
+}
+.pv-disc.hidden { display: none; }
+
+/* 供应商详情里的一次性回执（如「已添加 N 个模型」）。
+   写成跨重绘的闪信，而不是直接往 DOM 上写 —— 详情是整块重绘的，写上去会被冲掉。 */
+.prov-flash {
+  margin: 6px 0 10px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  color: #16a34a;
+  background: rgba(22, 163, 74, .1);
+  border: 1px solid rgba(22, 163, 74, .28);
+}
+
+/* ===== 供应商管理：主从双栏 ===== */
+.prov-banner {
+  display: flex; gap: 8px; align-items: flex-start;
+  background: var(--accent-dim);
+  border: 1px solid rgba(67, 115, 245, .22);
+  border-radius: 12px;
+  padding: 11px 14px;
+  margin-bottom: 14px;
+  font-size: 12.5px; line-height: 1.65;
+  color: var(--text);
+}
+.prov-md {
+  display: grid;
+  grid-template-columns: 210px minmax(0, 1fr);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: hidden;
+  min-height: 420px;
+  background: var(--bg);
+}
+.prov-list {
+  background: var(--bg-elev);
+  border-right: 1px solid var(--border);
+  padding: 10px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.prov-item {
+  display: flex; align-items: center; gap: 9px;
+  width: 100%; text-align: left;
+  border: none; background: transparent;
+  color: var(--text); font: inherit; font-size: 13px;
+  padding: 9px 10px; border-radius: 9px; cursor: pointer;
+}
+.prov-item:hover { background: var(--bg-elev-2); }
+.prov-item.active { background: var(--bg-elev-2); font-weight: 600; }
+.prov-item .pv-dot { width: 6px; height: 6px; border-radius: 50%; background: #16a34a; flex: none; }
+.prov-item .pv-dot.off { background: var(--text-dim); opacity: .5; }
+.prov-item .pv-cnt { margin-left: auto; font-size: 11px; color: var(--text-dim); font-weight: 400; }
+.prov-item.prov-add { color: var(--accent); font-weight: 600; }
+.prov-detail { padding: 18px 20px 22px; min-width: 0; }
+.prov-detail .settings-card { padding: 0 16px; }
+.prov-sub {
+  font-size: 13px; font-weight: 600; color: var(--text-dim);
+  margin: 18px 0 8px; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+}
+.prov-sub .pv-hint { font-weight: 400; font-size: 12px; opacity: .85; }
+.prov-empty { padding: 16px 0; font-size: 12.5px; color: var(--text-dim); }
+.prov-actions { display: flex; gap: 8px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
+.prov-actions .mf-test-result { margin-right: auto; }
+.prov-actions button {
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+  border-radius: 9px; padding: 7px 13px; font: inherit; font-size: 12.5px; cursor: pointer;
+}
+.prov-actions button:hover { background: var(--bg-elev-2); }
+.prov-actions button.primary { background: var(--accent-solid); border-color: var(--accent-solid); color: var(--on-accent); }
+
+/* 供应商表单（右侧详情的编辑态） */
+.prov-form { display: flex; flex-direction: column; gap: 12px; padding: 14px 0 2px; }
+
+/* 「继承自供应商」只读块：添加模型时替代地址 / 密钥两项 */
+.mf-inherit {
+  border: 1px dashed rgba(67, 115, 245, .45);
+  background: var(--accent-dim);
+  border-radius: 11px;
+  padding: 11px 13px;
+  font-size: 12.5px;
+}
+.mf-inherit .ih { margin-bottom: 8px; }
+.mf-inherit .ir { display: flex; gap: 10px; padding: 3px 0; align-items: baseline; }
+.mf-inherit .ir > span { width: 74px; flex: none; color: var(--text-dim); }
+.mf-inherit .ir code { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+
 /* 添加 / 编辑模型表单 */
 .mf-title { font-size: 14px; font-weight: 600; padding: 4px 0 12px; }
 .form-grid { display: flex; flex-direction: column; gap: 14px; padding: 6px 0 2px; }
@@ -806,9 +1067,27 @@ body.has-bg #main { background: transparent; }
   color: var(--text-dim);
 }
 .key-eye:hover { background: var(--bg-elev-2); color: var(--text); }
-.ctx-inputs { display: flex; gap: 14px; }
-.ctx-inputs label { display: inline-flex; align-items: center; gap: 6px; color: var(--text); font-size: 13px; }
-.ctx-inputs input { width: 90px; }
+/* 上下文：整行铺开 —— 输入组靠左、输出组靠右，中间自然留白（用户要求「排开」）。
+   窄屏放不下时换行，不会挤成一团。 */
+.ctx-inputs {
+  display: flex; gap: 12px 28px; flex-wrap: wrap;
+  align-items: center; justify-content: space-between;
+}
+.ctx-inputs label { display: inline-flex; align-items: center; gap: 8px; color: var(--text); font-size: 13px; }
+.ctx-inputs input { width: 104px; }
+/* 档位控件：**保留数字输入框**（可自由填任意值）+ 右侧直接点的档位按钮。
+   点档位把数值写进输入框；输入值命中某档时该档高亮。
+   不做下拉是因为配置里本来就有非整档的值（如 1040000），纯下拉会退化成第一项、
+   一保存就静默改数；保留输入框天然没这个问题。 */
+.ctx-pick { display: inline-flex; align-items: center; gap: 8px; }
+.ctx-chips { display: inline-flex; gap: 4px; }
+.ctx-chip {
+  border: 1px solid var(--border); background: var(--bg);
+  color: var(--text-dim); font-size: 12px; font-family: inherit;
+  border-radius: 7px; padding: 3px 9px; cursor: pointer; line-height: 1.5;
+}
+.ctx-chip:hover { color: var(--text); border-color: var(--text-dim); }
+.ctx-chip.on { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); font-weight: 600; }
 .mf-actions {
   display: flex; justify-content: flex-end; align-items: center; gap: 8px;
   border-top: 1px solid var(--border);
@@ -820,7 +1099,7 @@ body.has-bg #main { background: transparent; }
   border-radius: 9px; padding: 7px 16px; cursor: pointer;
 }
 .mf-actions button:hover { border-color: var(--text-dim); }
-.mf-actions button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.mf-actions button.primary { background: var(--accent-solid); border-color: var(--accent-solid); color: var(--on-accent); }
 .mf-actions button.primary:hover { filter: brightness(1.1); }
 .mf-test-result { margin-right: auto; font-size: 12.5px; }
 .mf-test-result.ok { color: var(--ok); }
@@ -836,7 +1115,7 @@ body.has-bg #main { background: transparent; }
 }
 .mcp-tab:hover { border-color: var(--text-dim); color: var(--text); }
 .mcp-tab.active {
-  background: var(--accent); border-color: var(--accent); color: #fff;
+  background: var(--accent-solid); border-color: var(--accent-solid); color: var(--on-accent);
 }
 .mcp-pane { display: none; }
 .mcp-pane.active { display: block; }
@@ -902,7 +1181,7 @@ body.has-bg #main { background: transparent; }
   border: 1px solid var(--border); background: var(--bg); color: var(--text);
   font-size: 13px; font-family: inherit; border-radius: 9px; padding: 7px 16px; cursor: pointer;
 }
-.disc-foot button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.disc-foot button.primary { background: var(--accent-solid); border-color: var(--accent-solid); color: var(--on-accent); }
 .disc-foot button.primary:hover { filter: brightness(1.1); }
 
 /* 「总开关」标记：与行标题同行的小徽标 */
@@ -1048,9 +1327,15 @@ body.resizing { cursor: col-resize; user-select: none; }
    注意它的**位置**：#composer-wrap 内、#composer 外（见 index.html）。
    面板跟着输入卡片浮动，但不参与输入卡片的 transform，所以输入卡片
    折叠上移或空态居中时，清单依然停在原地可见。
-   宽度与输入卡片同一口径：min(80%, --composer-max-w)，两者左右严丝合缝。 */
+
+   ⚠️ 宽度必须是 100%，**不要**再写 min(80%, --composer-max-w)：
+   父级 #composer-wrap 已经是那个宽度了，子级再套一次 80% 会得到
+   「80% 的 760px ≈ 608px」，比输入卡片窄一截，右边参差不齐。
+   （2026-09-19 由运行时验证抓出：宽度差 152px。）
+
+   默认关闭：清单为空时加 .hidden 整个隐藏（只有 AI 调用过任务清单才有内容）。 */
 .todo-bar {
-  width: min(80%, var(--composer-max-w));
+  width: 100%;                 /* 撑满 #composer-wrap，与 #composer 等宽 */
   margin: 0 auto 8px;
   background: var(--bg-elev);
   border: 1px solid var(--border);
@@ -1061,6 +1346,9 @@ body.resizing { cursor: col-resize; user-select: none; }
   display: flex;
   flex-direction: column;
 }
+/* 无清单时整个面板不占位（默认态）：display:none 连 margin 一起收起，
+   不会在输入卡片上方留一道空隙。 */
+.todo-bar.hidden { display: none; }
 .todo-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 8px 12px;
@@ -1103,7 +1391,6 @@ body.resizing { cursor: col-resize; user-select: none; }
 .todo-icon.st-cancelled { color: var(--text-dim); }
 .todo-text { color: var(--text); word-break: break-word; }
 .todo-text.done { color: var(--text-dim); text-decoration: line-through; }
-.todo-empty { font-size: 12.5px; color: var(--text-dim); padding: 2px 0; }
 
 /* ---------- 右下角「回到底部」箭头 ---------- */
 .to-bottom {
@@ -1240,8 +1527,8 @@ body.resizing { cursor: col-resize; user-select: none; }
   width: 28px; height: 28px;
   border-radius: 50%;
   border: none;
-  background: var(--accent);
-  color: #fff;
+  background: var(--accent-solid);
+  color: var(--on-accent);
   cursor: pointer;
   margin: 4px 0 0 8px;
   opacity: 0.9;
@@ -1351,7 +1638,7 @@ body.resizing { cursor: col-resize; user-select: none; }
   font-size: 13px; font-family: inherit;
   padding: 6px 16px; cursor: pointer;
 }
-.approval-btn.approve { background: var(--accent); color: #fff; }
+.approval-btn.approve { background: var(--accent-solid); color: var(--on-accent); }
 .approval-btn.approve:hover { filter: brightness(1.1); }
 .approval-btn.reject { background: var(--bg-elev-2); color: var(--text); border: 1px solid var(--border); }
 
@@ -1573,7 +1860,7 @@ body.resizing { cursor: col-resize; user-select: none; }
   font-size: 13px; font-family: inherit;
   border-radius: 10px; padding: 7px 16px; cursor: pointer;
 }
-.picker-actions button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.picker-actions button.primary { background: var(--accent-solid); border-color: var(--accent-solid); color: var(--on-accent); }
 .picker-actions button.primary:hover { filter: brightness(1.1); }
 /* 文件模式：没选中文件时确认键不可用 */
 .picker-actions button:disabled { opacity: .5; cursor: default; }
@@ -1661,9 +1948,9 @@ body.resizing { cursor: col-resize; user-select: none; }
 }
 .edit-bar-btn:hover { background: var(--bg-elev-2); }
 .edit-bar-btn.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
+  background: var(--accent-solid);
+  border-color: var(--accent-solid);
+  color: var(--on-accent);
 }
 .edit-bar-btn.primary:hover { filter: brightness(1.06); }
 
@@ -1706,8 +1993,8 @@ body.resizing { cursor: col-resize; user-select: none; }
 }
 .ap-opt:hover { border-color: var(--accent); }
 .ap-opt.primary {
-  background: var(--accent); border-color: var(--accent);
-  color: #fff; font-weight: 600;
+  background: var(--accent-solid); border-color: var(--accent-solid);
+  color: var(--on-accent); font-weight: 600;
 }
 .ap-opt.primary:hover { filter: brightness(1.06); }
 /* 底部行：用户输入 + 发送（可空：无输入行时整行收起） */
@@ -1721,7 +2008,7 @@ body.resizing { cursor: col-resize; user-select: none; }
 }
 .ap-input:focus { border-color: var(--accent); }
 .ap-go {
-  border: none; background: var(--accent); color: #fff;
+  border: none; background: var(--accent-solid); color: var(--on-accent);
   font-size: 13px; padding: 7px 14px; border-radius: 10px; cursor: pointer;
 }
 .ap-go:hover { filter: brightness(1.06); }
@@ -1797,6 +2084,52 @@ body.resizing { cursor: col-resize; user-select: none; }
 }
 .pop-opt:hover { background: var(--bg-elev-2); }
 .pop-opt.selected { color: var(--accent); background: var(--accent-dim); }
+/* 模型弹层条目：两行 —— 上行供应商（小字灰），下行模型显示名。
+   供应商名要能被截断，否则长域名会把弹层撑宽。 */
+.pop-opt-prov {
+  display: block;
+  font-size: 11px; color: var(--text-dim); line-height: 1.3;
+  margin-bottom: 1px;
+  max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pop-opt.selected .pop-opt-prov { color: inherit; opacity: .75; }
+.pop-opt-name { display: block; line-height: 1.35; }
+
+/* 模型弹层整体居中（供应商与显示名都居中）。
+   ⚠️ 只作用于 #model-list —— 权限弹层共用 .pop-opt 类，那里要左对齐。 */
+#model-list .pop-opt { text-align: center; }
+/* 供应商行有 max-width，块本身也要居中，否则文字居中但整块仍贴左 */
+#model-list .pop-opt-prov { margin-left: auto; margin-right: auto; }
+
+/* 模型弹层：顶段供应商选择器（左对齐，明显是「标题栏」样式）
+   与下方的居中条目形成层级感：这是「在选供应商」、下面是「在选它下面的模型」。 */
+.pop-prov-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px; margin: 0 0 8px;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg-elev);
+  font-size: 13px; color: var(--text); font-family: inherit;
+  cursor: pointer; text-align: left; width: 100%;
+}
+.pop-prov-row:hover { background: var(--bg-elev-2); }
+.pop-prov-label { color: var(--text-dim); font-size: 12px; }
+.pop-prov-name { font-weight: 600; }
+.pop-prov-arrow { margin-left: auto; color: var(--text-dim); }
+
+.pop-prov-list {
+  margin: 0 0 8px;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.pop-prov-item {
+  border: none; background: transparent;
+  color: var(--text); font-size: 13px; font-family: inherit;
+  text-align: left;
+  padding: 6px 12px; cursor: pointer;
+}
+.pop-prov-item:hover { background: var(--bg-elev-2); }
+.pop-prov-item.selected { color: var(--accent); background: var(--accent-dim); font-weight: 600; }
 /* 模型列表文字居中；选中态：文字右侧显示一个小圆点（无背景加深） */
 #model-list .pop-opt { display: block; width: 100%; text-align: center; position: relative; }
 #model-list .pop-opt.selected { color: var(--text); background: transparent; }
@@ -2008,7 +2341,7 @@ body.resizing { cursor: col-resize; user-select: none; }
   width: 36px; height: 36px;
   border: none;
   border-radius: 10px;        /* 圆角矩形，非圆形 */
-  background: var(--accent); color: #fff;
+  background: var(--accent-solid); color: var(--on-accent);
   font-size: 18px; line-height: 1;
   cursor: pointer;
   display: flex; align-items: center; justify-content: center;
@@ -2171,7 +2504,7 @@ body.resizing { cursor: col-resize; user-select: none; }
   transition: .15s;
 }
 .btn:hover { border-color: var(--accent); }
-.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary { background: var(--accent-solid); border-color: var(--accent-solid); color: var(--on-accent); }
 .btn.primary:hover { filter: brightness(1.1); }
 .btn.ghost { background: transparent; }
 .btn.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
@@ -2223,6 +2556,12 @@ body.resizing { cursor: col-resize; user-select: none; }
 
 .muted { color: var(--text-dim); }
 .hidden { display: none !important; }
+/* hidden 属性也要能赢过作者样式。
+   浏览器 UA 样式表里的 [hidden]{display:none} 优先级低于**任何**作者样式，
+   所以 `<div class="f-field" hidden>` 会被 .f-field{display:flex} 顶掉 ——
+   属性写了等于没写，元素照样显示。这里补一条 !important，与上面的 .hidden 对齐，
+   让「class 隐藏」和「属性隐藏」两套写法行为一致。 */
+[hidden] { display: none !important; }
 
 /* ---------- 新建项目弹窗 ---------- */
 .newproj-modal { width: min(460px, 100%); gap: 14px; }
@@ -2248,7 +2587,7 @@ body.resizing { cursor: col-resize; user-select: none; }
   flex: 0 0 auto;
 }
 .np-btn:hover { border-color: var(--accent); color: var(--accent); }
-.np-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.np-btn.primary { background: var(--accent-solid); border-color: var(--accent-solid); color: var(--on-accent); }
 .np-btn.primary:hover { filter: brightness(1.1); color: #fff; }
 .np-btn:disabled { opacity: .5; cursor: default; }
 .np-btn.primary:disabled:hover { filter: none; }

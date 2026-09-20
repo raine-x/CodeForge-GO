@@ -245,26 +245,126 @@
     $('#model-name').textContent = modelName || model; // 优先显示显示名，缺省回退模型 id
     $('#model-name').title = model;
   }
-  // 模型弹层：列出模型库全部条目，点击即切换生效模型（POST /api/models/apply）；
-  // 当前生效项带选中小圆点。库为空 / 生效项被删出库时补一行提示，避免弹层空无一物。
+// 模型弹层：**两段式** —— 供应商单独拎一段在最上、点击可切换；
+  // 下方只列出当前供应商下的模型。选模型时会把 filter 同步到该模型的供应商，
+  // 上下两段始终一致 —— 用户看到的「供应商 ↓ 模型」是一体的两段，不是耦合的一团。
+  //
+  // 早先一弹层列所有模型的写法有两个问题：
+  //   ① 模型库多了就一长串，找特定供应商的模型得肉眼过滤；
+  //   ② 选模型隐式带上了供应商，看起来像「模型和供应商被一起选中」，但实际上
+  //      两者并不真的耦合 ——「供应商」这一维度被埋没了。
+  let modelProvFilter = '';   // 用户在弹层里挑的供应商过滤；'' = 跟随当前生效模型
+  let provListOpen = false;   // 供应商列表是否展开
+
   function renderModelPop() {
     modelList.innerHTML = '';
     const activeInLib = !!model && modelInLib;
+    const activeEntry = activeInLib ? modelChoices.find(function (m) { return m.id === model; }) : null;
+    const activeProvId = activeEntry ? activeEntry.provider_id : '';
+
+    // 供应商列表**从 modelChoices 推导**，不依赖 providersCache。
+    // ⚠️ providersCache 只在设置页 loadLibrary() 时填充，主界面从没加载过它 ——
+    // 早先直接用 providersCache，结果顶段供应商行在主界面**根本不渲染**（实测为 null）。
+    // 从模型条目推导还有个好处：只列出真正挂了模型的供应商，没有空条目。
+    const provList = [];
+    const seenProv = {};
     modelChoices.forEach(function (m) {
+      const id = m.provider_id || '';
+      const key = id || ('\u0000orphan\u0000' + (m.id || ''));
+      if (seenProv[key]) return;
+      seenProv[key] = 1;
+      provList.push({ id: id, name: m.provider_name || '' });
+    });
+
+    // 当前显示的供应商：用户在弹层里挑的 → 失效则退回当前生效模型的供应商 → 再退回第一个
+    const curProvId = modelProvFilter || activeProvId || (modelChoices[0] && modelChoices[0].provider_id) || '';
+    const curProv = provList.find(function (p) { return p.id === curProvId; }) || null;
+
+    // ---- 顶部：供应商行（独立的一段，可点击切换）----
+    if (provList.length) {
+      const provRow = document.createElement('button');
+      provRow.type = 'button';
+      provRow.className = 'pop-prov-row';
+      const lbl = document.createElement('span');
+      lbl.className = 'pop-prov-label';
+      lbl.textContent = '供应商';
+      const nm = document.createElement('span');
+      nm.className = 'pop-prov-name';
+      nm.textContent = (curProv && (curProv.name || curProv.id)) || '未选择';
+      const arrow = document.createElement('span');
+      arrow.className = 'pop-prov-arrow';
+      arrow.textContent = provListOpen ? '▴' : '▾';
+      provRow.appendChild(lbl);
+      provRow.appendChild(nm);
+      provRow.appendChild(arrow);
+      provRow.addEventListener('click', function (e) {
+        e.stopPropagation();
+        provListOpen = !provListOpen;
+        renderModelPop();
+      });
+      modelList.appendChild(provRow);
+
+      // 展开时列出所有供应商，选中的高亮 —— 点一个就切 filter 并收起
+      if (provListOpen) {
+        const list = document.createElement('div');
+        list.className = 'pop-prov-list';
+        provList.forEach(function (p) {
+          const item = document.createElement('button');
+          item.type = 'button';
+          item.className = 'pop-prov-item' + (p.id === curProvId ? ' selected' : '');
+          item.textContent = p.name || p.id;
+          item.addEventListener('click', function (e) {
+            e.stopPropagation();
+            modelProvFilter = p.id;
+            provListOpen = false;
+            renderModelPop();
+          });
+          list.appendChild(item);
+        });
+        modelList.appendChild(list);
+      }
+    }
+
+    // ---- 模型列表：只显示当前供应商下的 ----
+    const filtered = modelChoices.filter(function (m) {
+      return !curProvId || m.provider_id === curProvId;
+    });
+    // 当前列表已经全在同一供应商下，组内不必重复供应商名 —— 只在首条显示
+    let lastProvName = '';
+    filtered.forEach(function (m) {
       const b = document.createElement('button');
       b.type = 'button';
       const active = activeInLib && m.id === model;
       b.className = 'pop-opt' + (active ? ' selected' : '');
       b.dataset.model = m.id;
-      b.textContent = m.name || m.id; // 显示名优先，缺省回退模型 id
-      b.title = m.id;
+      // 顶段已经显示供应商了，这里只在首条（也就是列表第一条、紧挨着供应商行）再提示一次，
+      // 视觉上是「一个供应商标题 + 它下面的模型」，列表内的模型不再每行重复供应商名。
+      if (m.provider_name && m.provider_name !== lastProvName) {
+        const pv = document.createElement('span');
+        pv.className = 'pop-opt-prov';
+        pv.textContent = m.provider_name;
+        b.appendChild(pv);
+      }
+      lastProvName = m.provider_name || lastProvName;
+      const nm = document.createElement('span');
+      nm.className = 'pop-opt-name';
+      nm.textContent = m.name || m.id;
+      b.appendChild(nm);
+      b.title = (m.provider_name ? m.provider_name + ' ↓ ' : '') + (m.name || m.id) + '（' + m.id + '）';
       if (!active) b.addEventListener('click', function () { switchActiveModel(m.id); });
       modelList.appendChild(b);
     });
+
+    // 提示行：优先级 库为空 > 当前供应商下没模型 > 当前生效模型不在库
     if (!modelChoices.length) {
       const tip = document.createElement('div');
       tip.className = 'pop-tip';
       tip.textContent = '模型库为空，请在 设置 → 模型 → 添加模型 中添加';
+      modelList.appendChild(tip);
+    } else if (curProvId && !filtered.length) {
+      const tip = document.createElement('div');
+      tip.className = 'pop-tip';
+      tip.textContent = '该供应商下还没有模型：点上方「供应商」换一个，或去 设置 → 模型 添加';
       modelList.appendChild(tip);
     } else if (!activeInLib) {
       const tip = document.createElement('div');
@@ -280,6 +380,13 @@
   function switchActiveModel(id) {
     if (switchingModel || !id || id === model) return;
     switchingModel = true;
+    // 选模型时把供应商过滤切到该模型的供应商 —— 这样弹层顶段的「供应商」
+    // 跟实际生效的模型始终是同一家，不会出现「上面 A、下面选了 B」的不一致。
+    const m = (modelChoices || []).find(function (x) { return x.id === id; });
+    if (m && m.provider_id) {
+      modelProvFilter = m.provider_id;
+      provListOpen = false;
+    }
     fetch('/api/models/apply', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: id })
@@ -483,6 +590,12 @@
     closeAllPops(willOpen ? modelPop : null);
     if (willOpen) {
       modelPop.classList.remove('leaving', 'hidden');
+      // 每次打开都把供应商过滤复位：**默认跟随当前生效模型**。
+      // 否则上一次「切去别家浏览」的选择会一直留着，而生效模型可能已经
+      // 从设置页换成别家的了 —— 顶上显示 A、实际生效的是 B，自相矛盾。
+      // 只在本次展开期间保留浏览选择；关掉再开就重新跟随生效模型。
+      modelProvFilter = '';
+      provListOpen = false;
       loadModels();          // 拉出时加载当前配置的模型与思考分级
       renderModelPop();
     } else {
@@ -609,12 +722,14 @@
   //    表现成「模型报『已更新任务列表』但界面什么都看不见」。
   //    放进输入卡片上方后，它任何时候都在视野里，与滚动位置无关。
   //
-  // 无条件渲染：列表为空时也保留面板，只显示「暂无任务」占位。
-  // 这样用户随时知道有没有清单，而不是在「有清单」和「面板消失」之间猜。
+  // 默认关闭：面板只在**清单非空**时出现。
+  // 清单非空 ⟺ AI 真的调用过任务清单 —— 服务端推来的 todos 只有两种情况：
+  // ① AI 调了 todo_write；② 载入的会话里存着上次的清单。两种都是「有内容」，
+  // 都该显示；而空数组意味着这轮压根没有清单，留一个空壳面板长期占着输入框
+  // 上方的一块地方只会碍事，所以直接整个隐藏（见 renderTodoBar 的 empty 分支）。
   let todoBar = null;         // 运行时绑定到 #todo-bar（HTML 里已写好骨架）
   const todoBarEl = $('#todo-bar');
   const TODO_COLLAPSE_KEY = 'cf_todo_collapsed';
-  const TODO_EMPTY_HINT = '暂无任务';
   // 折叠状态跨会话保留：用户收起过一次，就不该在每轮工具调用后被强行展开。
   let todoCollapsed = false;
   try { todoCollapsed = localStorage.getItem(TODO_COLLAPSE_KEY) === '1'; } catch (e) {}
@@ -642,18 +757,20 @@
   function renderTodoBar(todos) {
     todoBar = todoBarEl;
     const list = todos || [];
-    const done = list.filter(function (t) { return t.status === 'completed'; }).length;
-    todoBar.querySelector('.todo-count').textContent = list.length ? (done + '/' + list.length) : '';
-    applyTodoCollapsed();      // 折叠类要在填内容前落好
     const body = todoBar.querySelector('.todo-body');
     body.innerHTML = '';
+    // 空清单 → 整个面板隐藏（默认关闭）。先隐藏再返回，
+    // 顺便把 body 清空，避免下次出现时闪过上一轮的旧条目。
     if (!list.length) {
-      const empty = document.createElement('div');
-      empty.className = 'todo-empty';
-      empty.textContent = TODO_EMPTY_HINT;
-      body.appendChild(empty);
+      todoBar.querySelector('.todo-count').textContent = '';
+      todoBar.classList.add('hidden');
+      requestAnimationFrame(function () { syncComposerPadding(); }); // 面板消失后重算底部留白
       return;
     }
+    todoBar.classList.remove('hidden');
+    const done = list.filter(function (t) { return t.status === 'completed'; }).length;
+    todoBar.querySelector('.todo-count').textContent = done + '/' + list.length;
+    applyTodoCollapsed();      // 折叠类要在填内容后落好（内部会重算底部留白）
     const icon = { pending: '○', in_progress: '◐', completed: '✓', cancelled: '✕' };
     list.forEach(function (t) {
       const row = document.createElement('div');
@@ -878,6 +995,12 @@
   function toolPhrase(name) {
     // 与 toolLabel 同一套规则：插件工具（插件名.工具名）按去前缀的本名查表，
     // 兜底也只给中文描述 —— 任何情况下都不把工具 ID 显示给用户。
+    //
+    // ⚠️ name 可能缺失：历史里确实存在 name 为 undefined 的 tool_use 块
+    // （实测某个会话 65 条消息里有 4 个）。裸用 name.indexOf 会抛 TypeError，
+    // 而调用点在 replayHistory 里 —— 异常会**中断整次回放**，
+    // 导致末尾的 renderSessions 跑不到、侧栏高亮停在上一个会话（2026-09-19 实际故障）。
+    name = typeof name === 'string' ? name : '';
     const local = name.indexOf('.') > 0 ? name.slice(name.indexOf('.') + 1) : name;
     return toolPhrases[name] || toolPhrases[local] || '外部能力';
   }
@@ -886,6 +1009,9 @@
   // 只取路径最后一段，避免长路径把卡片撑宽；完整参数仍在 title 悬浮提示里。
   // ⚠️ 未识别的工具**绝不显示工具 ID**（那是系统内部标识），只给中文兜底文案。
   function toolLabel(name, input) {
+    // ⚠️ 同 toolPhrase：name 可能为 undefined，必须先归一化再做 indexOf。
+    // 缺失时走 default 分支，返回「调用了外部能力」—— 既不崩，也不泄露工具 ID。
+    name = typeof name === 'string' ? name : '';
     let arg = '';
     if (input && typeof input === 'object') {
       arg = input.path || input.command || '';
@@ -2402,21 +2528,30 @@
     (ev.messages || []).forEach(function (m) {
       const blocks = m.content || [];
       blocks.forEach(function (b) {
-        if (b.type === 'text') {
-          if (m.role === 'user') {
+        // ⚠️ 单块渲染失败**绝不能**让整次回放中断：本函数末尾还有 renderSessions
+        // （重打侧栏高亮）、scrollBottom、syncComposerMode 等状态同步。
+        // 一旦中途抛出，会话切了但侧栏高亮还停在上一个会话 —— 实测就是这么发生的
+        // （一个 name 缺失的 tool_use 块把 65 条消息的回放整个打断）。
+        // 这里吞掉异常并打日志：回放是「尽力重建视图」，坏一块不该毁掉整屏。
+        try {
+          if (b.type === 'text') {
+            if (m.role === 'user') {
+              closeText();
+              addUser(b.text || '');
+              lastUserText = b.text || '';
+            } else {
+              appendText(b.text || ''); // 助手段落：markdown 渲染
+            }
+          } else if (b.type === 'tool_use') {
+            settleActiveTool();
             closeText();
-            addUser(b.text || '');
-            lastUserText = b.text || '';
-          } else {
-            appendText(b.text || ''); // 助手段落：markdown 渲染
+            addTool(toolLabel(b.name, b.input),
+              b.input ? JSON.stringify(b.input, null, 2) : '');
+          } else if (b.type === 'tool_result') {
+            settleActiveTool(); // 工具已完成：无 spinner
           }
-        } else if (b.type === 'tool_use') {
-          settleActiveTool();
-          closeText();
-          addTool(toolLabel(b.name, b.input),
-            b.input ? JSON.stringify(b.input, null, 2) : '');
-        } else if (b.type === 'tool_result') {
-          settleActiveTool(); // 工具已完成：无 spinner
+        } catch (err) {
+          console.warn('[replay] 跳过无法渲染的历史块', b && b.type, err);
         }
       });
     });
@@ -4186,18 +4321,75 @@ case 'idle': {
     return el;
   })();
   let bgSaveTimer = null;
+  let bgBright = 100;        // 当前亮度（%），供「深浅色自适应」判断
+  let bgAvgLum = null;       // 背景图平均亮度 0..1（按图片缓存）
+  let bgLumFor = '';         // bgAvgLum 对应的图片 URL
+
+  // ---------- 深浅色自适应：保证文字永远清楚 ----------
+  // 需求：亮度调低 → 整页变暗 → 文字必须转白，否则深色文字压在暗背景上完全看不见。
+  //
+  // 判据不是「滑条值」而是**图片实际有多亮**：一张亮图调到 60% 可能仍然偏亮，
+  // 一张暗图即使 100% 也已经够暗。所以先量出图片的平均亮度，再乘上亮度系数。
+  const BG_DARK_THRESHOLD = 0.4;   // 有效亮度低于此值 → 切浅色文字
+
+  function syncBgTheme() {
+    if (!bgLayer.classList.contains('on') || bgAvgLum === null) {
+      // 没有背景图（或图还没量出来）→ 维持默认浅色主题
+      document.body.classList.remove('bg-dark');
+      return;
+    }
+    const effective = bgAvgLum * (bgBright / 100);
+    document.body.classList.toggle('bg-dark', effective < BG_DARK_THRESHOLD);
+  }
+
+  // 量背景图的平均亮度：缩到 32×32 再读像素，代价可忽略。
+  // 图片走同源接口（/api/appearance/background），canvas 不会被跨域污染。
+  function loadBgLuminance(url, done) {
+    if (bgLumFor === url && bgAvgLum !== null) { done(); return; }
+    const img = new Image();
+    img.onload = function () {
+      try {
+        const N = 32;
+        const cv = document.createElement('canvas');
+        cv.width = N; cv.height = N;
+        const ctx = cv.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0, N, N);
+        const d = ctx.getImageData(0, 0, N, N).data;
+        let sum = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          sum += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+        }
+        bgAvgLum = sum / (d.length / 4) / 255;
+        bgLumFor = url;
+      } catch (e) {
+        bgAvgLum = null;   // 量不出来就退回浅色主题，不让主题卡在半路
+      }
+      done();
+    };
+    img.onerror = function () { bgAvgLum = null; done(); };
+    img.src = url;
+  }
 
   function applyBgFilters(blur, bright) {
+    bgBright = bright;
     bgLayer.style.filter = 'blur(' + blur + 'px) brightness(' + bright + '%)';
+    syncBgTheme();   // 亮度一变就重判深浅色
   }
   function applyBgImage(on) {
     bgLayer.classList.toggle('on', !!on);
     document.body.classList.toggle('has-bg', !!on);
-    if (on) bgLayer.style.backgroundImage = 'url(/api/appearance/background?t=' + Date.now() + ')';
-    else bgLayer.style.backgroundImage = '';
+    if (on) {
+      const url = '/api/appearance/background?t=' + Date.now();
+      bgLayer.style.backgroundImage = 'url(' + url + ')';
+      loadBgLuminance(url, syncBgTheme);
+    } else {
+      bgLayer.style.backgroundImage = '';
+      bgAvgLum = null; bgLumFor = '';
+      syncBgTheme();
+    }
   }
   function saveBg(patch) {
-    fetch('/api/appearance', {
+    return fetch('/api/appearance', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch)
     }).catch(function () {});
@@ -4228,14 +4420,25 @@ case 'idle': {
       if (d.background_set) applyBgImage(true);
     }).catch(function () {});
 
+    // 模糊与亮度**共用**一个防抖定时器，且每次都提交**完整状态**（blur + brightness）。
+    //
+    // ⚠️ 早先两个 handler 各自 setTimeout 且只提交自己的字段，后果是：
+    // 拖完模糊紧接着拖亮度 → 后者的 clearTimeout 把前者**尚未发出**的保存取消掉，
+    // 于是模糊值永远存不进服务端（刷新后被打回原值），而亮度正常。
+    // 表现成「设置不生效」，且只在一部分操作顺序下复现，极难自查（2026-09-19 实测抓到）。
+    // 合成一次保存后：既不会互相取消，最后一次请求也必然带着全部值。
+    function scheduleBgSave() {
+      clearTimeout(bgSaveTimer);
+      bgSaveTimer = setTimeout(function () { saveBg({ blur: blur, brightness: bright }); }, 400);
+    }
+
     blurEl.addEventListener('input', function () {
       blur = +blurEl.value;
       blurVal.textContent = blur + 'px';
       localStorage.setItem('cf_bg_blur', blur);
       localStorage.setItem('cf_bg_blur_touched', '1');
       applyBgFilters(blur, bright);
-      clearTimeout(bgSaveTimer);
-      bgSaveTimer = setTimeout(function () { saveBg({ blur: blur }); }, 400);
+      scheduleBgSave();
     });
     brightEl.addEventListener('input', function () {
       bright = +brightEl.value;
@@ -4243,8 +4446,7 @@ case 'idle': {
       localStorage.setItem('cf_bg_bright', bright);
       localStorage.setItem('cf_bg_bright_touched', '1');
       applyBgFilters(blur, bright);
-      clearTimeout(bgSaveTimer);
-      bgSaveTimer = setTimeout(function () { saveBg({ brightness: bright }); }, 400);
+      scheduleBgSave();
     });
 
     clearBtn.addEventListener('click', function () {
@@ -4262,12 +4464,22 @@ case 'idle': {
             // Linux 桌面：内置选择器选图 → 把路径 POST 回服务端
             openBuiltinPicker(d.start_path || '', 'file', function (path) {
               if (!path) return;
-              saveBg({ background_path: path });
-              applyBgImage(true);
+              saveBg({ background_path: path }).then(function () { applyBgImage(true); });
             });
             return;
           }
-          if (d.ok && d.path) { applyBgImage(true); return; }  // Windows/安卓已由服务端落库
+          if (d.ok && d.path) {
+            // 服务端返回 background:true 表示**它已经把路径落库了**，直接生效即可。
+            //
+            // 否则（老版本服务端、或某个平台分支漏写 cfg）必须自己补一次显式保存：
+            // 背景图由 /api/appearance/background 提供，那个接口读的是服务端配置里的路径，
+            // 没落库就永远 404 —— 图层 .on 了却无图可画，界面上一点反应都没有。
+            // 这正是 Windows 分支曾经的 bug（2026-09-19），前端这层兜底可以防复发。
+            // ⚠️ 必须等保存完成再 applyBgImage，否则请求会赶在落库前发出、照样 404。
+            if (d.background) { applyBgImage(true); return; }
+            saveBg({ background_path: d.path }).then(function () { applyBgImage(true); });
+            return;
+          }
         })
         .catch(function (e) { addError('选择背景图失败：' + e); })
         .then(function () { pickBtn.disabled = false; });
@@ -4670,9 +4882,14 @@ case 'idle': {
   settingsOverlay.querySelectorAll('.nav-item[data-page="archived"]').forEach(function (n) {
     n.addEventListener('click', loadArchived);
   });
-
-  // ---------- 模型管理：＋模型 / 列表 / 配置 ----------
-  const settingsContent = document.querySelector('.settings-content');
+  // ---------- 模型管理：模型列表 / 供应商管理 / 添加模型 ----------
+  //
+  // 自供应商机制引入后，连接信息（Base URL / 协议 / 密钥）只在「供应商」上维护
+  // 一份，模型条目只留 id 与显示名。由此得到三条主路径：
+  //   · 模型列表：按供应商分组，点「设为当前」即可在同供应商下换 id；
+  //   · 供应商管理：改地址 / 轮换密钥，其下模型与当前生效配置一起跟着变；
+  //   · 添加模型：选已有供应商 → 只填模型 id（地址与密钥继承），
+  //              或「获取模型列表」勾选多个一次性批量入库。
 
   function showPage(id) {
     settingsOverlay.querySelectorAll('.nav-item').forEach(function (n) {
@@ -4687,108 +4904,861 @@ case 'idle': {
     document.querySelectorAll('.models-tab').forEach(function (t) {
       t.classList.toggle('active', t.dataset.mtab === name);
     });
-    document.getElementById('mtab-list').classList.toggle('active', name === 'list');
-    document.getElementById('mtab-config').classList.toggle('active', name === 'config');
+    // 三个面板用字面量 id 逐个切换，而不是 'mtab-' + name 拼接 ——
+    // test/audit_dom_refs.mjs 靠静态匹配核对「ui.js 找的元素是否真的存在」，
+    // 拼接写法会让它无法解析，等于把这类静默失效漏出审计网。
+    function setPane(id, on) {
+      const pane = document.getElementById(id);
+      if (pane) pane.classList.toggle('active', on);
+    }
+    setPane('mtab-list', name === 'list');
+    setPane('mtab-prov', name === 'prov');
+    setPane('mtab-config', name === 'config');
   }
 
-  // ---------- 模型管理（服务端模型库）----------
+  // ---------- 模型库（服务端唯一数据源）----------
   //
-  // 模型列表的唯一数据源是服务端 config/models.yaml（/api/models/list|save|delete）。
-  // 旧的 localStorage 方案已废弃 —— 它把明文 API Key 存在浏览器里，且与服务端配置互不同步。
-  // 「应用」只发 {model}，密钥由服务端从库里解析，前端永远接触不到明文 key。
+  // 列表与供应商都来自 /api/models/list。服务端下发的 base_url / protocol /
+  // key_set 已是「补齐供应商后」的结果，前端因此不必自己再拼一遍继承逻辑。
+  // 旧的 localStorage 方案已废弃 —— 它把明文 API Key 存在浏览器里，且与服务端不同步。
+  let editingIndex = -1;   // -1 = 新增；>=0 编辑现有项（仅用于表单标题态，列表以 id 判重）
+  let modelsCache = [];    // 最近一次 /api/models/list 的脱敏模型列表
+  let providersCache = []; // 同上，供应商列表
+  let activeModelId = '';  // 当前生效模型 id
+  // 供应商管理页「新建」态的哨兵值。
+  // ⚠️ 不能用空串表示新建态：renderProviders 开头有
+  //     `if (!provSelected && providersCache.length) provSelected = providersCache[0].id;`
+  //   空串是假值，点「添加供应商」置空后立刻被重置回第一个供应商 ——
+  //   表现就是「点添加没反应」（2026-09-20 实际故障）。用真值哨兵就不会被吃掉。
+  const PROV_NEW = '__new__';
+  let provSelected = '';   // 供应商管理页选中的供应商 id；'' = 尚未选择（会自动选第一个）
+  // 一次性回执：由批量添加等操作写入，renderProviderDetail 渲染时取走并清空。
+  // 为什么要这么绕：详情区是整块重绘的，直接往旧 DOM 上写提示会被下一次重绘冲掉。
+  let provFlash = '';
 
-  let editingIndex = -1; // -1 = 新增；>=0 编辑现有项（仅用于表单标题态，列表本身以 id 判重）
-  let modelsCache = [];  // 最近一次 /api/models/list 的脱敏列表
+  function loadLibrary() {
+    return fetch('/api/models/list').then(function (r) { return r.json(); }).then(function (d) {
+      modelsCache = d.models || [];
+      providersCache = d.providers || [];
+      activeModelId = d.active || '';
+      return d;
+    });
+  }
+  function findProvider(id) {
+    for (let i = 0; i < providersCache.length; i++) {
+      if (providersCache[i].id === id) return providersCache[i];
+    }
+    return null;
+  }
+  function modelsOfProvider(pid) {
+    return modelsCache.filter(function (m) { return (m.provider_id || '') === pid; });
+  }
+  // 供应商密钥的可读描述：明文只有「当前生效模型所属供应商」会下发。
+  function providerKeyLabel(p) {
+    if (!p) return '未设置';
+    if (p.key_source === 'env') return p.key_name ? ('环境变量 ' + p.key_name) : '未设置环境变量';
+    if (p.key_plain) return p.key_plain;
+    return p.key_set ? '已保存（留空保持不变）' : '未设置';
+  }
+  function fmtCtx(n) {
+    n = Number(n) || 0;
+    if (n >= 1000000) return (n / 1000000).toFixed(2).replace(/\.?0+$/, '') + 'M';
+    if (n >= 1000) return Math.round(n / 1000) + 'K';
+    return String(n);
+  }
+
+  // ---------- 上下文长度：数字输入框 + 右侧**直接点击**的预置档位 ----------
+  // 档位按**二进制 K（1024）**算，与各家模型的标注口径一致：256K = 262144。
+  // 输出单独一套档：不少模型的输出上限是输入的 1/2 或 3/8，384K 是常见档。
+  const CTX_PRESETS_IN = [1048576, 524288, 262144, 131072]; // 1M / 512K / 256K / 128K
+  const CTX_PRESETS_OUT = [393216, 262144, 131072];         // 384K / 256K / 128K
+
+  // 把 token 数渲染成档位标签：1048576 → 1M、393216 → 384K。
+  // 不是整 K 的（如历史配置里的 1040000）**原样显示**，不要四舍五入成假档位 ——
+  // 那会让用户以为自己配的是 1M。
+  function fmtCtxSlot(n) {
+    n = Number(n) || 0;
+    if (n >= 1048576 && n % 1048576 === 0) return (n / 1048576) + 'M';
+    if (n >= 1024 && n % 1024 === 0) return (n / 1024) + 'K';
+    return String(n);
+  }
+
+  // 上下文控件：**保留数字输入框**（可自由填任意值），右侧挂几个直接点的档位按钮。
+  // 点档位 = 把数值写进输入框，不做下拉、不弹层；输入框里的值命中某档时该档高亮。
+  // 返回 { node, value(), set(v) }。
+  //
+  // 为什么不做成纯下拉：配置里本来就有非整档的值（实测 deepseek-flash 是
+  // ctx_in=1040000 / ctx_out=384000），纯下拉会退化成第一项、一保存就静默改数。
+  // 保留输入框就天然没有这个问题，也不用再搞「自定义…」出口。
+  function buildCtxPicker(current, presets, fallback) {
+    const wrap = domEl('span', 'ctx-pick');
+    const num = domInput('number', '', '');
+    num.className = 'ctx-num';
+    const chips = domEl('span', 'ctx-chips');
+    const btns = [];
+
+    // 输入值命中某档 → 该档高亮；否则全部熄灭（表示这是自定义值）
+    function sync() {
+      const v = Number(num.value);
+      btns.forEach(function (b) { b.classList.toggle('on', Number(b.dataset.v) === v); });
+    }
+
+    presets.forEach(function (v) {
+      const b = domEl('button', 'ctx-chip', fmtCtxSlot(v));
+      b.type = 'button';
+      b.dataset.v = String(v);
+      b.title = fmtCtxSlot(v) + ' = ' + v + ' tokens';
+      b.addEventListener('click', function () { num.value = String(v); sync(); });
+      btns.push(b);
+      chips.appendChild(b);
+    });
+
+    num.addEventListener('input', sync);
+    num.value = String(Number(current) || fallback);
+    sync();
+
+    wrap.appendChild(num);
+    wrap.appendChild(chips);
+    return {
+      node: wrap,
+      value: function () { return Number(num.value) || fallback; },
+      set: function (v) { num.value = String(Number(v) || fallback); sync(); }
+    };
+  }
+  function domEl(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+  function domField(label, control) {
+    const w = domEl('label', 'f-field');
+    w.appendChild(domEl('span', null, label));
+    w.appendChild(control);
+    return w;
+  }
+  function domInput(type, value, placeholder) {
+    const i = domEl('input');
+    i.type = type;
+    if (value) i.value = value;
+    if (placeholder) i.placeholder = placeholder;
+    return i;
+  }
+  function domButton(text, cls, onClick) {
+    const b = domEl('button', cls, text);
+    b.type = 'button';
+    b.addEventListener('click', onClick);
+    return b;
+  }
+  function setNote(node, ok, msg) {
+    if (!node) return;
+    node.className = 'mf-test-result' + (ok === true ? ' ok' : ok === false ? ' fail' : '');
+    node.textContent = msg || '';
+  }
+
+  // 模型行：显示名 / id / 上下文 + 密钥状态 + 操作。
+  function modelRowEl(m, opts) {
+    opts = opts || {};
+    const wrap = domEl('div', 'model-wrap');
+    const row = domEl('div', 'model-item');
+    const main = domEl('div', 'mi-main');
+    const nm = domEl('div', 'mi-name', m.name || m.id);
+    if (m.id === activeModelId) {
+      const tag = domEl('span', 'mi-badge ok', '当前');
+      tag.style.marginLeft = '8px';
+      nm.appendChild(tag);
+    }
+    main.appendChild(nm);
+    main.appendChild(domEl('div', 'mi-id',
+      m.id + ' · 上下文 ' + fmtCtx(m.ctx_in) + ' / ' + fmtCtx(m.ctx_out)));
+
+    const badge = domEl('span', 'mi-badge' + (m.key_set ? '' : ' err'),
+      m.key_set ? '密钥✓' : '无密钥');
+
+    const acts = domEl('div', 'mi-actions');
+    if (m.id !== activeModelId) {
+      acts.appendChild(domButton('设为当前', 'apply', function () { applyModel(m.id); }));
+    }
+    acts.appendChild(domButton('编辑', '', function () { toggleEdit(); }));
+
+    const delBtn = domButton('删除', '', function () {
+      const confirmBtn = domButton('确认删除', 'confirming', function () {
+        fetch('/api/models/delete', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: m.id })
+        }).then(function (r) { return r.json(); }).then(function () {
+          modelsLoaded = false; // 删掉的可能是当前模型，刷新主界面模型显示
+          loadLibrary().then(function () {
+            renderModelItems();
+            if (opts.afterChange) opts.afterChange();
+            loadModels();
+          });
+        });
+      });
+      const cancelBtn = domButton('取消', '', function () {
+        acts.removeChild(confirmBtn);
+        acts.removeChild(cancelBtn);
+        acts.appendChild(delBtn);
+      });
+      acts.replaceChild(confirmBtn, delBtn);
+      acts.appendChild(cancelBtn);
+    });
+    acts.appendChild(delBtn);
+
+    row.appendChild(main);
+    row.appendChild(badge);
+    row.appendChild(acts);
+    wrap.appendChild(row);
+
+    // 就地展开编辑区。
+    // ⚠️ 不再跳去「添加模型」标签页复用那张表单 —— 那张表单含供应商下拉、地址、协议、
+    // 密钥分段控件，对「改个名字 / 调上下文」这种小修改来说太重，也容易让人误以为
+    // 要重填密钥。这里只放模型自己的字段，连接信息以只读方式展示来源。
+    let editor = null;
+    function toggleEdit() {
+      if (editor) { wrap.removeChild(editor); editor = null; row.classList.remove('editing'); return; }
+      editor = buildModelEditor(m, opts, function () {
+        if (editor) { wrap.removeChild(editor); editor = null; }
+        row.classList.remove('editing');
+      });
+      wrap.appendChild(editor);
+      row.classList.add('editing');
+      const first = editor.querySelector('input');
+      if (first) first.focus();
+    }
+
+    return wrap;
+  }
+
+  // 就地编辑一个模型：只改模型自身字段，不动连接信息。
+  function buildModelEditor(m, opts, close) {
+    const box = domEl('div', 'model-editor');
+    const grid = domEl('div', 'form-grid');
+
+    const nameIn = domInput('text', m.name || '', '界面显示的名称');
+    const idIn = domInput('text', m.id || '', '如 gpt-4o');
+    grid.appendChild(domField('显示名称', nameIn));
+    grid.appendChild(domField('模型 id', idIn));
+
+    const ctxRow = domEl('div', 'f-field ctx-row');
+    ctxRow.appendChild(domEl('span', null, '上下文'));
+    const ctxInputs = domEl('div', 'ctx-inputs');
+    // 与「添加模型」表单同一套控件：预置档位 + 自定义
+    const ctxIn = buildCtxPicker(m.ctx_in, CTX_PRESETS_IN, 262144);
+    const ctxOut = buildCtxPicker(m.ctx_out, CTX_PRESETS_OUT, 131072);
+    const inLab = domEl('label', null, '输入 ');
+    inLab.appendChild(ctxIn.node);
+    const outLab = domEl('label', null, '输出 ');
+    outLab.appendChild(ctxOut.node);
+    ctxInputs.appendChild(inLab);
+    ctxInputs.appendChild(outLab);
+    ctxRow.appendChild(ctxInputs);
+    grid.appendChild(ctxRow);
+
+    // 归属供应商：只读展示连接信息来源，编辑区里不重复出现地址与密钥
+    const p = m.provider_id ? findProvider(m.provider_id) : null;
+    const provRow = domEl('div', 'f-field');
+    provRow.appendChild(domEl('span', null, '连接信息'));
+    provRow.appendChild(domEl('div', 'me-inherit',
+      p ? ((p.name || p.id) + ' · ' + p.base_url + '（地址与密钥继承自该供应商，无需在此填写）')
+        : '写在本条目上（该模型未归属供应商）'));
+    grid.appendChild(provRow);
+    box.appendChild(grid);
+
+    const foot = domEl('div', 'me-foot');
+    const note = domEl('span', 'mf-test-result');
+    foot.appendChild(note);
+
+    foot.appendChild(domButton('取消', '', close));
+    const saveBtn = domButton('保存修改', 'primary', function () {
+      const id = idIn.value.trim();
+      if (!id) { setNote(note, false, '模型 id 不能为空'); return; }
+      const body = {
+        name: nameIn.value.trim(),
+        id: id,
+        model: id,
+        ctx_in: ctxIn.value(),
+        ctx_out: ctxOut.value()
+      };
+      if (m.provider_id) {
+        body.provider_id = m.provider_id;
+        body.protocol = '';
+        body.inherit_key = true; // 清掉条目上历史遗留的自带密钥，否则它会一直压着供应商的
+      } else {
+        // 未归属供应商的旧条目：连接信息写在自己身上，必须原样带回，否则会被清空。
+        // 密钥**不提交** —— 列表是脱敏视图拿不到明文，服务端按「保持已存密钥」处理。
+        body.provider_id = '';
+        body.base_url = m.base_url || '';
+        body.protocol = m.protocol || 'openai';
+        body.key_source = m.key_source || 'env';
+        body.key_name = m.key_name || '';
+      }
+      saveBtn.disabled = true;
+      setNote(note, null, '保存中…');
+      fetch('/api/models/save', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      }).then(function (r) { return r.json(); }).then(function (d) {
+        if (!d.ok) { setNote(note, false, d.error || '保存失败'); saveBtn.disabled = false; return; }
+        modelsLoaded = false; // 改的可能是当前生效模型，主界面显示需刷新
+        loadLibrary().then(function () {
+          renderModelItems();
+          if (opts.afterChange) opts.afterChange();
+          loadModels();
+        });
+      }).catch(function (e) {
+        setNote(note, false, '保存失败：' + e);
+        saveBtn.disabled = false;
+      });
+    });
+    foot.appendChild(saveBtn);
+    box.appendChild(foot);
+    return box;
+  }
+
+  // 切换生效模型：服务端热切换后刷新主界面（对话框弹层 + 常规页显示）。
+  function applyModel(id) {
+    fetch('/api/models/apply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: id })
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (!d.ok) { alert('应用失败：' + (d.error || '未知错误')); return; }
+      activeModelId = id;
+      modelsLoaded = false;
+      loadModels().then(function () { renderModelBtn(); });
+      loadLibrary().then(function () {
+        renderModelItems();
+        if (document.getElementById('mtab-prov').classList.contains('active')) renderProviders();
+      });
+      showPage('general');
+    });
+  }
+
+  // 编辑模型已改为**就地展开**（见 modelRowEl / buildModelEditor），
+  // 不再跳到「添加模型」标签页复用那张表单 —— 所以原来的 editModel() 已删除。
+
+  // ---------- 模型列表：按供应商分组 ----------
+  // 模型列表里「供应商分组」的折叠状态：provider_id → 是否折叠（内存态，刷新重置）。
+  // 与侧栏 wsFolded 同一套做法，只是作用对象换成模型分组。
+  const modelGroupFolded = {};
 
   function renderModelItems() {
     const box = document.getElementById('model-items');
     box.innerHTML = '<div class="mi-empty">加载中…</div>';
-    fetch('/api/models/list').then(function (r) { return r.json(); }).then(function (d) {
-      modelsCache = d.models || [];
+    loadLibrary().then(function () {
       box.innerHTML = '';
       if (!modelsCache.length) {
-        box.innerHTML = '<div class="mi-empty">还没有模型，点击右边「＋ 模型」添加</div>';
+        box.innerHTML = '<div class="mi-empty">还没有模型：切到「添加模型」，选定供应商后只需填模型 id</div>';
         return;
       }
-      modelsCache.forEach(function (m, i) {
-        const row = document.createElement('div');
-        row.className = 'model-item';
-        const main = document.createElement('div');
-        main.className = 'mi-main';
-        const nm = document.createElement('div');
-        nm.className = 'mi-name';
-        nm.textContent = m.name || m.id;
-        if (m.id === d.active) {
-          const tag = document.createElement('span');
-          tag.className = 'mi-badge';
-          tag.style.marginLeft = '8px';
-          tag.textContent = '当前';
-          nm.appendChild(tag);
-        }
-        const idv = document.createElement('div');
-        idv.className = 'mi-id';
-        idv.textContent = m.id + (m.base_url ? ' · ' + m.base_url : '');
-        main.appendChild(nm); main.appendChild(idv);
-        const badge = document.createElement('span');
-        badge.className = 'mi-badge';
-        badge.textContent = (m.protocol || 'openai') + (m.key_set ? ' · 密钥✓' : ' · 无密钥');
-        const acts = document.createElement('div');
-        acts.className = 'mi-actions';
-        function mkBtn(text, cls, fn) {
-          const b = document.createElement('button');
-          b.type = 'button'; b.textContent = text;
-          if (cls) b.className = cls;
-          b.addEventListener('click', fn);
-          return b;
-        }
-        acts.appendChild(mkBtn('应用', 'apply', function () {
-          fetch('/api/models/apply', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: m.id })
-          }).then(function (r) { return r.json(); }).then(function (d2) {
-            if (d2.ok) {
-              modelsLoaded = false; // 让对话框下次拉取刷新
-              loadModels().then(function () { renderModelBtn(); });
-              showPage('general');
-            } else if (d2.error) {
-              alert('应用失败：' + d2.error);
-            }
-          });
-        }));
-        acts.appendChild(mkBtn('编辑', '', function () {
-          editingIndex = i;
-          fillForm(m);
-          showPage('models');
-          showMTab('config');
-        }));
-        const delBtn = mkBtn('删除', '', function () {
-          delBtn.classList.add('confirming');
-          delBtn.textContent = '确认删除';
-          const confirmBtn = mkBtn('确认删除', 'confirming', function () {
-            fetch('/api/models/delete', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ model: m.id })
-            }).then(function (r) { return r.json(); }).then(function () {
-              renderModelItems();
-              modelsLoaded = false; // 删除的可能是当前模型，刷新主界面模型显示
-              loadModels().then(function () { renderModelBtn(); });
-            });
-          });
-          const cancelBtn = mkBtn('取消', '', function () {
-            acts.removeChild(confirmBtn);
-            delBtn.classList.remove('confirming');
-            delBtn.textContent = '删除';
-            acts.appendChild(delBtn);
-          });
-          acts.replaceChild(confirmBtn, delBtn);
-          acts.appendChild(cancelBtn);
+      // 按 provider_id 分组；未归属供应商的（旧格式条目）单独成组。
+      const order = [];
+      const groups = {};
+      modelsCache.forEach(function (m) {
+        const key = m.provider_id || '';
+        if (!groups[key]) { groups[key] = []; order.push(key); }
+        groups[key].push(m);
+      });
+      order.forEach(function (pid) {
+        const p = pid ? findProvider(pid) : null;
+        const folded = !!modelGroupFolded[pid];
+        const head = domEl('div', 'model-group');
+
+        // 折叠箭头：供应商下的子模型可以整组收起（模型多的时候不用一直滚）
+        const fold = document.createElement('button');
+        fold.type = 'button';
+        fold.className = 'label-btn mg-fold' + (folded ? ' folded' : '');
+        fold.title = folded ? '展开该供应商的模型' : '收起该供应商的模型';
+        const arrow = svgIcon('M6 9l6 6 6-6', 12);
+        arrow.setAttribute('stroke', 'currentColor');
+        arrow.setAttribute('fill', 'none');
+        arrow.setAttribute('stroke-width', '2');
+        arrow.setAttribute('stroke-linecap', 'round');
+        arrow.setAttribute('stroke-linejoin', 'round');
+        fold.appendChild(arrow);
+        fold.addEventListener('click', function () {
+          modelGroupFolded[pid] = !modelGroupFolded[pid];
+          renderModelItems();
         });
-        acts.appendChild(delBtn);
-        row.appendChild(main); row.appendChild(badge); row.appendChild(acts);
-        box.appendChild(row);
+        head.appendChild(fold);
+
+        head.appendChild(domEl('span', 'mg-name', p ? (p.name || p.id) : '未归属供应商'));
+        head.appendChild(domEl('span', 'mg-base',
+          p ? p.base_url : '各条目自带连接信息'));
+        head.appendChild(domEl('span', 'mi-badge', groups[pid].length + ' 个模型'));
+        if (p) {
+          head.appendChild(domEl('span', 'mi-badge' + (p.disabled ? ' err' : ' ok'),
+            p.disabled ? '已停用' : '密钥共用'));
+        }
+        head.appendChild(domEl('span', 'mg-sp'));
+        if (p) {
+          head.appendChild(domButton('＋ 添加模型', '', function () {
+            gotoAddModel(p.id);
+          }));
+        }
+        box.appendChild(head);
+
+        if (folded) return;   // 收起时子模型整组不渲染（也省掉一批 DOM）
+
+        // 子模型缩进一层，视觉上从属于上面的供应商
+        const kids = domEl('div', 'model-children');
+        groups[pid].forEach(function (m) { kids.appendChild(modelRowEl(m)); });
+        box.appendChild(kids);
       });
     }).catch(function () {
       box.innerHTML = '<div class="mi-empty">模型列表加载失败，请确认服务正在运行</div>';
+    });
+  }
+
+  // 跳到「添加模型」并预选供应商：地址与密钥继承，用户只需填 id。
+  function gotoAddModel(providerId) {
+    showPage('models');
+    showMTab('config');
+    loadLibrary().then(function () {
+      resetForm();
+      const sel = document.getElementById('mf-prov');
+      if (sel && providerId) { sel.value = providerId; syncProviderForm(); }
+      const idEl = document.getElementById('mf-id');
+      if (idEl) idEl.focus();
+    });
+  }
+
+  // ---------- 供应商管理：左列供应商 / 右侧详情 ----------
+  function renderProviders() {
+    const listEl = document.getElementById('prov-list');
+    const detailEl = document.getElementById('prov-detail');
+    if (!listEl || !detailEl) return;
+    loadLibrary().then(function () {
+      if (!provSelected && providersCache.length) provSelected = providersCache[0].id;
+      listEl.innerHTML = '';
+      providersCache.forEach(function (p) {
+        const b = domEl('button', 'prov-item' + (p.id === provSelected ? ' active' : ''));
+        b.type = 'button';
+        b.appendChild(domEl('span', 'pv-dot' + (p.disabled ? ' off' : '')));
+        b.appendChild(domEl('span', null, p.name || p.id));
+        b.appendChild(domEl('span', 'pv-cnt', String(modelsOfProvider(p.id).length)));
+        b.addEventListener('click', function () { provSelected = p.id; renderProviders(); });
+        listEl.appendChild(b);
+      });
+      const add = domEl('button', 'prov-item prov-add', '＋ 添加供应商');
+      add.type = 'button';
+      if (provSelected === PROV_NEW) add.classList.add('active');
+      add.addEventListener('click', function () { provSelected = PROV_NEW; renderProviders(); });
+      listEl.appendChild(add);
+      renderProviderDetail(detailEl);
+    });
+  }
+
+  // 密钥输入控件（供应商表单用）：环境变量 / 明文 分段 + 眼睛。
+  // 返回取值接口；touched 记录用户是否动过，决定保存时是否提交 key_value。
+  function buildKeyControl(state) {
+    const wrap = domEl('div', 'key-row');
+    const seg = domEl('div', 'key-seg');
+    const envBtn = domEl('button', 'active', '环境变量');
+    envBtn.type = 'button';
+    const plainBtn = domEl('button', null, '明文密钥');
+    plainBtn.type = 'button';
+    seg.appendChild(envBtn); seg.appendChild(plainBtn);
+
+    const envIn = domInput('text', state.name, '变量名，如 OPENAI_API_KEY');
+    const eyeWrap = domEl('span', 'key-eye-wrap');
+    const plainIn = domInput('password', state.plain, state.placeholder || 'sk-...');
+    const eye = domEl('button', 'key-eye', '👁');
+    eye.type = 'button';
+    eyeWrap.appendChild(plainIn); eyeWrap.appendChild(eye);
+
+    wrap.appendChild(seg); wrap.appendChild(envIn); wrap.appendChild(eyeWrap);
+
+    let src = state.source === 'plain' ? 'plain' : 'env';
+    let touched = false;
+    function apply() {
+      envBtn.classList.toggle('active', src === 'env');
+      plainBtn.classList.toggle('active', src === 'plain');
+      envIn.style.display = src === 'env' ? '' : 'none';
+      plainIn.style.display = src === 'plain' ? '' : 'none';
+      eye.style.display = (src === 'plain' && plainIn.value) ? '' : 'none';
+    }
+    envBtn.addEventListener('click', function () { if (src !== 'env') touched = true; src = 'env'; apply(); });
+    plainBtn.addEventListener('click', function () { if (src !== 'plain') touched = true; src = 'plain'; apply(); });
+    envIn.addEventListener('input', function () { touched = true; });
+    plainIn.addEventListener('input', function () { touched = true; apply(); });
+    eye.addEventListener('click', function () {
+      const show = plainIn.type === 'password';
+      plainIn.type = show ? 'text' : 'password';
+      eye.textContent = show ? '🙈' : '👁';
+    });
+    apply();
+    return {
+      node: wrap,
+      source: function () { return src; },
+      name: function () { return envIn.value.trim(); },
+      value: function () { return plainIn.value; },
+      touched: function () { return touched; }
+    };
+  }
+
+  function renderProviderDetail(host) {
+    // PROV_NEW（或 id 已失效）→ findProvider 返回 undefined → 走「新建供应商」分支
+    const p = (provSelected && provSelected !== PROV_NEW) ? findProvider(provSelected) : null;
+    host.innerHTML = '';
+
+    const title = domEl('div', 'mf-title', p ? (p.name || p.id) : '新建供应商');
+    if (p) {
+      const tag = domEl('span', 'mi-badge' + (p.disabled ? ' err' : ' ok'),
+        p.disabled ? '已停用' : '已启用');
+      tag.style.marginLeft = '8px';
+      title.appendChild(tag);
+    }
+    host.appendChild(title);
+
+    // 一次性回执（如「已添加 N 个模型」）：跨重绘保留，显示一次即清空
+    if (provFlash) {
+      const flash = domEl('div', 'prov-flash', provFlash);
+      provFlash = '';
+      host.appendChild(flash);
+    }
+
+    const form = domEl('div', 'prov-form');
+    const nameIn = domInput('text', p ? p.name : '', '如 上海模型实验室 / SiliconFlow');
+    const urlIn = domInput('text', p ? p.base_url : '', 'https://api.example.com/v1');
+    const protoSel = domEl('select');
+    ['openai', 'anthropic'].forEach(function (v) {
+      const o = domEl('option', null, v === 'anthropic' ? 'Anthropic' : 'OpenAI');
+      o.value = v;
+      protoSel.appendChild(o);
+    });
+    protoSel.value = (p && p.protocol === 'anthropic') ? 'anthropic' : 'openai';
+    const key = buildKeyControl({
+      source: p ? p.key_source : 'env',
+      name: p ? p.key_name : '',
+      plain: (p && p.key_plain) ? p.key_plain : '',
+      placeholder: (p && p.key_set && !p.key_plain) ? '已保存（留空保持不变）' : 'sk-...'
+    });
+
+    form.appendChild(domField('名称', nameIn));
+    form.appendChild(domField('Base URL', urlIn));
+    form.appendChild(domField('兼容协议', protoSel));
+    form.appendChild(domField('密钥', key.node));
+
+    const disWrap = domEl('label', 'f-field');
+    disWrap.style.flexDirection = 'row';
+    disWrap.style.alignItems = 'center';
+    disWrap.style.gap = '8px';
+    const disIn = domEl('input');
+    disIn.type = 'checkbox';
+    disIn.checked = !!(p && p.disabled);
+    disWrap.appendChild(disIn);
+    disWrap.appendChild(domEl('span', null, '停用该供应商（其下模型不可选用，配置保留）'));
+    form.appendChild(disWrap);
+    host.appendChild(form);
+
+    const result = domEl('span', 'mf-test-result');
+    result.id = 'pv-result'; // 保存成功后整块重绘，靠 id 找回新节点写回执
+    const acts = domEl('div', 'prov-actions');
+    acts.appendChild(result);
+
+    const testBtn = domButton('测试连接', '', function () {
+      if (!p) { setNote(result, false, '先保存供应商再测试'); return; }
+      setNote(result, null, '测试中…');
+      // 用「拉取上游模型列表」当连通性测试：一次请求同时验证地址与密钥，
+      // 还能顺带告诉用户这个供应商下有多少模型可用。
+      fetch('/api/models/discover', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider_id: p.id })
+      }).then(function (r) { return r.json(); }).then(function (d) {
+        if (d.ok) setNote(result, true, '连接正常，上游 ' + (d.count || 0) + ' 个模型可用');
+        else setNote(result, false, '失败：' + (d.error || '未知错误'));
+      }).catch(function (e) { setNote(result, false, '失败：' + e); });
+    });
+    acts.appendChild(testBtn);
+
+    const saveBtn = domButton('保存供应商', 'primary', function () {
+      const name = nameIn.value.trim();
+      const url = urlIn.value.trim();
+      if (!name) { setNote(result, false, '名称不能为空'); return; }
+      if (!url) { setNote(result, false, 'Base URL 不能为空'); return; }
+      const body = {
+        id: p ? p.id : newProviderId(name),
+        name: name,
+        base_url: url,
+        protocol: protoSel.value,
+        key_source: key.source(),
+        key_name: key.name(),
+        key_value: key.value(),
+        key_touched: key.touched(),
+        disabled: disIn.checked
+      };
+      setNote(result, null, '保存中…');
+      fetch('/api/providers/save', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      }).then(function (r) { return r.json(); }).then(function (d) {
+        if (!d.ok) { setNote(result, false, d.error || '保存失败'); return; }
+        provSelected = body.id;
+        modelsLoaded = false; // 改地址 / 轮换密钥会热切换当前模型，主界面显示需刷新
+        loadModels();
+        loadLibrary().then(function () {
+          renderProviders();
+          const fresh = document.getElementById('pv-result');
+          setNote(fresh, true, d.hot ? '已保存，当前生效模型已改用新配置' : '已保存');
+        });
+      }).catch(function (e) { setNote(result, false, '保存失败：' + e); });
+    });
+    acts.appendChild(saveBtn);
+
+    if (p) {
+      const delBtn = domButton('删除', '', function () {
+        const n = modelsOfProvider(p.id).length;
+        const confirmBtn = domButton('确认删除', 'confirming', function () {
+          fetch('/api/providers/delete', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ provider: p.id })
+          }).then(function (r) { return r.json(); }).then(function (d) {
+            if (!d.ok) { setNote(result, false, d.error || '删除失败'); return; }
+            provSelected = '';
+            loadLibrary().then(function () {
+              if (!provSelected && providersCache.length) provSelected = providersCache[0].id;
+              renderProviders();
+              renderModelItems();
+            });
+          });
+        });
+        const cancelBtn = domButton('取消', '', function () {
+          acts.removeChild(confirmBtn);
+          acts.removeChild(cancelBtn);
+          acts.insertBefore(delBtn, testBtn);
+        });
+        acts.replaceChild(confirmBtn, delBtn);
+        acts.appendChild(cancelBtn);
+        if (n) setNote(result, null, '其下 ' + n + ' 个模型不会被删除，连接信息会保留到各自条目上');
+      });
+      delBtn.style.color = 'var(--danger)';
+      acts.appendChild(delBtn);
+    }
+    host.appendChild(acts);
+
+    if (!p) {
+      host.appendChild(domEl('div', 'prov-empty',
+        '填好名称、Base URL 与密钥后保存；之后在同一供应商下添加模型只需填模型 id。'));
+      return;
+    }
+
+    const list = modelsOfProvider(p.id);
+    const sub = domEl('div', 'prov-sub');
+    sub.appendChild(document.createTextNode('模型 · ' + list.length + ' 个'));
+    sub.appendChild(domEl('span', 'pv-hint', '共用上面的 Base URL 与 Key，切换只需换 id'));
+    host.appendChild(sub);
+
+    if (list.length) {
+      list.forEach(function (m) { host.appendChild(modelRowEl(m)); });
+    } else {
+      host.appendChild(domEl('div', 'prov-empty',
+        '该供应商下暂无模型 —— 点下方按钮添加，只需填模型 id。'));
+    }
+
+    // ---- 获取模型列表：就地展开，**不弹窗** ----
+    // 放在供应商详情里，因为它用的就是这个供应商的 Base URL 与密钥；
+    // 勾选后一次性批量入库，天然归到该供应商名下（符合「按供应商分类」）。
+    const discBox = domEl('div', 'pv-disc hidden');
+    let discItems = [], discPick = {};
+
+    const discHead = domEl('div', 'disc-head');
+    discHead.appendChild(domEl('div', 'disc-title', '上游可用模型'));
+    const discCountEl = domEl('span', 'disc-count');
+    discHead.appendChild(discCountEl);
+    const discTools = domEl('div', 'disc-tools');
+    const discFilter = domInput('text', '', '筛选模型 id…');
+    const discCloseBtn = domButton('收起', '', function () {
+      discItems = []; discPick = {};
+      discBox.classList.add('hidden');
+    });
+    discTools.appendChild(discFilter);
+    discTools.appendChild(discCloseBtn);
+    discHead.appendChild(discTools);
+    discBox.appendChild(discHead);
+
+    const discListEl = domEl('div', 'disc-list');
+    discBox.appendChild(discListEl);
+
+    const discFoot = domEl('div', 'disc-foot');
+    const discNote = domEl('span', 'mf-test-result');
+    const discAddBtn = domButton('批量添加选中', 'primary', function () { commitPicked(); });
+    discAddBtn.disabled = true;
+    discFoot.appendChild(discNote);
+    discFoot.appendChild(discAddBtn);
+    discBox.appendChild(discFoot);
+
+    function discSync() {
+      const n = Object.keys(discPick).length;
+      discCountEl.textContent = discItems.length ? '共 ' + discItems.length + ' 个' +
+        (n ? '，已选 ' + n + ' 个' : '') : '';
+      discAddBtn.disabled = n === 0;
+      discAddBtn.textContent = n ? '批量添加选中（' + n + ' 个）' : '批量添加选中';
+    }
+
+    function discRender() {
+      const q = (discFilter.value || '').trim().toLowerCase();
+      const shown = discItems.filter(function (m) {
+        return !q || m.id.toLowerCase().indexOf(q) >= 0 ||
+          (m.name || '').toLowerCase().indexOf(q) >= 0;
+      });
+      discListEl.innerHTML = '';
+      if (!shown.length) {
+        discListEl.innerHTML = '<div class="disc-empty">' +
+          (discItems.length ? '没有匹配的模型' : '没有可添加的模型') + '</div>';
+        discSync();
+        return;
+      }
+      shown.forEach(function (m) {
+        const row = domEl('label', 'disc-item' + (m.in_library ? ' added' : ''));
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = !!discPick[m.id];
+        cb.disabled = !!m.in_library; // 已在库中：不可选，也不覆盖
+        cb.addEventListener('change', function () {
+          if (cb.checked) discPick[m.id] = true; else delete discPick[m.id];
+          discSync();
+        });
+        row.appendChild(cb);
+        row.appendChild(domEl('span', 'disc-id', m.id));
+        if (m.in_library) row.appendChild(domEl('span', 'disc-tag', '已在库'));
+        discListEl.appendChild(row);
+      });
+      discSync();
+    }
+
+    function discNoteSet(ok, msg) {
+      discNote.className = 'mf-test-result' + (ok === true ? ' ok' : ok === false ? ' fail' : '');
+      discNote.textContent = msg || '';
+    }
+
+    // 拉取上游模型列表：直接用该供应商已保存的地址与密钥（provider_id），
+    // 不必先「测试连接」——两者其实是同一个请求，合并成一个按钮更省事。
+    function fetchUpstream() {
+      discBox.classList.remove('hidden');
+      discNoteSet(null, '正在获取模型列表…');
+      fetch('/api/models/discover', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider_id: p.id })
+      }).then(function (r) { return r.json(); }).then(function (d) {
+        if (!d.ok) {
+          discItems = []; discPick = {};
+          discListEl.innerHTML = '';
+          discSync();
+          discNoteSet(false, '获取失败：' + (d.error || '未知错误'));
+          return;
+        }
+        discItems = d.models || [];
+        discPick = {};
+        discFilter.value = '';
+        discRender();
+        discNoteSet(true, '已获取 ' + discItems.length + ' 个模型' +
+          (d.key_from_active ? '（密钥取自当前生效模型）' : ''));
+      }).catch(function (e) {
+        discNoteSet(false, '获取失败：' + e);
+      });
+    }
+
+    function commitPicked() {
+      const ids = Object.keys(discPick);
+      if (!ids.length) { discNoteSet(false, '请先勾选模型 id'); return; }
+      const pick = function (id) {
+        return discItems.filter(function (m) { return m.id === id; })[0] || {};
+      };
+      discNoteSet(null, '正在添加 ' + ids.length + ' 个模型…');
+      fetch('/api/models/save_batch', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider_id: p.id,
+          ctx_in: 262144,
+          ctx_out: 131072,
+          models: ids.map(function (id) {
+            const hit = pick(id);
+            return { id: id, name: (hit.name && hit.name !== id) ? hit.name : '' };
+          })
+        })
+      }).then(function (r) { return r.json(); }).then(function (d) {
+        if (!d.ok) { discNoteSet(false, d.error || '批量添加失败'); return; }
+        discItems = []; discPick = {};
+        modelsLoaded = false;
+        // 回执写成一次性闪信再重绘 —— 直接写 DOM 会被这次重绘冲掉。
+        provFlash = '已添加 ' + d.added + ' 个模型（共用该供应商的地址与密钥）' +
+          (d.skipped ? '，跳过已存在 ' + d.skipped + ' 个' : '');
+        loadLibrary().then(function () {
+          renderModelItems();
+          loadModels();
+          renderProviders();   // 顺带刷新详情里的模型列表与计数
+        });
+      }).catch(function (e) {
+        discNoteSet(false, '批量添加失败：' + e);
+      });
+    }
+
+    discFilter.addEventListener('input', discRender);
+    host.appendChild(discBox);
+
+    const acts2 = domEl('div', 'prov-actions');
+    acts2.appendChild(domButton('＋ 添加模型到此供应商', 'primary', function () {
+      gotoAddModel(p.id);
+    }));
+    acts2.appendChild(domButton('获取模型列表', '', fetchUpstream));
+    host.appendChild(acts2);
+  }
+
+  // 由名称生成一个稳定的供应商 id（重名追加序号）。
+  function newProviderId(name) {
+    let slug = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    if (!slug) slug = 'provider';
+    let id = 'p-' + slug;
+    for (let n = 2; findProvider(id); n++) id = 'p-' + slug + '-' + n;
+    return id;
+  }
+
+  // ---------- 添加 / 编辑模型表单 ----------
+
+  // 供应商下拉：'' 表示「新建供应商」，此时连接信息在本表单填写。
+  function populateProviderSelect(selected) {
+    const sel = document.getElementById('mf-prov');
+    if (!sel) return;
+    sel.innerHTML = '';
+    const optNew = domEl('option', null, '＋ 新建供应商（在本表单填地址与密钥）');
+    optNew.value = '';
+    sel.appendChild(optNew);
+    providersCache.forEach(function (p) {
+      const o = domEl('option', null, (p.name || p.id) + (p.disabled ? '（已停用）' : ''));
+      o.value = p.id;
+      sel.appendChild(o);
+    });
+    sel.value = selected || '';
+  }
+
+  // 选定供应商后，地址 / 协议 / 密钥三块换成「继承自供应商」只读块 ——
+  // 表单只剩 模型 id / 显示名 / 上下文。这就是「同供应商下加模型只填 id」。
+  function syncProviderForm() {
+    const inheritField = document.getElementById('mf-inherit-field');
+    if (!inheritField) return;
+    const pid = document.getElementById('mf-prov').value;
+    const p = pid ? findProvider(pid) : null;
+    inheritField.hidden = !p;
+    document.getElementById('mf-url-field').hidden = !!p;
+    document.getElementById('mf-key-field').hidden = !!p;
+    document.getElementById('mf-proto-field').hidden = !!p;
+    if (!p) return;
+
+    const box = document.getElementById('mf-inherit');
+    box.innerHTML = '';
+    box.appendChild(domEl('div', 'ih', '继承自供应商「' + (p.name || p.id) + '」，无需重复填写'));
+    [
+      ['Base URL', p.base_url],
+      ['API 格式', p.protocol === 'anthropic'
+        ? 'Anthropic Messages (/v1/messages)'
+        : 'Chat Completions (/chat/completions)'],
+      ['API Key', providerKeyLabel(p)]
+    ].forEach(function (pair) {
+      const r = domEl('div', 'ir');
+      r.appendChild(domEl('span', null, pair[0]));
+      r.appendChild(domEl('code', null, pair[1] || '—'));
+      box.appendChild(r);
     });
   }
 
@@ -4810,8 +5780,10 @@ case 'idle': {
     updateKeyEye();
     const proto = (m.protocol || 'openai').toLowerCase();
     document.getElementById('mf-proto').value = proto === 'custom' ? 'openai' : proto; // 旧数据 custom ≡ openai
-    document.getElementById('mf-ctx-in').value = m.ctx_in || 262144;
-    document.getElementById('mf-ctx-out').value = m.ctx_out || 131072;
+    if (ctxInPicker) ctxInPicker.set(m.ctx_in || 262144);
+    if (ctxOutPicker) ctxOutPicker.set(m.ctx_out || 131072);
+    populateProviderSelect(m.provider_id || '');
+    syncProviderForm();
     setTestResult('', '');
     collapseDiscover(); // 换了模型就收起上一次的上游列表，避免勾选状态串味
   }
@@ -4822,18 +5794,29 @@ case 'idle': {
     updateKeyEye();
   }
   function collectForm() {
-    return {
+    const pid = document.getElementById('mf-prov').value;
+    const id = document.getElementById('mf-id').value.trim();
+    const f = {
       name: document.getElementById('mf-name').value.trim(),
-      id: document.getElementById('mf-id').value.trim(),
-      model: document.getElementById('mf-id').value.trim(), // 测试接口字段名（后端 modelTestReq.model）
-      base_url: document.getElementById('mf-url').value.trim(),
-      key_source: keySrc,
-      key_name: document.getElementById('mf-key-env').value.trim(),
-      key_value: document.getElementById('mf-key-plain').value,
-      protocol: document.getElementById('mf-proto').value,
-      ctx_in: Number(document.getElementById('mf-ctx-in').value) || 262144,
-      ctx_out: Number(document.getElementById('mf-ctx-out').value) || 131072
+      id: id,
+      model: id, // 测试 / 发现接口的字段名（后端 modelTestReq.model）
+      provider_id: pid,
+      ctx_in: ctxInPicker ? ctxInPicker.value() : 262144,
+      ctx_out: ctxOutPicker ? ctxOutPicker.value() : 131072
     };
+    if (pid) {
+      // 归属供应商：连接信息全部继承，条目上不写任何覆盖值；
+      // inherit_key 让服务端清掉条目上历史遗留的自带密钥，否则它会一直压着供应商的密钥。
+      f.protocol = '';
+      f.inherit_key = true;
+    } else {
+      f.base_url = document.getElementById('mf-url').value.trim();
+      f.key_source = keySrc;
+      f.key_name = document.getElementById('mf-key-env').value.trim();
+      f.key_value = document.getElementById('mf-key-plain').value;
+      f.protocol = document.getElementById('mf-proto').value;
+    }
+    return f;
   }
   function setTestResult(ok, msg) {
     const el = document.getElementById('mf-test-result');
@@ -4844,6 +5827,20 @@ case 'idle': {
   // 密钥来源分段；keyTouched 记录本次编辑是否动过密钥（决定保存时是否提交 key_value）。
   let keySrc = 'env';
   let keyTouched = false;
+
+  // 上下文输入/输出控件（预置档位 + 自定义）。在下方 init 里挂到 #mf-ctx-*-host 上，
+  // 表单其余部分一律通过这两个对象读写，不再直接碰 DOM —— 免得预置/自定义两套状态各写各的。
+  let ctxInPicker = null;
+  let ctxOutPicker = null;
+  (function initCtxPickers() {
+    const inHost = document.getElementById('mf-ctx-in-host');
+    const outHost = document.getElementById('mf-ctx-out-host');
+    if (!inHost || !outHost) return;
+    ctxInPicker = buildCtxPicker(262144, CTX_PRESETS_IN, 262144);
+    ctxOutPicker = buildCtxPicker(131072, CTX_PRESETS_OUT, 131072);
+    inHost.appendChild(ctxInPicker.node);
+    outHost.appendChild(ctxOutPicker.node);
+  })();
   function setKeySrc(ks) {
     keySrc = ks === 'plain' ? 'plain' : 'env';
     document.querySelectorAll('#mf-key-seg button').forEach(function (b) {
@@ -4881,8 +5878,13 @@ case 'idle': {
       setKeySrc(b.dataset.ks);
     });
   });
+  // 切换归属供应商 → 地址与密钥在「继承 / 手填」之间切换。
+  document.getElementById('mf-prov').addEventListener('change', function () {
+    syncProviderForm();
+    updateDiscCount();
+  });
 
-  // ＋ 模型：左侧导航项 → 模型管理页（列表视图）
+  // 「模型」导航项 → 模型管理页（列表视图）
   document.getElementById('nav-models').addEventListener('click', function () {
     settingsOverlay.querySelectorAll('.nav-item').forEach(function (n) { n.classList.remove('active'); });
     this.classList.add('active');
@@ -4890,11 +5892,19 @@ case 'idle': {
     showMTab('list');
     renderModelItems();
   });
-  // 子 Tab：模型列表 / 添加模型（点「添加模型」即回到空白新建态，编辑态复用同一表单）
+  // 子 Tab：模型列表 / 供应商管理 / 添加模型
+  // （点「添加模型」即回到空白新建态，编辑态复用同一表单）
   document.querySelectorAll('.models-tab').forEach(function (t) {
     t.addEventListener('click', function () {
-      if (t.dataset.mtab === 'config') resetForm();
-      showMTab(t.dataset.mtab);
+      const name = t.dataset.mtab;
+      showMTab(name);
+      if (name === 'config') {
+        loadLibrary().then(function () { resetForm(); });
+      } else if (name === 'prov') {
+        renderProviders();
+      } else {
+        renderModelItems();
+      }
     });
   });
 
@@ -4922,12 +5932,15 @@ case 'idle': {
   document.getElementById('mf-save').addEventListener('click', function () {
     const m = collectForm();
     if (!m.id) { setTestResult(false, '模型 id 不能为空'); return; }
-    // 编辑已有模型：本次没动过密钥 → 不提交 key_value，服务端按「保持库里已存
-    // 密钥」处理。前端拿到的列表是脱敏视图，明文框为空只是回显受限，绝不能被
-    // 当成「用户清空了密钥」而覆盖掉。
-    if (editingIndex >= 0 && !keyTouched) {
+    if (m.provider_id) {
+      // 归属供应商：连接信息继承，不提交任何覆盖值。
       delete m.key_value;
-    } else if (m.key_source === 'plain' && !m.key_value.trim()) {
+    } else if (editingIndex >= 0 && !keyTouched) {
+      // 编辑已有模型且本次没动过密钥 → 不提交 key_value，服务端按「保持库里已存
+      // 密钥」处理。前端拿到的列表是脱敏视图，明文框为空只是回显受限，绝不能被
+      // 当成「用户清空了密钥」而覆盖掉。
+      delete m.key_value;
+    } else if (m.key_source === 'plain' && !String(m.key_value || '').trim()) {
       delete m.key_value;
     }
     setTestResult(null, '保存中…');
@@ -4939,9 +5952,8 @@ case 'idle': {
         editingIndex = -1;
         collapseDiscover();
         showMTab('list');
-        renderModelItems();   // 新增/编辑立即出现在模型列表
         modelsLoaded = false; // 置假后 loadModels 会重拉模型库快照，对话框的模型选择同步出现新条目
-        loadModels();
+        loadLibrary().then(function () { renderModelItems(); loadModels(); });
       } else {
         setTestResult(false, d.error || '保存失败');
       }
@@ -4950,10 +5962,9 @@ case 'idle': {
     });
   });
 
-  // ---------- 添加模型：从上游 /models 拉取列表 → 选中 → 填入表单 ----------
+  // ---------- 添加模型：从上游 /models 拉取列表 → 勾选 → 批量入库 ----------
   // 与「测试连接」的区别：测试是「所见即所测」，这里允许在表单没填地址/密钥时
-  // 回退到当前生效模型（用户常在同一个网关上添加模型），服务端会在响应里
-  // 用 key_from_active 如实告知，界面据此提示。
+  // 回退到当前生效模型，服务端会在响应里用 key_from_active 如实告知。
   //
   // 用 var 而非 let 声明状态：collapseDiscover 会被 fillForm/resetForm 早期调用，
   // var 提升到函数顶部（值为 undefined）不会踩 let 的暂时性死区。
@@ -4989,7 +6000,12 @@ case 'idle': {
     const cnt = document.getElementById('disc-count');
     if (cnt) cnt.textContent = '共 ' + (discModels || []).length + ' 个' + (n ? '，已选 ' + n + ' 个' : '');
     const btn = document.getElementById('disc-add');
-    if (btn) btn.disabled = n === 0;
+    if (btn) {
+      const pid = document.getElementById('mf-prov').value;
+      btn.disabled = n === 0;
+      // 有供应商 → 直接批量入库；还没确认连接信息 → 只填入表单。
+      btn.textContent = pid ? ('批量添加选中（' + n + ' 个）') : '填入表单';
+    }
   }
 
   function renderDiscList() {
@@ -5012,13 +6028,14 @@ case 'idle': {
       const row = document.createElement('label');
       row.className = 'disc-item' + (m.in_library ? ' added' : '');
       const cb = document.createElement('input');
-      // 单选：模型 id 只能一个一个填进表单，不做批量添加。
-      cb.type = 'radio';
-      cb.name = 'disc-model';
+      // 多选：选中的 id 会一次性批量写入同一供应商（地址与密钥共用），
+      // 这正是「同一个供应商下不必一个一个添加」的实现方式。
+      cb.type = 'checkbox';
       cb.checked = !!discSelected[m.id];
       cb.disabled = !!m.in_library; // 已在库中：不可选，也不覆盖
       cb.addEventListener('change', function () {
-        if (cb.checked) { discSelected = {}; discSelected[m.id] = true; }
+        if (cb.checked) discSelected[m.id] = true;
+        else delete discSelected[m.id];
         updateDiscCount();
       });
       const idEl = document.createElement('span');
@@ -5071,19 +6088,53 @@ case 'idle': {
     }).then(function () { btn.disabled = false; });
   }
 
-  // 「添加选中」：只把选中的模型 id（及上游显示名）填进上方表单，
-  // 由用户确认连接信息、补好密钥后点「保存」正式入库 —— 所见即所得，
-  // 不会把表单里还没确认的内容偷偷写进模型库。
-  function fillSelectedDiscModel() {
+  // 「批量添加选中」：
+  //  - 已选定供应商 → 一次 POST 把全部选中的 id 写进该供应商（地址与密钥共用）；
+  //  - 还没选供应商（正在新建）→ 只把第一个 id 填进表单，由用户补好地址与密钥后
+  //    再点「保存」正式入库 —— 所见即所得，不把还没确认的连接信息偷偷写进模型库。
+  function addSelectedDiscModels() {
     const ids = Object.keys(discSelected);
-    if (!ids.length) { setDiscResult(false, '请先选择一个模型'); return; }
-    const id = ids[0];
-    const hit = (discModels || []).filter(function (m) { return m.id === id; })[0] || {};
-    document.getElementById('mf-id').value = id;
-    const nameEl = document.getElementById('mf-name');
-    if (!nameEl.value.trim() && hit.name && hit.name !== id) nameEl.value = hit.name;
-    setTestResult(true, '已填入模型 id：' + id + '，填好密钥后点「保存」');
-    collapseDiscover();
+    if (!ids.length) { setDiscResult(false, '请先勾选模型 id'); return; }
+    const pick = function (id) {
+      return (discModels || []).filter(function (m) { return m.id === id; })[0] || {};
+    };
+    const pid = document.getElementById('mf-prov').value;
+
+    if (!pid) {
+      const id = ids[0];
+      const hit = pick(id);
+      document.getElementById('mf-id').value = id;
+      const nameEl = document.getElementById('mf-name');
+      if (!nameEl.value.trim() && hit.name && hit.name !== id) nameEl.value = hit.name;
+      setTestResult(true, '已填入模型 id：' + id + '，补好地址与密钥后点「保存」');
+      collapseDiscover();
+      return;
+    }
+
+    const payload = {
+      provider_id: pid,
+      ctx_in: ctxInPicker ? ctxInPicker.value() : 262144,
+      ctx_out: ctxOutPicker ? ctxOutPicker.value() : 131072,
+      models: ids.map(function (id) {
+        const hit = pick(id);
+        return { id: id, name: (hit.name && hit.name !== id) ? hit.name : '' };
+      })
+    };
+    setDiscResult(null, '正在添加 ' + ids.length + ' 个模型…');
+    fetch('/api/models/save_batch', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (!d.ok) { setDiscResult(false, d.error || '批量添加失败'); return; }
+      const msg = '已添加 ' + d.added + ' 个模型（共用该供应商的地址与密钥）' +
+        (d.skipped ? '，跳过已存在 ' + d.skipped + ' 个' : '');
+      setDiscResult(true, msg);
+      collapseDiscover();
+      modelsLoaded = false;
+      loadLibrary().then(function () { renderModelItems(); loadModels(); });
+    }).catch(function (e) {
+      setDiscResult(false, '批量添加失败：' + e);
+    });
   }
 
   (function bindModelDiscover() {
@@ -5092,6 +6143,6 @@ case 'idle': {
     btn.addEventListener('click', discoverModels);
     document.getElementById('disc-close').addEventListener('click', collapseDiscover);
     document.getElementById('disc-filter').addEventListener('input', renderDiscList);
-    document.getElementById('disc-add').addEventListener('click', fillSelectedDiscModel);
+    document.getElementById('disc-add').addEventListener('click', addSelectedDiscModels);
   })();
 })();

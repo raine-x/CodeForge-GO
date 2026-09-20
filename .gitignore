@@ -27,6 +27,11 @@ config/models.yaml
 # （pkg/server/models.yaml 曾被误提交进仓库），这里一并忽略，防复发。
 *models.yaml
 
+# --- 供应商库（设置页统一管理；**同样含明文 Key**：key_value 字段）
+# 与 models.yaml 是一对，漏掉它等于把密钥原样暴露给 git。
+config/providers.yaml
+*providers.yaml
+
 # --- 环境变量文件（密钥入口）
 .env
 .env.*

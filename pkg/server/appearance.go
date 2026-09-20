@@ -133,7 +133,7 @@ func (s *Server) handleAppearancePick(w http.ResponseWriter, r *http.Request) {
 				`$d.Filter = '图片|*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp'; ` +
 				`$d.Title = '选择背景图片'; ` +
 				`if ($d.ShowDialog() -ne 'OK') { exit }; Write-Output $d.FileName`)
-		s.finishPick(w, path, err, "背景图")
+		s.finishBackgroundPick(w, path, err)
 
 	case platform.IsTermux():
 		// 安卓系统选择器：termux-storage-get 会弹 SAF 图片选择器，
@@ -153,9 +153,7 @@ func (s *Server) handleAppearancePick(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "path": ""}) // 用户取消
 			return
 		}
-		s.cfg.Appearance.BackgroundPath = dest
-		s.saveLocalYAML(w, "外观设置保存失败")
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": dest, "background": true})
+		s.finishBackgroundPick(w, dest, nil)
 
 	default:
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -164,13 +162,49 @@ func (s *Server) handleAppearancePick(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// saveLocalYAML 把当前配置写回 local.yaml（失败时 500，调用方直接 return）。
-func (s *Server) saveLocalYAML(w http.ResponseWriter, what string) {
-	if dir := s.cfg.ConfigDir(); dir != "" {
-		if err := s.cfg.Save(filepath.Join(dir, "local.yaml")); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": what + ": " + err.Error()})
-		}
+// finishBackgroundPick 收尾「背景图选择」：校验 → **落库** → 响应。
+//
+// ⚠️ 落库这一步曾经缺失，是 2026-09-19 用户报「选完图啥也没有」的根因：
+// 只返回 {ok, path} 而不写 cfg.Appearance.BackgroundPath 的话，前端随即去请求
+// /api/appearance/background —— 那个接口读的正是这个字段，于是永远 404，
+// 界面上一点反应都没有（图层 .on 了，却没有图可画，也不报错）。
+//
+// 当年 Termux 分支顺手写了 cfg，Windows 分支漏了，所以故障只在 Windows 上暴露；
+// 两个分支现在统一走这里，避免再出现「某平台忘了写」。
+func (s *Server) finishBackgroundPick(w http.ResponseWriter, path string, err error) {
+	p, msg := validatePick(path, err, "背景图")
+	if msg != "" {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": msg})
+		return
 	}
+	if p == "" { // 用户取消
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "path": ""})
+		return
+	}
+	if !fileExists(p) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "背景图文件不存在: " + p})
+		return
+	}
+	s.cfg.Appearance.BackgroundPath = p
+	if !s.saveLocalYAML(w, "外观设置保存失败") {
+		return
+	}
+	// background:true 是给前端的「已落库」确认信号（前端据此决定是否补一次显式保存）。
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": p, "background": true})
+}
+
+// saveLocalYAML 把当前配置写回 local.yaml。返回 false 表示已写出 500 响应，
+// 调用方必须立即 return（否则会二次写 body，产出拼接的坏 JSON）。
+func (s *Server) saveLocalYAML(w http.ResponseWriter, what string) bool {
+	dir := s.cfg.ConfigDir()
+	if dir == "" {
+		return true // 无配置目录：无处可存，按成功处理（与旧行为一致）
+	}
+	if err := s.cfg.Save(filepath.Join(dir, "local.yaml")); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": what + ": " + err.Error()})
+		return false
+	}
+	return true
 }
 
 func fileExists(p string) bool {

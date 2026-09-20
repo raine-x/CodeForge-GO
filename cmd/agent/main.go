@@ -59,6 +59,10 @@ func main() {
 	noOpen := flag.Bool("no-open", false, "不自动打开浏览器")
 	flag.Parse()
 
+	// 配置目录统一解析（含「可执行文件旁」回退），stop / restart / start 共用同一份，
+	// 否则在错误 CWD 下 `stop` 会找不到运行信息文件。
+	*configDir = resolveConfigDir(*configDir)
+
 	switch sub {
 	case "stop":
 		stopInstanceCmd(*configDir)
@@ -333,12 +337,62 @@ func startCmd(configDir, workDir string, noOpen bool) int {
 	return 0
 }
 
+// resolveConfigDir 解析配置目录，必要时回退到「可执行文件旁」的同名目录。
+//
+// 背景：-config 是相对**当前工作目录**解析的，而用户很容易直接双击或运行
+// bin/ 下的可执行文件 —— 此时默认值 "config" 解析到 bin/config（不存在），
+// provider / 模型 / 外观 / 密钥 全部落回内置默认值，表现成
+// 「我上次设的背景图、模型配置，下次启动就没了」，而程序本身照常启动，极难自查。
+//
+// 回退规则（保守，绝不猜）：
+//   - CWD 相对路径下确实有 default.yaml → 原样使用，行为完全不变；
+//   - 否则若是相对路径，试 <exe目录>/../<dir>（对应仓库约定 <root>/bin/exe + <root>/config）；
+//     那里有 default.yaml 就用它，并打印提示；
+//   - 都不满足 → 原样返回，交给 warnConfigDir 告警。
+func resolveConfigDir(dir string) string {
+	resolved := resolveConfigDirAt(dir, exeDir())
+	if resolved != dir {
+		abs, _ := filepath.Abs(resolved)
+		log.Printf("提示：当前工作目录下没有 %s，已自动改用可执行文件旁的配置目录：%s", dir, abs)
+		log.Printf("提示：直接运行 bin/ 下的可执行文件会导致工作目录不对，建议用项目根目录的启动脚本（cf）。")
+	}
+	return resolved
+}
+
+// exeDir 返回可执行文件所在目录；取不到时返回空串（调用方按「不回退」处理）。
+func exeDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return filepath.Dir(exe)
+}
+
+// resolveConfigDirAt 是 resolveConfigDir 的可测版本：exeDir 由调用方注入，
+// 避免测试里依赖 os.Executable()（那会指向测试二进制）。
+func resolveConfigDirAt(dir, exeDir string) string {
+	if _, err := os.Stat(filepath.Join(dir, "default.yaml")); err == nil {
+		return dir
+	}
+	if filepath.IsAbs(dir) || exeDir == "" {
+		return dir // 绝对路径还找不到就是真找不到，不猜
+	}
+	cand := filepath.Join(exeDir, "..", dir)
+	if _, err := os.Stat(filepath.Join(cand, "default.yaml")); err != nil {
+		return dir
+	}
+	return cand
+}
+
 // warnConfigDir 在配置目录缺少 default.yaml 时给出醒目告警。
 //
 // 典型误用：在 bin/ 目录下直接执行 ./codeforge.exe。此时 -config 的默认值
 // "config" 会相对 CWD 解析到 bin/config/，于是 provider/model 全部落回内置
 // 默认值、项目根目录的 .env 也找不到，但程序仍能正常启动，问题极难察觉。
 // 这里只告警不中止：内置默认配置本身是合法用法（例如首次体验）。
+//
+// 注意：resolveConfigDir 已经尽力做过一次「可执行文件旁」的回退，
+// 走到这里说明两处都没有 —— 这时告警才是真正需要用户干预的信号。
 func warnConfigDir(configDir string) {
 	if _, err := os.Stat(filepath.Join(configDir, "default.yaml")); err == nil {
 		return

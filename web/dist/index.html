@@ -64,8 +64,10 @@
               · 在 #composer-wrap 之内 → 随输入卡片一起上下移动，宽度与它对齐。
             DOM 顺序在 #composer 之前是刻意的（不用 order 反转）：这样浏览器、
             读屏器、以及我们的前端断言看到的顺序都是「清单在上、输入在下」。
-            内容由 renderTodoBar() 填充，空列表时也保留面板并显示占位文案。 -->
-        <div id="todo-bar" class="todo-bar">
+            内容由 renderTodoBar() 填充；**默认带 hidden**（默认关闭）——
+            只有 AI 真的调用过任务清单（todos 非空）才会显形，
+            HTML 里就写好 hidden 是为了避免 JS 执行前闪一下空壳面板。 -->
+        <div id="todo-bar" class="todo-bar hidden">
           <div class="todo-head" id="todo-head" role="button" tabindex="0"
                aria-expanded="true" aria-controls="todo-body" title="点击折叠 / 展开">
             <span class="todo-title">任务清单</span>
@@ -159,14 +161,20 @@
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
           <span>返回</span>
         </button>
+        <div class="nav-group">个人</div>
         <button class="nav-item active" data-page="general">
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.09a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.09a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z"/></svg>
           <span>常规</span>
         </button>
-        <button class="nav-item nav-add" id="nav-models">
-          <span class="nav-plus">＋</span>
+        <button class="nav-item" id="nav-models">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.6 20.5 7v10L12 21.4 3.5 17V7z"/><path d="M3.5 7 12 11.6 20.5 7M12 11.6v9.8"/></svg>
           <span>模型</span>
         </button>
+        <button class="nav-item" data-page="appearance">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+          <span>外观</span>
+        </button>
+        <div class="nav-group">扩展</div>
         <button class="nav-item" data-page="memory">
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a3 3 0 0 0-3 3v1a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-6"/><path d="M12 3v4"/><circle cx="10" cy="10" r=".6"/><circle cx="14" cy="10" r=".6"/><circle cx="10" cy="13" r=".6"/><circle cx="14" cy="13" r=".6"/><circle cx="10" cy="16" r=".6"/><circle cx="14" cy="16" r=".6"/></svg>
           <span>记忆</span>
@@ -187,13 +195,10 @@
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="2.4"/><circle cx="19" cy="12" r="2.4"/><circle cx="12" cy="5" r="2.4"/><circle cx="12" cy="19" r="2.4"/><path d="M7.2 10.8 10.4 6.7M16.8 10.8 13.6 6.7M7.2 13.2l3.2 4.1M16.8 13.2l-3.2 4.1"/></svg>
           <span>MCP 服务</span>
         </button>
+        <div class="nav-group">数据</div>
         <button class="nav-item" data-page="archived">
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8v13H3V8M1 3h22v5H1zM10 12h4"/></svg>
           <span>归档</span>
-        </button>
-        <button class="nav-item" data-page="appearance">
-          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
-          <span>外观</span>
         </button>
       </aside>
       <div class="settings-content">
@@ -511,16 +516,26 @@
           </div>
         </section>
 
-        <!-- 模型管理：列表 / 添加（列表的「编辑」复用同一表单，标题切为「编辑模型」） -->
+        <!-- 模型管理：模型列表 / 供应商管理 / 添加模型
+             供应商持有 Base URL 与密钥，其下模型只填 id —— 同供应商下切换模型不必重复配置 -->
         <section id="page-models" class="settings-page">
           <div class="models-tabs">
             <button type="button" class="models-tab active" data-mtab="list">模型列表</button>
+            <button type="button" class="models-tab" data-mtab="prov">供应商管理</button>
             <button type="button" class="models-tab" data-mtab="config">添加模型</button>
           </div>
 
-          <!-- 模型列表 -->
+          <!-- 模型列表：按供应商分组，逐行「设为当前」 -->
           <div id="mtab-list" class="mtab-pane active">
             <div id="model-items" class="settings-card model-items"></div>
+          </div>
+
+          <!-- 供应商管理：左列供应商 / 右侧详情（连接信息 + 其下模型） -->
+          <div id="mtab-prov" class="mtab-pane">
+            <div class="prov-md">
+              <div class="prov-list" id="prov-list"></div>
+              <div class="prov-detail" id="prov-detail"></div>
+            </div>
           </div>
 
           <!-- 添加模型（编辑复用同款表单，仅标题切换） -->
@@ -528,15 +543,23 @@
             <div class="settings-card">
               <div id="mf-title" class="mf-title">添加模型</div>
               <div class="form-grid">
+                <label class="f-field"><span>归属供应商</span>
+                  <select id="mf-prov"></select>
+                </label>
+                <!-- 选定供应商后：地址与密钥自动继承，表单里不再重复出现这两项 -->
+                <div class="f-field" id="mf-inherit-field" hidden>
+                  <span>请求地址 / 密钥</span>
+                  <div class="mf-inherit" id="mf-inherit"></div>
+                </div>
                 <label class="f-field"><span>显示名称</span><input id="mf-name" type="text" placeholder="界面显示的名称"></label>
                 <label class="f-field"><span>模型 id</span>
                   <div class="id-row">
                     <input id="mf-id" type="text" placeholder="如 gpt-4o / claude-sonnet-4">
-                    <button type="button" id="mf-discover" title="向上游请求模型列表，选中后填入模型 id">获取模型列表</button>
+                    <button type="button" id="mf-discover" title="向上游请求模型列表，可勾选多个一次性批量添加">获取模型列表</button>
                   </div>
                 </label>
-                <label class="f-field"><span>请求地址</span><input id="mf-url" type="text" placeholder="https://api.openai.com/v1"></label>
-                <div class="f-field">
+                <label class="f-field" id="mf-url-field"><span>请求地址</span><input id="mf-url" type="text" placeholder="https://api.openai.com/v1"></label>
+                <div class="f-field" id="mf-key-field">
                   <span>密钥</span>
                   <div class="key-row">
                     <div class="key-seg" id="mf-key-seg">
@@ -550,7 +573,7 @@
                     </span>
                   </div>
                 </div>
-                <label class="f-field"><span>兼容协议</span>
+                <label class="f-field" id="mf-proto-field"><span>兼容协议</span>
                   <select id="mf-proto">
                     <option value="openai">OpenAI</option>
                     <option value="anthropic">Anthropic</option>
@@ -559,8 +582,10 @@
                 <div class="f-field ctx-row">
                   <span>上下文</span>
                   <div class="ctx-inputs">
-                    <label>输入 <input id="mf-ctx-in" type="number" value="262144"></label>
-                    <label>输出 <input id="mf-ctx-out" type="number" value="131072"></label>
+                    <!-- 输入/输出改成「预置档位 + 自定义」的下拉：档位由 ui.js 的
+                         buildCtxPicker 填充（预置档见 CTX_PRESETS_IN / _OUT）。 -->
+                    <label>输入 <span id="mf-ctx-in-host"></span></label>
+                    <label>输出 <span id="mf-ctx-out-host"></span></label>
                   </div>
                 </div>
               </div>

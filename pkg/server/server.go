@@ -60,6 +60,9 @@ type Server struct {
 
 	// modelStore 是设置页统一管理的模型库（config/models.yaml）。
 	modelStore *config.ModelStore
+	// providerStore 是模型连接信息的归属地（config/providers.yaml）：
+	// 模型条目只留 id，Base URL / 协议 / 密钥由它统一持有。
+	providerStore *config.ProviderStore
 
 	// plugins 是插件配置（侧栏 MCP 入口展示用）。
 	plugins []config.PluginConfig
@@ -85,15 +88,21 @@ func (s *Server) SetPluginManager(m *plugins.Manager) { s.pluginManager = m }
 // New 构造 Web 服务。
 func New(cfg *config.Config, ag *agent.Agent, executor *tools.Executor, registry *tools.Registry, fsys Undoer) *Server {
 	s := &Server{
-		cfg:        cfg,
-		agent:      ag,
-		executor:   executor,
-		registry:   registry,
-		fs:         fsys,
-		token:      randomToken(),
-		modelStore: config.NewModelStore(modelStorePath(cfg)),
-		plugins:    cfg.Plugins,
-		done:       make(chan struct{}),
+		cfg:           cfg,
+		agent:         ag,
+		executor:      executor,
+		registry:      registry,
+		fs:            fsys,
+		token:         randomToken(),
+		modelStore:    config.NewModelStore(modelStorePath(cfg)),
+		providerStore: config.NewProviderStore(providerStorePath(cfg)),
+		plugins:       cfg.Plugins,
+		done:          make(chan struct{}),
+	}
+	// 把旧 models.yaml（每条模型各自保存 base_url + 密钥）归并成供应商。
+	// 失败只记日志不阻断启动：迁移不了顶多维持旧格式，模型照常可用。
+	if err := s.ensureProvidersMigrated(); err != nil {
+		log.Printf("[server] 供应商归并失败（模型仍按自带连接信息工作）: %v", err)
 	}
 	// 启动即把当前生效模型的上下文窗口同步给 Agent：压缩阈值（窗口 × 95%）
 	// 从第一轮对话就生效，而不是等用户在设置里点一次「应用」。
@@ -175,6 +184,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/models/save", s.requireAuth(s.handleModelSave))
 	mux.HandleFunc("/api/models/delete", s.requireAuth(s.handleModelDelete))
 	mux.HandleFunc("/api/models/apply", s.requireAuth(s.handleModelApply))
+	mux.HandleFunc("/api/providers/list", s.requireAuth(s.handleProviderList))
+	mux.HandleFunc("/api/providers/save", s.requireAuth(s.handleProviderSave))
+	mux.HandleFunc("/api/providers/delete", s.requireAuth(s.handleProviderDelete))
 	mux.HandleFunc("/api/shutdown", s.handleShutdown)
 	mux.HandleFunc("/ws", s.requireAuth(s.handleWS))
 	mux.HandleFunc("/", s.handleRoot)

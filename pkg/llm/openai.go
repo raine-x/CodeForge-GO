@@ -271,6 +271,16 @@ func (p *OpenAIProvider) consume(ctx context.Context, r io.Reader, out chan<- St
 					send(ctx, out, StreamEvent{Type: EventToolUseStart, ToolUseID: id, ToolName: tc.Function.Name})
 				} else if tc.Function.Name != "" && names[tc.Index] == "" {
 					names[tc.Index] = tc.Function.Name
+					// ⚠️ 必须**补发**一次 ToolUseStart。
+					//
+					// OpenAI 兼容协议允许把 function.name 拆在后续 delta 里 —— 首个 delta
+					// 可能只带 index/arguments（甚至只带 id）。上面 `if !seen` 那次已经把
+					// ToolUseStart 发出去了，当时 ToolName 是空的。
+					// 消费端 agent.go 只在 ToolName 非空时才回填名字，所以这里若只更新本地
+					// map 而不补发事件，**落库的 tool_use 块就会没有 name**。
+					// 后果：前端回放该会话历史时 toolLabel 拿到 undefined 抛异常，
+					// 中断整次回放 → 侧栏高亮停在上一个会话（2026-09-19 实际故障）。
+					send(ctx, out, StreamEvent{Type: EventToolUseStart, ToolUseID: id, ToolName: tc.Function.Name})
 				}
 				if tc.Function.Arguments != "" {
 					send(ctx, out, StreamEvent{Type: EventToolUseDelta, ToolUseID: id, InputDelta: tc.Function.Arguments})

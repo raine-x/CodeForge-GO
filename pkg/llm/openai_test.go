@@ -92,3 +92,64 @@ func TestOpenAIConsumeNormalStopNoError(t *testing.T) {
 		}
 	}
 }
+
+// 上游把 function.name 拆在**后续** delta 里时，适配器必须补发一次 ToolUseStart。
+//
+// 背景（2026-09-19 实际故障）：OpenAI 兼容协议允许首个 tool_call delta 只带 id，
+// name 稍后才到。适配器原本只在首个 delta 发一次 ToolUseStart（那时 name 是空的），
+// 后续补 name 时只改了本地 map、没补发事件 —— 于是消费端（agent.go）拿不到名字，
+// 落库的 tool_use 块缺 name。后果是前端回放该会话历史时 toolLabel 拿到 undefined 抛异常，
+// 中断整次回放，侧栏高亮停在上一个会话（表现为「切过去没有选中态」）。
+func TestOpenAIConsumeReemitsToolStartWhenNameArrivesLate(t *testing.T) {
+	body := strings.Join([]string{
+		// 首个 delta：只有 id，没有 name
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","function":{"arguments":""}}]}}]}`,
+		``,
+		// name 在第二个 delta 才到
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file"}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"a.txt\"}"}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	var starts []string
+	for _, ev := range runConsume(t, body) {
+		if ev.Type == EventToolUseStart {
+			starts = append(starts, ev.ToolName)
+		}
+	}
+	if len(starts) < 2 {
+		t.Fatalf("name 迟到时必须补发一次 ToolUseStart，实际只发了 %d 次: %q", len(starts), starts)
+	}
+	if last := starts[len(starts)-1]; last != "read_file" {
+		t.Fatalf("补发的 ToolUseStart 应带真实工具名，实际 %q（全部: %q）", last, starts)
+	}
+}
+
+// 反例保护：name 在首个 delta 就到位时，**不该**多补发（否则消费端会收到重复事件）。
+func TestOpenAIConsumeDoesNotReemitWhenNameArrivesFirst(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","function":{"name":"read_file","arguments":""}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}`,
+		``,
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	var starts int
+	for _, ev := range runConsume(t, body) {
+		if ev.Type == EventToolUseStart {
+			starts++
+		}
+	}
+	if starts != 1 {
+		t.Fatalf("name 首个 delta 就到位时只应发 1 次 ToolUseStart，实际 %d 次", starts)
+	}
+}

@@ -316,23 +316,31 @@ func runPSDialog(body string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// finishPick 统一收尾：对话框失败 → 500；路径非法 UTF-8 → 500（宁可报错也不放损坏的路径过去）；
-// 正常 → {ok, path}，用户取消时 ok=false 且 path 为空。
+// validatePick 校验对话框返回值，返回 (清理后的路径, 错误文案)。
+// 错误文案非空 = 应报 500；路径为空且无错误 = 用户取消。
 //
 // 为什么非法 UTF-8 要报错而不是照用：损坏的工作区路径会一路写进会话的 workspace 键，
 // 再被重命名/新建会话反复放大（见 memory 里那次 '????' 事故）。
-func (s *Server) finishPick(w http.ResponseWriter, path string, err error, what string) {
+func validatePick(path string, err error, what string) (string, string) {
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "打开系统对话框失败: " + err.Error()})
-		return
+		// 用户取消（退出码 -1073741510 / Ctrl-C 类）以外的情况都视为对话框失败
+		return "", "打开系统对话框失败: " + err.Error()
 	}
 	if path != "" && !utf8.ValidString(path) {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": "所选" + what + "路径不是合法 UTF-8（PowerShell 输出编码异常）：请把该" + what + "改成纯英文名后重试",
-		})
+		return "", "所选" + what + "路径不是合法 UTF-8（PowerShell 输出编码异常）：请把该" + what + "改成纯英文名后重试"
+	}
+	return path, ""
+}
+
+// finishPick 统一收尾：对话框失败 → 500；路径非法 UTF-8 → 500；正常 → {ok, path}。
+// 注意它**不落库** —— 需要持久化的场景（如背景图）请用 finishBackgroundPick。
+func (s *Server) finishPick(w http.ResponseWriter, path string, err error, what string) {
+	p, msg := validatePick(path, err, what)
+	if msg != "" {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": msg})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": path != "", "path": path})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": p != "", "path": p})
 }
 
 // pickFolderWindows 通过 PowerShell 调用 .NET FolderBrowserDialog（零 CGO）。

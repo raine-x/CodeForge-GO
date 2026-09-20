@@ -1,21 +1,27 @@
 // models.go 实现服务端「模型库」：设置页统一管理的模型条目。
 //
-// 设计要点（与 local.yaml 的关系）：
+// 设计要点（与 local.yaml、providers.yaml 的关系）：
 //   - local.yaml 只保留「当前生效」的 LLM 配置（单数），由设置页「应用」动作写入；
 //   - models.yaml 保存「模型库」（复数），是设置页模型列表的唯一数据源；
-//   - 密钥明文只存在服务端这两个被 .gitignore 忽略的文件里，**绝不下发前端**
+//   - providers.yaml 保存「供应商」（见 providers.go），持有 Base URL / 协议 / 密钥；
+//     模型条目通过 provider_id 引用它，连接信息留空即继承。
+//   - 密钥明文只存在服务端这几个被 .gitignore 忽略的文件里，**绝不下发前端**
 //     （前端历史实现把明文 key 存进 localStorage，属于安全隐患，已废弃）。
 //
 // 文件格式（config/models.yaml，与 local.yaml 同级、同权限 0600）：
 //
 //	models:
-//	  - id: z-ai/glm-5.3-free
-//	    name: GLM
-//	    base_url: https://api.tokenrouter.com/v1
+//	  - id: deepseek-v4-flash-0731
+//	    name: DeepSeekV4Flash
+//	    provider_id: p-discovery-api-intern-ai-org-cn   # 地址与密钥都在供应商上
+//	    ctx_in: 262144
+//	    ctx_out: 131072
+//	  - id: gpt-4o                                     # 自带连接信息（旧格式，仍支持）
+//	    name: GPT-4o
+//	    base_url: https://api.openai.com/v1
 //	    protocol: openai
 //	    key_source: env
-//	    key_name: CODEFORGE_API_KEY
-//	    key_value: ""
+//	    key_name: OPENAI_API_KEY
 package config
 
 import (
@@ -29,16 +35,21 @@ import (
 )
 
 // ModelEntry 是模型库中的一条模型配置。
+//
+// 自供应商机制引入后，连接信息（BaseURL / Protocol / Key*）全部降级为
+// **可选覆盖**：留空即继承 ProviderID 指向的供应商。正常配置里这些字段都是空的，
+// 只有「同一个供应商下某个模型需要走不同地址或不同密钥」这种例外才填。
 type ModelEntry struct {
-	ID        string `yaml:"id" json:"id"`                 // 模型 id（唯一键），如 z-ai/glm-5.3-free
-	Name      string `yaml:"name" json:"name"`             // 显示名，可空（空则回退 ID）
-	BaseURL   string `yaml:"base_url" json:"base_url"`     // 请求地址，官方默认端点可留空
-	Protocol  string `yaml:"protocol" json:"protocol"`     // openai | anthropic（兼容协议；历史 custom 归一化为 openai）
-	KeySource string `yaml:"key_source" json:"key_source"` // env | plain
-	KeyName   string `yaml:"key_name" json:"key_name"`     // 环境变量名（KeySource=env 时）
-	KeyValue  string `yaml:"key_value" json:"-"`           // 明文 Key（KeySource=plain 时），绝不序列化到 JSON
-	CtxIn     int    `yaml:"ctx_in,omitempty" json:"ctx_in,omitempty"`     // 输入上下文上限（tokens，无单位直填），0 表示未设置
-	CtxOut    int    `yaml:"ctx_out,omitempty" json:"ctx_out,omitempty"`   // 输出上限（tokens，无单位直填），应用时写入 LLM.MaxTokens
+	ID         string `yaml:"id" json:"id"`                                       // 模型 id（唯一键），如 z-ai/glm-5.3-free
+	Name       string `yaml:"name" json:"name"`                                   // 显示名，可空（空则回退 ID）
+	ProviderID string `yaml:"provider_id,omitempty" json:"provider_id,omitempty"` // 归属供应商；空 = 自带连接信息（旧格式，仍完全可用）
+	BaseURL    string `yaml:"base_url,omitempty" json:"base_url"`                 // 覆盖：请求地址；留空继承供应商
+	Protocol   string `yaml:"protocol,omitempty" json:"protocol"`                 // 覆盖：openai | anthropic；留空继承供应商
+	KeySource  string `yaml:"key_source,omitempty" json:"key_source"`             // 覆盖：env | plain；留空继承供应商
+	KeyName    string `yaml:"key_name,omitempty" json:"key_name"`                 // 覆盖：环境变量名（KeySource=env 时）
+	KeyValue   string `yaml:"key_value,omitempty" json:"-"`                       // 覆盖：明文 Key（KeySource=plain 时），绝不序列化到 JSON
+	CtxIn      int    `yaml:"ctx_in,omitempty" json:"ctx_in,omitempty"`           // 输入上下文上限（tokens，无单位直填），0 表示未设置
+	CtxOut     int    `yaml:"ctx_out,omitempty" json:"ctx_out,omitempty"`         // 输出上限（tokens，无单位直填），应用时写入 LLM.MaxTokens
 }
 
 // DisplayName 返回界面展示名：优先 name，回退 id。
@@ -101,7 +112,12 @@ func (s *ModelStore) loadLocked() error {
 	for _, m := range f.Models {
 		if v := strings.TrimSpace(m.ID); v != "" {
 			m.ID = v
-			m.Protocol = NormalizeModelProtocol(m.Protocol)
+			m.ProviderID = strings.TrimSpace(m.ProviderID)
+			// 协议留空表示「继承供应商」，不能在这里被归一化成 openai ——
+			// 否则供应商是 anthropic 时，条目会被自己的空值覆盖掉。
+			if strings.TrimSpace(m.Protocol) != "" {
+				m.Protocol = NormalizeModelProtocol(m.Protocol)
+			}
 			s.entries = append(s.entries, m)
 		}
 	}
@@ -165,7 +181,11 @@ func (s *ModelStore) Upsert(m ModelEntry) error {
 	if m.ID == "" {
 		return fmt.Errorf("模型 id 不能为空")
 	}
-	m.Protocol = NormalizeModelProtocol(m.Protocol)
+	m.ProviderID = strings.TrimSpace(m.ProviderID)
+	// 空协议 = 继承供应商，保持空；非空才归一化（custom → openai）。
+	if strings.TrimSpace(m.Protocol) != "" {
+		m.Protocol = NormalizeModelProtocol(m.Protocol)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// 必须先懒加载：否则首次 Upsert 的修改会被随后的 List() 触发的
@@ -200,18 +220,46 @@ func (s *ModelStore) Delete(id string) bool {
 }
 
 // Sanitized 返回脱敏视图：明文 key 不下发，只给「是否已配置」。
+//
+// 输出的是**未解析**的原始字段（base_url 可能为空 = 继承供应商）。设置页要的是
+// 补齐后的视图，用 SanitizedResolved。
 func (s *ModelStore) Sanitized() []map[string]any {
-	entries := s.List()
+	return sanitizeEntries(s.List(), nil)
+}
+
+// SanitizedResolved 返回脱敏视图，并用供应商把连接信息补齐后再输出。
+// 这样前端拿到的 base_url / protocol / key_set 就是「实际会用的那一份」，
+// 不必自己再拼一遍继承逻辑。
+func (s *ModelStore) SanitizedResolved(ps *ProviderStore) []map[string]any {
+	return sanitizeEntries(s.List(), ps)
+}
+
+func sanitizeEntries(entries []ModelEntry, ps *ProviderStore) []map[string]any {
 	out := make([]map[string]any, len(entries))
-	for i, m := range entries {
+	for i, raw := range entries {
+		m := ResolveModel(raw, ps)
+		// 供应商**显示名**：主界面模型弹层要按「供应商 ↓ 显示名称」列出，
+		// 只给 provider_id 的话前端还得自己再拉一份供应商表来拼。
+		// ps 为 nil（未解析视图）时留空，前端回退到只显示名称。
+		provName := ""
+		if ps != nil && strings.TrimSpace(raw.ProviderID) != "" {
+			if p, ok := ps.Find(raw.ProviderID); ok {
+				provName = p.Name
+				if strings.TrimSpace(provName) == "" {
+					provName = p.ID
+				}
+			}
+		}
 		out[i] = map[string]any{
-			"id":         m.ID,
-			"name":       m.Name,
-			"base_url":   m.BaseURL,
-			"protocol":   m.Protocol,
-			"key_source": m.KeySource,
-			"key_name":   m.KeyName,
-			"key_set":    s.entryKeySet(m),
+			"id":            m.ID,
+			"name":          m.Name,
+			"provider_id":   raw.ProviderID,
+			"provider_name": provName,
+			"base_url":      m.BaseURL,
+			"protocol":      m.Protocol,
+			"key_source":    m.KeySource,
+			"key_name":      m.KeyName,
+			"key_set":       EntryKeySet(m),
 			// 上下文上限必须下发：设置页表单要回显、上下文进度条要展示模型窗口。
 			// 早前漏了这两项，表单只能落到前端默认值（262144），用户改过也看不到。
 			"ctx_in":  m.CtxIn,
@@ -221,12 +269,61 @@ func (s *ModelStore) Sanitized() []map[string]any {
 	return out
 }
 
-// entryKeySet 判断条目是否有可用密钥（env 命名变量已设置，或明文非空）。
-func (s *ModelStore) entryKeySet(m ModelEntry) bool {
-	if strings.EqualFold(m.KeySource, "env") {
+// EntryKeySet 判断一条（已补齐供应商信息的）条目是否有可用密钥：
+// env 命名的变量已设置，或明文非空。
+func EntryKeySet(m ModelEntry) bool {
+	if strings.EqualFold(strings.TrimSpace(m.KeySource), "env") {
 		return strings.TrimSpace(os.Getenv(strings.TrimSpace(m.KeyName))) != ""
 	}
 	return strings.TrimSpace(m.KeyValue) != ""
+}
+
+// ResolveModel 用供应商补齐条目上留空的连接信息，返回「实际会用的那一份」。
+//
+// 找不到供应商（条目自带连接信息，或供应商已被删）时原样返回，只是把空协议
+// 兜底成 openai —— 旧格式条目因此完全不受供应商机制影响。
+func ResolveModel(m ModelEntry, ps *ProviderStore) ModelEntry {
+	if strings.TrimSpace(m.Protocol) != "" {
+		m.Protocol = NormalizeModelProtocol(m.Protocol)
+	}
+	id := strings.TrimSpace(m.ProviderID)
+	if ps == nil || id == "" {
+		if m.Protocol == "" {
+			m.Protocol = "openai"
+		}
+		return m
+	}
+	p, ok := ps.Find(id)
+	if !ok {
+		if m.Protocol == "" {
+			m.Protocol = "openai"
+		}
+		return m
+	}
+	return m.MergeProvider(p)
+}
+
+// MergeProvider 返回把供应商连接信息补齐后的副本：条目上的非空字段优先，
+// 因此单条模型仍可以覆盖地址或协议（例外场景），但默认什么都不用填。
+//
+// 密钥按「三件套整体继承」处理：条目只要没有自己的 KeyName 与 KeyValue，
+// 就整套（来源 / 变量名 / 明文）取自供应商 —— 逐字段继承会拼出
+// 「来源=plain、变量名=别人的 env 名、值=空」这种自相矛盾的组合。
+func (m ModelEntry) MergeProvider(p Provider) ModelEntry {
+	out := m
+	if strings.TrimSpace(out.BaseURL) == "" {
+		out.BaseURL = p.BaseURL
+	}
+	if strings.TrimSpace(out.Protocol) == "" {
+		out.Protocol = p.Protocol
+	}
+	if strings.TrimSpace(out.KeyName) == "" && strings.TrimSpace(out.KeyValue) == "" {
+		out.KeySource = p.KeySource
+		out.KeyName = p.KeyName
+		out.KeyValue = p.KeyValue
+	}
+	out.Protocol = NormalizeModelProtocol(out.Protocol)
+	return out
 }
 
 // NormalizeModelProtocol 把协议名归一化到 openai | anthropic。

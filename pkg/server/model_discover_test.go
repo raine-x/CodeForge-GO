@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"codeforge/config"
 )
@@ -585,5 +587,48 @@ func TestModelSaveBatchRejectsEmpty(t *testing.T) {
 	getResp.Body.Close()
 	if getResp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("GET 期望 405，实际 %d", getResp.StatusCode)
+	}
+}
+
+// 超时报错必须能区分「连不通」与「上游慢」。
+//
+// 背景：早先无论什么原因超时都报「上游响应过慢，请稍后重试或检查网络」，
+// 而用户实际遇到的往往是**地址根本连不上**（境外服务在部分网络下就是连不通）。
+// 照着这句话排查会一直往「上游慢」的方向找，方向就是错的。
+//
+// 用 httptest 挂住不响应来**稳定**命中超时分支 —— 靠真实网络复现不了：
+// 连不通时大多会立刻被拒，或被中间代理回 502，根本走不到超时。
+func TestFetchModelListTimeoutMessageIsDiagnostic(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done() // 一直挂到客户端放弃
+	}))
+	defer srv.Close()
+
+	old := upstreamTimeout
+	upstreamTimeout = 200 * time.Millisecond // 别真等 30 秒
+	defer func() { upstreamTimeout = old }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), upstreamTimeout)
+	defer cancel()
+
+	s := &Server{}
+	_, _, err := s.fetchModelList(ctx, srv.URL, "openai", "dummy")
+	if err == nil {
+		t.Fatal("上游挂住不响应，应当报超时")
+	}
+	msg := err.Error()
+
+	if !strings.Contains(msg, "未能连上") {
+		t.Fatalf("超时文案应说明「连不上」，而不只是「上游慢」，实际: %s", msg)
+	}
+	if strings.Contains(msg, "上游响应过慢") {
+		t.Fatalf("不应再出现「上游响应过慢」这种单一归因: %s", msg)
+	}
+	host := strings.TrimPrefix(srv.URL, "http://")
+	if !strings.Contains(msg, host) {
+		t.Fatalf("文案应带上出问题的主机名（%s），实际: %s", host, msg)
+	}
+	if !strings.Contains(msg, "200ms") {
+		t.Fatalf("文案里的时长应取自 upstreamTimeout（200ms），不该写死 30s，实际: %s", msg)
 	}
 }

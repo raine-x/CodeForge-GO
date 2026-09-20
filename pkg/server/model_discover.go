@@ -20,6 +20,13 @@ type discoveredModel struct {
 	InLibrary bool   `json:"in_library,omitempty"` // 模型库中是否已有，前端据此标记「已添加」
 }
 
+// upstreamTimeout 是「向上游发单次请求」的超时，模型列表拉取与连接测试共用同一档。
+//
+// 提成变量而非常量：测试要能缩短它，否则验证超时分支的用例每次都得真等 30 秒。
+// 它同时是超时文案里那个时长的来源 —— 写死「30s」的话，
+// 一旦有人调大/调小超时，报错就开始骗人。
+var upstreamTimeout = 30 * time.Second
+
 // handleModelDiscover 拉取上游 /models 列表，供「添加模型」时勾选。
 //
 // 与 /api/models/test 的「所见即所测」不同，这里允许回退：
@@ -36,6 +43,9 @@ func (s *Server) handleModelDiscover(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体解析失败"})
 		return
 	}
+	// 选定供应商时，地址 / 协议 / 密钥都从供应商取 —— 前端因此不必重复提交，
+	// 也保证了「列出上游模型」用的就是该供应商真实生效的那一份配置。
+	req = s.applyProviderDefaults(req)
 
 	proto := config.NormalizeModelProtocol(req.Protocol)
 	base := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
@@ -59,7 +69,7 @@ func (s *Server) handleModelDiscover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second) // 覆盖慢网关
+	ctx, cancel := context.WithTimeout(r.Context(), upstreamTimeout) // 覆盖慢网关
 	defer cancel()
 
 	// base_url 约定已含版本段（如 https://host/v1），因此首选 base+/models；
@@ -118,7 +128,13 @@ func (s *Server) fetchModelList(ctx context.Context, url, proto, key string) ([]
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, 0, fmt.Errorf("请求超时（30s）：上游响应过慢，请稍后重试或检查网络")
+			// ⚠️ 别一口咬定是「上游慢」：连不通时（SYN 被丢、地址在部分网络下不可达）
+			// 也会走到这里，两者的排查方向完全不同。带上主机名，并给出「先确认可达」的动作。
+			// 时长取 upstreamTimeout，不写死 —— 见该变量的注释。
+			return nil, 0, fmt.Errorf(
+				"请求超时（%s）：未能连上 %s。既可能是上游响应慢，也可能是当前网络到该地址不通"+
+					"（域名能解析、但 TCP 连不上，境外服务在部分网络下就是这样）。"+
+					"请先用浏览器或 curl 确认该地址可达，再重试", upstreamTimeout, httpReq.URL.Host)
 		}
 		return nil, 0, fmt.Errorf("请求失败：%v", err)
 	}
@@ -258,26 +274,31 @@ func modelFromAny(v any) (discoveredModel, bool) {
 	return discoveredModel{}, false
 }
 
-// modelBatchSaveReq 是「勾选后批量添加」的请求体：
-// 每条模型共用同一套连接信息（地址 / 协议 / 密钥），只有 id 与显示名不同。
+// modelBatchSaveReq 是「勾选后批量添加」的请求体。
+//
+// 两种形态：
+//   - 指定 provider_id：每条模型只需 id（与可选显示名），地址与密钥由供应商提供 ——
+//     这是「同一个供应商下一次性补进多个模型 id」的主路径；
+//   - 不指定 provider_id：沿用旧行为，整批共用同一套连接信息（写进每条条目）。
 type modelBatchSaveReq struct {
 	Models []struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
 	} `json:"models"`
-	BaseURL   string `json:"base_url"`
-	Protocol  string `json:"protocol"`
-	KeySource string `json:"key_source"`
-	KeyName   string `json:"key_name"`
-	KeyValue  string `json:"key_value"`
-	CtxIn     int    `json:"ctx_in"`
-	CtxOut    int    `json:"ctx_out"`
+	ProviderID string `json:"provider_id"`
+	BaseURL    string `json:"base_url"`
+	Protocol   string `json:"protocol"`
+	KeySource  string `json:"key_source"`
+	KeyName    string `json:"key_name"`
+	KeyValue   string `json:"key_value"`
+	CtxIn      int    `json:"ctx_in"`
+	CtxOut     int    `json:"ctx_out"`
 }
 
 // handleModelSaveBatch 批量添加模型（一次 Upsert + 一次落盘）。
 //
 // 已存在的条目一律**跳过而不覆盖**：批量添加的语义是「把上游还没有的补进来」，
-// 覆盖会悄悄改掉用户手调过的 base_url / 密钥 / 上下文上限。
+// 覆盖会悄悄改掉用户手调过的上下文上限等设置。
 func (s *Server) handleModelSaveBatch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -294,6 +315,14 @@ func (s *Server) handleModelSaveBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	store := s.ModelStore()
+	ps := s.ProviderStore()
+	providerID := strings.TrimSpace(req.ProviderID)
+	if providerID != "" {
+		if _, ok := ps.Find(providerID); !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "供应商不存在: " + providerID})
+			return
+		}
+	}
 	proto := config.NormalizeModelProtocol(req.Protocol)
 	keySource := "env"
 	if strings.EqualFold(strings.TrimSpace(req.KeySource), "plain") {
@@ -313,15 +342,19 @@ func (s *Server) handleModelSaveBatch(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		entry := config.ModelEntry{
-			ID:        id,
-			Name:      strings.TrimSpace(item.Name),
-			BaseURL:   strings.TrimSpace(req.BaseURL),
-			Protocol:  proto,
-			KeySource: keySource,
-			KeyName:   strings.TrimSpace(req.KeyName),
-			KeyValue:  strings.TrimSpace(req.KeyValue),
-			CtxIn:     req.CtxIn,
-			CtxOut:    req.CtxOut,
+			ID:         id,
+			Name:       strings.TrimSpace(item.Name),
+			ProviderID: providerID,
+			CtxIn:      req.CtxIn,
+			CtxOut:     req.CtxOut,
+		}
+		// 未指定供应商时才把连接信息写进条目本身（旧行为，条目自带连接信息）。
+		if providerID == "" {
+			entry.BaseURL = strings.TrimSpace(req.BaseURL)
+			entry.Protocol = proto
+			entry.KeySource = keySource
+			entry.KeyName = strings.TrimSpace(req.KeyName)
+			entry.KeyValue = strings.TrimSpace(req.KeyValue)
 		}
 		if err := store.Upsert(entry); err != nil {
 			failed = append(failed, id)
@@ -344,6 +377,7 @@ func (s *Server) handleModelSaveBatch(w http.ResponseWriter, r *http.Request) {
 		"added_ids":   added,
 		"skipped_ids": skipped,
 		"failed_ids":  failed,
-		"models":      store.Sanitized(),
+		"models":      store.SanitizedResolved(ps),
+		"providers":   ps.Sanitized(),
 	})
 }
