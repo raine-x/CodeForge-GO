@@ -115,6 +115,27 @@ func TestDefaultSystemPromptHasTaskWorkflow(t *testing.T) {
 	}
 }
 
+// 编辑纪律必须在场：「本该局部改却把整份文件重写一遍（+2200/-2170）」的根因
+// 是局部改动没有划算的写法 + 模型看不到自己搅动了多少行。提示词要把这几条钉住，
+// 免得日后精简提示词时被当成废话删掉。
+func TestDefaultSystemPromptHasEditDiscipline(t *testing.T) {
+	p := DefaultSystemPrompt("/tmp/proj")
+	for _, want := range []string{
+		"改已有文件一律用精确替换",
+		"多处改动", "一次调用", // 多处替换合并进一次提交，别一处一个来回
+		"共 N 行",     // 大文件分页读，别指望一次读完
+		"+N/-M",     // 覆盖写入的抖动统计要回到模型眼前
+		"本会话没读过的文件", // 先读后写闸门，并说明这不是故障
+		"任务运行中可能夹进来新的用户消息", // 转向语义：换方向，不重启
+		"编译或类型检查通过不等于验证过",  // 界面改动的验证边界
+		"连续两次没结果就换路",       // 失败即换策略，不三连
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("提示词缺少编辑/验证纪律 %q", want)
+		}
+	}
+}
+
 // 体积上限：System Prompt 每一轮都注入，膨胀会直接吃上下文预算。
 func TestDefaultSystemPromptSizeBudget(t *testing.T) {
 	p := DefaultSystemPrompt("/tmp/proj")

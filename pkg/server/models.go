@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"codeforge/config"
+	"codeforge/pkg/agent"
 )
 
 // modelTestReq 是测试连接请求。
@@ -29,6 +30,10 @@ type modelTestReq struct {
 	KeySrc     string `json:"key_source"` // env | plain
 	KeyName    string `json:"key_name"`   // 环境变量名
 	KeyValue   string `json:"key_value"`  // 明文 KEY
+	// ProbeContext 为真时，连通测试通过后继续逐档探测输入上下文上限。
+	// 单独一个开关而不是无条件跑：探测会向上游送一份大输入（成功那一档会真实计费），
+	// 用户可能只想确认「密钥和地址对不对」。
+	ProbeContext bool `json:"probe_context"`
 }
 
 // resolveKey 依表单来源解析 API Key（env 变量 → 明文）。
@@ -132,7 +137,19 @@ func (s *Server) handleModelTest(w http.ResponseWriter, r *http.Request) {
 		case <-time.After(8 * time.Second):
 		}
 		if n > 0 {
-			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": resp.StatusCode})
+			extra := map[string]any{"ok": true, "status": resp.StatusCode}
+			if req.ProbeContext {
+				// 基本连通性 OK 才值得探窗口：连不通时探测只会把无关错误解释成「窗口小」。
+				// 探测另起一份 context（沿用客户端断开即取消），它比单次测试慢得多。
+				pctx, pcancel := context.WithTimeout(r.Context(), probeTotalTimeout)
+				out := probeContextWindow(pctx, http.DefaultClient, apiURL, headers, req.Protocol, model)
+				pcancel()
+				extra["probe"] = out
+				if out.CtxIn > 0 {
+					extra["ctx_in"] = out.CtxIn
+				}
+			}
+			writeJSON(w, http.StatusOK, extra)
 		} else {
 			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "上游已接受请求但迟迟未开始输出，请稍后重试"})
 		}
@@ -184,6 +201,9 @@ func (s *Server) handleModelTest(w http.ResponseWriter, r *http.Request) {
 type modelApplyReq struct {
 	Model    string `json:"model"`
 	KeyValue string `json:"key_value"` // 可选：仅当库里该模型 key_set=false 时采用
+	// SessionID 用于「上下文护栏」：切换模型时校验当前会话的原始历史
+	// 是否已经超过目标模型的上下文窗口（见 handleModelApply）。
+	SessionID string `json:"session_id"`
 }
 
 // resolveEntryKey 解析一条模型配置的实际密钥：env 变量 → 明文 → 本次请求补充值。
@@ -398,11 +418,45 @@ func (s *Server) handleModelApply(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	// 上下文护栏：禁止把当前会话切到一个「装不下现有对话」的短上下文模型。
+	// 判定口径用**原始历史总量**（Raw，未压缩）—— 一旦切过去，整段历史塞不进
+	// 目标窗口就得立刻压缩，用户却未必意识到「为什么一切换就开始摘要」。
+	// 仅当目标模型声明了 ctx_in（>0）且当前会话确有历史时才拦截；否则放行。
+	if m.CtxIn > 0 && req.SessionID != "" {
+		if sess, found := s.agent.History().Get(req.SessionID); found && sess != nil {
+			raw := agent.EstimateTokens(sess.Messages)
+			if raw > m.CtxIn {
+				writeJSON(w, http.StatusConflict, map[string]any{
+					"ok": false,
+					"error": fmt.Sprintf(
+						"当前会话已累计约 %s tokens，超过该模型的上下文上限 %s tokens。"+
+							"切换后现有对话将放不进新模型的窗口，请先在当前模型下压缩/收尾，或新建会话再切换。",
+						humanTokens(raw), humanTokens(m.CtxIn)),
+					"code": "context_overflow",
+					"raw":  raw, "window": m.CtxIn,
+				})
+				return
+			}
+		}
+	}
+
 	if err := s.applyModelEntry(m, req.KeyValue); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "config": s.configView()})
+}
+
+// humanTokens 把 token 数格式化成易读单位（12.3k / 1.2M），供提示文案使用。
+func humanTokens(n int) string {
+	if n >= 1000000 {
+		return fmt.Sprintf("%.1fM", float64(n)/1000000)
+	}
+	if n >= 1000 {
+		return fmt.Sprintf("%.1fk", float64(n)/1000)
+	}
+	return fmt.Sprintf("%d", n)
 }
 
 // applyModelEntry 把一条**已入库**的模型条目设为「当前生效」配置并热切换 Provider。

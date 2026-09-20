@@ -72,3 +72,4 @@ venv/
 *.tmp
 *.log
 
+docs

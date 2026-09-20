@@ -67,6 +67,15 @@ type oaiToolCall struct {
 	ID       string      `json:"id"`
 	Type     string      `json:"type"`
 	Function oaiFunction `json:"function"`
+	// ExtraContent 回填上游的厂商私有字段（Gemini 的 thought_signature 走这里）。
+	// 用 any 而不是固定结构：不同兼容网关的嵌套略有差异，原样回送最稳。
+	ExtraContent any `json:"extra_content,omitempty"`
+}
+
+// thoughtSignatureKey 是思考签名在 OpenAI 兼容载荷里的固定路径：
+// tool_calls[i].extra_content.google.thought_signature。
+func thoughtSignatureKey(sig string) any {
+	return map[string]any{"google": map[string]any{"thought_signature": sig}}
 }
 
 type oaiMessage struct {
@@ -156,6 +165,12 @@ func convertOAIMessages(m Message) []oaiMessage {
 					Arguments: args,
 				},
 			})
+			if b.ThoughtSig != "" {
+				// 丢签名的后果是下一轮直接 400，工具链整条断掉，
+				// 所以历史上拿到过就必须一路带回去（含从 SQLite 读回的旧消息）。
+				n := len(toolCalls) - 1
+				toolCalls[n].ExtraContent = thoughtSignatureKey(b.ThoughtSig)
+			}
 		case BlockToolResult:
 			toolResults = append(toolResults, oaiMessage{
 				Role:       "tool",
@@ -205,6 +220,14 @@ type oaiChunk struct {
 					Name      string `json:"name"`
 					Arguments string `json:"arguments"`
 				} `json:"function"`
+				// ExtraContent 用 RawMessage 收：官方位置是
+				// extra_content.google.thought_signature，但自建网关会把它挂在
+				// 别的层级（甚至平铺在 tool call 上）。只认一种位置时，签名会被
+				// **静默**丢掉 —— 表现为下一轮 400，且没有任何本地线索。
+				// 因此这里按「找到就用」处理，见 extractThoughtSignature。
+				ExtraContent json.RawMessage `json:"extra_content"`
+				// 平铺位置。
+				ThoughtSignature string `json:"thought_signature"`
 			} `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
@@ -214,6 +237,38 @@ type oaiChunk struct {
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
+}
+
+// extractThoughtSignature 从工具调用的原始载荷里取思考签名，不猜死位置。
+//
+// 已知有三种落点：官方 extra_content.google.thought_signature、
+// extra_content 直下、以及平铺在 tool call 上。写死任一种，另一种就会
+// 被静默丢掉，而它的表现是「下一轮才 400」—— 离因太远，几乎查不到。
+func extractThoughtSignature(extra json.RawMessage, flat string) string {
+	if strings.TrimSpace(flat) != "" {
+		return flat
+	}
+	if len(extra) == 0 {
+		return ""
+	}
+	var node map[string]any
+	if err := json.Unmarshal(extra, &node); err != nil {
+		return ""
+	}
+	// 先本层，再往里看一层（google / 其它厂商命名都覆盖）。
+	if s, ok := node["thought_signature"].(string); ok && s != "" {
+		return s
+	}
+	for _, v := range node {
+		inner, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if s, ok := inner["thought_signature"].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 func (p *OpenAIProvider) consume(ctx context.Context, r io.Reader, out chan<- StreamEvent) {
@@ -284,6 +339,12 @@ func (p *OpenAIProvider) consume(ctx context.Context, r io.Reader, out chan<- St
 				}
 				if tc.Function.Arguments != "" {
 					send(ctx, out, StreamEvent{Type: EventToolUseDelta, ToolUseID: id, InputDelta: tc.Function.Arguments})
+				}
+				sig := extractThoughtSignature(tc.ExtraContent, tc.ThoughtSignature)
+				if sig != "" {
+					// 与参数增量同通道下发（ThoughtSig 字段），由消费端累加进该工具调用：
+					// 签名本身是 base64，可能整块到达也可能分块到达，累加两种都成立。
+					send(ctx, out, StreamEvent{Type: EventToolUseDelta, ToolUseID: id, ThoughtSig: sig})
 				}
 			}
 			if ch.FinishReason == "tool_calls" {

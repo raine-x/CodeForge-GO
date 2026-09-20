@@ -60,6 +60,40 @@ func UnifiedDiff(oldName, newName, oldText, newText string) string {
 	return sb.String()
 }
 
+// LineChurn 统计 oldText -> newText 的行级增删数（added, removed）。
+//
+// 为什么要单独算：编辑/写入工具的返回值原本只有字节数，模型看不到自己
+// 一次改了多少行。「覆盖式写入」把 2200 行文件整体重写、实际只动 30 行时，
+// 界面上报的是 +2200/-2170，而模型收到的却是「写入成功，34608 字节」——
+// 缺少这个信号，模型就没有从全量重写回到精确替换的纠正机会。
+func LineChurn(oldText, newText string) (added, removed int) {
+	a, b := splitLines(oldText), splitLines(newText)
+	// 与 UnifiedDiff 同一条退化线：LCS 是 O(n*m)，超大文件按位置逐行比对。
+	if len(a)*len(b) > 4_000_000 {
+		for i := 0; i < len(a) || i < len(b); i++ {
+			switch {
+			case i >= len(b):
+				removed++
+			case i >= len(a):
+				added++
+			case a[i] != b[i]:
+				added++
+				removed++
+			}
+		}
+		return added, removed
+	}
+	for _, o := range lcsDiff(a, b) {
+		switch o.kind {
+		case '+':
+			added++
+		case '-':
+			removed++
+		}
+	}
+	return added, removed
+}
+
 // writeHunk 输出 [start, end] 区间内的差异块。
 func writeHunk(sb *strings.Builder, ops []op, start, end int) {
 	oldStart, newStart := 1, 1

@@ -57,7 +57,7 @@ type LLMConfig struct {
 type AgentConfig struct {
 	MaxSteps           int `yaml:"max_steps"`
 	ContextTokenBudget int `yaml:"context_token_budget"`
-	// ContextCompressRatio 是自动压缩的触发比例，缺省 0.95（95%）。
+	// ContextCompressRatio 是自动压缩的触发比例，缺省 0.80（80%）。
 	// 压缩线 = (模型窗口 − 输出预留) × 该比例；
 	// 仅在模型窗口已知（模型库条目 ctx_in > 0）时按窗口计算，
 	// 窗口未知时改用 ContextTokenBudget 作为绝对阈值。
@@ -276,7 +276,7 @@ func Default() *Config {
 		Agent: AgentConfig{
 			MaxSteps:             500,
 			ContextTokenBudget:   120000,
-			ContextCompressRatio: 0.95,
+			ContextCompressRatio: 0.80,
 		},
 		Security: SecurityConfig{
 			DefaultDecision:     "ask",
@@ -455,7 +455,7 @@ func normalize(cfg *Config) {
 	// 压缩比例夹紧到 [0.5, 0.99]：太小会频繁压缩（每次都多一次模型调用），
 	// 太大则留给输出与摘要的空间不足。
 	if cfg.Agent.ContextCompressRatio < 0.5 || cfg.Agent.ContextCompressRatio > 0.99 {
-		cfg.Agent.ContextCompressRatio = 0.95
+		cfg.Agent.ContextCompressRatio = 0.80
 	}
 	if cfg.LLM.MaxTokens <= 0 {
 		cfg.LLM.MaxTokens = 8192

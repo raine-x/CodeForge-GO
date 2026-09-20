@@ -37,8 +37,8 @@ func TestSyncContextWindowDrivesCompressBudget(t *testing.T) {
 	if got["reserve"] != 131072 {
 		t.Errorf("reserve = %v，期望 131072（输出预留 = min(输出上限, 窗口/2)）", got["reserve"])
 	}
-	// (262144 − 131072) × 0.95 = 124518.4 → 四舍五入 124518
-	const wantBudget = 124518
+	// (262144 − 131072) × 0.80 = 104857.6 → 四舍五入 104858
+	const wantBudget = 104858
 	if got["budget"] != wantBudget {
 		t.Errorf("budget = %v，期望 %d", got["budget"], wantBudget)
 	}

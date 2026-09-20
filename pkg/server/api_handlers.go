@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"codeforge/config"
+	"codeforge/pkg/agent"
 	"codeforge/pkg/llm"
 )
 
@@ -515,6 +517,48 @@ func (s *Server) handleUndo(w http.ResponseWriter, r *http.Request) {
 		"ok":        true,
 		"path":      path,
 		"remaining": s.fs.UndoDepth(),
+	})
+}
+
+// handleContextCompress 主动压缩会话的较早历史（上下文面板上的「立即压缩上下文」）。
+//
+// 状态码分得细，是因为前端要给出不同说法：
+//   - 409：点早了（任务正在跑 / 没有可压缩的较早历史）—— 正常提示，不是故障；
+//   - 502：摘要这一步真的失败（上游报错）—— 历史未被改动，可以再试一次。
+func (s *Server) handleContextCompress(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体解析失败"})
+		return
+	}
+	id := strings.TrimSpace(body.SessionID)
+	if id == "" {
+		// 面板可能在会话建立前就被打开：退回当前工作区最近更新的那条。
+		id = s.agent.History().Latest(s.agent.WorkDir())
+	}
+	if id == "" {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "当前没有活动会话可压缩"})
+		return
+	}
+	info, err := s.agent.CompressNow(r.Context(), id)
+	if err != nil {
+		status := http.StatusBadGateway
+		if errors.Is(err, agent.ErrCompressBusy) || errors.Is(err, agent.ErrCompressNothing) {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "session_id": id,
+		"summarized": info.Summarized, "added": info.Added,
+		"before": info.Before, "after": info.After, "budget": info.Budget,
 	})
 }
 

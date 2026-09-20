@@ -198,6 +198,13 @@ func postJSON(
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		_ = resp.Body.Close()
 		apiErr := fmt.Errorf("LLM 请求失败 (%d): %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+		// 上游点名要「思考签名」时，把我们**实际送出去**的情况附在错误里。
+		// 少了这一句，用户只看到上游那句 missing a thought_signature，无法区分
+		// 「我们没回送」「上游压根没给签名」「旧会话里的历史调用本来就没签名」
+		// —— 三种成因的修法完全不同，甚至相反。
+		if bytes.Contains(msg, []byte("thought_signature")) {
+			apiErr = fmt.Errorf("%w（本次送出：%s）", apiErr, signatureSummary(body))
+		}
 		lastErr = apiErr
 
 		if !transientStatus[resp.StatusCode] || isQuotaExceeded(msg) || attempt >= policy.MaxAttempts {
@@ -280,4 +287,20 @@ func send(ctx context.Context, out chan<- StreamEvent, ev StreamEvent) {
 	case out <- ev:
 	case <-ctx.Done():
 	}
+}
+
+// signatureSummary 从已送出的请求体里统计函数调用与签名的数量（不解析结构，
+// 只要数量对得上就够定位成因；也因此不会把签名内容或密钥写进日志）。
+func signatureSummary(body []byte) string {
+	calls := bytes.Count(body, []byte(`"type":"function"`))
+	sigs := bytes.Count(body, []byte(`"thought_signature"`))
+	switch {
+	case calls == 0:
+		return "请求里没有函数调用，签名报错与本次请求无关"
+	case sigs == 0:
+		return fmt.Sprintf("%d 处函数调用，0 处带签名 → 上游在响应里没有给出签名（或签名位置未被识别）", calls)
+	case sigs < calls:
+		return fmt.Sprintf("%d 处函数调用，%d 处带签名 → 有 %d 处历史调用缺签名（多为修复前产生的旧会话，事后无法补造）", calls, sigs, calls-sigs)
+	}
+	return fmt.Sprintf("%d 处函数调用全部带签名 → 签名位置或格式不被上游接受", calls)
 }

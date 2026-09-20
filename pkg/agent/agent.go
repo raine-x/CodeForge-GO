@@ -29,6 +29,7 @@ const (
 	EventRetry       = "retry"    // 上游瞬时故障自动重试中
 	EventCompress    = "compress" // 上下文超阈值，已自动摘要压缩
 	EventEdit        = "edit"     // 历史被编辑重发截断（前端据此丢弃下方旧内容）
+	EventSteer       = "steer"    // 运行中收到的转向指令已并入上下文（下一个步骤边界生效）
 	EventRewind      = "rewind"   // 文件已按检查点回滚
 	EventDone        = "done"
 	EventError       = "error"
@@ -136,6 +137,13 @@ type Agent struct {
 	// HITL 判定 —— 隐藏 ≠ 禁止执行，若需隐藏即禁用应在 Executor 层加规则。
 	exposeMu sync.RWMutex
 	exposure func(name string) bool
+
+	// 中途转向（steering）：按会话暂存「运行中新收到的用户指令」，
+	// 在下一个步骤边界并入历史。见 steer.go。
+	// 三个字段都由 runMu 保护；map 延迟建表，因为部分调用方直接构造 Agent 字面量。
+	runMu   sync.Mutex
+	running map[string]bool
+	steers  map[string]*steerQueue
 }
 
 // New 构造 Agent 引擎。llmCfg 提供请求级参数（MaxTokens/Temperature），
@@ -364,6 +372,7 @@ func (a *Agent) prepareMessagesBudget(ctx context.Context, sess *Session, emit E
 
 	sess.summaryText = summary
 	sess.compressedUpTo = split
+	a.forgetReads(sess.ID)
 
 	next := a.requestView(sess)
 	after := EstimateTokens(next)
@@ -384,6 +393,23 @@ func (a *Agent) prepareMessagesBudget(ctx context.Context, sess *Session, emit E
 	return next
 }
 
+// forgetReads 在压缩生效后作废该会话的文件阅读登记。
+//
+// 压缩掉的段落里往往就有 read_file 的原文：此后模型对那份文件的了解只剩摘要，
+// 再让它直接覆盖写入，写出来的就是「凭印象重排的一整份文件」。
+// 登记一清，模型必须重读那一段才能落笔 —— 多一次定向读取，换回内容不被抹掉。
+func (a *Agent) forgetReads(sessionID string) {
+	// 只做摘要的轻量 Agent 没有注册表，压缩照常发生，闸门自然无需维护。
+	if a.registry == nil {
+		return
+	}
+	for _, tool := range a.registry.List() {
+		if g, ok := tool.(tools.ReadGate); ok {
+			g.ForgetReads(sessionID)
+		}
+	}
+}
+
 // degradedCompress 是压缩的兜底路径：摘要不可用（调用失败 / 无安全切点 /
 // 适配器未就绪）时退回机械压缩，保证请求一定不超窗。
 //
@@ -391,6 +417,7 @@ func (a *Agent) prepareMessagesBudget(ctx context.Context, sess *Session, emit E
 // 「已摘要」。下一轮只要摘要恢复可用，仍会正常走摘要路径。
 func (a *Agent) degradedCompress(sess *Session, view []llm.Message, used, budget, split int, emit Emitter) []llm.Message {
 	out := Compress(view, budget)
+	a.forgetReads(sess.ID)
 	after := EstimateTokens(out)
 	log.Printf("[compress] 会话=%s 摘要不可用，回退机械压缩（阈值=%d 候选切点=%d）%d → %d tokens",
 		sess.ID, budget, split, used, after)
@@ -637,12 +664,47 @@ func (a *Agent) runLoopWithPersistence(ctx context.Context, sess *Session, emit 
 	return a.runLoopWithLimit(ctx, sess, emit, persist, a.MaxSteps())
 }
 
+// injectSteers 把排队中的转向指令作为用户消息并入历史（见 steer.go）。
+//
+// 注入点是「新步骤开始、上一次工具结果已入账」这个边界：工具结果已经写进历史，
+// 模型收到转向指令时看到的是「做到哪一步、拿到了什么」，而不是半截的推理。
+// 刻意不掐断正在飞行中的那次请求 —— 那只会留下一条不完整的助手回复。
+func (a *Agent) injectSteers(sess *Session, emit Emitter, persist bool) {
+	texts := a.drainSteer(sess.ID)
+	if len(texts) == 0 {
+		return
+	}
+	a.appendSteers(sess, texts, emit)
+	a.save(sess, persist)
+}
+
+// appendSteers 把指令作为用户消息并入历史并广播事件（落盘由调用方负责）。
+func (a *Agent) appendSteers(sess *Session, texts []string, emit Emitter) {
+	for _, t := range texts {
+		sess.Messages = append(sess.Messages, llm.TextMessage(llm.RoleUser, t))
+		a.lastUserInput = t // 技能触发词按最新一条用户输入匹配
+	}
+	log.Printf("[steer] 会话=%s 已并入 %d 条中途指令", sess.ID, len(texts))
+	emit(Event{Type: EventSteer, Text: strings.Join(texts, "\n")})
+}
+
+// maxEmptyTurnRetries 是空回合的自动重试次数。
+// 设 1 而不是更多：空回合绝大多数是上游瞬时抖动，一次足够；
+// 真成性问题（输出上限太小、模型不支持工具调用）重试再多次也只是白等，
+// 不如早点把原因摊到用户面前。
+const maxEmptyTurnRetries = 1
+
 func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitter, persist bool, limit int) error {
+	a.beginRun(sess.ID)
+	defer a.endRun(sess.ID)
+	// 连续空回合计数（判据与提示见循环内）：任意一轮产出正文或工具调用就归零。
+	emptyTurns := 0
 	for step := 1; step <= limit; step++ {
 		if err := ctx.Err(); err != nil {
 			a.save(sess, persist)
 			return err
 		}
+		a.injectSteers(sess, emit, persist)
 		emit(Event{Type: EventStep, Step: step})
 		system := a.systemPromptFor(sess)
 		definitions := a.registry.DefinitionsFor(a.exposureFn())
@@ -710,17 +772,50 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 			tc := tc0
 			tc.Name = a.registry.ResolveWire(tc0.Name)
 			blocks = append(blocks, llm.ContentBlock{
-				Type:  llm.BlockToolUse,
-				ID:    tc.ID,
-				Name:  tc.Name,
-				Input: tc.Input,
+				Type:       llm.BlockToolUse,
+				ID:         tc.ID,
+				Name:       tc.Name,
+				Input:      tc.Input,
+				ThoughtSig: tc.ThoughtSig,
 			})
 		}
 		if len(blocks) > 0 {
 			sess.Messages = append(sess.Messages, llm.AssistantBlocksMessage(blocks))
 		}
 
+		if turn.Text != "" || len(turn.ToolCalls) > 0 {
+			emptyTurns = 0 // 本轮有产出，之前的空回合不再累计
+		}
+
 		if len(turn.ToolCalls) == 0 {
+			// 收尾前再看一眼队列：模型自认为说完了，但用户可能刚好在这一步按了转向。
+			// 这里直接退出等于把用户的话吞掉（endRun 会丢弃未消费的指令），
+			// 所以并入之后继续跑下一轮，让指令一定有落点。
+			if texts := a.drainSteer(sess.ID); len(texts) > 0 {
+				a.appendSteers(sess, texts, emit)
+				a.save(sess, persist)
+				continue
+			}
+			// 空回合：既没正文也没工具调用。思考型上游偶尔只回 reasoning_content，
+			// 或流被静默截断（实测 glm 连读十余个文件后出现过一次）。
+			// 当成「回答完毕」收摊的话，界面上就是任务凭空停了、一句话也没有，
+			// 用户只能自己猜是不是额度用完了 —— 先重试一次，仍然空就明确中止。
+			if strings.TrimSpace(turn.Text) == "" {
+				emptyTurns++
+				if emptyTurns <= maxEmptyTurnRetries {
+					log.Printf("[agent] 会话=%s 第 %d 步是空回合（思考 %d 字、正文 0 字、工具 0 次），重试",
+						sess.ID, step, turn.ReasoningLen)
+					emit(Event{Type: EventRetry, Error: "模型本轮没有返回内容，正在重试",
+						Attempt: emptyTurns, MaxAttempts: maxEmptyTurnRetries + 1})
+					continue
+				}
+				a.save(sess, persist)
+				if turn.ReasoningLen > 0 {
+					return fmt.Errorf("模型连续 %d 次只返回思考、没有正文也没有工具调用，本轮中止。"+
+						"重发一句「继续」通常就能接上；反复出现请调大设置里的「输出上限」或换个模型", emptyTurns)
+				}
+				return fmt.Errorf("模型连续 %d 次返回空内容，本轮中止。可重发这句，或换个模型重试", emptyTurns)
+			}
 			a.save(sess, persist)
 			emit(Event{Type: EventDone})
 			return nil
@@ -789,6 +884,9 @@ func (a *Agent) save(sess *Session, persist bool) {
 type partialCall struct {
 	name string
 	args strings.Builder
+	// sig 累加上游随该工具调用下发的「思考签名」。它必须跟着这条调用一起
+	// 存进历史并原样回送，否则 Gemini 一类上游会在下一轮直接 400。
+	sig strings.Builder
 }
 
 // consumeStream 消费流式事件并拼装为一轮助手回复。
@@ -819,6 +917,7 @@ streamLoop:
 			turn.Text += ev.Text
 			emit(Event{Type: EventText, Text: ev.Text})
 		case llm.EventReasoningDelta:
+			turn.ReasoningLen += len([]rune(ev.Text))
 			emit(Event{Type: "reasoning", Text: ev.Text})
 		case llm.EventUsage:
 			if ev.Usage != nil {
@@ -839,7 +938,11 @@ streamLoop:
 			}
 		case llm.EventToolUseDelta:
 			if p, ok := parts[ev.ToolUseID]; ok {
-				p.args.WriteString(ev.InputDelta)
+				if ev.ThoughtSig != "" {
+					p.sig.WriteString(ev.ThoughtSig)
+				} else {
+					p.args.WriteString(ev.InputDelta)
+				}
 			}
 		case llm.EventError:
 			errMsg = ev.Error
@@ -862,9 +965,10 @@ streamLoop:
 			args = "{}"
 		}
 		turn.ToolCalls = append(turn.ToolCalls, llm.ToolCall{
-			ID:    id,
-			Name:  p.name,
-			Input: json.RawMessage(args),
+			ID:         id,
+			Name:       p.name,
+			Input:      json.RawMessage(args),
+			ThoughtSig: strings.TrimSpace(p.sig.String()),
 		})
 	}
 	return turn, nil

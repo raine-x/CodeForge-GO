@@ -63,6 +63,12 @@ type wsClient struct {
 
 	cancelMu sync.Mutex
 	cancel   context.CancelFunc
+	// runSeq 是「第几轮」的代号：每起一轮 +1，收尾时比对代号，
+	// 只有仍是当前轮的 goroutine 才允许改前端的运行态。
+	// 上一轮被打断后是异步收尾的，它那句迟到的 idle 若照发，
+	// 就会把紧接着起来的新一轮标成「已空闲」（按钮恢复、思考条消失，
+	// 看起来像任务凭空停了）。
+	runSeq int
 
 	// 任务完成通知的状态：页面可见性 + 节流时间戳。
 	notifyMu        sync.Mutex
@@ -116,25 +122,26 @@ func (c *wsClient) dispatch(msg wsMessage) {
 	ws := c.srv.agent.WorkDir() // 会话/记忆按工作区隔离
 	switch msg.Type {
 	case "user_message":
-		if strings.TrimSpace(msg.Text) == "" && len(msg.Attachments) == 0 {
+		c.startUserMessage(msg)
+
+	case "steer":
+		// 运行中追加指令（转向）：交给正在跑的循环在下一个步骤边界并入，
+		// 已产生的工具结果全部保留在上下文里。
+		text := strings.TrimSpace(msg.Text)
+		if text == "" {
 			return
 		}
-		sessionID := msg.SessionID
-		if sessionID == "" {
-			sess, err := c.srv.agent.History().Create(ws, "")
-			if err != nil {
-				c.send(map[string]any{"type": "error", "error": err.Error()})
-				return
-			}
-			sessionID = sess.ID
+		switch c.srv.agent.Steer(msg.SessionID, text) {
+		case agent.SteerQueued:
+			c.send(map[string]any{"type": "steer_queued", "session_id": msg.SessionID})
+		case agent.SteerFull:
+			c.send(map[string]any{"type": "error", "error": "转向指令排队已满，请等当前任务消化完再发"})
+		default:
+			// 没有运行中的循环：指令不该压在队列里等一个不会来的步骤边界，
+			// 按普通用户消息照常起一轮。
+			msg.Text = text
+			c.startUserMessage(msg)
 		}
-		go c.run(sessionID, msg.Thinking, "用户消息", msg.Text, func(ctx context.Context, emit func(agent.Event)) error {
-			images, err := readAttachmentImages(ws, msg.Attachments)
-			if err != nil {
-				return err
-			}
-			return c.srv.agent.RunWithImages(ctx, sessionID, msg.Text, images, emit)
-		})
 
 	case "regenerate":
 		// 重新生成：回退会话历史中最后一轮回复，基于同一条用户提问重跑。
@@ -238,6 +245,33 @@ func (c *wsClient) dispatch(msg wsMessage) {
 	}
 }
 
+// startUserMessage 起一轮正常的用户对话。
+//
+// 附件读取放在 run() 的 goroutine 里做：浏览器上传的暂存文件可能是一整个目录，
+// 留在读循环里会把后续消息（包括打断）一起堵死。
+func (c *wsClient) startUserMessage(msg wsMessage) {
+	if strings.TrimSpace(msg.Text) == "" && len(msg.Attachments) == 0 {
+		return
+	}
+	ws := c.srv.agent.WorkDir() // 会话按工作区隔离
+	sessionID := msg.SessionID
+	if sessionID == "" {
+		sess, err := c.srv.agent.History().Create(ws, "")
+		if err != nil {
+			c.send(map[string]any{"type": "error", "error": err.Error()})
+			return
+		}
+		sessionID = sess.ID
+	}
+	go c.run(sessionID, msg.Thinking, "用户消息", msg.Text, func(ctx context.Context, emit func(agent.Event)) error {
+		images, err := readAttachmentImages(ws, msg.Attachments)
+		if err != nil {
+			return err
+		}
+		return c.srv.agent.RunWithImages(ctx, sessionID, msg.Text, images, emit)
+	})
+}
+
 // run 在独立 goroutine 中执行一轮 Agent 交互（正常对话或重新生成）。
 // trigger/label 仅用于日志：明确「这一轮是谁、以什么方式触发的」，
 // 便于事后排查「我没操作，怎么跑了一轮」这类问题。
@@ -249,8 +283,18 @@ func (c *wsClient) run(sessionID, thinking, trigger, label string, agentFn func(
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancelMu.Lock()
 	c.cancel = cancel
+	c.runSeq++
+	mySeq := c.runSeq
 	c.cancelMu.Unlock()
 	defer cancel()
+
+	// owns 判断这一轮是否仍是「当前轮」：被打断的旧轮在收尾时要用它挡一遍，
+	// 否则迟到的 idle / error 会覆盖新一轮的运行态。
+	owns := func() bool {
+		c.cancelMu.Lock()
+		defer c.cancelMu.Unlock()
+		return c.runSeq == mySeq
+	}
 
 	// 将本连接的审批器注入 context，使 HITL 请求路由到当前浏览器。
 	ctx = tools.WithApprover(ctx, c.approver)
@@ -287,6 +331,12 @@ func (c *wsClient) run(sessionID, thinking, trigger, label string, agentFn func(
 	c.send(map[string]any{"type": "busy"})
 
 	runErr := agentFn(ctx, emit)
+	if !owns() {
+		// 已被新一轮取代（用户打断后立刻又发了话）：这一轮的收尾全部作废，
+		// 由接管它的那一轮负责发 idle / 刷新占用 / 通知。
+		log.Printf("[run] 会话=%s 本轮已被更新的轮次取代，跳过收尾事件", sessionID)
+		return
+	}
 	if runErr != nil && ctx.Err() == nil {
 		c.send(map[string]any{"type": "error", "error": runErr.Error()})
 	}

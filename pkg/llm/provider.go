@@ -43,6 +43,13 @@ type ContentBlock struct {
 	ToolUseID string          `json:"tool_use_id,omitempty"` // tool_result 关联的 tool_use id
 	Content   string          `json:"content,omitempty"`     // tool_result 内容
 	IsError   bool            `json:"is_error,omitempty"`    // tool_result 是否为错误
+	// ThoughtSig 是上游附在函数调用上的「思考签名」，仅 tool_use 使用。
+	//
+	// Gemini 3 的 OpenAI 兼容层把它放在 tool call 的
+	// extra_content.google.thought_signature，并要求后续请求**原样送回**：
+	// 漏掉就直接 400 INVALID_ARGUMENT（Function call is missing a thought_signature），
+	// 多轮工具调用彻底跑不动。它不是给人看的文本，只做透传，别去解析或改写。
+	ThoughtSig string `json:"thought_sig,omitempty"`
 }
 
 // Message 是一条对话消息。
@@ -120,8 +127,10 @@ type StreamEvent struct {
 	ToolUseID  string          `json:"tool_use_id,omitempty"`
 	ToolName   string          `json:"tool_name,omitempty"`
 	InputDelta string          `json:"input_delta,omitempty"`
-	Error      string          `json:"error,omitempty"`
-	Usage      *Usage          `json:"usage,omitempty"` // 仅 EventUsage 携带
+	// ThoughtSig 随 EventToolUseDelta 携带：该工具调用的思考签名（分块流式时按到达顺序累加）。
+	ThoughtSig string `json:"thought_sig,omitempty"`
+	Error      string `json:"error,omitempty"`
+	Usage      *Usage `json:"usage,omitempty"` // 仅 EventUsage 携带
 }
 
 // Request 是一次对话请求。
@@ -148,6 +157,8 @@ type ToolCall struct {
 	ID    string          `json:"id"`
 	Name  string          `json:"name"`
 	Input json.RawMessage `json:"input"`
+	// ThoughtSig 见 ContentBlock.ThoughtSig：上游给的思考签名，必须原样回送。
+	ThoughtSig string `json:"thought_sig,omitempty"`
 }
 
 // AssistantTurn 是模型一轮回复的汇总。
@@ -155,6 +166,9 @@ type AssistantTurn struct {
 	Text      string         `json:"text"`
 	ToolCalls []ToolCall     `json:"tool_calls"`
 	Blocks    []ContentBlock `json:"blocks"`
+	// ReasoningLen 是本轮收到的思考内容长度（仅用于判断「只回思考、没回正文」的空回合）。
+	// 只记长度不存正文：思考正文已经实时推给前端，再留一份在内存里纯属重复。
+	ReasoningLen int `json:"reasoning_len,omitempty"`
 }
 
 // NewProvider 按配置构造适配器。

@@ -325,7 +325,11 @@ func TestRunLoopCompressesRequestOverhead(t *testing.T) {
 	messages := buildTurns(5, 200)
 	messages = append(messages, llm.TextMessage(llm.RoleUser, "继续"))
 	sess := &Session{ID: "overhead", Messages: messages}
-	a.cfg.ContextTokenBudget = EstimateTokens(messages) + 100
+	// 预算按当前真实的请求开销给：历史单独放得下（B > 历史），
+	// 但扣掉「系统提示词 + 工具定义」的固定开销后放不下 —— 这正是要验证的口径。
+	// 写成绝对数值的话，提示词或工具描述一加长就会撞上「开销已占满预算」的上限告警。
+	overhead := requestOverhead(a.systemPrompt(), a.registry.DefinitionsFor(nil))
+	a.cfg.ContextTokenBudget = EstimateTokens(messages) + overhead/2
 	var compressed bool
 	err := a.runLoopWithPersistence(context.Background(), sess, func(ev Event) {
 		compressed = compressed || ev.Type == EventCompress
@@ -604,12 +608,12 @@ func TestCompressBudgetFromModelWindow(t *testing.T) {
 	}
 }
 
-// TestCompressRatioClamped 非法比例回退到 0.95，不让配置写坏阈值。
+// TestCompressRatioClamped 非法比例回退到 0.80，不让配置写坏阈值。
 func TestCompressRatioClamped(t *testing.T) {
 	for _, bad := range []float64{0, -1, 1, 2} {
 		a := newCtxAgent(config.AgentConfig{ContextCompressRatio: bad}, config.LLMConfig{MaxTokens: 1000}, nil)
 		a.SetContextWindow(100000)
-		want := int(float64(100000-1000) * 0.95)
+		want := int(float64(100000-1000) * 0.80)
 		if got := a.compressBudget(); got != want {
 			t.Errorf("比例 %v 未被夹紧：budget = %d，期望 %d", bad, got, want)
 		}

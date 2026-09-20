@@ -56,7 +56,7 @@ windows:
 linux-amd64:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-linux-amd64 $(CMD)
 
-## Linux arm64（树莓派 / 低配云主机）
+## Linux arm64（树莓派 / 低配云主机）—— 不在 all-platforms 里，需要时单独 make linux-arm64
 linux-arm64:
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-linux-arm64 $(CMD)
 
@@ -64,8 +64,8 @@ linux-arm64:
 android-arm64:
 	CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-android-arm64 $(CMD)
 
-## 全部平台
-all-platforms: windows linux-amd64 linux-arm64 android-arm64
+## 全部平台（默认不含 linux-arm64，见上）
+all-platforms: windows linux-amd64 android-arm64
 
 ## 全部测试（Go 单测 / 集成 + 前端渲染器 + LLM 端点 pytest）
 test: test-go test-web test-llm

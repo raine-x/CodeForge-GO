@@ -33,8 +33,8 @@ go build -o bin/codeforge     ./cmd/agent     # Linux / macOS
 
 # 或使用 Makefile（本机构建会自动带上正确的后缀，见 `make build`）
 make build
-# 交叉编译
-make windows linux-amd64 linux-arm64 android-arm64
+# 交叉编译（默认三件；Linux arm64 不在默认范围内，需要时 make linux-arm64）
+make windows linux-amd64 android-arm64
 ```
 
 ### 2. 配置 API Key
@@ -144,7 +144,7 @@ CodeForge 已启动：http://127.0.0.1:8420/
 |---|---|---|
 | Windows x64 | `bin/codeforge.exe` | 本机构建产物；`make windows` 另出 `codeforge-windows-amd64.exe` |
 | Linux x86_64 | `bin/codeforge-linux-amd64` | 云主机 / WSL |
-| Linux arm64 | `bin/codeforge-linux-arm64` | 树莓派 / ARM 云主机 |
+| Linux arm64 | `bin/codeforge-linux-arm64` | 树莓派 / ARM 云主机；**默认不编**，需要时 `make linux-arm64` |
 | Android Termux arm64 | `bin/codeforge-android-arm64` | `GOOS=android` 专为 Termux 编译 |
 
 ### 三条通用规则
@@ -169,7 +169,7 @@ cf restart                            # 停止后重启
 ### Linux x86_64 / arm64
 
 ```bash
-chmod +x codeforge-linux-amd64        # arm64 换成 codeforge-linux-arm64
+chmod +x codeforge-linux-amd64        # arm64 换成 codeforge-linux-arm64（默认不编，先 `make linux-arm64`）
 ./codeforge-linux-amd64 -config config
 ```
 

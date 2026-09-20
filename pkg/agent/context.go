@@ -3,7 +3,9 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -14,8 +16,13 @@ import (
 const (
 	// defaultContextBudget 是「模型窗口未知」时的兜底压缩线（tokens）。
 	defaultContextBudget = 120000
-	// defaultCompressRatio 是压缩线占模型窗口的比例：占用达到窗口的 95% 即触发压缩。
-	defaultCompressRatio = 0.95
+	// defaultCompressRatio 是压缩线占模型窗口的比例：占用达到窗口的 80% 即触发压缩。
+	//
+	// 之所以从 95% 提前到 80%：95% 时压缩前的最后几轮，模型是在「窗口将满」的
+	// 残血状态下推理，长任务后段质量明显下降；压缩本身是幂等的，提前触发只多
+	// 花一次摘要成本，换来的是整段对话都留有充足的推理余量（对齐 Claude Code
+	// 约 80% 的触发线）。README「宁可高估、提前压」的口径也指向同一方向。
+	defaultCompressRatio = 0.80
 	// minCompressRatio / maxCompressRatio 是配置夹紧区间。
 	minCompressRatio = 0.5
 	maxCompressRatio = 0.99
@@ -103,6 +110,9 @@ func EstimateTokens(msgs []llm.Message) int {
 			wide, narrow = countRunes(b.Content, wide, narrow)
 			wide, narrow = countRunes(string(b.Input), wide, narrow)
 			wide, narrow = countRunes(b.Name, wide, narrow)
+			// 思考签名也会随请求上行（Gemini 一类要求原样回送），是真实占位，
+			// 不计入就会低估送模体量、把压缩线算高。
+			wide, narrow = countRunes(b.ThoughtSig, wide, narrow)
 		}
 		// 角色、分隔符等结构开销。
 		wide += 4
@@ -458,6 +468,74 @@ func (a *Agent) summarizeChunk(ctx context.Context, prev, transcript string) (st
 		return "", fmt.Errorf("摘要超时或中断：%w", err)
 	}
 	return "", fmt.Errorf("摘要返回为空")
+}
+
+// ErrCompressBusy / ErrCompressNothing 是「用户点早了」两类可预期结果，
+// 与真正的失败（摘要调用出错）分开，好让界面上说明原因而不是报故障。
+var (
+	ErrCompressBusy    = errors.New("该会话的任务正在运行，请先打断再压缩")
+	ErrCompressNothing = errors.New("没有可压缩的较早历史：最近几轮需要保留原文，继续对话一段之后再压缩")
+)
+
+// CompressNow 主动把较早的历史并入摘要（上下文面板上的「立即压缩上下文」）。
+//
+// 与自动压缩走同一条摘要路径、同一个保留段预算，区别只有触发时机：
+// 用户明知后面用不到这些原文时，不必等到撞线才被动压缩。
+// Before/After 与自动口径一致地含请求开销（系统提示词 + 工具定义），
+// 因为界面上的占比就是按整个请求算的。
+func (a *Agent) CompressNow(ctx context.Context, sessionID string) (CompressInfo, error) {
+	sess, ok := a.history.Get(sessionID)
+	if !ok {
+		return CompressInfo{}, fmt.Errorf("会话不存在或已被删除")
+	}
+	if a.IsRunning(sessionID) {
+		return CompressInfo{}, ErrCompressBusy
+	}
+	// 与主循环同一套开销口径：只读会话（如摘要用的轻量 Agent）没有注册表。
+	var definitions []llm.ToolDef
+	if a.registry != nil {
+		definitions = a.registry.DefinitionsFor(a.exposureFn())
+	}
+	overhead := requestOverhead(a.systemPromptFor(sess), definitions)
+	budget := a.compressBudget() - overhead
+	if budget <= 0 {
+		return CompressInfo{}, fmt.Errorf("系统提示词和工具定义已占满上下文预算，请减少提示词或工具数量")
+	}
+
+	sess.normalizeCompression()
+	before := EstimateTokens(a.requestView(sess))
+	split := chooseSplit(sess.Messages, budget*keepRatioNum/keepRatioDen)
+	if split <= sess.compressedUpTo {
+		return CompressInfo{}, ErrCompressNothing
+	}
+
+	prev := sess.summaryText
+	added := split - sess.compressedUpTo
+	summary, err := a.summarizeRange(ctx, prev, sess.Messages, sess.compressedUpTo, split)
+	if err != nil {
+		return CompressInfo{}, err
+	}
+	if strings.TrimSpace(summary) == "" {
+		return CompressInfo{}, fmt.Errorf("摘要返回为空，未改动会话历史")
+	}
+
+	sess.summaryText = summary
+	sess.compressedUpTo = split
+	// 原文已被挤出送模视图，「这个会话读过它」不再成立（与自动压缩同一口径）。
+	a.forgetReads(sess.ID)
+	if err := a.history.Save(sess.ID); err != nil {
+		log.Printf("[compress] 会话=%s 主动压缩后落库失败：%v", sess.ID, err)
+	}
+
+	after := EstimateTokens(a.requestView(sess))
+	log.Printf("[compress] 会话=%s 主动压缩 阈值=%d 累计 %d 条（本次新增 %d）%d → %d tokens",
+		sess.ID, a.compressBudget(), split, added, before, after)
+	return CompressInfo{
+		Summarized: split, Added: added,
+		Before: before + overhead, After: after + overhead,
+		Budget: a.compressBudget(), Window: a.ContextWindow(),
+		Incremental: strings.TrimSpace(prev) != "",
+	}, nil
 }
 
 // summarizeRange 把 msgs[start:end] 并入既有摘要，返回新摘要。

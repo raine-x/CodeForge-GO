@@ -341,8 +341,22 @@ check('百分比用等宽数字防抖动', /\.ctx-pct\s*\{[^}]*tabular-nums/.tes
 check('占用过高变警告 / 危险色',
   /\.ctx-meter\.warn\s+\.ctx-fill\s*\{[^}]*var\(--warn\)/.test(css) &&
   /\.ctx-meter\.danger\s+\.ctx-fill\s*\{[^}]*var\(--danger\)/.test(css));
-check('明细弹层贴右边缘（否则侧栏内会溢出视口）',
-  /\.ctx-anchor\s+\.ctx-pop\s*\{[^}]*right:\s*0/.test(css));
+check('明细弹层向左取齐、向右生长（贴右锚定会被顶出侧栏左边缘）',
+  // 实测：侧栏只有 ~217px，而弹层 250px 宽（模型名一行就撑开），
+  // 用 right:0 锚定时左边缘跑到 x=-16 → 标题和每行标签都被裁掉。
+  // 改为 left:0 向右长（右侧是主对话区，永远在视口内）+ max-width 兜底。
+  /\.ctx-anchor\s+\.ctx-pop\s*\{[^}]*left:\s*0;[^}]*right:\s*auto/.test(css) &&
+  /\.ctx-anchor\s+\.ctx-pop\s*\{[^}]*max-width/.test(css));
+check('上下文面板提供「立即压缩上下文」动作（含后端接口与结果说明）',
+  /function ctxCompressBox\(\)/.test(uiSrc) &&
+  /fetch\('\/api\/context\/compress'/.test(uiSrc) &&
+  /立即压缩上下文/.test(uiSrc) &&
+  /\.ctx-pop \.ctx-compress:disabled/.test(css));
+check('主动压缩的结果与失败原因存成状态并回写面板（不静默、不被占用重绘冲掉）',
+  /let ctxManualNote = /.test(uiSrc) &&
+  /ctxManualNote = \(d && d\.error\)/.test(uiSrc) &&
+  /hint\.textContent = \(ctxManualNoteFor === sessionID && ctxManualNote\)/.test(uiSrc) &&
+  /ctxManualNoteFor = owner;/.test(uiSrc));
 check('前端订阅服务端 context 事件',
   /case 'context':[\s\S]{0,220}?renderCtxUsage\(ev\)/.test(uiSrc));
 check('点击进度条主动拉取最新占用', uiSrc.indexOf("type: 'context', session_id: sessionID") > 0);
@@ -496,7 +510,10 @@ check('但居中态仍要维护「跟随态 + 回到底部」判定（提前返�
 check('页面加载自动回放历史时不做过渡（composer-no-anim）',
   /#composer-wrap\.composer-no-anim\s*\{\s*transition:\s*none/.test(css));
 check('ready 自动恢复前重新武装「直接落位」标记',
-  /case 'ready':[\s\S]{0,500}?composerSnap\s*=\s*true/.test(uiSrc));
+  // 落位标记由 restoreStartSession 统一设：不论走 ?s= 深链还是回退到最近会话，
+  // 开场回放都不该让输入卡片滑一下。
+  /case 'ready':[\s\S]{0,400}?restoreStartSession\(\)/.test(uiSrc) &&
+  /function restoreStartSession\(\)\s*\{[\s\S]{0,200}?composerSnap\s*=\s*true;/.test(uiSrc));
 check('用户发言走平滑下放（submit 清掉落位标记后 addUser）',
   /composerSnap\s*=\s*false;[\s\S]{0,300}?addUser\(p\.display\)/.test(uiSrc));
 

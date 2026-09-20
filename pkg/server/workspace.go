@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -200,8 +201,23 @@ func (s *Server) handleStageFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	info, err := os.Stat(src)
-	if err != nil || info.IsDir() {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "文件不存在: " + src})
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "路径不存在: " + src})
+		return
+	}
+
+	// 目录：整棵复制进 attachments/<目录名>/（保持内部结构）。
+	if info.IsDir() {
+		stagedRoot, count, serr := stageDirectory(root, src)
+		if serr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "暂存文件夹失败: " + serr.Error()})
+			return
+		}
+		log.Printf("已暂存工作区外文件夹：%s → %s（%d 个文件）", src, stagedRoot, count)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "inside": false, "is_dir": true, "count": count,
+			"staged_path": stagedRoot, "name": filepath.Base(src),
+		})
 		return
 	}
 
@@ -249,6 +265,98 @@ func (s *Server) handleStageFile(w http.ResponseWriter, r *http.Request) {
 		"ok": true, "inside": false,
 		"staged_path": filepath.ToSlash(rel), "name": name,
 	})
+}
+
+// stageDirectory 把工作区外的目录整棵复制到 工作区/attachments/<目录名>/，
+// 保持内部相对结构。返回（相对工作区根的正斜杠路径, 复制的文件数, error)。
+//
+// 与单文件 stage 同一约定：attachments 不用 .codeforge（隐藏目录会被 tree/搜索
+// 排除）；同名文件若内容一致则复用、不重复复制；软链接与非普通文件一律跳过
+// （避免把指向区外的链接拷进来）。目录过大时截断并返回部分结果，防止误把整个
+// 磁盘塞进工作区。
+func stageDirectory(root, src string) (string, int, error) {
+	const (
+		maxFiles = 2000      // 单个文件夹最多复制的文件数
+		maxBytes = 512 << 20 // 累计字节上限（512MiB）
+		maxDepth = 32        // 目录嵌套深度上限
+	)
+	base := filepath.Base(src)
+	dstRoot := filepath.Join(root, "attachments", base)
+	// 目标根目录同名防覆盖：已存在且非空时追加 -1/-2 序号。
+	for i := 1; ; i++ {
+		fi, err := os.Stat(dstRoot)
+		if err != nil {
+			break // 不存在：可用
+		}
+		if fi.IsDir() {
+			if entries, _ := os.ReadDir(dstRoot); len(entries) == 0 {
+				break // 空目录可直接复用
+			}
+		}
+		dstRoot = filepath.Join(root, "attachments", base+"-"+strconv.Itoa(i))
+	}
+
+	count := 0
+	total := int64(0)
+	truncated := false
+	err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, p)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		depth := len(strings.Split(rel, string(filepath.Separator)))
+		if d.IsDir() {
+			if depth > maxDepth {
+				return filepath.SkipDir
+			}
+			return os.MkdirAll(filepath.Join(dstRoot, rel), 0o755)
+		}
+		if !d.Type().IsRegular() { // 跳过软链接、设备、管道等
+			return nil
+		}
+		if count >= maxFiles || total >= maxBytes {
+			truncated = true
+			return filepath.SkipAll
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		dst := filepath.Join(dstRoot, rel)
+		if sameFile(p, dst) { // 同名同内容复用（重复 stage 幂等）
+			count++
+			total += info.Size()
+			return nil
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(dst, data, 0o644); err != nil {
+			return err
+		}
+		count++
+		total += info.Size()
+		return nil
+	})
+	if err != nil {
+		return "", count, err
+	}
+	relRoot, _ := filepath.Rel(root, dstRoot)
+	out := filepath.ToSlash(relRoot)
+	if truncated {
+		return out, count, fmt.Errorf("文件夹过大，已截断（最多 %d 个文件 / %d MiB）", maxFiles, maxBytes>>20)
+	}
+	return out, count, nil
 }
 
 // sameFile 粗比较两个文件是否同一内容（大小一致且字节相同）。

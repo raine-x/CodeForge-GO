@@ -3,7 +3,8 @@
 ## 完成后的编译
 
 每次修改完成并验证后，默认进行全平台编译，除非用户明确指明不编译。
-产物放入 `bin/`：Windows amd64、Linux amd64、Linux arm64、Android arm64；同时更新本机入口 `bin/codeforge.exe`。
+产物放入 `bin/`：Windows amd64、Linux amd64、Android arm64；同时更新本机入口 `bin/codeforge.exe`。
+`bin/codeforge-linux-arm64` **不在默认编译范围内**（2026-09-20 起）：需要时用 `make linux-arm64` 单独出，或明确点名要求编译。
 使用 `CGO_ENABLED=0`、`-trimpath` 和 `-ldflags "-s -w"`。编译失败须如实说明，不得宣称已完成编译。
 
 ## 测试用例 / 临时文件 / 断言的位置

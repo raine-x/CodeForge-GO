@@ -53,6 +53,47 @@ func TestProjectMemorySection(t *testing.T) {
 	}
 }
 
+// 注入必须限幅：一份超长的 AGENTS.md 不能把「提示词 + 工具定义」顶过上下文预算，
+// 否则会话开局即报「开销已占满预算」；内容与已注入文件相同的副本不重复占位。
+func TestProjectMemorySectionCapsAndDedupes(t *testing.T) {
+	dir := t.TempDir()
+	a := &Agent{workDir: dir}
+
+	unit := "很长的项目约定内容。"
+	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"),
+		[]byte(strings.Repeat(unit, projectDocMaxRunes)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// CLAUDE.md 是 AGENTS.md 的副本（仅首尾空白不同）：去重后不应再出现。
+	if err := os.WriteFile(filepath.Join(dir, "CLAUDE.md"),
+		[]byte("  \n"+strings.Repeat(unit, projectDocMaxRunes)+"\n "), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sec := a.projectMemorySection()
+	if n := len([]rune(sec)); n > projectDocMaxRunes+600 {
+		t.Errorf("注入未限幅，注入段 %d 字（上限 %d）", n, projectDocMaxRunes)
+	}
+	if !strings.Contains(sec, "已截断") {
+		t.Error("超长文件应标注已截断，并告诉模型去哪读全文")
+	}
+	if strings.Contains(sec, "### CLAUDE.md") {
+		t.Error("内容与 AGENTS.md 相同的文件不应重复注入")
+	}
+
+	// 内容不同时要都在（AGENTS 在前）。
+	if err := os.WriteFile(filepath.Join(dir, "CLAUDE.md"), []byte("只跑 make test"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sec = a.projectMemorySection()
+	if !strings.Contains(sec, "### AGENTS.md") || !strings.Contains(sec, "### CLAUDE.md") {
+		t.Errorf("两份不同的说明文件都应注入: %s", sec[:min(300, len(sec))])
+	}
+	if strings.Index(sec, "### AGENTS.md") > strings.Index(sec, "### CLAUDE.md") {
+		t.Error("AGENTS.md 应排在 CLAUDE.md 之前")
+	}
+}
+
 // SKILL.md 解析：frontmatter 字段 + 正文 + enabled 开关。
 func TestParseSkill(t *testing.T) {
 	text := `---

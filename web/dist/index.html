@@ -7,6 +7,10 @@
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
+  <!-- 网页内顶部通知横幅（可复用）：固定于视口顶部，供各类「需要用户注意」的
+       提示统一使用（模型切换被护栏拦截、上下文将满、后台任务完成等）。
+       全程不用浏览器 Notification —— 一律走页内横幅。 -->
+  <div id="top-banner" class="top-banner hidden" role="status" aria-live="polite"></div>
   <div id="app">
     <!-- 左栏（可拖拽调宽，最窄 200px） -->
     <aside id="sidebar">

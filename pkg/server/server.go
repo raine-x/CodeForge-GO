@@ -168,6 +168,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/builtin-plugins", s.requireAuth(s.handleBuiltinPlugins))
 	mux.HandleFunc("/api/subagents", s.requireAuth(s.handleSubagentPrefs))
 	mux.HandleFunc("/api/undo", s.requireAuth(s.handleUndo))
+	mux.HandleFunc("/api/context/compress", s.requireAuth(s.handleContextCompress))
 	mux.HandleFunc("/api/workspace", s.requireAuth(s.handleWorkspace))
 	mux.HandleFunc("/api/pick_folder", s.requireAuth(s.handlePickFolder))
 	mux.HandleFunc("/api/pick_file", s.requireAuth(s.handlePickFile))

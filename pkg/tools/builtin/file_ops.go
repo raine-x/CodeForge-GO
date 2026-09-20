@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"codeforge/pkg/tools"
 )
@@ -30,6 +31,10 @@ type FS struct {
 	mu           sync.Mutex
 	undo         []Snapshot
 	maxUndo      int
+	// readSeen 是「哪个会话读过/改过哪个文件」的登记表，用于先读后写约束。
+	// 整个工作区共用一份 FS，故键必须带上会话 ID：子智能体与各会话之间
+	// 不能拿别人读过的原文下自己的笔。
+	readSeen map[string]bool
 }
 
 // NewFS 构造文件工具工作区。root 为空表示「未选择工作区」，
@@ -40,7 +45,7 @@ func NewFS(root string) *FS {
 			root = abs
 		}
 	}
-	return &FS{root: root, maxUndo: 100}
+	return &FS{root: root, maxUndo: 100, readSeen: map[string]bool{}}
 }
 
 // Root 返回工作区根目录（空字符串表示未选择工作区）。
@@ -70,6 +75,7 @@ func (f *FS) SetRoot(root string) {
 	defer f.mu.Unlock()
 	f.root = root
 	f.undo = nil
+	f.readSeen = map[string]bool{}
 }
 
 // SetAllowOutside 设置是否允许访问工作区之外的路径。
@@ -313,8 +319,145 @@ func (f *FS) UndoDepth() int {
 }
 
 // ---------------------------------------------------------------------------
+// 先读后写登记
+// ---------------------------------------------------------------------------
+
+// maxReadSeen 是登记表条目上限，只为封住无界增长，不做精细淘汰：
+// 淘汰的后果仅仅是「模型需要重读一次文件」，不会丢任何数据。
+const maxReadSeen = 20000
+
+func seenKey(sessionID, path string) string { return sessionID + "\n" + path }
+
+// markReadSeen 登记「本会话见过该文件的当前内容」：读成功算，
+// 自己刚改完也算（下一步往往是在刚才的改动上继续）。
+func (f *FS) markReadSeen(ctx context.Context, path string) {
+	sc, ok := tools.SessionFrom(ctx)
+	if !ok || sc.SessionID == "" {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.readSeen) >= maxReadSeen {
+		f.readSeen = map[string]bool{}
+	}
+	f.readSeen[seenKey(sc.SessionID, path)] = true
+}
+
+// requireReadSeen 是写操作的先读后写闸门。
+//
+// 为什么必须有：未经阅读就覆盖，模型依据的是记忆里（多半是压缩后摘要里）
+// 的旧版本，整份文件会按记忆重排一遍 —— 界面上就是 +2200/-2170，
+// 丢掉的是这一轮它根本没看到的内容。
+//
+// 两种情形不拦：
+//   - 目标文件不存在（新建）：没有可丢的旧内容；
+//   - 调用不在会话运行域内：无法判定「谁读过」，此时拦截只会让工具不可用。
+func (f *FS) requireReadSeen(ctx context.Context, path string, existed bool) error {
+	if !existed {
+		return nil
+	}
+	sc, ok := tools.SessionFrom(ctx)
+	if !ok || sc.SessionID == "" {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.readSeen[seenKey(sc.SessionID, path)] {
+		return nil
+	}
+	return fmt.Errorf("本会话还没读过 %s，不能凭记忆改写。先用 read_file 读取（大文件按返回末尾的行号窗口分段读），" +
+		"看到原文后再提交精确替换。", path)
+}
+
+// ForgetReads 作废该会话的全部阅读登记（实现 tools.ReadGate，由压缩路径调用）。
+//
+// 原文一旦被挤出送模视图，「这个会话读过它」就不再是事实了：此时放任模型
+// 覆盖写入，它依据的是摘要里的印象 —— 正是整份重排的来源。
+func (f *FS) ForgetReads(sessionID string) {
+	prefix := sessionID + "\n"
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for k := range f.readSeen {
+		if strings.HasPrefix(k, prefix) {
+			delete(f.readSeen, k)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // read_file
 // ---------------------------------------------------------------------------
+
+// 读取窗口的限幅参数。
+const (
+	// defaultReadLines 是单次读取的最大行数。
+	defaultReadLines = 2000
+	// maxReadBytes 是 read_file 自身返回值的字节上限。
+	//
+	// 它必须明显低于执行器的输出限幅（默认 32KiB）：撞到这里由本工具收尾，
+	// 并明确告诉模型「共多少行、读到第几行、怎么接着读」；
+	// 若放任长度长到限幅以上，执行器会按**字节位置**硬切一刀，模型拿到的
+	// 是一份悄悄少了一截的文件原文 —— 凭这份残本再整体覆盖写回，
+	// 尾部内容就静默丢了。
+	maxReadBytes = 24 * 1024
+	// maxLineRunes 是单行长度上限：压缩过的 JS/CSS 一行可达数百 KB，
+	// 单行就足以吃满整个上下文窗口。
+	maxLineRunes = 2000
+)
+
+// numberLines 把文本渲染成带行号的视图（cat -n 风格），并按 [start, end] 截取。
+//
+// 行号是精确替换的锚点：模型只有在「第 1234 行写着什么」这个坐标系里，
+// 才能在几百行的文件里准确定位到要改的那一处；没有锚点时它只能整体重写。
+// 返回实际读到的末行号；末行号小于 total 即说明还有内容未读。
+func numberLines(content string, start, end int) (text string, last, total int, lineTooLong int) {
+	lines := splitLines(content) // 已兼容 CRLF、丢弃末尾空行
+	total = len(lines)
+	if start < 1 {
+		start = 1
+	}
+	if start > total {
+		return "", 0, total, 0
+	}
+	if end > total {
+		end = total
+	}
+
+	var sb strings.Builder
+	written := 0
+	for i := start - 1; i < end; i++ {
+		line := lines[i]
+		if n := utf8.RuneCountInString(line); n > maxLineRunes {
+			line = string([]rune(line)[:maxLineRunes]) + fmt.Sprintf("…（本行共 %d 字，已截断）", n)
+			if lineTooLong == 0 {
+				lineTooLong = i + 1
+			}
+		}
+		rendered := fmt.Sprintf("%6d\t%s\n", i+1, line)
+		if written+len(rendered) > maxReadBytes {
+			// 字节预算用尽：就此收尾，交给调用方提示续读位置。
+			break
+		}
+		written += len(rendered)
+		sb.WriteString(rendered)
+		last = i + 1
+	}
+	return sb.String(), last, total, lineTooLong
+}
+
+// readWindow 把入参行范围归一为「本工具能够返回」的窗口。
+// 只给 start_line 时向后取满一个窗口；什么都不给时取首个窗口。
+func readWindow(startLine, endLine int) (start, end int) {
+	start = startLine
+	if start < 1 {
+		start = 1
+	}
+	end = endLine
+	if end <= 0 || end > start+defaultReadLines-1 {
+		end = start + defaultReadLines - 1
+	}
+	return start, end
+}
 
 // ReadFileTool 读取文件内容。
 type ReadFileTool struct{ fs *FS }
@@ -327,15 +470,18 @@ func (t *ReadFileTool) Name() string { return "read_file" }
 
 // Description 实现 tools.Tool。
 func (t *ReadFileTool) Description() string {
-	return "读取指定文本文件的内容，可选 start_line / end_line 限定行范围（1-based，含端点）。"
+	return "按行读取文件，每行以「行号 + 制表符」前缀标注（cat -n 风格）。" +
+		"单次最多返回 2000 行，未读满时用 start_line 继续；" +
+		"对 .docx / .pptx / .xlsx / .pdf 等文档会自动提取其中的文字（PDF 仅文本型，扫描件无法提取）。" +
+		"编辑文件时请从这些行号定位目标片段，old_string 仍需逐字照抄（不含行号前缀）。"
 }
 
 // InputSchema 实现 tools.Tool。
 func (t *ReadFileTool) InputSchema() json.RawMessage {
 	return tools.NewSchema().
 		Str("path", "文件路径（相对工作区或绝对路径，必须位于工作区内）", true).
-		Int("start_line", "起始行号，1-based，可选", false).
-		Int("end_line", "结束行号，1-based，含端点，可选", false).
+		Int("start_line", "起始行号，1-based，可选（默认从第 1 行）", false).
+		Int("end_line", "结束行号，1-based，含端点，可选（单次上限 2000 行）", false).
 		Build()
 }
 
@@ -366,25 +512,48 @@ func (t *ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (*tool
 	if err != nil {
 		return tools.Err("读取文件失败: %v", err), nil
 	}
-	content := string(data)
 
-	if p.StartLine > 0 || p.EndLine > 0 {
-		lines := strings.Split(content, "\n")
-		start := p.StartLine
-		if start <= 0 {
-			start = 1
+	content := string(data)
+	extracted := false
+	// 多格式文档（docx/pptx/xlsx/pdf）：自动提取文字后再按行窗口截取。
+	// 提取失败（扫描件 PDF、损坏的包等）把错误如实回给模型，不降级为乱码。
+	if text, ok, exErr := extractDocText(data, p.Path); ok {
+		if exErr != nil {
+			return tools.Err("文档文字提取失败: %v", exErr), nil
 		}
-		end := p.EndLine
-		if end <= 0 || end > len(lines) {
-			end = len(lines)
-		}
-		if start > len(lines) {
-			return tools.Ok(""), nil
-		}
-		content = strings.Join(lines[start-1:end], "\n")
+		content, extracted = text, true
+	}
+	// 只有「看到的就是文件本身」才算读过：文档提取出的是残缺正文，
+	// 拿它当依据写回原文件同样是在赌。
+	if !extracted {
+		t.fs.markReadSeen(ctx, path)
 	}
 
-	return tools.OkMeta(content, map[string]any{"path": path, "bytes": len(data)}), nil
+	start, end := readWindow(p.StartLine, p.EndLine)
+	text, last, total, longLine := numberLines(content, start, end)
+
+	meta := map[string]any{"path": path, "bytes": len(data), "total_lines": total}
+	if extracted {
+		meta["extracted"] = true
+	}
+	switch {
+	case total == 0:
+		return tools.OkMeta("（文件为空）", meta), nil
+	case last == 0:
+		// 起始行越界：明确告知文件真实长度，避免模型反复往后探。
+		return tools.OkMeta(fmt.Sprintf(
+			"（第 %d 行已超出文件末尾，该文件共 %d 行）", start, total), meta), nil
+	}
+	if longLine > 0 {
+		text += fmt.Sprintf("（注意：第 %d 行超长已截断，该行无法用于精确替换的原文比对。）\n", longLine)
+	}
+	if last < total {
+		text += fmt.Sprintf("（该文件共 %d 行，本次返回第 %d-%d 行；剩余 %d 行未读，需要时用 start_line=%d 继续。）",
+			total, start, last, total-last, last+1)
+		meta["truncated"] = true
+	}
+	meta["from"], meta["to"] = start, last
+	return tools.OkMeta(text, meta), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -505,14 +674,16 @@ func (t *WriteFileTool) Name() string { return "write_file" }
 
 // Description 实现 tools.Tool。
 func (t *WriteFileTool) Description() string {
-	return "将内容写入指定文件（覆盖式）。若文件不存在则创建，父目录自动补齐。"
+	return "整体覆盖写入文件：只在创建新文件或确需重写整份内容时使用（覆盖已有文件时，本会话内必须先读过它）。" +
+		"修改已有文件的局部内容一律用「编辑文件」的精确替换（多处改动就一次提交多处替换），" +
+		"覆盖式写入会把整份文件重新计算一遍差异（返回里会给出 +N/-M）。"
 }
 
 // InputSchema 实现 tools.Tool。
 func (t *WriteFileTool) InputSchema() json.RawMessage {
 	return tools.NewSchema().
 		Str("path", "文件路径", true).
-		Str("content", "要写入的完整内容", true).
+		Str("content", "要写入的完整内容；清空文件请显式传空串，省略该字段会被拒绝", true).
 		Build()
 }
 
@@ -536,14 +707,17 @@ func (t *WriteFileTool) PreviewDiff(args json.RawMessage) (string, error) {
 // OutsideScope 实现 tools.ScopeChecker。
 func (t *WriteFileTool) OutsideScope(args json.RawMessage) bool { return t.fs.OutsideScopePath(args) }
 
+// ForgetReads 实现 tools.ReadGate（与 edit_file 共用同一份 FS 登记表）。
+func (t *WriteFileTool) ForgetReads(sessionID string) { t.fs.ForgetReads(sessionID) }
+
 // Execute 实现 tools.Tool。
 func (t *WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (*tools.ToolResult, error) {
 	if r := t.fs.noWorkspace(); r != nil {
 		return r, nil
 	}
 	var p struct {
-		Path    string `json:"path"`
-		Content string `json:"content"`
+		Path    string  `json:"path"`
+		Content *string `json:"content"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return tools.Err("参数解析失败: %v", err), nil
@@ -551,28 +725,97 @@ func (t *WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (*too
 	if p.Path == "" {
 		return tools.Err("path 不能为空"), nil
 	}
+	// 区分「显式清空」与「漏传 content」：后者会把已有文件静默抹成空文件。
+	if p.Content == nil {
+		return tools.Err("缺少 content 参数：不写入任何内容。确需清空文件请显式传 content=\"\""), nil
+	}
+	content := *p.Content
 	path, err := t.fs.ResolveCheckedCtx(ctx, p.Path)
 	if err != nil {
+		return tools.Err("%v", err), nil
+	}
+	// 先取旧内容：既是为了判断目标是否已存在（先读后写闸门），
+	// 也是为了把「这次到底改了多少行」回给模型。
+	// 只报字节数的话，模型永远不知道自己把一份 2200 行的文件整体重写了，
+	// 也就没有回到精确替换的机会 —— 界面上的 +2200/-2170 只有人看得到。
+	old, readErr := os.ReadFile(path)
+	existed := readErr == nil
+	if err := t.fs.requireReadSeen(ctx, path, existed); err != nil {
 		return tools.Err("%v", err), nil
 	}
 	t.fs.snapshot(ctx, path)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return tools.Err("创建目录失败: %v", err), nil
 	}
-	if err := os.WriteFile(path, []byte(p.Content), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return tools.Err("写入文件失败: %v", err), nil
 	}
-	return tools.OkMeta(map[string]any{
-		"path":  path,
-		"bytes": len(p.Content),
-	}, map[string]any{"path": path}), nil
+	t.fs.markReadSeen(ctx, path)
+	out := map[string]any{"path": path, "bytes": len(content), "created": !existed}
+	if existed {
+		added, removed := LineChurn(string(old), content)
+		out["added"], out["removed"] = added, removed
+		out["lines_before"], out["lines_after"] = len(splitLines(string(old))), len(splitLines(content))
+		if hint := overwriteHint(string(old), content, added, removed); hint != "" {
+			out["hint"] = hint
+		}
+	}
+	return tools.OkMeta(out, map[string]any{"path": path}), nil
+}
+
+// overwriteChurnPercent 是「整文件覆盖」提醒的改动比例阈值（%）。
+// 低于它说明这次覆盖写的确是局部改动，不值得啰嗦；高于它说明
+// 这次提交把大半个文件重排了一遍 —— 通常本可以用几处精确替换完成。
+const overwriteChurnPercent = 60
+
+// overwriteHint 在覆盖式写入抖动过大时给模型一句可执行的提醒。
+// 只提醒、不拦截：整份重写（新建、重构、格式转换）是合法操作。
+func overwriteHint(old, new string, added, removed int) string {
+	oldLines, newLines := len(splitLines(old)), len(splitLines(new))
+	if oldLines == 0 {
+		return ""
+	}
+	if added+removed == 0 {
+		return "写入内容与原文件完全一致，本次没有产生任何改动：确认是否重复写了同一份内容。"
+	}
+	// 抖动比例：全量重写且每行都不同时为 100%（added=newLines, removed=oldLines）。
+	denom := oldLines + newLines
+	pct := (added + removed) * 100 / denom
+	if pct < overwriteChurnPercent {
+		return ""
+	}
+	return fmt.Sprintf(
+		"本次是整文件覆盖：原 %d 行 → 新 %d 行（+ %d / - %d），抖动比例 %d%%。"+
+			"若本意只是局部修改，请改用精确替换（同一文件的多处改动一次提交），"+
+			"避免整份重写带入无关改动、或丢掉本次没读到的内容。",
+		oldLines, newLines, added, removed, pct)
 }
 
 // ---------------------------------------------------------------------------
 // edit_file
 // ---------------------------------------------------------------------------
 
-// EditFileTool 以「读→旧串替换→写」方式编辑文件。
+// editPair 是一处精确替换。
+type editPair struct {
+	OldString  string `json:"old_string"`
+	NewString  string `json:"new_string"`
+	ReplaceAll bool   `json:"replace_all,omitempty"`
+}
+
+type editArgs struct {
+	Path string `json:"path"`
+	editPair
+	// Edits 一次提交多处替换，按顺序依次生效（后一处在前一处的结果上匹配）。
+	// 提供本字段时忽略顶层的 old_string / new_string。
+	//
+	// 为什么需要它：一次跨多处的改动若只能一处一次调用来回，
+	// 「精确替换」的代价就远高于「覆盖写入整份文件」，模型会理性地选择后者，
+	// 于是出现 +2200/-2170 这种把整份文件重写的提交。补齐多替换能力，
+	// 才是让局部编辑在成本上真正划得来。
+	Edits []editPair `json:"edits,omitempty"`
+}
+
+// EditFileTool 以「读→替换→写」方式编辑文件。
 type EditFileTool struct{ fs *FS }
 
 // NewEditFileTool 构造 edit_file 工具。
@@ -583,30 +826,62 @@ func (t *EditFileTool) Name() string { return "edit_file" }
 
 // Description 实现 tools.Tool。
 func (t *EditFileTool) Description() string {
-	return "对文件做精确字符串替换：将 old_string 替换为 new_string。old_string 必须在文件中唯一出现（除非 replace_all=true）。"
+	return "对文件做精确字符串替换，改已有内容一律用它（本会话内未读过的文件需先读取）。" +
+		"单处替换传 old_string/new_string；同一文件的多处改动放进 edits 数组一次提交（原子：任一处不匹配则整笔不写）。" +
+		"old_string 需与文件原文逐字一致（含缩进与行尾），默认要求唯一匹配，重复时可设 replace_all=true。"
 }
 
 // InputSchema 实现 tools.Tool。
 func (t *EditFileTool) InputSchema() json.RawMessage {
-	return tools.NewSchema().
-		Str("path", "文件路径", true).
-		Str("old_string", "要被替换的原文（需与文件内容完全一致，含缩进）", true).
-		Str("new_string", "替换后的新文本", true).
-		Bool("replace_all", "是否替换全部匹配（默认 false，要求唯一匹配）", false).
-		Build()
+	return json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "path": {"type": "string", "description": "文件路径"},
+    "old_string": {"type": "string", "description": "要被替换的原文（需与文件内容完全一致，含缩进）"},
+    "new_string": {"type": "string", "description": "替换后的新文本"},
+    "replace_all": {"type": "boolean", "description": "是否替换全部匹配（默认 false，要求唯一匹配）"},
+    "edits": {
+      "type": "array",
+      "description": "一次提交多处替换，按顺序依次生效；与顶层 old_string 互斥。整笔原子写入：任何一处不匹配则文件不改动。",
+      "items": {
+        "type": "object",
+        "properties": {
+          "old_string": {"type": "string", "description": "要被替换的原文（逐字一致）"},
+          "new_string": {"type": "string", "description": "替换后的新文本"},
+          "replace_all": {"type": "boolean", "description": "是否替换该处的全部匹配"}
+        },
+        "required": ["old_string", "new_string"]
+      }
+    }
+  },
+  "required": ["path"]
+}`)
 }
 
-type editArgs struct {
-	Path       string `json:"path"`
-	OldString  string `json:"old_string"`
-	NewString  string `json:"new_string"`
-	ReplaceAll bool   `json:"replace_all"`
+// normalizeEdits 归一化两种入参形态为统一的替换列表。
+func (p editArgs) normalizeEdits() ([]editPair, error) {
+	if len(p.Edits) > 0 {
+		if p.OldString != "" || p.NewString != "" {
+			return nil, fmt.Errorf("edits 与顶层 old_string/new_string 不能混用，二选一")
+		}
+		for i, pr := range p.Edits {
+			if pr.OldString == "" {
+				return nil, fmt.Errorf("第 %d 处替换的 old_string 为空", i+1)
+			}
+		}
+		return p.Edits, nil
+	}
+	return []editPair{p.editPair}, nil
 }
 
 // PreviewDiff 返回本次编辑的 Unified Diff。
 func (t *EditFileTool) PreviewDiff(args json.RawMessage) (string, error) {
 	var p editArgs
 	if err := json.Unmarshal(args, &p); err != nil {
+		return "", err
+	}
+	pairs, err := p.normalizeEdits()
+	if err != nil {
 		return "", err
 	}
 	path, err := t.fs.ResolveChecked(p.Path)
@@ -617,7 +892,7 @@ func (t *EditFileTool) PreviewDiff(args json.RawMessage) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	updated, _, err := applyEdit(string(old), p)
+	updated, _, err := applyPairs(string(old), pairs)
 	if err != nil {
 		return "", err
 	}
@@ -626,6 +901,9 @@ func (t *EditFileTool) PreviewDiff(args json.RawMessage) (string, error) {
 
 // OutsideScope 实现 tools.ScopeChecker。
 func (t *EditFileTool) OutsideScope(args json.RawMessage) bool { return t.fs.OutsideScopePath(args) }
+
+// ForgetReads 实现 tools.ReadGate（与 write_file 共用同一份 FS 登记表）。
+func (t *EditFileTool) ForgetReads(sessionID string) { t.fs.ForgetReads(sessionID) }
 
 // Execute 实现 tools.Tool。
 func (t *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (*tools.ToolResult, error) {
@@ -636,6 +914,10 @@ func (t *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (*tool
 	if err := json.Unmarshal(args, &p); err != nil {
 		return tools.Err("参数解析失败: %v", err), nil
 	}
+	pairs, err := p.normalizeEdits()
+	if err != nil {
+		return tools.Err("%v", err), nil
+	}
 	path, err := t.fs.ResolveCheckedCtx(ctx, p.Path)
 	if err != nil {
 		return tools.Err("%v", err), nil
@@ -644,7 +926,10 @@ func (t *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (*tool
 	if err != nil {
 		return tools.Err("读取文件失败: %v", err), nil
 	}
-	updated, count, err := applyEdit(string(data), p)
+	if err := t.fs.requireReadSeen(ctx, path, true); err != nil {
+		return tools.Err("%v", err), nil
+	}
+	updated, count, err := applyPairs(string(data), pairs)
 	if err != nil {
 		return tools.Err("%v", err), nil
 	}
@@ -652,28 +937,103 @@ func (t *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (*tool
 	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
 		return tools.Err("写入文件失败: %v", err), nil
 	}
+	t.fs.markReadSeen(ctx, path)
+	added, removed := LineChurn(string(data), updated)
 	return tools.OkMeta(map[string]any{
 		"path":         path,
+		"hunks":        len(pairs),
 		"replacements": count,
+		"added":        added,
+		"removed":      removed,
+		"total_lines":  len(splitLines(updated)),
 	}, map[string]any{"path": path}), nil
 }
 
-// applyEdit 执行替换并返回新内容与替换次数。
-func applyEdit(content string, p editArgs) (string, int, error) {
-	if p.OldString == "" {
+// applyPairs 依次应用多处替换；任何一处失败都不产出结果（调用方不落盘）。
+func applyPairs(content string, pairs []editPair) (string, int, error) {
+	out := content
+	total := 0
+	for i, pr := range pairs {
+		next, n, err := applyOne(out, pr)
+		if err != nil {
+			if len(pairs) == 1 {
+				return "", 0, err
+			}
+			return "", 0, fmt.Errorf("第 %d/%d 处替换失败：%v（本次未写入任何改动）", i+1, len(pairs), err)
+		}
+		out, total = next, total+n
+	}
+	return out, total, nil
+}
+
+// applyOne 执行单处替换，带行尾符兼容。
+func applyOne(content string, pr editPair) (string, int, error) {
+	if pr.OldString == "" {
 		return "", 0, fmt.Errorf("old_string 不能为空")
 	}
-	count := strings.Count(content, p.OldString)
-	if count == 0 {
-		return "", 0, fmt.Errorf("未在文件中找到 old_string")
+	if pr.OldString == pr.NewString {
+		return "", 0, fmt.Errorf("old_string 与 new_string 完全相同，这处替换没有改动")
 	}
-	if count > 1 && !p.ReplaceAll {
-		return "", 0, fmt.Errorf("old_string 在文件中出现 %d 次，不唯一；请扩大上下文或设置 replace_all=true", count)
+	for _, v := range lineEndingVariants(pr) {
+		count := strings.Count(content, v.OldString)
+		if count == 0 {
+			continue
+		}
+		if count > 1 && !v.ReplaceAll {
+			return "", 0, fmt.Errorf("old_string 在文件中出现 %d 次，不唯一；请扩大上下文或设置 replace_all=true", count)
+		}
+		if v.ReplaceAll {
+			return strings.ReplaceAll(content, v.OldString, v.NewString), count, nil
+		}
+		return strings.Replace(content, v.OldString, v.NewString, 1), 1, nil
 	}
-	if p.ReplaceAll {
-		return strings.ReplaceAll(content, p.OldString, p.NewString), count, nil
+	return "", 0, fmt.Errorf("未在文件中找到 old_string。%s", nearMissHint(content, pr.OldString))
+}
+
+// lineEndingVariants 生成行尾符兼容的匹配候选。
+//
+// Windows 工作区里的文件常是 CRLF，而模型照抄带行号的读取结果时给出的多行
+// 片段是 \n —— 逐字比对必然失配。失配几次之后模型就会退化成整文件覆盖，
+// 这正是「本该局部编辑却全量重写」的起点，所以在这里兼容掉。
+func lineEndingVariants(pr editPair) []editPair {
+	base := editPair{OldString: pr.OldString, NewString: pr.NewString, ReplaceAll: pr.ReplaceAll}
+	if !strings.Contains(pr.OldString, "\n") {
+		return []editPair{base}
 	}
-	return strings.Replace(content, p.OldString, p.NewString, 1), 1, nil
+	toCRLF := func(s string) string { return strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\n", "\r\n") }
+	toLF := func(s string) string { return strings.ReplaceAll(s, "\r\n", "\n") }
+	return []editPair{
+		base,
+		{OldString: toCRLF(pr.OldString), NewString: toCRLF(pr.NewString), ReplaceAll: pr.ReplaceAll},
+		{OldString: toLF(pr.OldString), NewString: toLF(pr.NewString), ReplaceAll: pr.ReplaceAll},
+	}
+}
+
+// nearMissHint 为「找不到 old_string」补一句可执行的排查方向：
+// 只报首行落在第几行，不回吐文件内容（那是模型下一步 read_file 的事）。
+func nearMissHint(content, oldString string) string {
+	head := strings.TrimSpace(strings.SplitN(strings.ReplaceAll(oldString, "\r\n", "\n"), "\n", 2)[0])
+	if head == "" {
+		return "old_string 只有换行，请先读取文件确认原文。"
+	}
+	if utf8.RuneCountInString(head) > 60 {
+		head = string([]rune(head)[:60]) + "…"
+	}
+	lines := splitLines(content)
+	for i, l := range lines {
+		if strings.TrimSpace(l) == head {
+			return fmt.Sprintf("首行内容在文件第 %d 行出现过，多半是缩进或前后文不一致；用 start_line=%d 重新读取该处原文后再替换。",
+				i+1, maxInt(1, i-5))
+		}
+	}
+	return fmt.Sprintf("文件共 %d 行，找不到该片段的起始内容；不要凭记忆改写，先 read_file 确认该处原文。", len(lines))
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // ---------------------------------------------------------------------------
@@ -741,6 +1101,13 @@ func RegisterFS(reg *tools.Registry, fs *FS) {
 	reg.Register(NewEditFileTool(fs))
 	reg.Register(NewDeleteFileTool(fs))
 }
+
+// 编译期确认两个写工具都带着先读后写闸门：压缩路径按 tools.ReadGate
+// 批量作废登记，漏实现就等于压缩后重新放任凭记忆改写。
+var (
+	_ tools.ReadGate = (*EditFileTool)(nil)
+	_ tools.ReadGate = (*WriteFileTool)(nil)
+)
 
 // skipDir 判断是否跳过某些目录（供检索与遍历共用）。
 func skipDir(name string) bool {

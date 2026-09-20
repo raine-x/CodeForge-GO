@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -50,6 +51,13 @@ func main() {
   codeforge stop     [-config 目录]                              停止运行中的服务
   codeforge restart  [-config 目录] [-workdir 目录] [-no-open]   重启服务
 
+会话续跑（回到上次中断的地方继续）:
+  codeforge -continue                 打开上次那个会话
+  codeforge -resume last              同上
+  codeforge -resume <会话ID前缀>       打开指定会话（ID / ID 前缀 / 标题均可）
+  codeforge -continue -workdir <目录>  先切到该工作区，再回到它上次的会话
+  与已在运行的实例共存时：仅把浏览器指到目标会话（不重启服务）。
+
 选项:
 `)
 		flag.PrintDefaults()
@@ -57,7 +65,14 @@ func main() {
 	configDir := flag.String("config", "config", "配置目录")
 	workDir := flag.String("workdir", "", "Agent 工作目录（默认当前目录）")
 	noOpen := flag.Bool("no-open", false, "不自动打开浏览器")
+	continueLast := flag.Bool("continue", false, "启动后回到上次会话（该工作区最近更新的一条）")
+	resumeID := flag.String("resume", "", "启动后回到指定会话：会话 ID / ID 前缀 / 会话标题，或 last")
 	flag.Parse()
+
+	resumeTarget := strings.TrimSpace(*resumeID)
+	if *continueLast && resumeTarget == "" {
+		resumeTarget = "last" // -continue 与 -resume last 是同一件事
+	}
 
 	// 配置目录统一解析（含「可执行文件旁」回退），stop / restart / start 共用同一份，
 	// 否则在错误 CWD 下 `stop` 会找不到运行信息文件。
@@ -71,9 +86,132 @@ func main() {
 		stopInstanceCmd(*configDir) // 尽力停止旧实例，未运行则直接启动
 	}
 
-	os.Exit(startCmd(*configDir, *workDir, *noOpen))
+	os.Exit(startCmd(*configDir, *workDir, *noOpen, resumeTarget))
 }
 
+// resumeTarget 是一次会话续跑的定位结果。
+type resumeTarget struct {
+	SessionID string // 要打开的会话 ID
+	Workspace string // 该会话归属的工作区（空 = 未选择工作区的会话）
+	Title     string
+}
+
+// resolveResumeTarget 把 -continue / -resume 的目标翻译成具体会话。
+//
+// 匹配顺序：last（该工作区最近更新的一条）→ 会话 ID（精确或唯一前缀）→
+// 会话标题唯一。刻意不做「模糊命中一个算一个」：续跑开错会话比开不起来更糟，
+// 宁可列出候选让人自己选。
+func resolveResumeTarget(h *agent.History, workspace, target string) (*resumeTarget, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return nil, nil
+	}
+	if target == "last" {
+		id := h.Latest(workspace)
+		if id == "" {
+			if workspace == "" {
+				return nil, fmt.Errorf("尚未选择工作区，且该状态下没有会话可续跑")
+			}
+			return nil, fmt.Errorf("工作区 %s 下还没有会话可续跑", workspace)
+		}
+		s, ok := h.Get(id)
+		if !ok {
+			return nil, fmt.Errorf("会话 %s 已不存在", id)
+		}
+		return &resumeTarget{SessionID: s.ID, Workspace: s.Workspace, Title: s.Title}, nil
+	}
+
+	// 跨工作区查找：-resume 允许找回别的项目里的会话，找到后由调用方切工作区。
+	var idHits, titleHits []agent.SessionMeta
+	all := h.List("", false)
+	for _, m := range all {
+		if strings.HasPrefix(m.ID, target) {
+			idHits = append(idHits, m)
+		}
+		if strings.EqualFold(strings.TrimSpace(m.Title), target) {
+			titleHits = append(titleHits, m)
+		}
+	}
+	pick := func(hits []agent.SessionMeta, what string) (*resumeTarget, error) {
+		switch len(hits) {
+		case 0:
+			return nil, nil
+		case 1:
+			return &resumeTarget{SessionID: hits[0].ID, Workspace: hits[0].Workspace, Title: hits[0].Title}, nil
+		}
+		out := make([]string, 0, 6)
+		for i, m := range hits {
+			if i == 5 {
+				out = append(out, "…")
+				break
+			}
+			out = append(out, m.ID)
+		}
+		return nil, fmt.Errorf("%s %q 匹配到 %d 条会话（%s），请把 -resume 的参数写得更具体",
+			what, target, len(hits), strings.Join(out, ", "))
+	}
+	if got, err := pick(idHits, "会话 ID"); err != nil || got != nil {
+		return got, err
+	}
+	if got, err := pick(titleHits, "会话标题"); err != nil || got != nil {
+		return got, err
+	}
+	return nil, fmt.Errorf("找不到会话 %q（可续跑的会话共 %d 条；-resume last 回到上次那个）", target, len(all))
+}
+
+// lookupResume 只读打开用户级会话库，定位续跑目标。
+//
+// 单独开一次库是因为「实例已在运行」那条路径也要能查 —— 那时不会构造 Agent，
+// 而会话库本就是用户级、跨工作区共享的单个 SQLite 文件（WAL，允许多进程读）。
+func lookupResume(workspace, target string) (*resumeTarget, error) {
+	if strings.TrimSpace(target) == "" {
+		return nil, nil
+	}
+	st, err := store.Open(store.DefaultPath())
+	if err != nil {
+		return nil, fmt.Errorf("打开会话库失败：%w", err)
+	}
+	defer st.Close()
+	return resolveResumeTarget(agent.NewHistory(st), workspace, target)
+}
+
+// applyResumeWorkspace 把续跑会话的工作区落实为本次的运行工作区，返回最终路径。
+//
+// 会话在哪个项目里谈的，就该在哪个项目里接着谈：否则模型读的是 A 项目的文件，
+// 讨论的却是 B 项目的对话。目标目录已经不存在时保持原工作区不变（会话仍可读，
+// 只是改不了文件），这比默默切到一个不存在的目录好。
+func applyResumeWorkspace(current string, resume *resumeTarget) string {
+	if resume.Workspace == current {
+		return current
+	}
+	switch {
+	case resume.Workspace == "":
+		log.Printf("会话续跑：会话 %s 创建时尚未选择工作区，本次同样按「未选择工作区」打开", resume.SessionID)
+		return ""
+	default:
+		if st, err := os.Stat(resume.Workspace); err != nil || !st.IsDir() {
+			log.Printf("会话续跑：会话 %s 的工作区 %s 已不存在，仍按当前工作区打开（只读对话，别改文件）",
+				resume.SessionID, resume.Workspace)
+			return current
+		}
+		log.Printf("会话续跑：切到该会话所属工作区 %s（原 %s）", resume.Workspace, displayWorkDir(current))
+		return resume.Workspace
+	}
+}
+
+// withResumeParam 把续跑会话编进浏览器地址：前端首帧后按 ?s= 直接载入那条会话。
+func withResumeParam(base string, resume *resumeTarget) string {
+	if resume == nil {
+		return base
+	}
+	return base + "/?s=" + url.QueryEscape(resume.SessionID)
+}
+
+func openBrowserAt(target string) {
+	if err := platform.OpenBrowser(target); err != nil {
+		log.Printf("自动打开浏览器失败：%v", err)
+	}
+}
 // stopInstanceCmd 停止运行中的实例并输出结果。返回是否实际停止了进程。
 func stopInstanceCmd(configDir string) bool {
 	port := 0
@@ -89,7 +227,11 @@ func stopInstanceCmd(configDir string) bool {
 }
 
 // startCmd 启动服务并阻塞至收到退出信号或内部关闭请求。返回进程退出码。
-func startCmd(configDir, workDir string, noOpen bool) int {
+//
+// resumeArg 是 -continue / -resume 的原始参数（空 = 不续跑）：
+// 定位到具体会话后，把浏览器直接停在那条会话上
+// （会话属于别的工作区时，连工作区一起切过去，避免在一个项目里回放另一个项目的对话）。
+func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 	// 配置目录体检：缺少 default.yaml 时给出醒目告警（最常见原因是 CWD 不对）。
 	warnConfigDir(configDir)
 
@@ -123,16 +265,7 @@ func startCmd(configDir, workDir string, noOpen bool) int {
 		cfg.Agent.WorkDir = workDir
 	}
 
-	// 已有实例在运行时拒绝重复启动（以运行信息文件 + 健康检查为准）。
-	if info := readRunInfo(configDir); info != nil {
-		if healthOK(info.Port) {
-			log.Printf("CodeForge 已在运行（PID %d）：%s；如需重启请执行 codeforge restart", info.PID, info.URL)
-			return 0
-		}
-		removeRunInfo(configDir) // 过期的运行信息，清理后正常启动
-	}
-
-	// 工作目录：仅来自配置文件（agent.work_dir）；为空表示「未选择工作区」，
+	// 工作目录：来自配置文件（agent.work_dir）或 -workdir；为空表示「未选择工作区」，
 	// 由用户在界面显式选择后才挂载（不再兜底到进程启动目录）。
 	// 选择会持久化回 local.yaml，重启自动恢复；目录被删时打告警并按未选择处理。
 	wd := cfg.Agent.WorkDir
@@ -140,10 +273,36 @@ func startCmd(configDir, workDir string, noOpen bool) int {
 		wd = abs
 	}
 	if wd != "" {
-		if info, err := os.Stat(wd); err != nil || !info.IsDir() {
+		if st, err := os.Stat(wd); err != nil || !st.IsDir() {
 			log.Printf("警告：配置的工作目录 %s 不存在或不是目录，按「未选择工作区」处理（请在界面重新选择）", wd)
 			wd = ""
 		}
+	}
+
+	// 续跑目标先定位：会话可能属于另一个项目，工作区要跟着它走，
+	// 所以这一步必须排在 FS / Agent 构造之前。
+	// 定位失败（ID 打错、会话已删）只降级为正常启动 —— 一个参数笔误
+	// 不该让整个服务起不来。
+	var resume *resumeTarget
+	if r, err := lookupResume(wd, resumeArg); err != nil {
+		log.Printf("会话续跑：%v（按正常启动处理）", err)
+	} else if resume = r; resume != nil {
+		wd = applyResumeWorkspace(wd, resume)
+	}
+
+	// 已有实例在运行时拒绝重复启动（以运行信息文件 + 健康检查为准）。
+	if info := readRunInfo(configDir); info != nil {
+		if healthOK(info.Port) {
+			log.Printf("CodeForge 已在运行（PID %d）：%s；如需重启请执行 codeforge restart", info.PID, info.URL)
+			if resume != nil {
+				// 续跑不必重启服务：把浏览器指到那条会话即可。
+				// 工作区由界面按会话归属自行切换（旧实例的工作区不改写）。
+				log.Printf("会话续跑：在已运行的实例上打开会话 %s", resume.SessionID)
+				openBrowserAt(withResumeParam(info.URL, resume))
+			}
+			return 0
+		}
+		removeRunInfo(configDir) // 过期的运行信息，清理后正常启动
 	}
 
 	// 1) 工具注册中心与内置工具
@@ -316,9 +475,15 @@ func startCmd(configDir, workDir string, noOpen bool) int {
 
 	// 7) 自动打开浏览器（Token 通过 HttpOnly Cookie 下发，不出现在地址栏）
 	if cfg.Server.AutoOpen && !noOpen {
-		if err := platform.OpenBrowser(srv.URL()); err != nil {
-			log.Printf("自动打开浏览器失败：%v", err)
+		target := withResumeParam(srv.URL(), resume)
+		if resume != nil {
+			note := ""
+			if t := strings.TrimSpace(resume.Title); t != "" {
+				note = "（" + t + "）"
+			}
+			log.Printf("会话续跑：打开会话 %s%s", resume.SessionID, note)
 		}
+		openBrowserAt(target)
 	}
 
 	// 8) 等待退出信号或内部关闭请求（codeforge stop），统一优雅退出

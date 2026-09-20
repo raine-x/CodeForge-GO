@@ -389,9 +389,18 @@
     }
     fetch('/api/models/apply', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: id })
+      body: JSON.stringify({ model: id, session_id: sessionID })
     }).then(function (r) { return r.json(); }).then(function (d) {
-      if (!d.ok) { alert('切换模型失败：' + (d.error || '未知错误')); return; }
+      if (!d.ok) {
+        // 上下文护栏命中（context_overflow）：用顶部横幅阻断并给出引导，
+        // 不弹浏览器 alert —— 横幅可复用、且不阻塞页面。
+        if (d.code === 'context_overflow') {
+          showBanner(d.error || '当前会话上下文已超过该模型的窗口，无法切换', 'error');
+          return;
+        }
+        showBanner('切换模型失败：' + (d.error || '未知错误'), 'error');
+        return;
+      }
       const cfg = d.config || {};
       model = (cfg.model || id).trim();
       modelName = (cfg.display_name || cfg.model_display_name || '').trim();
@@ -404,8 +413,9 @@
       if (mEl) { mEl.textContent = modelName || model || '--'; mEl.title = model || ''; }
       // 设置页开着时同步列表里的「当前」徽标
       if (!settingsOverlay.classList.contains('hidden')) renderModelItems();
+      showBanner('已切换到 ' + (modelName || model), 'info');
     }).catch(function (e) {
-      alert('切换模型失败：' + e);
+      showBanner('切换模型失败：' + e, 'error');
     }).then(function () { switchingModel = false; });
   }
 
@@ -1572,6 +1582,47 @@
     return running && runSessionID && runSessionID !== sessionID;
   }
 
+  // 首帧该开哪个会话：
+  //   1. 地址栏带 ?s=<会话ID> —— codeforge -continue / -resume 的深链，优先照办；
+  //   2. 否则回到本工作区最近更新的那条（刷新/重启自动恢复）。
+  // 深链会话属于别的工作区时先切工作区再载入：在一个项目里回放另一个项目的
+  // 对话，模型下一步改的就是错项目的文件。
+  function restoreStartSession() {
+    // 开场自动恢复（不论深链还是最近会话）都属于「回放历史」：
+    // 位置修正要直接落位，不该让用户看见输入卡片从中间滑到底部。
+    composerSnap = true;
+    const id = consumeSessionDeepLink();
+    if (!id) {
+      if (sessionsCache.length) loadSession(sessionsCache[0].id);
+      return;
+    }
+    const meta = sessionsCache.find(function (s) { return s.id === id; });
+    const target = meta ? (meta.workspace || '') : '';
+    if (target && target !== workspaceRoot) {
+      addInfo('该会话属于 ' + target + '，正在切换工作区');
+      Promise.resolve(setWorkspace(target)).then(function (r) {
+        if (r && r.ok === false) addError('切换工作区失败：' + (r.error || '') + '，已在原工作区打开该会话');
+        loadSession(id);
+      });
+      return;
+    }
+    loadSession(id);
+  }
+
+  function consumeSessionDeepLink() {
+    try {
+      const u = new URL(location.href);
+      const id = u.searchParams.get('s') || '';
+      if (!id) return '';
+      // 用完即摘：留在地址栏里会让下一次刷新强行跳回这条会话，盖掉用户后来的选择
+      u.searchParams.delete('s');
+      history.replaceState(null, '', u.toString());
+      return id;
+    } catch (e) {
+      return '';
+    }
+  }
+
   function wsSend(obj) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     ws.send(JSON.stringify(obj));
@@ -1592,6 +1643,25 @@
   const ctxPct = $('#ctx-pct');
   const ctxPop = $('#ctx-pop');
   let ctxUsage = null;   // 最近一次下发的上下文占用数据
+
+  // ---------- 网页内顶部通知横幅（可复用，**不用浏览器 Notification**）----------
+  const topBanner = document.getElementById('top-banner');
+  let bannerTimer = 0;
+  function showBanner(msg, level, sticky) {
+    if (!topBanner) return;
+    topBanner.textContent = String(msg == null ? '' : msg);
+    topBanner.className = 'top-banner ' + (level || 'info');
+    void topBanner.offsetWidth; // 强制重排，连续两次也能重播进入动画
+    if (bannerTimer) { clearTimeout(bannerTimer); bannerTimer = 0; }
+    if (!sticky) {
+      bannerTimer = setTimeout(hideBanner, level === 'error' ? 6000 : 4000);
+    }
+  }
+  function hideBanner() {
+    if (!topBanner) return;
+    topBanner.classList.add('hidden');
+    if (bannerTimer) { clearTimeout(bannerTimer); bannerTimer = 0; }
+  }
 
   // 把 token 数缩写成 12.3k / 1.2M（明细与提示里空间有限）。
   function fmtTokens(n) {
@@ -1655,20 +1725,83 @@
     ];
     rows.forEach(function (r) { ctxPop.appendChild(ctxRow(r[0], r[1])); });
 
-    const tip = document.createElement('div');
     const level = pct >= 90 ? ' danger' : (pct >= 70 ? ' warn' : '');
-    tip.className = 'ctx-tip' + level;
     if (d.over_budget && !d.compressed) {
+      const tip = document.createElement('div');
+      tip.className = 'ctx-tip danger';
       tip.textContent = '已越过压缩线，正在压缩上下文…';
-    } else if (d.compressed) {
-      tip.textContent = '已自动压缩：前 ' + summarized +
-        ' 条历史被压成摘要送入模型，完整历史仍保留在会话里（可正常回看）。' +
-        '占比达 100% 时会继续增量压缩。';
-    } else {
-      tip.textContent = '占比 = 送模占用 / 压缩线（模型窗口扣除输出预留后的 95%）。' +
-        '达 100% 时自动调用模型把较早历史压成详细摘要。';
+      ctxPop.appendChild(tip);
+      return; // 自动压缩正在进行，别再点一次手动压缩
     }
-    ctxPop.appendChild(tip);
+    if (d.compressed) {
+      const tip = document.createElement('div');
+      tip.className = 'ctx-tip' + level;
+      tip.textContent = '已压缩：前 ' + summarized +
+        ' 条历史被压成摘要送入模型，完整历史仍保留在会话里（可正常回看）。';
+      ctxPop.appendChild(tip);
+    }
+    ctxPop.appendChild(ctxCompressBox());
+  }
+
+  // 「立即压缩上下文」：不等占比涨到 100% 被动手压，用户可现在就让出窗口。
+  // 走的是与自动压缩完全相同的一条摘要路径（同保留段预算、同样不动完整历史），
+  // 差别只在触发时机；压缩后「本会话读过哪些文件」的登记会一并作废。
+  // 上一次手动压缩的结果。必须存成状态而不是只写进 DOM：
+  // 压缩成功后会主动拉一次占用，回包会重绘整个面板，只写进节点的话那句结果
+  // 会在几十毫秒内被默认文案冲掉 —— 用户点了按钮却看不到国果。
+  // 记住它属于哪条会话：切到别的会话时不该把上一条的压缩结果带过去。
+  let ctxManualNote = '', ctxManualNoteFor = '';
+
+  function ctxCompressBox() {
+    const box = document.createElement('div');
+    box.className = 'ctx-act';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ctx-compress';
+    btn.textContent = '立即压缩上下文';
+    btn.title = '把较早的历史并入摘要，最近几轮保留原文；会调用一次模型生成摘要';
+    const hint = document.createElement('div');
+    hint.className = 'ctx-act-hint';
+    hint.textContent = (ctxManualNoteFor === sessionID && ctxManualNote) ? ctxManualNote :
+      '占比到 100% 时会自动压缩；也可以现在手动腾出窗口。';
+    btn.addEventListener('click', function () { compressContextNow(btn, hint); });
+    box.appendChild(btn);
+    box.appendChild(hint);
+    return box;
+  }
+
+  async function compressContextNow(btn, hint) {
+    btn.disabled = true;
+    btn.textContent = '压缩中…';
+    const owner = sessionID;
+    try {
+      const r = await fetch('/api/context/compress', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionID })
+      });
+      const d = await r.json().catch(function () { return {}; });
+      if (r.ok && d.ok) {
+        const saved = Math.max(0, (Number(d.before) || 0) - (Number(d.after) || 0));
+        ctxManualNote = '已并入 ' + (Number(d.added) || 0) + ' 条历史：' +
+          fmtTokens(d.before) + ' → ' + fmtTokens(d.after) + ' tokens（省 ' + fmtTokens(saved) + '）。';
+        ctxManualNoteFor = owner;
+        showBanner('上下文已压缩：' + ctxManualNote, 'info');
+        wsSend({ type: 'context', session_id: sessionID }); // 拉最新占用，进度条要跟着降下来
+      } else {
+        // 409（任务在跑 / 没有较早历史）与 502（摘要失败）都照实说明原因
+        ctxManualNote = (d && d.error) || ('压缩未完成（HTTP ' + r.status + '）');
+        ctxManualNoteFor = owner;
+        hint.textContent = ctxManualNote;
+      }
+    } catch (e) {
+      ctxManualNote = '压缩请求失败：' + (e.message || '服务不可达');
+      ctxManualNoteFor = owner;
+      hint.textContent = ctxManualNote;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '立即压缩上下文';
+    }
   }
 
   ctxMeter.addEventListener('click', function (e) {
@@ -2948,11 +3081,7 @@
           sendBtn.classList.remove('running');
           sendBtn.title = '发送';
           renderSessions(ev.sessions || []);
-          // 刷新/重启自动恢复：回放该工作区最近一次会话
-          if (!sessionID && sessionsCache.length) {
-            composerSnap = true; // 自动恢复的那次位置修正直接落位（避免「中间 → 底部」滑一下）
-            loadSession(sessionsCache[0].id);
-          }
+          if (!sessionID) restoreStartSession();
           break;
         case 'sessions':
           renderSessions(ev.items || []);
@@ -3017,6 +3146,12 @@ case 'busy':
           if (runAway()) break; // 后台会话的重试提示不画进当前视图
           removeThinking();
           addRetry(ev.error || '', Number(ev.attempt) || 0, Number(ev.max_attempts) || 0);
+          break;
+        case 'steer':
+          // 服务端已把转向指令并入上下文：气泡标注从「等待并入」变成「已并入」，
+          // 让用户看见话确实被接住了，而不是石沉大海。
+          if (runAway()) break;
+          markSteerMerged();
           break;
         case 'compress':
           // 上下文越过压缩线，服务端已自动压缩。这一段是「无声发生」的关键动作，
@@ -3580,6 +3715,53 @@ case 'idle': {
     return { text: text, display: display === undefined ? text : display, notes: notes, attachments: attachments };
   }
 
+  // ---------- 运行中转向（steering）与打断（cancel）----------
+  // 转向：任务不换、方向换。指令交给正在跑的循环，在下一个步骤边界并入上下文，
+  // 已经产生的工具结果全部保留 —— 不打断正在飞行中的那次请求，也不清空历史。
+  // 打断：输入框为空时的 Esc / 发送，让循环在边界处收摊（工具结果仍然留存）。
+  function steerNow() {
+    const raw = String(input.value || '').trim();
+    if (!raw) return false;
+    // 转向的对象是「正在跑的那一轮」：用户可能已经把视图切到别的会话。
+    const target = runSessionID || sessionID;
+    if (!target) { addError('还没有会话可转向，先发送一条消息'); return true; }
+    if (!wsSend({ type: 'steer', session_id: target, text: raw })) {
+      addError('未连接到服务，这条转向没发出去');
+      return true;
+    }
+    input.value = '';
+    syncInputMirror();
+    if (target === sessionID) addSteer(raw);
+    else addInfo('已把这条指令转向到后台正在运行的任务');
+    return true;
+  }
+
+  function markSteerMerged() {
+    const tags = document.querySelectorAll('.msg-steer .steer-tag');
+    const last = tags[tags.length - 1];
+    if (last) last.textContent = '转向 · 已并入上下文，本步起生效';
+  }
+
+  // 转向气泡：与普通用户消息同一角色（模型看到的就是用户插话），
+  // 但标注「转向」并说明何时生效，避免用户以为任务被打断了。
+  function addSteer(text) {
+    const row = document.createElement('div');
+    row.className = 'msg-user msg-steer';
+    const b = document.createElement('div');
+    b.className = 'bubble';
+    b.dataset.rawText = text;
+    const tag = document.createElement('span');
+    tag.className = 'steer-tag';
+    tag.textContent = '转向 · 下一步生效，不打断当前任务';
+    b.appendChild(tag);
+    const body = document.createElement('div');
+    renderUserText(body, text);
+    b.appendChild(body);
+    row.appendChild(b);
+    ensureCol().appendChild(row);
+    scrollBottom();
+  }
+
   async function submitMessage(e, override) {
     e.preventDefault();
     // 编辑态下按发送（含 Shift+Enter / 发送按钮）走编辑重发，而不是普通新消息。
@@ -3588,7 +3770,9 @@ case 'idle': {
     if (sending) { addInfo('消息正在发送，请勿重复提交'); return; }
     if (workspaceChanging || sessionChanging) { addInfo('正在切换会话或工作区，请稍候'); return; }
     if (running) {
-      // 运行中按发送 = 打断；若正在看别的会话，说明打断的是后台任务
+      // 运行中按发送 = 转向：任务继续跑，只是中途换个方向（已产生的工具结果保留）。
+      // 输入框是空的才算「打断」。
+      if (String(input.value).trim()) { steerNow(); return; }
       if (runAway()) addInfo('已请求打断正在后台运行的任务');
       wsSend({ type: 'cancel' });
       // 未回复的打断：显示重试圆环，点击可从用户输入重新开始（保留上下文）
@@ -4243,6 +4427,22 @@ case 'idle': {
     if (e.key === 'Escape' && !settingsOverlay.classList.contains('hidden')) {
       hideWithAnim(settingsOverlay);
     }
+  });
+  // Esc 打断 / 转向：任务在跑时按 Esc —— 输入框里有话就先转向（换个方向继续跑），
+  // 空着才是打断。任何弹层（设置、新建项目、终端选择、文件选择、@ 面板、更多菜单）
+  // 开着时一律让位：那些界面的 Esc 优先，这里不能抢。
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape' || !running || atPop || moreOpen) return;
+    if (['settings-overlay', 'newproj-overlay', 'termux-overlay', 'picker-overlay']
+      .some(function (id) {
+        const el = document.getElementById(id);
+        return el && !el.classList.contains('hidden');
+      })) return;
+    e.preventDefault();
+    if (String(input.value || '').trim()) { steerNow(); return; }
+    if (runAway()) addInfo('已请求打断正在后台运行的任务');
+    wsSend({ type: 'cancel' });
+    if (!hasModelReplied) showRetryRing();
   });
   // 左侧分类导航（nav-back / nav-models 无 data-page，各自单独绑定）
   settingsOverlay.querySelectorAll('.nav-item[data-page]').forEach(function (item) {
@@ -5908,19 +6108,36 @@ case 'idle': {
     });
   });
 
-  // 测试连接
+  // 把探测结论说成人话。探不到时必须明说「未探到」并保留手填值 ——
+  // 显示成 0 或悄悄清空字段，比不探测更糟（压缩线会按 0 回退到默认预算）。
+  function ctxProbeText(probe) {
+    if (!probe) return '';
+    const steps = probe.steps || [];
+    const got = Number(probe.ctx_in) || 0;
+    if (got <= 0) {
+      return '；上下文未探到：' + (probe.note || '上游未给出长度信号') + '（保留手填值）';
+    }
+    let idx = -1;
+    for (let i = 0; i < steps.length; i++) { if (steps[i].accepted) { idx = i; break; } }
+    const above = idx > 0 ? steps[idx - 1].want : 0;
+    return '；上下文 ≈ ' + fmtTokens(got) + ' tokens' +
+      (above ? '（' + fmtTokens(above) + ' 那一档被上游拒了）' : '（最大档就被接受，可能被高估）');
+  }
+
+  // 测试连接（连通后顺带逐档探测输入上下文）
   document.getElementById('mf-test').addEventListener('click', function () {
     const m = collectForm();
-    setTestResult(null, '测试中…');
+    m.probe_context = true;
+    setTestResult(null, '测试中…（通过后开始逐档探测上下文，最大档要上传数 MB 输入，可能要几十秒）');
     fetch('/api/models/test', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(m)
     }).then(function (r) { return r.json(); }).then(function (d) {
-      if (d.ok) {
-        setTestResult(true, '连接成功');
-      } else {
-        setTestResult(false, '失败：' + (d.error || '未知错误'));
-      }
+      if (!d.ok) { setTestResult(false, '失败：' + (d.error || '未知错误')); return; }
+      setTestResult(true, '连接成功' + ctxProbeText(d.probe));
+      // 探到了就填进表单（保存时随表单落库）；探不到保留用户手填值，绝不清零。
+      const got = Number((d.probe && d.probe.ctx_in) || 0);
+      if (got > 0 && ctxInPicker) ctxInPicker.set(got);
     }).catch(function (e) {
       setTestResult(false, '失败：' + e);
     });

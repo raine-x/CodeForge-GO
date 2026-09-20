@@ -143,8 +143,9 @@ func TestReadFileToolRejectsOutside(t *testing.T) {
 	if !res.Success {
 		t.Fatalf("读取区内文件应成功，实际失败: %s", res.Error)
 	}
-	if s, _ := res.Data.(string); s != "hello" {
-		t.Fatalf("区内文件内容不对: %v", res.Data)
+	// 读取结果带行号锚点（cat -n 风格），供精确替换定位。
+	if s, _ := res.Data.(string); s != "     1\thello\n" {
+		t.Fatalf("区内文件内容不对: %q", res.Data)
 	}
 }
 
