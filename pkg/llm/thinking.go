@@ -104,8 +104,8 @@ func (s ThinkingSpec) NormalizeThinking(v string) string {
 	}
 	// steps：校验枚举（关闭值已在上面返回空串 = 不发参数）
 	for _, st := range s.Steps {
-		if st.Value == v {
-			return v
+		if strings.EqualFold(st.Value, v) {
+			return st.Value
 		}
 	}
 	return s.Default

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"path/filepath"
 
 	"codeforge/config"
 	"codeforge/pkg/agent"
@@ -62,10 +61,8 @@ func (s *Server) handleSubagentPrefs(w http.ResponseWriter, r *http.Request) {
 			s.cfg.Subagents.AllowMemory = body.AllowMemory
 		}
 
-		if dir := s.cfg.ConfigDir(); dir != "" {
-			if err := s.cfg.Save(filepath.Join(dir, "local.yaml")); err != nil {
-				log.Printf("警告：子智能体设置已生效但写回配置失败（重启后需重新设置）: %v", err)
-			}
+		if err := s.cfg.SaveState(); err != nil {
+			log.Printf("警告：子智能体设置已生效但写回运行状态失败（重启后需重新设置）: %v", err)
 		}
 		if s.subagentApply != nil {
 			s.subagentApply()

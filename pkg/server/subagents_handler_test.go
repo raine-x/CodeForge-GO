@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -150,20 +149,28 @@ func TestSubagentPrefsRoundTrip(t *testing.T) {
 		t.Error("cfg.BuiltinPlugins.MultiAgent 应与总开关同源变为 false")
 	}
 
-	// 6) 落盘：local.yaml 记下 enabled / subagents 两节，重启后不丢。
+	// 6) 落盘：state.yaml 记下 enabled / subagents 两节，重启后不丢。
 	//    本轮共 4 次 POST，每次都应触发一次运行时应用钩子。
 	if appliedCount != 4 {
 		t.Errorf("4 次 POST 应触发 4 次应用钩子，实际 %d", appliedCount)
 	}
-	path := filepath.Join(cfgDir, "local.yaml")
+	path := config.StatePath()
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("设置未写回 local.yaml: %v", err)
+		t.Fatalf("设置未写回 state.yaml: %v", err)
 	}
 	text := string(raw)
 	for _, want := range []string{"multi_agent:", "subagents:", "max_concurrent:", "allow_write:", "allow_delete:", "allow_memory:"} {
 		if !strings.Contains(text, want) {
-			t.Errorf("local.yaml 缺少 %q，实际内容：\n%s", want, text)
+			t.Errorf("state.yaml 缺少 %q，实际内容：\n%s", want, text)
+		}
+	}
+	// 运行状态不得再把用户/代码维护的条目抄进覆盖文件。
+	for _, banned := range []string{"plugins:", "rules:", "deny_patterns:"} {
+		for _, ln := range strings.Split(text, "\n") {
+			if strings.HasPrefix(ln, banned) {
+				t.Errorf("state.yaml 不该带用户侧字段 %q:\n%s", banned, text)
+			}
 		}
 	}
 

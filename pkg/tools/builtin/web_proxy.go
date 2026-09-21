@@ -7,37 +7,106 @@
 // 方案：代理解析 = 环境变量代理（http.ProxyFromEnvironment，含 NO_PROXY）优先；
 // 没有时回落到系统代理。系统代理的实际探测按平台分文件实现
 // （Windows 读注册表 web_proxy_windows.go，其余平台 web_proxy_other.go）。
+//
+// ⚠️ 两条「不该走代理」的规则必须都生效，否则会把本机地址也塞给代理：
+//  1. 系统代理的绕过列表（Windows 的 ProxyOverride）—— 用户明确列出的例外；
+//  2. 回环地址（localhost / 127.* / ::1）—— 交给代理永远是错的。
 package builtin
 
 import (
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 )
 
 // proxyChain 构造 http.Transport.Proxy 用的解析函数。
-// fixed 为 NewWebClient 时探测到的系统代理（避免每次请求都查注册表）。
-func proxyChain(fixed *url.URL) func(*http.Request) (*url.URL, error) {
+//
+//	fixed  —— NewWebClient 时探测到的系统代理（避免每次请求都查注册表）
+//	bypass —— 系统代理的绕过列表（ProxyOverride 拆出的各项）
+func proxyChain(fixed *url.URL, bypass []string) func(*http.Request) (*url.URL, error) {
 	return func(req *http.Request) (*url.URL, error) {
+		// 环境变量代理优先（它自带 NO_PROXY 白名单语义）。
+		// 但同样要尊重绕过列表与回环地址 —— 否则设了 HTTP_PROXY 时
+		// 连本机地址也会被代理，行为与系统代理模式下不一致。
 		if e, err := http.ProxyFromEnvironment(req); err == nil && e != nil {
-			return e, nil // 环境变量代理优先（含 NO_PROXY 白名单语义）
+			if shouldBypassProxy(req.URL.Hostname(), bypass) {
+				return nil, nil
+			}
+			return e, nil
 		}
-		return fixed, nil // 系统代理兜底
+		if fixed == nil || shouldBypassProxy(req.URL.Hostname(), bypass) {
+			return nil, nil // 直连
+		}
+		return fixed, nil
 	}
 }
 
-// systemProxy 探测当前系统的代理设置（非 Windows 返回 nil）。
-func systemProxy() *url.URL {
-	server := systemProxyServer()
+// systemProxy 探测当前系统的代理设置与绕过列表（非 Windows 返回 nil / nil）。
+func systemProxy() (*url.URL, []string) {
+	server, bypass := systemProxyRaw()
 	if server == "" {
-		return nil
+		return nil, bypass
 	}
-	return parseProxyServer(server)
+	return parseProxyServer(server), bypass
 }
 
-// systemProxyServer 返回当前系统配置的代理地址（未启用或不存在返回空串）。
-// 平台相关实现：Windows 读注册表（web_proxy_windows.go），其余平台统返回空
-// （web_proxy_other.go）。
+// shouldBypassProxy 判断某个主机是否应绕过代理。
+//
+// 先看回环（无条件绕过），再看系统代理的绕过列表。
+// host 传 req.URL.Hostname() 即可（不含端口）。
+func shouldBypassProxy(host string, bypass []string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if h == "" {
+		return true // 拿不到主机名就别冒险走代理
+	}
+	h = strings.Trim(h, "[]") // IPv6 字面量 [::1]
+
+	// ---- 回环地址：无条件绕过 ----
+	// 代理软件普遍拒绝转发到它自己所在的主机；即便能转，绕一圈也没有意义。
+	if h == "localhost" || h == "::1" {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil && ip.IsLoopback() {
+		return true
+	}
+
+	// ---- 系统代理的绕过列表 ----
+	for _, pat := range bypass {
+		if matchProxyBypass(h, pat) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchProxyBypass 按 Windows ProxyOverride 的语义匹配单条规则：
+//
+//	"*"             绕过所有地址
+//	"<local>"       绕过不含点的主机名（如 intranet，但不含 a.example.com）
+//	"*.example.com" 绕过该域及其子域
+//	"192.168.*"     前缀匹配
+//	"example.com"   精确匹配
+func matchProxyBypass(host, pattern string) bool {
+	p := strings.ToLower(strings.TrimSpace(pattern))
+	if p == "" {
+		return false
+	}
+	switch {
+	case p == "*":
+		return true
+	case p == "<local>":
+		return !strings.Contains(host, ".")
+	case strings.HasPrefix(p, "*."):
+		// *.example.com 同时匹配子域与裸域本身 —— 与浏览器行为一致
+		return strings.HasSuffix(host, p[1:]) || host == p[2:]
+	case strings.HasPrefix(p, "*"):
+		return strings.HasSuffix(host, p[1:])
+	case strings.HasSuffix(p, "*"):
+		return strings.HasPrefix(host, strings.TrimSuffix(p, "*"))
+	}
+	return host == p
+}
 
 // parseProxyServer 解析 Windows ProxyServer 值的常见格式：
 //

@@ -2359,6 +2359,10 @@ body.bg-dark .msg-user.msg-steer .bubble { border-left-color: #f6b8ce; }
   opacity: 1;
   transform: translateX(-50%) translateY(0);
 }
+/* 深色主题下：气泡背景随 --text 变成浅色，提示文字必须钉回深色（防止白底白字） */
+body.bg-dark .fs-tip {
+  color: #1f2430;
+}
 
 /* ---------- 模型按钮（两行：思考强度 / 模型名） ---------- */
 #model-btn {

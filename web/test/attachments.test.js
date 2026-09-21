@@ -41,6 +41,11 @@ function harness() {
     syncComposerMode() {}, renderSessions() {}, scrollBottom() {},
     removeThinking() {}, removeRetry() {}, removeRetryRing() {}, showRetryRing() {}, settleActiveTool() {}, foldReason() {}, closeText() {},
     resetSubagentCards() {}, syncRunBadges() {}, maybeShowPlanActions() {},
+    // submitMessage 开头会问「现在是不是编辑态」——这里只测附件路径，
+    // 编辑重发由 checkpoints 测试覆盖，本框架恒为非编辑态。
+    // syncUserEditButtons 由 busy 事件触发，steerNow 在「运行中再按发送」时触发，
+    // 两者都不在本框架的覆盖范围内。
+    isEditing() { return false; }, syncUserEditButtons() {}, steerNow() {},
     setTimeout() {},
     thinkingVal: 'high', composerSnap: false, lastUserText: '', lastReply: '',
     runSessionID: '', runReason: '', runText: '', pendingToolEl: null
@@ -314,9 +319,12 @@ test('WS payload uses display-independent text and attachments, locks duplicate 
   assert.equal(h.sent.length, 1);
   h.event('busy');
   assert.equal(h.run('sending'), false);
+  // 运行中再按发送：输入框有字会走「转向」而非打断，这里要验的是打断路径，先清空。
+  h.text('');
   await h.submit();
   assert.equal(h.sent[1].type, 'cancel');
   h.event('idle');
+  h.text('第二轮');
   await h.submit();
   assert.deepEqual(h.sent[2].attachments, []);
 });

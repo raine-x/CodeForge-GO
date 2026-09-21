@@ -81,15 +81,13 @@ func (s *Server) handleWorkspace(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// persistWorkDir 把工作区绝对路径写进 config/local.yaml（agent.work_dir），
+// persistWorkDir 把工作区绝对路径写进运行状态（state.yaml 的 agent.work_dir），
 // 使选择在重启后依然生效。失败只记日志，不阻断切换本身。
 func (s *Server) persistWorkDir(dir string) {
 	dir = filepath.Clean(dir)
 	s.cfg.Agent.WorkDir = dir
-	if cfgDir := s.cfg.ConfigDir(); cfgDir != "" {
-		if err := s.cfg.Save(filepath.Join(cfgDir, "local.yaml")); err != nil {
-			log.Printf("警告：工作区已切换但写回配置失败（重启后需重新选择）: %v", err)
-		}
+	if err := s.cfg.SaveState(); err != nil {
+		log.Printf("警告：工作区已切换但写回运行状态失败（重启后需重新选择）: %v", err)
 	}
 }
 
@@ -121,10 +119,8 @@ func (s *Server) handleNotifyPrefs(w http.ResponseWriter, r *http.Request) {
 		}
 		on := *body.Enabled
 		s.cfg.Notify.Enabled = &on
-		if cfgDir := s.cfg.ConfigDir(); cfgDir != "" {
-			if err := s.cfg.Save(filepath.Join(cfgDir, "local.yaml")); err != nil {
-				log.Printf("警告：通知开关已生效但写回配置失败（重启后需重新设置）: %v", err)
-			}
+		if err := s.cfg.SaveState(); err != nil {
+			log.Printf("警告：通知开关已生效但写回运行状态失败（重启后需重新设置）: %v", err)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": s.cfg.NotifyEnabled()})
 

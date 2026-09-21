@@ -68,6 +68,10 @@ func newTestDepsAtProvider(t *testing.T, configDir string, provider llm.Provider
 	t.Helper()
 	dir := t.TempDir()
 
+	// 每个用例一份独立 state.yaml。TestMain 的重定向只保证「不写真实用户目录」，
+	// 但全包共用同一个文件会让上一个用例写的模型/背景漏进下一个用例。
+	t.Setenv("CODEFORGE_STATE", filepath.Join(dir, "state.yaml"))
+
 	cfg := config.Default()
 	if configDir != "" {
 		loaded, err := config.Load(configDir)

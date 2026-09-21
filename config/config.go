@@ -2,9 +2,10 @@
 //
 // 加载顺序（后者覆盖前者）：
 //
-//	default.yaml  ->  local.yaml  ->  环境变量回退
+//	default.yaml  ->  local.yaml  ->  ~/.codeforge/state.yaml  ->  环境变量回退
 //
-// 插件配置独立存放在 plugins.yaml，通过 LoadPlugins 单独加载。
+// default.yaml 由代码/Git 维护，local.yaml 由用户编辑（程序不写），
+// state.yaml 由程序写（见 state.go）。插件目录独立存放在 plugins.yaml。
 package config
 
 import (
@@ -305,6 +306,11 @@ func Load(configDir string) (*Config, error) {
 	if err := mergeYAML(cfg, filepath.Join(configDir, "local.yaml")); err != nil {
 		return nil, err
 	}
+	// 运行状态（~/.codeforge/state.yaml）排在 local.yaml 之后：
+	// 它记的是界面上最近一次真实选择，优先级高于用户手写的静态覆盖。
+	if err := LoadStateInto(cfg); err != nil {
+		return nil, err
+	}
 
 	// 插件配置：内建默认（embed 进二进制，裸 exe 自带 Parallel Search 等 MCP
 	// 服务）+ 用户本地 plugins.yaml 覆盖同名条目并追加新条目。
@@ -389,7 +395,11 @@ func SavePlugins(path string, plugins []PluginConfig) error {
 	return os.WriteFile(path, data, 0o600)
 }
 
-// Save 将当前配置写入 path（通常为 local.yaml）。
+// Save 将当前配置全量写入 path（历史行为，仅供测试与一次性迁移使用）。
+//
+// ⚠️ 设置处理器不要调它：这里序列化的是整个 Config，会把插件目录、安全规则
+// 和明文密钥一并复制进 path，让「用户覆盖文件」退化成程序的全量转储。
+// 运行时状态请改用 SaveState()（只写程序自有字段，见 state.go）。
 func (c *Config) Save(path string) error {
 	data, err := yaml.Marshal(c)
 	if err != nil {

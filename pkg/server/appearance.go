@@ -79,7 +79,7 @@ func (s *Server) handleAppearance(w http.ResponseWriter, r *http.Request) {
 			}
 			s.cfg.Appearance.BackgroundBrightness = n
 		}
-		s.saveLocalYAML(w, "外观设置保存失败")
+		s.saveState(w, "外观设置保存失败")
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":         true,
 			"background": s.cfg.Appearance.BackgroundPath != "",
@@ -186,21 +186,18 @@ func (s *Server) finishBackgroundPick(w http.ResponseWriter, path string, err er
 		return
 	}
 	s.cfg.Appearance.BackgroundPath = p
-	if !s.saveLocalYAML(w, "外观设置保存失败") {
+	if !s.saveState(w, "外观设置保存失败") {
 		return
 	}
 	// background:true 是给前端的「已落库」确认信号（前端据此决定是否补一次显式保存）。
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": p, "background": true})
 }
 
-// saveLocalYAML 把当前配置写回 local.yaml。返回 false 表示已写出 500 响应，
-// 调用方必须立即 return（否则会二次写 body，产出拼接的坏 JSON）。
-func (s *Server) saveLocalYAML(w http.ResponseWriter, what string) bool {
-	dir := s.cfg.ConfigDir()
-	if dir == "" {
-		return true // 无配置目录：无处可存，按成功处理（与旧行为一致）
-	}
-	if err := s.cfg.Save(filepath.Join(dir, "local.yaml")); err != nil {
+// saveState 把运行状态写回 state.yaml（不再碰用户的 local.yaml）。
+// 返回 false 表示已写出 500 响应，调用方必须立即 return
+// （否则会二次写 body，产出拼接的坏 JSON）。
+func (s *Server) saveState(w http.ResponseWriter, what string) bool {
+	if err := s.cfg.SaveState(); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": what + ": " + err.Error()})
 		return false
 	}

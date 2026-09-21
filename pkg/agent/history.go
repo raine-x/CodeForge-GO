@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -50,6 +51,24 @@ type Session struct {
 	usageIn  int // 累计输入 tokens（含缓存命中部分）
 	usageHit int // 其中命中上游缓存的 tokens
 	usageOut int // 累计输出 tokens
+
+	// reqEstimate 是「上一次真正发给上游的请求」的估算总量
+	//（系统提示 + 工具定义 + 消息），用于和上游回报的真实值做比对。
+	reqEstimate int
+
+	// tokenFactor 是估算器的**校准系数** = 真实输入 / 估算输入。
+	//
+	// 为什么需要它：EstimateTokens 对代码/JSON 会低估（代码约 3–3.5 字符/token，
+	// 而估算按 4 字符/token 计），压缩线又只留 5% 余量。两者叠加会稳定出现
+	// 「判定没超预算、真请求却超窗」—— 2026-09-21 实测：输入 134145 被判为未超，
+	// 请求发出后被上游 400 拒绝，整轮任务白跑。
+	//
+	// 拿到真实值后按比例放大估算，压缩就会在该触发的时候触发
+	//（也就是「在合适的时间压缩」，而不是撞墙之后）。
+	//
+	// 只放大不缩小（下限 1.0）：宁可早压 —— 压缩是幂等的，多压一次只多花一点
+	// 摘要成本；漏压的代价是整轮失败。
+	tokenFactor float64
 }
 
 // AddUsage 累计一次请求的用量（供上下文统计展示「已使用总 / 缓存命中 / 未命中」）。
@@ -60,6 +79,34 @@ func (s *Session) AddUsage(u llm.Usage) {
 	s.usageIn += u.InputTokens
 	s.usageHit += u.CachedTokens
 	s.usageOut += u.OutputTokens
+	s.calibrateTokenFactor(u.InputTokens)
+}
+
+// calibrateTokenFactor 用上游回报的真实输入 tokens 校准估算器。
+//
+// 真实值比估算大多少，后续估算就按同样的比例放大 —— 这样压缩线才真正
+// 对应「上游眼里的占用量」，而不是「我们自己算出来的乐观数字」。
+func (s *Session) calibrateTokenFactor(realInput int) {
+	if s == nil || s.reqEstimate <= 0 || realInput <= 0 {
+		return
+	}
+	f := float64(realInput) / float64(s.reqEstimate)
+	if f < 1 {
+		f = 1 // 只放大不缩小：宁可早压，别漏压
+	}
+	if f > maxTokenFactor {
+		f = maxTokenFactor
+	}
+	s.tokenFactor = f
+}
+
+// calibratedEstimate 返回按校准系数放大后的估算（无校准数据时等于 EstimateTokens）。
+func (s *Session) calibratedEstimate(msgs []llm.Message) int {
+	n := EstimateTokens(msgs)
+	if s != nil && s.tokenFactor > 1 {
+		n = int(math.Round(float64(n) * s.tokenFactor))
+	}
+	return n
 }
 
 // compressionState 返回（是否处于压缩态、被摘要覆盖的消息条数）。
@@ -139,7 +186,12 @@ func (h *History) Get(id string) (*Session, bool) {
 		CreatedAt: row.CreatedAt,
 		UpdatedAt: row.UpdatedAt,
 		Messages:  msgs,
+		// 恢复压缩状态：重启后不该把已摘要覆盖的历史再发一遍。
+		// 越界由 normalizeCompression 兜底（历史可能被回退/整体替换过）。
+		compressedUpTo: row.CompressedUpTo,
+		summaryText:    row.SummaryText,
 	}
+	s.normalizeCompression()
 	h.cache[id] = s
 	return s, true
 }
@@ -163,6 +215,9 @@ func (h *History) Save(id string) error {
 		CreatedAt: s.CreatedAt,
 		UpdatedAt: s.UpdatedAt,
 		Messages:  s.Messages,
+		// 压缩状态一并落盘，否则重启后被摘要覆盖的历史会原样重发、立刻超窗
+		CompressedUpTo: s.compressedUpTo,
+		SummaryText:    s.summaryText,
 	})
 }
 

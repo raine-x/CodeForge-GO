@@ -83,7 +83,7 @@ func TestStageFileCopiesOutside(t *testing.T) {
 }
 
 // TestStageFileResolvesRelativeToWorkspace 相对路径的解析基准必须是**工作区根**
-//（与文件工具 FS.Resolve 的约定一致：相对路径基于工作区根），不能落到进程 CWD。
+// （与文件工具 FS.Resolve 的约定一致：相对路径基于工作区根），不能落到进程 CWD。
 //
 // 否则用户/模型写 `@sub/a.go` 时，服务端会去「进程启动目录」找同名文件：
 // 找不到 → 报「文件不存在」这种莫名其妙的错；**恰好找到 → 把另一个文件静默拷进

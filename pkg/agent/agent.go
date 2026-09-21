@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 
 	"codeforge/config"
+	"codeforge/pkg/errs"
 	"codeforge/pkg/llm"
 	"codeforge/pkg/store"
 	"codeforge/pkg/tools"
@@ -310,6 +311,38 @@ type ContextStat struct {
 }
 
 // ContextStat 汇总指定会话的上下文占用。
+// RequestViewTokens 返回会话「实际会送进模型」的估算 tokens（含校准系数）。
+//
+// 与 ContextStat().Raw 的区别：Raw 是**原始历史**总量，这个是**压缩后**的送模量。
+// 服务端提示文案要说「压缩后还占多少」，用这个才不误导。
+func (a *Agent) RequestViewTokens(sess *Session) int {
+	if sess == nil {
+		return 0
+	}
+	return sess.calibratedEstimate(a.requestView(sess))
+}
+
+// SessionOverflowFor 报告会话在**目标窗口** ctxIn 下是否放不下，
+// 放不下时返回超出量（tokens），放得下返回 0。
+//
+// 判定口径是**压缩后的实际送模量**（requestView + 校准系数），不是原始历史。
+//
+// 为什么不能用原始历史：压缩过的会话原始历史仍然很大，用原始量判会把
+// 「已经压好、本来完全跑得动」的会话也判成超窗 —— 服务端据此拦住切换，
+// 用户就会遇到「明明刚压缩过，一切换又说超限」（2026-09-21 反馈）。
+//
+// 供服务端在切换模型前判断要不要先压缩。
+func (a *Agent) SessionOverflowFor(sess *Session, ctxIn int) int {
+	if sess == nil || ctxIn <= 0 {
+		return 0
+	}
+	used := sess.calibratedEstimate(a.requestView(sess))
+	if used > ctxIn {
+		return used - ctxIn
+	}
+	return 0
+}
+
 func (a *Agent) ContextStat(sess *Session) ContextStat {
 	budget := a.compressBudget()
 	st := ContextStat{
@@ -348,7 +381,10 @@ func (a *Agent) prepareMessagesBudget(ctx context.Context, sess *Session, emit E
 	sess.normalizeCompression()
 
 	view := a.requestView(sess)
-	used := EstimateTokens(view)
+	// 用**校准后**的估算判定，而不是裸估算：估算器对代码/JSON 会低估
+	//（代码约 3–3.5 字符/token，估算按 4 计），只用裸估算会漏压，
+	// 请求带着超窗的体量发出去被上游拒绝。校准系数见 Session.tokenFactor。
+	used := sess.calibratedEstimate(view)
 	if used <= budget {
 		return view
 	}
@@ -526,7 +562,7 @@ func (a *Agent) Regenerate(ctx context.Context, sessionID string, emit Emitter) 
 	return a.runLoopWithLimit(ctx, sess, emit, true, limit)
 }
 
-// EditAndResend 编辑一条历史用户消息并重跑。
+// EditAndResend 编辑一条历史用户消息并重跑（newText 不可为空）。
 //
 // 语义（与「重新生成」同族，但可指定目标消息并改写其内容）：
 //
@@ -540,23 +576,39 @@ func (a *Agent) Regenerate(ctx context.Context, sessionID string, emit Emitter) 
 //  4. 用新文本替换该条消息（仅替换文本块，图片等其它块原样保留）；
 //  5. 重新跑循环，新回复自然追加在截断点之后 —— 界面上就是「覆盖掉下面的内容」。
 //
-// 返回被替换消息在历史中的下标与新文本，供 WS 层回报前端。
+// 返回被替换消息在历史中的下标与**实际生效的文本**，供 WS 层回报前端。
 func (a *Agent) EditAndResend(ctx context.Context, sessionID string, back int, newText string, emit Emitter) (int, error) {
+	if strings.TrimSpace(newText) == "" {
+		// 「编辑」却没给新内容 = 无效操作（RerunFrom 会把它当成「保留原文」，
+		// 那是断点重试的语义，不该被编辑入口误触）。
+		return -1, fmt.Errorf("编辑后的内容不能为空")
+	}
+	idx, _, err := a.RerunFrom(ctx, sessionID, back, newText, emit)
+	return idx, err
+}
+
+// RerunFrom 是 EditAndResend 的底层实现，也是「断点重试」的服务端入口。
+//
+// 与 EditAndResend 的唯一差别：newText 为空时**保留原用户消息原文**，只把其后
+// 的助手回复与工具结果截掉重跑。被打断 / 报错 / 刷新页面后「没有完整结束」的
+// 轮次都走这条路径——用户的提问本身没错，不需要改，也不该被覆盖。
+//
+// 返回的 text 永远是实际送进历史的那段文本（重试时即原文），WS 层要靠它
+// 重建前端视图。
+func (a *Agent) RerunFrom(ctx context.Context, sessionID string, back int, newText string, emit Emitter) (int, string, error) {
 	limit := a.MaxSteps()
 	sess, ok := a.history.Get(sessionID)
 	if !ok {
-		return -1, fmt.Errorf("会话不存在: %s", sessionID)
+		return -1, "", fmt.Errorf("会话不存在: %s", sessionID)
 	}
-	if strings.TrimSpace(newText) == "" {
-		return -1, fmt.Errorf("编辑后的内容不能为空")
-	}
+	keepOriginal := strings.TrimSpace(newText) == ""
 	if back < 0 {
 		back = 0
 	}
 
 	idx := nthLastPlainUserIndex(sess.Messages, back)
 	if idx < 0 {
-		return -1, fmt.Errorf("找不到可编辑的用户消息（仅支持最近 %d 条纯文本提问）", back+1)
+		return -1, "", fmt.Errorf("找不到可编辑的用户消息（仅支持最近 %d 条纯文本提问）", back+1)
 	}
 
 	// 截断到该条用户消息：其后的一切（助手回复 / 工具调用与结果）全部丢弃。
@@ -569,24 +621,79 @@ func (a *Agent) EditAndResend(ctx context.Context, sessionID string, back int, n
 		sess.summaryText = ""
 	}
 
-	// 替换文本块：只改 text，图片等其它内容块保持不动。
-	msg := sess.Messages[idx]
-	replaced := false
-	for i, block := range msg.Content {
-		if block.Type != llm.BlockText {
+	// 取实际生效的文本：重试取原文，编辑取新文本。
+	var sb strings.Builder
+	for _, block := range sess.Messages[idx].Content {
+		if block.Type == llm.BlockText {
+			sb.WriteString(block.Text)
+		}
+	}
+	text := sb.String()
+	if !keepOriginal {
+		text = newText
+		// 替换文本块：只改 text，图片等其它内容块保持不动。
+		msg := sess.Messages[idx]
+		replaced := false
+		for i, block := range msg.Content {
+			if block.Type != llm.BlockText {
+				continue
+			}
+			msg.Content[i].Text = newText
+			replaced = true
+			break
+		}
+		if !replaced {
+			msg.Content = append([]llm.ContentBlock{{Type: llm.BlockText, Text: newText}}, msg.Content...)
+		}
+		sess.Messages[idx] = msg
+	}
+
+	a.lastUserInput = text
+	if err := a.runLoopWithLimit(ctx, sess, emit, true, limit); err != nil {
+		return idx, text, err
+	}
+	return idx, text, nil
+}
+
+// UnfinishedTurnBack 判断「最后一轮是否没有完整结束」，并给出断点重试的锚点。
+//
+// 判据只看历史形状，不依赖任何内存态（页面刷新、进程重启后都能算）：
+//   - 存在最后一条用户纯文本发言，且它之后**没有**任何「纯文本、无工具调用」的
+//     助手终稿 → 该轮未完成（打断 / 上游报错 / 崩溃 / 刚发出尚未回复），返回 0；
+//   - 已有这样的终稿 → 返回 -1，表示不需要提示重试。
+//
+// 返回的是 back（距最后一条用户消息的距离），目前只有 0 / -1 两种取值：
+// 断点重试只认「最后一轮」，更早的轮次用「编辑」按钮即可。
+func (a *Agent) UnfinishedTurnBack(sessionID string) int {
+	sess, ok := a.history.Get(sessionID)
+	if !ok {
+		return -1
+	}
+	idx := lastPlainUserIndex(sess.Messages)
+	if idx < 0 {
+		return -1
+	}
+	for _, m := range sess.Messages[idx+1:] {
+		if m.Role != llm.RoleAssistant {
 			continue
 		}
-		msg.Content[i].Text = newText
-		replaced = true
-		break
+		hasToolUse, hasText := false, false
+		for _, b := range m.Content {
+			switch b.Type {
+			case llm.BlockToolUse:
+				hasToolUse = true
+			case llm.BlockText:
+				if strings.TrimSpace(b.Text) != "" {
+					hasText = true
+				}
+			}
+		}
+		// 有正文且没有工具调用 = 这一轮已经给出了终稿。
+		if hasText && !hasToolUse {
+			return -1
+		}
 	}
-	if !replaced {
-		msg.Content = append([]llm.ContentBlock{{Type: llm.BlockText, Text: newText}}, msg.Content...)
-	}
-	sess.Messages[idx] = msg
-
-	a.lastUserInput = newText
-	return idx, a.runLoopWithLimit(ctx, sess, emit, true, limit)
+	return 0
 }
 
 // UserMessageRef 描述一条「可编辑的用户消息」（供前端渲染编辑按钮）。
@@ -709,44 +816,82 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 		system := a.systemPromptFor(sess)
 		definitions := a.registry.DefinitionsFor(a.exposureFn())
 		overhead := requestOverhead(system, definitions)
-		budget := a.compressBudget() - overhead
-		if budget <= 0 {
-			a.save(sess, persist)
-			return fmt.Errorf("系统提示词和工具定义已占满上下文预算，请减少提示词或工具数量")
-		}
-		messages := a.prepareMessagesBudget(ctx, sess, func(ev Event) {
-			if ev.Compress != nil {
-				ev.Compress.Before += overhead
-				ev.Compress.After += overhead
-				ev.Compress.Budget += overhead
+
+		// 组装并发送本步请求。
+		//
+		// **上游以「上下文超窗」拒绝时，把压缩线收紧再发一次**，而不是直接返回。
+		//
+		// 为什么必须这样兜底：压缩判定用的是 EstimateTokens 的**估算**，而估算器
+		// 对代码/JSON 会低估（代码约 3–3.5 字符/token，估算按 4 字符/token 计），
+		// 压缩线又只留 5% 余量。于是稳定出现「判定没超、真请求超窗」：
+		// 输入 134145 + 输出预留 128000 > 窗口 262144，上游回 400
+		// upstream_request_rejected，整轮任务白跑（2026-09-21 实测）。
+		//
+		// 收紧后重发是安全的：压缩是幂等的，且这里不改变用户可见的历史
+		//（压缩只影响「送模视图」，sess.Messages 始终完整）。
+		var stream <-chan llm.StreamEvent
+		shrink := 1.0
+		for attempt := 1; ; attempt++ {
+			base := a.compressBudget() - overhead
+			budget := int(float64(base) * shrink)
+			if budget <= 0 {
+				a.save(sess, persist)
+				return fmt.Errorf("系统提示词和工具定义已占满上下文预算，请减少提示词或工具数量")
 			}
-			emit(ev)
-		}, budget)
-		if EstimateTokens(messages) > budget {
-			messages = a.degradedCompress(sess, messages, EstimateTokens(messages), budget, sess.compressedUpTo, emit)
-		}
-		if EstimateTokens(messages) > budget {
-			a.save(sess, persist)
-			return fmt.Errorf("压缩后仍超过上下文预算，请缩短输入或减少工具定义")
-		}
-		req := llm.Request{
-			System:      system,
-			Messages:    messages,
-			Tools:       definitions,
-			MaxTokens:   a.llmCfg.MaxTokens,   // 来自模型条目「输出上限」/配置，不再硬编码
-			Temperature: a.llmCfg.Temperature, // 同上
-			Thinking:    ThinkingFromCtx(ctx),
-		}
+			messages := a.prepareMessagesBudget(ctx, sess, func(ev Event) {
+				if ev.Compress != nil {
+					ev.Compress.Before += overhead
+					ev.Compress.After += overhead
+					ev.Compress.Budget += overhead
+				}
+				emit(ev)
+			}, budget)
+			if sess.calibratedEstimate(messages) > budget {
+				messages = a.degradedCompress(sess, messages, sess.calibratedEstimate(messages), budget, sess.compressedUpTo, emit)
+			}
+			if sess.calibratedEstimate(messages) > budget {
+				a.save(sess, persist)
+				return fmt.Errorf("压缩后仍超过上下文预算，请缩短输入或减少工具定义")
+			}
+			req := llm.Request{
+				System:      system,
+				Messages:    messages,
+				Tools:       definitions,
+				MaxTokens:   a.llmCfg.MaxTokens,   // 来自模型条目「输出上限」/配置，不再硬编码
+				Temperature: a.llmCfg.Temperature, // 同上
+				Thinking:    ThinkingFromCtx(ctx),
+			}
+			// 记下本次请求的估算总量，供拿到上游真实用量后校准估算器
+			//（见 Session.calibrateTokenFactor）。必须**含**系统提示与工具定义，
+			// 否则比值口径对不上，校准会偏。
+			sess.reqEstimate = EstimateTokens(messages) + overhead
 
-		// 注入重试通知：上游瞬时故障自动重试时，向前端透出「请求失败，正在重试…」。
-		// 连「第几次 / 共几次」一起带上 —— 只给一句笼统的「正在重试」，用户无法判断
-		// 是偶发抖动还是上游持续故障（实测 429 会连撞满 5 次，界面上必须看得出进度）。
-		hookCtx := llm.WithRetryHook(ctx, func(attempt, maxAttempts int, reason string) {
-			emit(Event{Type: EventRetry, Error: reason, Attempt: attempt, MaxAttempts: maxAttempts})
-		})
+			// 注入重试通知：上游瞬时故障自动重试时，向前端透出「请求失败，正在重试…」。
+			// 连「第几次 / 共几次」一起带上 —— 只给一句笼统的「正在重试」，用户无法判断
+			// 是偶发抖动还是上游持续故障（实测 429 会连撞满 5 次，界面上必须看得出进度）。
+			hookCtx := llm.WithRetryHook(ctx, func(attempt, maxAttempts int, reason string) {
+				emit(Event{Type: EventRetry, Error: reason, Attempt: attempt, MaxAttempts: maxAttempts})
+			})
 
-		stream, err := a.provider.Stream(hookCtx, req)
-		if err != nil {
+			s, err := a.provider.Stream(hookCtx, req)
+			if err == nil {
+				stream = s
+				break
+			}
+			if errs.Classify(err) == errs.KindContextOverflow && attempt <= maxOverflowShrinks {
+				// 告知用户「不是你的错，我在自救」——否则界面上只会突然多出一段
+				// 摘要，用户不知道发生了什么。
+				shrink *= overflowShrinkRatio
+				log.Printf("[compress] 会话=%s 上游报上下文超窗，收紧压缩线至 %.0f%% 后重试（第 %d 次）",
+					sess.ID, shrink*100, attempt)
+				emit(Event{Type: EventCompress, Compress: &CompressInfo{
+					Budget:   budget,
+					Window:   a.ContextWindow(),
+					Degraded: true,
+					Reason:   "上游报告上下文超窗，正在压缩历史后重试",
+				}})
+				continue
+			}
 			// 不在这里 emit：错误返回给调用方后，WS 层（ws_handler.run）会统一
 			// 下发一次 error 事件；这里再 emit 就会显示两遍（如 402 余额不足）。
 			a.save(sess, persist)

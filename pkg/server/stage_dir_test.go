@@ -62,7 +62,7 @@ func TestStageDirectoryCopiesTree(t *testing.T) {
 	// 结构保持：attachments/myproj/sub/deep/c.txt 内容一致。
 	staged := filepath.Join(deps.dir, filepath.FromSlash(d.StagedPath))
 	for rel, want := range map[string]string{
-		"a.go":                                 "package a",
+		"a.go":                                "package a",
 		filepath.Join("sub", "b.go"):          "package b",
 		filepath.Join("sub", "deep", "c.txt"): "deep content",
 	} {

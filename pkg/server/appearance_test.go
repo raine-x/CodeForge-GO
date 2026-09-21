@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"codeforge/config"
 )
 
 // 背景图选择链路的回归测试。
@@ -19,10 +21,11 @@ import (
 // 图层虽然 .on 了却没有图可画，界面上一点反应都没有（也不报错，所以极难自查）。
 //
 // 关键断言是「落库」那一条：只测 HTTP 返回体是不够的，
-// 必须同时证明 cfg 被改写 **且** 写回了 local.yaml。
+// 必须同时证明 cfg 被改写 **且** 写回了运行状态（state.yaml）。
 
 // setupAppearance 建一个绑定真实配置目录的 Server。
-// 背景图路径要落 local.yaml，所以 ConfigDir 必须非空（否则 saveLocalYAML 直接跳过）。
+// 旧实现要求 ConfigDir 非空（否则写回会被跳过）；现在运行状态落在用户级
+// state.yaml，与配置目录无关，ConfigDir 保留是因为背景图仍要读工作区外的本地文件。
 func setupAppearance(t *testing.T) (*Server, string) {
 	t.Helper()
 	cfgDir := t.TempDir()
@@ -90,7 +93,7 @@ func TestValidatePick(t *testing.T) {
 // TestFinishBackgroundPickPersists 是本次故障的核心回归防线：
 // 选中的路径必须同时进入 cfg 与 local.yaml，否则 /api/appearance/background 会一直 404。
 func TestFinishBackgroundPickPersists(t *testing.T) {
-	s, cfgDir := setupAppearance(t)
+	s, _ := setupAppearance(t)
 	img := makeImage(t, t.TempDir(), "bg.png")
 
 	rec := httptest.NewRecorder()
@@ -114,12 +117,12 @@ func TestFinishBackgroundPickPersists(t *testing.T) {
 	}
 
 	// ② 必须真的写回磁盘（否则重启就丢，且 GET 会报 background_set:false）
-	raw, err := os.ReadFile(filepath.Join(cfgDir, "local.yaml"))
+	raw, err := os.ReadFile(config.StatePath())
 	if err != nil {
-		t.Fatalf("读取 local.yaml 失败: %v", err)
+		t.Fatalf("读取 state.yaml 失败: %v", err)
 	}
 	if !strings.Contains(string(raw), "background_path") {
-		t.Fatalf("local.yaml 未写入 background_path：\n%s", raw)
+		t.Fatalf("state.yaml 未写入 background_path：\n%s", raw)
 	}
 
 	// ③ GET /api/appearance 应报告已设置

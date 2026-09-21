@@ -160,7 +160,7 @@ func (s *Server) handleProviderSave(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := store.Upsert(p); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		writeErr(w, http.StatusBadRequest, "保存供应商", err)
 		return
 	}
 	if err := store.Save(); err != nil {

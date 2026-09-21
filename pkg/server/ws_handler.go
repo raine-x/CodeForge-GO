@@ -13,6 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"codeforge/pkg/agent"
+	"codeforge/pkg/errs"
 	"codeforge/pkg/platform"
 	"codeforge/pkg/tools"
 )
@@ -81,6 +82,17 @@ func (c *wsClient) send(v any) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	_ = c.conn.WriteJSON(v)
+}
+
+// sendErr 通过 WS 下发一条**可读**的错误提示。
+//
+// 与 writeErr 同一口径：底层错误先经 errs.FriendlyOr 翻译成「成因 + 建议」，
+// 已经是人话的业务错误则原样透出。
+//
+// 此前这里直接发 err.Error()，用户会在对话里看到 "unexpected EOF"
+// 这种标准库原文 —— 既不知道发生了什么，也不知道能不能重试（2026-09-21 实测）。
+func (c *wsClient) sendErr(action string, err error) {
+	c.send(map[string]any{"type": "error", "error": errs.FriendlyOr(action, err)})
 }
 
 // handleWS 处理 WebSocket 连接：接收用户消息、推送事件流、处理 HITL 决策。
@@ -172,13 +184,46 @@ func (c *wsClient) dispatch(msg wsMessage) {
 					emit(agent.Event{Type: agent.EventRewind, Text: "已回退文件改动", Rewind: res})
 				}
 			}
-			idx, err := c.srv.agent.EditAndResend(ctx, msg.SessionID, msg.Back, msg.Text, emit)
-			if err != nil {
-				return err
-			}
+			idx, editErr := c.srv.agent.EditAndResend(ctx, msg.SessionID, msg.Back, msg.Text, emit)
 			// 回放新视图：前端需要知道历史被截断到哪里，才能丢弃下方旧内容。
-			emit(agent.Event{Type: agent.EventEdit, Step: idx, Text: msg.Text})
-			return nil
+			// 失败也要补这一帧，否则截断已经发生、提问却没被放回屏幕。
+			if idx >= 0 {
+				emit(agent.Event{Type: agent.EventEdit, Step: idx, Text: msg.Text})
+			}
+			return editErr
+		})
+
+	case "retry":
+		// 断点重试：最后一轮没跑完（打断 / 报错 / 刷新页面），保留用户原话，
+		// 只把其后未完成的回复与工具结果截掉重跑。与 edit_user_message 同一套
+		// 截断 + 文件回退逻辑，唯一区别是不改写用户消息。
+		if msg.SessionID == "" {
+			return
+		}
+		back := msg.Back
+		if back < 0 {
+			back = 0
+		}
+		go c.run(msg.SessionID, msg.Thinking, "断点重试", "", func(ctx context.Context, emit func(agent.Event)) error {
+			rollback := msg.RollbackFiles == nil || *msg.RollbackFiles
+			if rollback {
+				// 检查点按「步骤」归属，而消息截断按「消息」归属，两者没有直接映射。
+				// 参见 agent.RewindAfterEdit：无法定位目标消息时返回 nil（跳过文件回滚，
+				// 只截断对话），可定位时按其保守口径回退。
+				res, err := c.srv.agent.RewindAfterEdit(msg.SessionID, back)
+				if err != nil {
+					log.Printf("[retry] 会话=%s 文件回退失败（已跳过，仅重跑对话）：%v", msg.SessionID, err)
+				} else if res != nil && len(res.Paths) > 0 {
+					emit(agent.Event{Type: agent.EventRewind, Text: "已回退文件改动", Rewind: res})
+				}
+			}
+			idx, text, rerunErr := c.srv.agent.RerunFrom(ctx, msg.SessionID, back, "", emit)
+			// 即使重跑失败也要回放视图：截断已经发生，不补这一帧，用户的提问就会
+			// 从屏幕上消失、只剩错误信息——断点重试的全部意义就是保住提问。
+			if idx >= 0 {
+				emit(agent.Event{Type: agent.EventEdit, Step: idx, Text: text})
+			}
+			return rerunErr
 		})
 
 	case "rewind":
@@ -188,7 +233,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		}
 		res, err := c.srv.agent.RewindFiles(msg.SessionID, msg.ToStep)
 		if err != nil {
-			c.send(map[string]any{"type": "error", "error": err.Error()})
+			c.sendErr("回退文件改动", err)
 			return
 		}
 		c.send(map[string]any{"type": "rewind", "session_id": msg.SessionID, "result": res})
@@ -201,7 +246,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 	case "new_session":
 		sess, err := c.srv.agent.History().Create(ws, msg.Title)
 		if err != nil {
-			c.send(map[string]any{"type": "error", "error": err.Error()})
+			c.sendErr("创建会话", err)
 			return
 		}
 		c.send(map[string]any{"type": "session", "session_id": sess.ID, "title": sess.Title})
@@ -223,7 +268,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		// 内存缓存换成用户想继续的那条（后续 user_message 直接续聊）
 		c.send(map[string]any{"type": "history", "session_id": sess.ID, "title": sess.Title, "messages": sess.Messages})
 		c.send(c.srv.contextUsage(sess.ID))
-		c.send(c.srv.todoEvent(sess.ID)) // 切会话：回放该会话的任务清单
+		c.send(c.srv.todoEvent(sess.ID))       // 切会话：回放该会话的任务清单
 		c.send(c.srv.checkpointEvent(sess.ID)) // 回放可编辑白名单（编辑按钮的数据源）
 
 	case "hitl_decision":
@@ -258,7 +303,7 @@ func (c *wsClient) startUserMessage(msg wsMessage) {
 	if sessionID == "" {
 		sess, err := c.srv.agent.History().Create(ws, "")
 		if err != nil {
-			c.send(map[string]any{"type": "error", "error": err.Error()})
+			c.sendErr("创建会话", err)
 			return
 		}
 		sessionID = sess.ID
@@ -320,11 +365,22 @@ func (c *wsClient) run(sessionID, thinking, trigger, label string, agentFn func(
 	}
 
 	// 主动打断引发的中间层错误不作为故障下发（前端点击 ▶ 打断属正常操作）。
+	//
+	// 这里顺带**实时刷新上下文占用**：此前只在「新建 / 切换会话」与「本轮 idle」
+	// 时下发，轮次进行中进度条一直不动，跑完才「跳」一下 —— 用户看不到上下文
+	// 正在被消耗，也就无从预判什么时候会触发压缩（2026-09-21 反馈）。
+	//
+	// ⚠️ 能在这里安全读取会话：emit 是 agent 在**自己的 goroutine 里同步调用**的，
+	// 与它修改 sess.Messages 是同一个 goroutine，不存在数据竞争。
+	// 若改成另起 goroutine 去轮询，就必须先给 Session 加锁。
 	emit := func(ev agent.Event) {
 		if ev.Type == agent.EventError && ctx.Err() != nil {
 			return
 		}
 		c.send(ev)
+		if pushesContextOn(ev.Type) {
+			c.send(c.srv.contextUsage(sessionID))
+		}
 	}
 
 	c.send(map[string]any{"type": "session", "session_id": sessionID})
@@ -445,6 +501,26 @@ func (c *wsClient) sessionLabel(sessionID string) string {
 //
 // percent 保留一位小数且**不封顶**：>100% 表示已越过压缩线（over_budget=true），
 // 前端画条时自行夹到 100%，明细里照实显示。
+// pushesContextOn 报告某类 agent 事件之后是否要顺带刷新一次上下文占用。
+//
+// 选的这几类，覆盖「占用会变化」的全部时机：
+//   - user：用户刚发的话进了历史 —— 本轮第一次增长；
+//   - step：每个步骤边界，上一轮的回复与工具结果都进了历史；
+//   - tool_result：**占用增长的主要来源** —— 读文件、跑命令的输出动辄上万 token，
+//     用户最需要在这里看到进度条动起来；
+//   - compress：压缩刚发生，占用会**回落**，必须立刻反映，否则进度条会一直
+//     停在 100% 以上，看起来像坏了。
+//
+// 刻意不选 delta 类事件（text_delta / reasoning_delta）：它们每秒几十上百条，
+// 每次都重算一遍全历史的 EstimateTokens 会白白烧 CPU。
+func pushesContextOn(t string) bool {
+	switch t {
+	case agent.EventUser, agent.EventStep, agent.EventToolResult, agent.EventCompress:
+		return true
+	}
+	return false
+}
+
 func (s *Server) contextUsage(sessionID string) map[string]any {
 	sess, _ := s.agent.History().Get(sessionID)
 	st := s.agent.ContextStat(sess)
@@ -493,6 +569,10 @@ func (s *Server) checkpointEvent(sessionID string) map[string]any {
 		"session_id": sessionID,
 		"steps":      s.agent.CheckpointSteps(sessionID),
 		"editables":  s.agent.EditableUserMessages(sessionID, editableUserMessageLimit),
+		// retry_back：最后一轮「没有完整结束」时可重试的锚点（back），否则 -1。
+		// 前端据此在打断 / 报错 / 刷新页面后挂出重试圆环——判据在服务端算，
+		// 页面刷新后视图是无状态的，前端自己猜不出来。
+		"retry_back": s.agent.UnfinishedTurnBack(sessionID),
 	}
 }
 

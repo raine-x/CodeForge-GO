@@ -216,19 +216,25 @@
     renderModelPop();
   }
 
-  // 思考档位显示名：枚举档直接用原值（minimal/low/…），range 为 token 数，关闭档显示「关闭」
+  function capitalizeFirst(s) {
+    if (!s) return '';
+    return s.charAt(0).toUpperCase() + s.slice(1);
+  }
+
+  // 思考档位显示名：枚举档首字母大写（Minimal/Low/…），range 为 token 数，关闭档显示「关闭」
   function thinkingLabel() {
-    if (!thinkingSpec) return 'medium';
+    if (!thinkingSpec) return 'Medium';
     if (thinkingSpec.mode === 'steps') {
       if (thinkingVal === 'none') return '关闭';
       const hit = (thinkingSpec.steps || []).find(function (s) { return s.value === thinkingVal; });
-      return hit ? hit.value : thinkingVal;
+      const val = hit ? hit.value : thinkingVal;
+      return val ? capitalizeFirst(val) : 'Medium';
     }
     if (thinkingSpec.mode === 'range') {
       if (!thinkingVal || thinkingVal === 'none' || thinkingVal === '0') return '关闭';
       return thinkingVal + ' tokens';
     }
-    return 'medium';
+    return 'Medium';
   }
 
   function renderModelBtn() {
@@ -503,7 +509,7 @@
     };
     // 拖动中预览档位名（关闭档统一显示「关闭」，range 的 0 就是关闭）
     function previewLabel(v) {
-      if (spec.mode === 'steps') return v === 'none' ? '关闭' : v;
+      if (spec.mode === 'steps') return v === 'none' ? '关闭' : capitalizeFirst(v);
       if (!v || v === '0' || v === 'none') return '关闭';
       return v + ' tokens';
     }
@@ -1284,18 +1290,47 @@
     retryRingEl = document.createElement('button');
     retryRingEl.type = 'button';
     retryRingEl.className = 'retry-ring';
-    retryRingEl.title = '重新发送（保留上下文）';
+    retryRingEl.title = '重试这一轮（保留原提问，回退未完成的改动）';
     retryRingEl.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 4v6h6M23 20v-6h-6"/></svg>';
     retryRingEl.addEventListener('click', function () {
-      removeRetryRing();
-      // 重新发送：使用 lastUserText（保留上下文），走正常发送流程
-      form.requestSubmit();
+      sendRetryRequest(retryBack);
     });
     ensureCol().appendChild(retryRingEl);
     scrollBottom();
   }
   function removeRetryRing() {
     if (retryRingEl) { retryRingEl.remove(); retryRingEl = null; }
+  }
+
+  // 断点重试：把「未完成那一轮」之后的内容从视图截掉，通知服务端按原提问重跑。
+  // 与编辑重发同一套截断 / 文件回退逻辑，差别只是不改写用户消息——
+  // 被打断的对话里，提问本身往往没错，覆盖掉它就丢掉了用户真正说的话。
+  function sendRetryRequest(back) {
+    if (running) { addInfo('正在处理中，请稍后再试'); return; }
+    if (!wsReady) { addError('未连接到服务，请稍候重试'); return; }
+    if (back < 0) back = 0;
+    sending = true;
+    removeRetryRing();
+    // 先记住这条提问的原文：截断会把它一起删掉，而服务端的 edit 事件要等
+    // 这一轮跑完才到——中间这段时间屏幕上不该是空的。
+    const keepText = editableMessageText(back);
+    // 先在前端把未完成那一轮的残缺回复删掉：既立刻给出反馈，也避免等服务端
+    // 事件回来的间隙里旧内容与新回复混排。服务端随后会重放历史。
+    truncateAfterEditableMessage(back);
+    if (keepText) addUser(keepText);
+    if (!wsSend({
+      type: 'retry',
+      session_id: sessionID,
+      back: back,
+      rollback_files: true,
+      thinking: thinkingVal
+    })) {
+      sending = false;
+      addError('未连接到服务，请稍候重试');
+      return;
+    }
+    composerSnap = false;
+    showThinking();
   }
 
   // ---------- 可复用操作选择面板（ActionPanel）：输入框上方多选 / 用户输入 / 多页 ----------
@@ -3108,6 +3143,12 @@
           if (!ev.session_id || ev.session_id === sessionID) {
             setEditables(ev.editables || []);
             checkpointSteps = ev.steps || [];
+            // 最后一轮没跑完（打断 / 报错 / 刷新后重新连上）时，服务端给出可重试锚点。
+            // 页面刷新后视图是无状态的，只能靠服务端判；run 结束后的 checkpoints
+            // 一定在 idle 之后到达，所以这里直接按结果挂/摘圆环即可。
+            retryBack = Math.max(-1, Number(ev.retry_back));
+            if (retryBack >= 0 && !running) showRetryRing();
+            else removeRetryRing();
           }
           break;
         case 'edit':
@@ -3512,6 +3553,25 @@ case 'idle': {
     showThinking();
   }
 
+  // 取第 (back+1) 条用户消息的原文（与 truncateAfterEditableMessage 同一套倒序遍历）。
+  // dataset.rawText 是发送时的原文：提及高亮会把 @路径 缩成文件名，拿渲染结果不对。
+  function editableMessageText(back) {
+    const col = ensureCol();
+    let remaining = back + 1;
+    let node = col.lastChild;
+    while (node) {
+      if (node.classList && node.classList.contains('msg-user')) {
+        remaining--;
+        if (remaining <= 0) {
+          const bubble = node.querySelector('.bubble');
+          return bubble ? (bubble.dataset.rawText || '') : '';
+        }
+      }
+      node = node.previousSibling;
+    }
+    return '';
+  }
+
   // 删除界面中「被编辑那条用户消息之后」的全部节点（含那条消息自身的旧气泡，
   // 因为重跑后服务端会把改过的消息重新推出来）。
   // 从后往前扫，遇到第 (back+1) 条用户消息即停 —— 与 back 的语义一致。
@@ -3545,6 +3605,8 @@ case 'idle': {
 
   // 最近一次收到的检查点列表（回滚菜单的数据源；空数组 = 没有可回滚的步骤）。
   let checkpointSteps = [];
+  // 服务端给的「未完成轮次」重试锚点（back；-1 = 上一轮已完整结束，不需要提示）。
+  let retryBack = -1;
 
   // 服务端确认历史已截断到被编辑的那条消息：把聊天列清空，只留这条消息，
   // 后续的流式事件会把新回复画在它下面 —— 视觉上就是「覆盖掉下面的内容」。

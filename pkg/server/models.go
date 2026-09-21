@@ -6,15 +6,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"codeforge/config"
-	"codeforge/pkg/agent"
+	"codeforge/pkg/errs"
 )
 
 // modelTestReq 是测试连接请求。
@@ -101,7 +101,8 @@ func (s *Server) handleModelTest(w http.ResponseWriter, r *http.Request) {
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(payload))
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": false, "error": errs.FriendlyOr("测试模型连接", err)})
 		return
 	}
 	for k, v := range headers {
@@ -341,7 +342,7 @@ func (s *Server) handleModelSave(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := store.Upsert(m); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		writeErr(w, http.StatusBadRequest, "保存模型", err)
 		return
 	}
 	if err := store.Save(); err != nil {
@@ -352,7 +353,7 @@ func (s *Server) handleModelSave(w http.ResponseWriter, r *http.Request) {
 	// 免去用户再点一次「应用」。非当前模型只入库，待「应用」时再切换。
 	if m.ID == s.cfg.LLM.Model {
 		if err := s.applyModelEntry(m, m.KeyValue); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			writeErr(w, http.StatusBadRequest, "保存模型", err)
 			return
 		}
 	}
@@ -419,30 +420,44 @@ func (s *Server) handleModelApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 上下文护栏：禁止把当前会话切到一个「装不下现有对话」的短上下文模型。
-	// 判定口径用**原始历史总量**（Raw，未压缩）—— 一旦切过去，整段历史塞不进
-	// 目标窗口就得立刻压缩，用户却未必意识到「为什么一切换就开始摘要」。
-	// 仅当目标模型声明了 ctx_in（>0）且当前会话确有历史时才拦截；否则放行。
+	// 上下文装不下时**先压缩，再切换** —— 不要拦下来让用户自己去处理。
+	//
+	// 早先这里直接返回 409 让用户「先在当前模型下压缩/收尾，或新建会话再切换」，
+	// 用户的原话是「不要直接截断」（2026-09-21）。
+	// 压缩是幂等的、且不改变用户可见的历史（只影响送模视图），
+	// 所以完全可以在切换前自动压一次，把选择权还给用户。
+	//
+	// 判定口径用**压缩后的实际送模量**，不是原始历史 —— 否则刚压好的会话
+	// 也会被判成超窗，用户会遇到「明明压过了，一切换又说超限」。
 	if m.CtxIn > 0 && req.SessionID != "" {
 		if sess, found := s.agent.History().Get(req.SessionID); found && sess != nil {
-			raw := agent.EstimateTokens(sess.Messages)
-			if raw > m.CtxIn {
-				writeJSON(w, http.StatusConflict, map[string]any{
-					"ok": false,
-					"error": fmt.Sprintf(
-						"当前会话已累计约 %s tokens，超过该模型的上下文上限 %s tokens。"+
-							"切换后现有对话将放不进新模型的窗口，请先在当前模型下压缩/收尾，或新建会话再切换。",
-						humanTokens(raw), humanTokens(m.CtxIn)),
-					"code": "context_overflow",
-					"raw":  raw, "window": m.CtxIn,
-				})
-				return
+			if over := s.agent.SessionOverflowFor(sess, m.CtxIn); over > 0 {
+				// 目标模型窗口更小 → 先按它的窗口压一次。
+				// CompressNow 内部会按当前生效模型的预算做摘要；压完再复核一次，
+				// 仍然放不下才如实拒绝（此时确实没有别的办法）。
+				if _, err := s.agent.CompressNow(r.Context(), req.SessionID); err != nil {
+					log.Printf("[apply] 会话=%s 切换前自动压缩失败：%v", req.SessionID, err)
+				}
+				if sess2, ok2 := s.agent.History().Get(req.SessionID); ok2 && sess2 != nil {
+					if over2 := s.agent.SessionOverflowFor(sess2, m.CtxIn); over2 > 0 {
+						writeJSON(w, http.StatusConflict, map[string]any{
+							"ok": false,
+							"error": fmt.Sprintf(
+								"已尝试压缩上下文，但仍放不进该模型的窗口（压缩后约 %s tokens，"+
+									"模型上限 %s tokens）。请新建会话后再切换，或换一个窗口更大的模型。",
+								humanTokens(s.agent.RequestViewTokens(sess2)),
+								humanTokens(m.CtxIn)),
+							"code": "context_overflow",
+						})
+						return
+					}
+				}
 			}
 		}
 	}
 
 	if err := s.applyModelEntry(m, req.KeyValue); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		writeErr(w, http.StatusBadRequest, "应用模型", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "config": s.configView()})
@@ -486,8 +501,10 @@ func (s *Server) applyModelEntry(m config.ModelEntry, supplied string) error {
 	if err := s.rebuildProvider(); err != nil {
 		return err
 	}
-	if dir := s.cfg.ConfigDir(); dir != "" {
-		_ = s.cfg.Save(filepath.Join(dir, "local.yaml"))
+	// 运行状态写 state.yaml。这里也是明文密钥的落盘点：阶段 3 把 llm 段缩成
+	// 一个 model id 之后，密钥就只留在 providers.yaml / models.yaml 里了。
+	if err := s.cfg.SaveState(); err != nil {
+		log.Printf("警告：模型已切换但写回运行状态失败（重启后需重新应用）: %v", err)
 	}
 	return nil
 }

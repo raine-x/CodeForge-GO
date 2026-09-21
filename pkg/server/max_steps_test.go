@@ -139,7 +139,9 @@ func TestConfigMaxStepsSaveFailureIsAtomic(t *testing.T) {
 			d.cfg.LLM.APIKey = "test-key"
 			s := New(d.cfg, d.agent, d.executor, d.registry, d.fsys)
 			before := *d.cfg
-			if err := os.Mkdir(filepath.Join(dir, "local.yaml"), 0o755); err != nil {
+			// 让写盘必然失败：state.yaml 的位置放一个目录，
+			// os.WriteFile 就会报错（旧实现是把 local.yaml 做成目录）。
+			if err := os.Mkdir(config.StatePath(), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			status, out := configLimitRequest(t, s, http.MethodPost, body)

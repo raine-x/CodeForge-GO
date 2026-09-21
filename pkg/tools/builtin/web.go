@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"codeforge/config"
+	"codeforge/pkg/errs"
 	"codeforge/pkg/tools"
 )
 
@@ -54,11 +55,16 @@ type WebClient struct {
 // NewWebClient 按配置构造联网客户端。searcher 由 RegisterWeb 决定（provider 已知才注入）。
 func NewWebClient(cfg config.WebConfig, searcher WebSearcher) *WebClient {
 	client := &WebClient{allowPrivate: cfg.AllowPrivate, searcher: searcher}
+	// 代理链：环境变量代理（HTTP_PROXY 等）优先，否则回落系统代理 ——
+	// 用户开着代理软件但没设环境变量时，直连 GitHub 会超时（见 web_proxy.go）。
+	//
+	// 同时带上**绕过列表**（Windows ProxyOverride）与回环地址判定：
+	// 本机/内网地址不该走代理，否则会被代理回 502（而 502 是「正常响应」，
+	// 连下面的直连兜底都不会触发）。
+	sysProxy, proxyBypass := systemProxy()
 	client.http = &http.Client{
-		Timeout: webFetchTimeout,
-		// 代理链：环境变量代理（HTTP_PROXY 等）优先，否则回落系统代理 ——
-		// 用户开着代理软件但没设环境变量时，直连 GitHub 会超时（见 web_proxy.go）。
-		Transport:     &http.Transport{Proxy: proxyChain(systemProxy())},
+		Timeout:       webFetchTimeout,
+		Transport:     &http.Transport{Proxy: proxyChain(sysProxy, proxyBypass)},
 		CheckRedirect: redirectCheck(client),
 	}
 	// 无代理直连客户端：实测有些代理软件（TUN/透明转发）对 Go 的 CONNECT 隧道返回 EOF，
@@ -197,7 +203,7 @@ func (t *FetchTool) Execute(ctx context.Context, args json.RawMessage) (*tools.T
 		return tools.Err("URL 无效: %v", err), nil
 	}
 	if err := t.c.checkTarget(ctx, u); err != nil {
-		return tools.Err("%v", err), nil
+		return tools.Err("%s", errs.FriendlyOr("抓取网页", err)), nil
 	}
 	maxBytes := p.MaxBytes
 	if maxBytes <= 0 || maxBytes > webFetchMaxBytes {

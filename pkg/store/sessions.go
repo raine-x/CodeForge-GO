@@ -18,6 +18,17 @@ type SessionRow struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 	Messages  []llm.Message
+
+	// 压缩状态：Messages[:CompressedUpTo] 已被 SummaryText 覆盖。
+	//
+	// ⚠️ 必须落盘。此前只存在内存里，**重启即丢** —— 用户重新打开同一个会话时，
+	// 被摘要覆盖的那段历史又原样送了上去，刚压到线下的会话立刻又超窗
+	//（2026-09-21 实测：「重新打开同一个对话后直接显示超出上下文限制了」）。
+	//
+	// 压缩本身是幂等的，但**摘要不可复现**（要再花一次上游调用、内容还会变），
+	// 所以只能存下来复用，不能指望每次重启重算。
+	CompressedUpTo int
+	SummaryText    string
 }
 
 // SessionMetaRow 是会话元信息。
@@ -44,10 +55,13 @@ func (s *Store) CreateSession(id, workspace, title string, now time.Time) error 
 
 // GetSession 读取会话元信息（不含消息）。
 func (s *Store) GetSession(id string) (*SessionRow, bool, error) {
-	row := s.db.QueryRow(`SELECT id, workspace, title, created_at, updated_at FROM sessions WHERE id = ?`, id)
+	row := s.db.QueryRow(
+		`SELECT id, workspace, title, created_at, updated_at, compressed_up_to, summary_text
+		   FROM sessions WHERE id = ?`, id)
 	var r SessionRow
 	var created, updated int64
-	if err := row.Scan(&r.ID, &r.Workspace, &r.Title, &created, &updated); err != nil {
+	if err := row.Scan(&r.ID, &r.Workspace, &r.Title, &created, &updated,
+		&r.CompressedUpTo, &r.SummaryText); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, false, nil
 		}
@@ -68,8 +82,9 @@ func (s *Store) SaveSession(sess SessionRow) error {
 	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.Exec(
-		`UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?`,
-		sess.Title, sess.UpdatedAt.Unix(), sess.ID); err != nil {
+		`UPDATE sessions SET title = ?, updated_at = ?, compressed_up_to = ?, summary_text = ?
+		  WHERE id = ?`,
+		sess.Title, sess.UpdatedAt.Unix(), sess.CompressedUpTo, sess.SummaryText, sess.ID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM messages WHERE session_id = ?`, sess.ID); err != nil {

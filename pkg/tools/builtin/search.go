@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"codeforge/pkg/errs"
 	"codeforge/pkg/tools"
 )
 
@@ -78,7 +79,7 @@ func (t *SearchTool) Execute(ctx context.Context, args json.RawMessage) (*tools.
 
 	root, err := t.fs.ResolveCheckedCtx(ctx, p.Path)
 	if err != nil {
-		return tools.Err("%v", err), nil
+		return tools.Err("%s", errs.FriendlyOr("搜索内容", err)), nil
 	}
 	needle := p.Query
 	if !p.CaseSensitive {
@@ -197,7 +198,7 @@ func (t *FindFilesTool) Execute(ctx context.Context, args json.RawMessage) (*too
 
 	root, err := t.fs.ResolveCheckedCtx(ctx, p.Path)
 	if err != nil {
-		return tools.Err("%v", err), nil
+		return tools.Err("%s", errs.FriendlyOr("查找文件", err)), nil
 	}
 
 	matches := make([]findItem, 0, maxResults)

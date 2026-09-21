@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"codeforge/pkg/errs"
 	"codeforge/pkg/tools"
 )
 
@@ -365,7 +366,7 @@ func (f *FS) requireReadSeen(ctx context.Context, path string, existed bool) err
 	if f.readSeen[seenKey(sc.SessionID, path)] {
 		return nil
 	}
-	return fmt.Errorf("本会话还没读过 %s，不能凭记忆改写。先用 read_file 读取（大文件按返回末尾的行号窗口分段读），" +
+	return fmt.Errorf("本会话还没读过 %s，不能凭记忆改写。先用 read_file 读取（大文件按返回末尾的行号窗口分段读），"+
 		"看到原文后再提交精确替换。", path)
 }
 
@@ -506,7 +507,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (*tool
 	}
 	path, err := t.fs.ResolveCheckedCtx(ctx, p.Path)
 	if err != nil {
-		return tools.Err("%v", err), nil
+		return tools.Err("%s", errs.FriendlyOr("读取文件", err)), nil
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -609,7 +610,7 @@ func (t *ListDirTool) Execute(ctx context.Context, args json.RawMessage) (*tools
 	}
 	dir, err := t.fs.ResolveCheckedCtx(ctx, p.Path)
 	if err != nil {
-		return tools.Err("%v", err), nil
+		return tools.Err("%s", errs.FriendlyOr("列出目录", err)), nil
 	}
 
 	entries := make([]dirEntry, 0, 64)
@@ -732,7 +733,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (*too
 	content := *p.Content
 	path, err := t.fs.ResolveCheckedCtx(ctx, p.Path)
 	if err != nil {
-		return tools.Err("%v", err), nil
+		return tools.Err("%s", errs.FriendlyOr("写入文件", err)), nil
 	}
 	// 先取旧内容：既是为了判断目标是否已存在（先读后写闸门），
 	// 也是为了把「这次到底改了多少行」回给模型。
@@ -741,7 +742,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (*too
 	old, readErr := os.ReadFile(path)
 	existed := readErr == nil
 	if err := t.fs.requireReadSeen(ctx, path, existed); err != nil {
-		return tools.Err("%v", err), nil
+		return tools.Err("%s", errs.FriendlyOr("写入文件", err)), nil
 	}
 	t.fs.snapshot(ctx, path)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -916,22 +917,22 @@ func (t *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (*tool
 	}
 	pairs, err := p.normalizeEdits()
 	if err != nil {
-		return tools.Err("%v", err), nil
+		return tools.Err("%s", errs.FriendlyOr("编辑文件", err)), nil
 	}
 	path, err := t.fs.ResolveCheckedCtx(ctx, p.Path)
 	if err != nil {
-		return tools.Err("%v", err), nil
+		return tools.Err("%s", errs.FriendlyOr("编辑文件", err)), nil
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return tools.Err("读取文件失败: %v", err), nil
 	}
 	if err := t.fs.requireReadSeen(ctx, path, true); err != nil {
-		return tools.Err("%v", err), nil
+		return tools.Err("%s", errs.FriendlyOr("读取文件", err)), nil
 	}
 	updated, count, err := applyPairs(string(data), pairs)
 	if err != nil {
-		return tools.Err("%v", err), nil
+		return tools.Err("%s", errs.FriendlyOr("编辑文件", err)), nil
 	}
 	t.fs.snapshot(ctx, path)
 	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
@@ -1077,7 +1078,7 @@ func (t *DeleteFileTool) Execute(ctx context.Context, args json.RawMessage) (*to
 	}
 	path, err := t.fs.ResolveCheckedCtx(ctx, p.Path)
 	if err != nil {
-		return tools.Err("%v", err), nil
+		return tools.Err("%s", errs.FriendlyOr("删除文件", err)), nil
 	}
 	info, err := os.Stat(path)
 	if err != nil {

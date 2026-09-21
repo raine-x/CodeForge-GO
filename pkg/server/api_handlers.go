@@ -16,6 +16,7 @@ import (
 
 	"codeforge/config"
 	"codeforge/pkg/agent"
+	"codeforge/pkg/errs"
 	"codeforge/pkg/llm"
 )
 
@@ -24,6 +25,21 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeErr 是**所有面向用户的失败响应**的统一出口。
+//
+// 为什么要有它：此前各 handler 直接写 `"error": err.Error()`，
+// 于是 "unexpected EOF"、"Access is denied."、SQLite 的原始报错
+// 都会原样显示到界面上 —— 用户既看不出发生了什么，也不知道该怎么办。
+//
+// 这里统一走 errs.FriendlyOr：
+//   - 认得出的系统级故障 → 补上中文成因与处置建议；
+//   - 已经是人话的业务错误（如「子智能体越权：…」）→ 原样返回，不套废话。
+//
+// action 用动宾短语，如「创建会话」「保存模型库」。
+func writeErr(w http.ResponseWriter, status int, action string, err error) {
+	writeJSON(w, status, map[string]any{"error": errs.FriendlyOr(action, err)})
 }
 
 // handlePerm 查询 / 热切换权限模式（readonly/ask/auto）。
@@ -50,9 +66,7 @@ func (s *Server) handlePerm(w http.ResponseWriter, r *http.Request) {
 		}
 		s.executor.Policy().SetMode(mode)
 		s.cfg.Security.PermissionMode = mode
-		if dir := s.cfg.ConfigDir(); dir != "" {
-			_ = s.cfg.Save(filepath.Join(dir, "local.yaml"))
-		}
+		_ = s.cfg.SaveState()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": mode})
 
 	default:
@@ -154,15 +168,13 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			var err error
 			provider, err = llm.NewProvider(next.LLM)
 			if err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				writeErr(w, http.StatusBadRequest, "创建模型提供方", err)
 				return
 			}
 		}
-		if dir := next.ConfigDir(); dir != "" {
-			if err := next.Save(filepath.Join(dir, "local.yaml")); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "保存配置失败: " + err.Error()})
-				return
-			}
+		if err := next.SaveState(); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "保存配置失败: " + err.Error()})
+			return
 		}
 		s.cfg.LLM = next.LLM
 		if body.MaxSteps != nil {
@@ -367,7 +379,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		sess, err := hist.Create(ws, body.Title)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeErr(w, http.StatusInternalServerError, "创建会话", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"session": sess})
@@ -387,7 +399,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.Workspace != "" {
 			if err := hist.SetWorkspace(body.ID, strings.TrimSpace(body.Workspace)); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				writeErr(w, http.StatusInternalServerError, "切换会话所属项目", err)
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -401,14 +413,14 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 				err = hist.Unarchive(body.ID)
 			}
 			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				writeErr(w, http.StatusInternalServerError, "归档或取消归档会话", err)
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 			return
 		}
 		if err := hist.Rename(body.ID, strings.TrimSpace(body.Title)); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeErr(w, http.StatusInternalServerError, "重命名会话", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -420,7 +432,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := hist.Delete(id); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeErr(w, http.StatusInternalServerError, "删除会话", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -460,7 +472,7 @@ func (s *Server) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 				err = hist.UnarchiveWorkspace(body.Workspace)
 			}
 			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				writeErr(w, http.StatusInternalServerError, "归档或取消归档项目", err)
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -473,7 +485,7 @@ func (s *Server) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 			// ⚠️ 绝不顺手改 sessions.workspace / agent 工作目录：那个键就是磁盘路径，
 			// 一改项目就失去工作区（文件工具全线报错），历史上这里正是这么坏的。
 			if err := hist.SetWorkspaceName(body.Workspace, *body.NewName); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				writeErr(w, http.StatusInternalServerError, "重命名项目", err)
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -485,7 +497,7 @@ func (s *Server) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 		// DELETE /api/workspaces?workspace=xxx → 删除整个项目及其全部会话
 		ws := r.URL.Query().Get("workspace")
 		if err := hist.DeleteWorkspace(ws); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeErr(w, http.StatusInternalServerError, "删除项目", err)
 			return
 		}
 		// 删除的是当前运行中的项目 → 清空运行态（回到未选择项目）
@@ -552,7 +564,7 @@ func (s *Server) handleContextCompress(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, agent.ErrCompressBusy) || errors.Is(err, agent.ErrCompressNothing) {
 			status = http.StatusConflict
 		}
-		writeJSON(w, status, map[string]any{"error": err.Error()})
+		writeErr(w, status, "压缩会话上下文", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -593,7 +605,7 @@ func (s *Server) handleRewind(w http.ResponseWriter, r *http.Request) {
 		}
 		res, err := s.agent.RewindFiles(body.ID, body.ToStep)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeErr(w, http.StatusInternalServerError, "回退文件改动", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": res})
@@ -618,7 +630,7 @@ func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if _, err := s.agent.AddMemory(body.Content); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeErr(w, http.StatusInternalServerError, "添加记忆", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "items": s.agent.ListMemories()})
@@ -633,7 +645,7 @@ func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.agent.UpdateMemory(body.ID, body.Content); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeErr(w, http.StatusInternalServerError, "更新记忆", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "items": s.agent.ListMemories()})
@@ -646,7 +658,7 @@ func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.agent.DeleteMemory(id); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeErr(w, http.StatusInternalServerError, "删除记忆", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -730,7 +742,7 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
 			}
 		case "mcp-http":
 			if err := validateMCPEndpoint(body.Endpoint); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				writeErr(w, http.StatusBadRequest, "校验 MCP 端点", err)
 				return
 			}
 		default:
@@ -759,7 +771,7 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
 			Env:         body.Env,
 		}
 		if err := s.savePlugin(p); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeErr(w, http.StatusInternalServerError, "保存插件", err)
 			return
 		}
 		// 增量热加载：只拉起新增插件，不重启其他运行中的 MCP

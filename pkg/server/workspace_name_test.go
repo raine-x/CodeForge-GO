@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"codeforge/config"
 )
 
 // patchJSON 是 postJSON 的 PATCH 版本（models_handlers_test.go 里那个只做 POST）。
@@ -85,9 +87,9 @@ func TestWorkspaceRenameIsDisplayNameOnly(t *testing.T) {
 		t.Errorf("⚠️ 重命名改动了 agent 工作目录：期望 %q，实际 %q", before, got)
 	}
 
-	// ③ 也不该顺手把配置写回 local.yaml（旧实现在这里 SetWorkDir(name) + Save）
-	if _, err := os.Stat(filepath.Join(cfgDir, "local.yaml")); err == nil {
-		t.Errorf("重命名不应写回 local.yaml（会把 work_dir 覆盖成显示名）")
+	// ③ 也不该顺手把配置写回运行状态（旧实现在这里 SetWorkDir(name) + Save）
+	if _, err := os.Stat(config.StatePath()); err == nil {
+		t.Errorf("重命名不应写 state.yaml（会把 work_dir 覆盖成显示名）")
 	}
 
 	// ④ 清空显示名 = 回落默认
@@ -131,8 +133,8 @@ func TestWorkspaceSwitchRejectsMissingDir(t *testing.T) {
 	if got := d.fsys.Root(); got != beforeRoot {
 		t.Errorf("拒绝后不该改 FS 根：期望 %q，实际 %q", beforeRoot, got)
 	}
-	if _, err := os.Stat(filepath.Join(cfgDir, "local.yaml")); err == nil {
-		t.Errorf("拒绝后不该写 local.yaml")
+	if _, err := os.Stat(config.StatePath()); err == nil {
+		t.Errorf("拒绝后不该写 state.yaml")
 	}
 
 	// 顺带确认「文件当目录」也要拒
@@ -214,7 +216,7 @@ func TestWorkspaceArchiveRoundTrip(t *testing.T) {
 
 // 工作区必须是**绝对路径**。别的接口的相对路径语义是「相对工作区根」，但工作区根没法
 // 相对自己 —— 放任相对路径会被 FS.SetRoot 的 filepath.Abs 静默按**进程 CWD** 解析
-//（cf 是项目根、直接跑二进制又可能是别处），换个启动方式工作区就变了。
+// （cf 是项目根、直接跑二进制又可能是别处），换个启动方式工作区就变了。
 func TestWorkspaceSwitchRejectsRelativePath(t *testing.T) {
 	cfgDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(cfgDir, "default.yaml"), []byte("{}\n"), 0o644); err != nil {
@@ -248,9 +250,9 @@ func TestWorkspaceSwitchPersistsButEmptyDoesNotClear(t *testing.T) {
 	defer ts.Close()
 	client := withAuthClient(t, ts)
 
-	localPath := filepath.Join(cfgDir, "local.yaml")
+	localPath := config.StatePath()
 
-	// 换到一个新目录 → 应写回 local.yaml
+	// 换到一个新目录 → 应写回运行状态（state.yaml）
 	another := t.TempDir()
 	body, _ := json.Marshal(map[string]any{"path": another})
 	resp, err := client.Post(ts.URL+"/api/workspace", "application/json", bytes.NewReader(body))
@@ -263,10 +265,10 @@ func TestWorkspaceSwitchPersistsButEmptyDoesNotClear(t *testing.T) {
 	}
 	saved, err := os.ReadFile(localPath)
 	if err != nil {
-		t.Fatalf("切换工作区后应写出 local.yaml: %v", err)
+		t.Fatalf("切换工作区后应写出 state.yaml: %v", err)
 	}
 	if !strings.Contains(string(saved), another) {
-		t.Errorf("local.yaml 应记录新工作区 %q，实际内容:\n%s", another, saved)
+		t.Errorf("state.yaml 应记录新工作区 %q，实际内容:\n%s", another, saved)
 	}
 
 	// path=""（新建项目）→ 只清运行态，不覆盖已保存的工作区
@@ -284,6 +286,6 @@ func TestWorkspaceSwitchPersistsButEmptyDoesNotClear(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(after), another) {
-		t.Errorf("⚠️「新建项目」不该抹掉已保存的工作区，local.yaml 现在:\n%s", after)
+		t.Errorf("⚠️「新建项目」不该抹掉已保存的工作区，state.yaml 现在:\n%s", after)
 	}
 }

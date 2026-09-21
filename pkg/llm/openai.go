@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
+	"time"
 
 	"codeforge/config"
+	"codeforge/pkg/errs"
 )
 
 const defaultOpenAIBase = "https://api.openai.com/v1"
@@ -37,6 +40,81 @@ func NewOpenAI(cfg config.LLMConfig) *OpenAIProvider {
 // Name 实现 Provider。
 func (p *OpenAIProvider) Name() string { return "openai" }
 
+// pumpStream 是流式请求的公共骨架：消费流，若在**尚未产出任何内容**时被传输故障
+// 打断，则重开连接重试。
+//
+// 为什么只在这种条件下重试：
+//   - 一旦已经吐出正文或工具调用，重试会产生**重复内容**，甚至**重复执行工具调用**
+//     （写文件、跑命令这类副作用会做两遍），代价远大于收益 —— 这种情况必须如实报错，
+//     由用户决定要不要用「断点重试」。
+//   - 而「一个字都还没出就断了」重试是**完全安全**的，用户甚至察觉不到。
+//
+// 2026-09-21 实测：一次 SSE 长连接在生成下一轮回复前被掐断（多半是 VPN/代理），
+// 用户只看到一行裸的 "unexpected EOF"，整轮白跑 —— 而当时恰恰一个字都还没产出，
+// 本来重试一次就无感恢复了。
+//
+// openai 与 anthropic 共用本函数，避免两边重试逻辑各写一份、日后漂移。
+//
+//	reopen  —— 重开一条连接（返回新的响应）
+//	consume —— 消费一条响应，返回 (是否已产出内容, 传输层错误)
+func pumpStream(
+	ctx context.Context,
+	policy RetryPolicy,
+	first *http.Response,
+	reopen func() (*http.Response, error),
+	consume func(io.Reader) (bool, error),
+	out chan<- StreamEvent,
+) {
+	policy = policy.normalize()
+	// 至少给 2 次机会：「建连成功、流刚开就断」是最常见的抖动，
+	// 若上游把 MaxAttempts 配成 1，这条兜底就形同虚设。
+	maxAttempts := policy.MaxAttempts
+	if maxAttempts < 2 {
+		maxAttempts = 2
+	}
+
+	resp := first
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if resp == nil {
+			// 上一轮的连接已经用完，重开一条。
+			r, err := reopen()
+			if err != nil {
+				lastErr = err
+				break // reopen 内部已按策略重试过，不再叠加
+			}
+			resp = r
+		}
+
+		emitted, err := consume(resp.Body)
+		resp.Body.Close()
+		resp = nil
+
+		if err == nil {
+			return // 正常结束；语义性失败已在 consume 内报过
+		}
+		lastErr = err
+
+		kind := errs.Classify(err)
+		if emitted || !errs.Retryable(kind) || ctx.Err() != nil {
+			// 已产出内容 / 不可重试 / 已被取消 —— 如实上报，附带成因与建议
+			send(ctx, out, StreamEvent{Type: EventError, Error: errs.Friendly("生成回复", err)})
+			return
+		}
+		if attempt < maxAttempts {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(policy.attemptDelay(attempt + 1)):
+			}
+		}
+	}
+	if lastErr != nil && ctx.Err() == nil {
+		send(ctx, out, StreamEvent{Type: EventError, Error: errs.Friendlyf(
+			lastErr, "生成回复（已重试 %d 次仍失败）", maxAttempts)})
+	}
+}
+
 // Stream 实现 Provider。
 func (p *OpenAIProvider) Stream(ctx context.Context, req Request) (<-chan StreamEvent, error) {
 	payload := p.buildPayload(req)
@@ -44,15 +122,18 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req Request) (<-chan Stream
 	if p.apiKey != "" {
 		headers["Authorization"] = "Bearer " + p.apiKey
 	}
-	resp, err := postJSON(ctx, p.baseURL+"/chat/completions", headers, payload, p.retry)
+	reopen := func() (*http.Response, error) {
+		return postJSON(ctx, p.baseURL+"/chat/completions", headers, payload, p.retry)
+	}
+	resp, err := reopen()
 	if err != nil {
 		return nil, err
 	}
 	out := make(chan StreamEvent, 64)
 	go func() {
 		defer close(out)
-		defer resp.Body.Close()
-		p.consume(ctx, resp.Body, out)
+		pumpStream(ctx, p.retry, resp, reopen,
+			func(r io.Reader) (bool, error) { return p.consume(ctx, r, out) }, out)
 	}()
 	return out, nil
 }
@@ -271,12 +352,24 @@ func extractThoughtSignature(extra json.RawMessage, flat string) string {
 	return ""
 }
 
-func (p *OpenAIProvider) consume(ctx context.Context, r io.Reader, out chan<- StreamEvent) {
+// consume 读取并派发一次流式响应。
+//
+// 返回值：
+//
+//	emitted —— 本轮是否**已经向下游产出过内容**（正文 / 思考 / 工具调用）。
+//	           调用方据此判断能否安全重试：未产出任何内容时重试不会造成重复输出。
+//	err     —— 传输层故障（流被中途掐断等）。nil 表示正常结束。
+//
+// ⚠️ 语义性失败（上游错误块 / max_tokens 截断 / content_filter）在这里**直接发
+// EventError 并返回 nil error**：它们不是传输故障，重试一百次也是同样结果，
+// 重试只会白白消耗额度。
+func (p *OpenAIProvider) consume(ctx context.Context, r io.Reader, out chan<- StreamEvent) (bool, error) {
 	ids := map[int]string{}
 	names := map[int]string{}
 	finish := ""
 	done := false
 	failed := false
+	emitted := false // 已产出内容 → 不可重试
 	var usage *Usage // 部分兼容网关会在多个块带 usage，取最后一次
 
 	err := scanSSE(r, func(_ string, data string) {
@@ -308,13 +401,18 @@ func (p *OpenAIProvider) consume(ctx context.Context, r io.Reader, out chan<- St
 			}
 		}
 		for _, ch := range chunk.Choices {
+			// 只要吐出过正文/思考/工具调用，本轮就算「已产出」—— 之后流再断也不能重试，
+			// 否则用户会看到重复内容，甚至重复执行工具调用。
 			if ch.Delta.Reasoning != "" {
+				emitted = true
 				send(ctx, out, StreamEvent{Type: EventReasoningDelta, Text: ch.Delta.Reasoning})
 			}
 			if ch.Delta.Content != "" {
+				emitted = true
 				send(ctx, out, StreamEvent{Type: EventTextDelta, Text: ch.Delta.Content})
 			}
 			for _, tc := range ch.Delta.ToolCalls {
+				emitted = true
 				id, seen := ids[tc.Index]
 				if !seen {
 					id = tc.ID
@@ -359,8 +457,10 @@ func (p *OpenAIProvider) consume(ctx context.Context, r io.Reader, out chan<- St
 		}
 	})
 	if err != nil && !failed {
-		failed = true
-		send(ctx, out, StreamEvent{Type: EventError, Error: err.Error()})
+		// 传输层故障（最典型：SSE 长连接被中途掐断 → io.ErrUnexpectedEOF）。
+		// **不在这里发 EventError** —— 交给调用方 pump 判断：没产出过内容就重试，
+		// 产出过或不可重试才报错。这样一次网络抖动对用户是无感的。
+		return emitted, err
 	}
 	if !failed && finish == "" && !done {
 		failed = true
@@ -384,4 +484,5 @@ func (p *OpenAIProvider) consume(ctx context.Context, r io.Reader, out chan<- St
 	if !failed {
 		send(ctx, out, StreamEvent{Type: EventMessageStop})
 	}
+	return emitted, nil
 }

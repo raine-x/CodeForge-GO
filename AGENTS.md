@@ -40,4 +40,24 @@ pkg/tools/builtin/workspace_test.go
 调试用的 `.py` / `.js` / `.log` / `.tmp` / `.bak` 一律放 `test/`，并在收尾时清理。
 
 > `.gitignore` 已忽略 `*.tmp`、`*.log`、`config/local.yaml`、`config/models.yaml`、
-> `config/codeforge.run`，但仍不要把它们当垃圾桶留在工作区。
+> `config/providers.yaml`，但仍不要把它们当垃圾桶留在工作区。
+
+### 配置分层：一个文件一个写入者
+
+合并次序 `default.yaml → local.yaml → ~/.codeforge/state.yaml`（后者覆盖前者）：
+
+| 文件 | 写入者 |
+|---|---|
+| `config/default.yaml`、`config/plugins.yaml` | 代码 / Git |
+| `config/local.yaml` | 用户手工编辑，**程序只读** |
+| `config/models.yaml`、`config/providers.yaml` | 设置页 |
+| `~/.codeforge/state.yaml` | 程序（`Config.SaveState()`，运行状态唯一写盘入口） |
+| `~/.codeforge/run.json` | 程序（当前进程，退出即删） |
+| `~/.codeforge/data.db` | 程序（会话/记忆，跨工作区共享） |
+
+**新增「界面可改」的配置项时，写进 `config/state.go` 的 `State` 投影，不要调
+`Config.Save()`。** 后者序列化整个 Config，会把插件目录和安全规则这类切片整体抄进
+目标文件；yaml 对切片是替换而非合并，于是默认值以后新增的条目会被旧副本静默吃掉
+（`security.rules` 少 `todo_write`、`web_*` 就是这样丢的）。投影刻意不含这些字段，
+所以不可能复发。运行状态文件的位置可用 `CODEFORGE_STATE` 覆盖 —— 测试必须覆盖它，
+否则会写真实用户目录（各包的 `TestMain` 已统一处理）。

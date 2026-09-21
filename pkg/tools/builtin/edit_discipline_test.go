@@ -427,4 +427,3 @@ func TestForgetReadsAfterCompression(t *testing.T) {
 		t.Errorf("作废登记后应重新要求读取，实际: %+v", res)
 	}
 }
-

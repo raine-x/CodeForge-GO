@@ -570,3 +570,117 @@ func TestRewindResultJSONShape(t *testing.T) {
 		t.Errorf("Paths 应含被还原文件: %v", res.Paths)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 断点重试：保留原提问，只截掉未完成的回复
+// ---------------------------------------------------------------------------
+
+// RerunFrom 传空文本 = 保留用户原话：这是「断点重试」与「编辑重发」的分界线
+// （被被打断的对话里，提问本身往往没错，覆盖掉就丢了用户真正说的话）。
+func TestRerunFromKeepsOriginalText(t *testing.T) {
+	ag, h, _ := newCheckpointAgent(t)
+	sess := seedSessionWith(t, h, []llm.Message{
+		userText("第一问"),
+		assistantText("第一答"),
+		userText("被打断的那一问"),
+		// 打断：助手只调了工具，没给终稿
+		llm.AssistantBlocksMessage([]llm.ContentBlock{
+			{Type: llm.BlockToolUse, ID: "t1", Name: "read_file"},
+		}),
+		llm.ToolResultMessage("t1", "文件内容", false),
+	})
+
+	ag.provider = nil
+	idx, text, err := ag.RerunFrom(context.Background(), sess.ID, 0, "", nil)
+	if err == nil {
+		t.Fatal("provider=nil 应直接失败，这里只关心失败前的截断与文本")
+	}
+	if idx != 2 {
+		t.Fatalf("期望定位到下标 2，得到 %d", idx)
+	}
+	if text != "被打断的那一问" {
+		t.Errorf("重试应返回原文，得到 %q", text)
+	}
+	if len(sess.Messages) != 3 {
+		t.Fatalf("截断后应余 3 条，得到 %d", len(sess.Messages))
+	}
+	if got := sess.Messages[2].Content[0].Text; got != "被打断的那一问" {
+		t.Errorf("原提问被覆盖了：得到 %q", got)
+	}
+}
+
+// 已完成的轮次不该被判定为「未完成」——有终稿就算跑完了。
+func TestUnfinishedTurnBackCompleted(t *testing.T) {
+	ag, h, _ := newCheckpointAgent(t)
+	sess := seedSessionWith(t, h, []llm.Message{
+		userText("q1"),
+		assistantText("a1"),
+	})
+	if got := ag.UnfinishedTurnBack(sess.ID); got != -1 {
+		t.Errorf("已完成的轮次应返回 -1，得到 %d", got)
+	}
+}
+
+// 各种「没跑完」的形状都应给出可重试锚点。
+func TestUnfinishedTurnBackIncomplete(t *testing.T) {
+	ag, h, _ := newCheckpointAgent(t)
+
+	cases := map[string][]llm.Message{
+		"还没回复": {
+			userText("q1"),
+		},
+		"调了工具没给终稿": {
+			userText("q1"),
+			llm.AssistantBlocksMessage([]llm.ContentBlock{
+				{Type: llm.BlockToolUse, ID: "t1", Name: "read_file"},
+			}),
+			llm.ToolResultMessage("t1", "内容", false),
+		},
+		"空回复": {
+			userText("q1"),
+			assistantText("   "),
+		},
+	}
+	for name, msgs := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := seedSessionWith(t, h, msgs)
+			if got := ag.UnfinishedTurnBack(s.ID); got != 0 {
+				t.Errorf("未完成轮次应返回 0，得到 %d", got)
+			}
+		})
+	}
+}
+
+// 有工具调用但也回了正文：只要还没给「无工具调用的终稿」就算未完成
+// （ReAct 循环中途打断正是最常见的断点场景）。
+func TestUnfinishedTurnBackToolThenText(t *testing.T) {
+	ag, h, _ := newCheckpointAgent(t)
+	sess := seedSessionWith(t, h, []llm.Message{
+		userText("q1"),
+		llm.AssistantBlocksMessage([]llm.ContentBlock{
+			{Type: llm.BlockText, Text: "我先读一下文件"},
+			{Type: llm.BlockToolUse, ID: "t1", Name: "read_file"},
+		}),
+		llm.ToolResultMessage("t1", "内容", false),
+	})
+	if got := ag.UnfinishedTurnBack(sess.ID); got != 0 {
+		t.Errorf("工具中途打断应返回 0，得到 %d", got)
+	}
+
+	// 真正的终稿（纯文本、无工具调用）出现后才算完成
+	sess.Messages = append(sess.Messages, assistantText("最终回答"))
+	if err := h.Save(sess.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := ag.UnfinishedTurnBack(sess.ID); got != -1 {
+		t.Errorf("给了终稿后应返回 -1，得到 %d", got)
+	}
+}
+
+// 不存在的会话返回 -1（别把空历史当成「可重试」）。
+func TestUnfinishedTurnBackMissingSession(t *testing.T) {
+	ag, _, _ := newCheckpointAgent(t)
+	if got := ag.UnfinishedTurnBack("不存在"); got != -1 {
+		t.Errorf("不存在的会话应返回 -1，得到 %d", got)
+	}
+}

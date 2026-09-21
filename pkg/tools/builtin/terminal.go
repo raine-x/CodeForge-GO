@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"codeforge/pkg/errs"
 	"codeforge/pkg/platform"
 	"codeforge/pkg/tools"
 )
@@ -84,7 +85,7 @@ func (t *TerminalTool) Execute(ctx context.Context, args json.RawMessage) (*tool
 
 	dir, err := t.fs.ResolveCheckedCtx(ctx, p.Cwd)
 	if err != nil {
-		return tools.Err("%v", err), nil
+		return tools.Err("%s", errs.FriendlyOr("执行命令", err)), nil
 	}
 	cmd := exec.CommandContext(cctx, shell, argv...)
 	cmd.Dir = dir

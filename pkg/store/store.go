@@ -99,6 +99,17 @@ func (s *Store) migrate() error {
 		)`,
 		// 升级路径：旧库补归档列（CREATE TABLE IF NOT EXISTS 不会给已存在的表加列）
 		`ALTER TABLE sessions ADD COLUMN archived_at INTEGER NOT NULL DEFAULT 0`,
+		// 压缩状态也要落盘。
+		//
+		// 此前 compressedUpTo / summaryText 只存在内存里，**重启即丢** ——
+		// 用户重新打开同一个会话时，被摘要覆盖的那段历史又原样送了上去，
+		// 于是刚压缩过、本来已经降到线下的会话，重启后立刻又超窗
+		//（2026-09-21 实测反馈：「重新打开同一个对话后直接显示超出上下文限制了」）。
+		//
+		// 压缩本身是幂等的，但**摘要不可复现**（要再花一次上游调用、且内容会变），
+		// 所以必须存下来复用，而不是每次重启重算。
+		`ALTER TABLE sessions ADD COLUMN compressed_up_to INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sessions ADD COLUMN summary_text TEXT NOT NULL DEFAULT ''`,
 		// 任务清单：会话级 todo 表（todo_write 整体替换语义，见 sessions.go）
 		`CREATE TABLE IF NOT EXISTS session_todos (
 			session_id  TEXT NOT NULL,

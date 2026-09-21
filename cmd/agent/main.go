@@ -463,12 +463,13 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 	log.Printf("平台：%s｜工作目录：%s｜可用工具：%d 个", platform.OSName(), displayWorkDir(wd), len(registry.Names()))
 	log.Printf("模型：%s（provider=%s，API Key %s）", cfg.LLM.Model, cfg.LLM.Provider, keyState(cfg.LLM.APIKey))
 
-	// 记录运行信息，供 codeforge stop / restart 使用。
-	if err := writeRunInfo(configDir, &runInfo{
-		PID:   os.Getpid(),
-		Port:  srv.Port(),
-		Token: srv.Token(),
-		URL:   srv.URL(),
+	// 记录运行信息，供 codeforge stop / restart 使用（退出时删除）。
+	if err := writeRunInfo(&runInfo{
+		PID:       os.Getpid(),
+		Port:      srv.Port(),
+		Token:     srv.Token(),
+		URL:       srv.URL(),
+		StartedAt: time.Now().Format(time.RFC3339),
 	}); err != nil {
 		log.Printf("写入运行信息失败: %v", err)
 	}

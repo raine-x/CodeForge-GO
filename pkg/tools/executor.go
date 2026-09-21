@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"codeforge/pkg/errs"
 	"codeforge/pkg/security"
 )
 
@@ -152,10 +153,11 @@ func (e *Executor) Execute(ctx context.Context, name string, args json.RawMessag
 		approved, err := approver.RequestApproval(ctx, req)
 		if err != nil {
 			entry.Success = false
+			// 审计留原始错误（要可追溯），给用户/模型的说明则翻译成人话
 			entry.Error = "approval-error: " + err.Error()
 			entry.DurationMs = time.Since(start).Milliseconds()
 			_ = e.audit.Log(entry)
-			return Err("审批通道异常：%s", err.Error()), nil
+			return Err("%s", errs.FriendlyOr("请求操作审批", err)), nil
 		}
 		entry.Approved = &approved
 		if !approved {
@@ -173,13 +175,14 @@ func (e *Executor) Execute(ctx context.Context, name string, args json.RawMessag
 	res, err := e.run(ctx, tool, args)
 	if err != nil {
 		entry.Success = false
-		entry.Error = err.Error()
+		entry.Error = err.Error() // 审计留原始错误
 		entry.DurationMs = time.Since(start).Milliseconds()
 		_ = e.audit.Log(entry)
 		if res != nil {
 			return res, nil
 		}
-		return Err("工具执行失败：%s", err.Error()), nil
+		// 给模型/用户的说明带上工具名与成因 —— 光说「工具执行失败」等于没说
+		return Err("%s", errs.FriendlyOr("执行工具 "+name, err)), nil
 	}
 	res = e.truncate(res)
 

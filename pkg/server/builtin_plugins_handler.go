@@ -27,7 +27,7 @@ func (s *Server) builtinEnabled(id string) bool {
 	}
 }
 
-// setBuiltinEnabled 写回开关状态并持久化到 local.yaml。
+// setBuiltinEnabled 写回开关状态并持久化到 state.yaml。
 func (s *Server) setBuiltinEnabled(id string, on bool) error {
 	switch id {
 	case agent.BuiltinSkillCreator.ID:
@@ -39,10 +39,7 @@ func (s *Server) setBuiltinEnabled(id string, on bool) error {
 	default:
 		return nil // 未知插件：仅运行态应用，不落盘
 	}
-	if dir := s.cfg.ConfigDir(); dir != "" {
-		return s.cfg.Save(dir + "/local.yaml")
-	}
-	return nil
+	return s.cfg.SaveState()
 }
 
 // handleBuiltinPlugins 内置插件列表 / 开关（设置 → 插件）。

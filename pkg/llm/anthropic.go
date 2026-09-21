@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
 	"strings"
 
 	"codeforge/config"
@@ -46,15 +47,19 @@ func (p *AnthropicProvider) Stream(ctx context.Context, req Request) (<-chan Str
 		"x-api-key":         p.apiKey,
 		"anthropic-version": anthropicVersion,
 	}
-	resp, err := postJSON(ctx, p.baseURL+"/v1/messages", headers, payload, p.retry)
+	reopen := func() (*http.Response, error) {
+		return postJSON(ctx, p.baseURL+"/v1/messages", headers, payload, p.retry)
+	}
+	resp, err := reopen()
 	if err != nil {
 		return nil, err
 	}
 	out := make(chan StreamEvent, 64)
 	go func() {
 		defer close(out)
-		defer resp.Body.Close()
-		p.consume(ctx, resp.Body, out)
+		// 与 openai 共用同一套「未产出内容则重试」的兜底
+		pumpStream(ctx, p.retry, resp, reopen,
+			func(r io.Reader) (bool, error) { return p.consume(ctx, r, out) }, out)
 	}()
 	return out, nil
 }
@@ -199,11 +204,14 @@ type anthropicUsage struct {
 	OutputTokens             int `json:"output_tokens"`
 }
 
-func (p *AnthropicProvider) consume(ctx context.Context, r io.Reader, out chan<- StreamEvent) {
+// consume 读取并派发一次流式响应。返回值语义与 OpenAIProvider.consume 一致：
+// emitted 表示本轮是否已产出内容（决定能否安全重试），err 为传输层故障。
+func (p *AnthropicProvider) consume(ctx context.Context, r io.Reader, out chan<- StreamEvent) (bool, error) {
 	toolIndex := map[int]string{}
 	var usage *Usage // message_start 建立输入侧，message_delta 补输出侧
 	var stopReason string
 	failed := false
+	emitted := false // 已产出内容 → 不可重试
 
 	err := scanSSE(r, func(_ string, data string) {
 		if data == "" {
@@ -222,6 +230,7 @@ func (p *AnthropicProvider) consume(ctx context.Context, r io.Reader, out chan<-
 			}
 		case "content_block_start":
 			if ev.Block.Type == BlockToolUse {
+				emitted = true // 已开始产出工具调用
 				toolIndex[ev.Index] = ev.Block.ID
 				send(ctx, out, StreamEvent{
 					Type:      EventToolUseStart,
@@ -233,14 +242,17 @@ func (p *AnthropicProvider) consume(ctx context.Context, r io.Reader, out chan<-
 			switch ev.Delta.Type {
 			case "text_delta":
 				if ev.Delta.Text != "" {
+					emitted = true
 					send(ctx, out, StreamEvent{Type: EventTextDelta, Text: ev.Delta.Text})
 				}
 			case "thinking_delta":
 				if ev.Delta.Thinking != "" {
+					emitted = true
 					send(ctx, out, StreamEvent{Type: EventReasoningDelta, Text: ev.Delta.Thinking})
 				}
 			case "input_json_delta":
 				if ev.Delta.PartialJSON != "" {
+					emitted = true
 					send(ctx, out, StreamEvent{
 						Type:       EventToolUseDelta,
 						ToolUseID:  toolIndex[ev.Index],
@@ -250,6 +262,7 @@ func (p *AnthropicProvider) consume(ctx context.Context, r io.Reader, out chan<-
 			}
 		case "content_block_stop":
 			if id, ok := toolIndex[ev.Index]; ok {
+				emitted = true
 				send(ctx, out, StreamEvent{Type: EventToolUseStop, ToolUseID: id})
 				delete(toolIndex, ev.Index)
 			}
@@ -269,8 +282,8 @@ func (p *AnthropicProvider) consume(ctx context.Context, r io.Reader, out chan<-
 		}
 	})
 	if err != nil && !failed {
-		failed = true
-		send(ctx, out, StreamEvent{Type: EventError, Error: err.Error()})
+		// 传输层故障：不在这里发 EventError，交给 pump 决定重试还是报错（同 openai.go）
+		return emitted, err
 	}
 	// max_tokens 截断：不报错会被上层当作正常完成，表现为「思考/回答到一半就停了」
 	if !failed && stopReason == "max_tokens" {
@@ -289,4 +302,5 @@ func (p *AnthropicProvider) consume(ctx context.Context, r io.Reader, out chan<-
 	if !failed {
 		send(ctx, out, StreamEvent{Type: EventMessageStop})
 	}
+	return emitted, nil
 }

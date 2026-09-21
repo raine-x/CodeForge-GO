@@ -1,8 +1,12 @@
 // lifecycle.go 管理 CodeForge 单实例生命周期：运行信息文件、stop/restart 支持。
 //
-// 启动时将 {pid, port, token} 写入 <config>/codeforge.run；stop 命令读取该文件
-// 通过内部关闭接口（/api/shutdown + 令牌请求头）优雅停止实例；文件缺失或
+// 启动时将 {pid, port, token, started_at} 写入 ~/.codeforge/run.json；stop 命令读取
+// 该文件，通过内部关闭接口（/api/shutdown + 令牌请求头）优雅停止实例；文件缺失或
 // 优雅通道不可用时，按端口定位进程强制结束兜底。
+//
+// 为什么在用户目录而不是配置目录：这份文件只描述「这一个进程」，进程退出即删除，
+// 既不是配置也不是数据。放在 <config>/codeforge.run 时它会被 .gitignore 单独豁免，
+// 且从别的 CWD 启动会在别处留下副本 —— 换到用户级路径后全局只有一份。
 package main
 
 import (
@@ -20,22 +24,50 @@ import (
 	"time"
 )
 
-// runInfo 是运行实例的标识信息，写入 codeforge.run。
+// runEnvKey 允许覆盖运行信息文件位置（测试必须用它，否则会写真实用户目录）。
+const runEnvKey = "CODEFORGE_RUN"
+
+// runInfo 是运行实例的标识信息，写入 run.json。
 type runInfo struct {
-	PID   int    `json:"pid"`
-	Port  int    `json:"port"`
-	Token string `json:"token"`
-	URL   string `json:"url"`
+	PID       int    `json:"pid"`
+	Port      int    `json:"port"`
+	Token     string `json:"token"`
+	URL       string `json:"url"`
+	StartedAt string `json:"started_at,omitempty"` // RFC3339，供「这个实例跑了多久」与陈旧判定
 }
 
-// runFilePath 返回运行信息文件路径（位于配置目录下）。
-func runFilePath(configDir string) string {
+// runFilePath 返回运行信息文件路径（用户级 ~/.codeforge/run.json）。
+func runFilePath() string {
+	if p := os.Getenv(runEnvKey); p != "" {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = "."
+	}
+	return filepath.Join(home, ".codeforge", "run.json")
+}
+
+// legacyRunFilePath 返回旧位置（<configDir>/codeforge.run）。
+//
+// 只用于回读与清理：升级后第一次 `codeforge stop` 要能停掉仍写着旧路径的老实例，
+// 否则它会变成没人认领的僵尸进程，新实例又因端口占用起不来。
+func legacyRunFilePath(configDir string) string {
 	return filepath.Join(configDir, "codeforge.run")
 }
 
 // readRunInfo 读取运行信息；文件缺失或损坏时返回 nil。
+// 新路径没有时回落到旧路径（见 legacyRunFilePath）。
 func readRunInfo(configDir string) *runInfo {
-	data, err := os.ReadFile(runFilePath(configDir))
+	if info := parseRunInfo(runFilePath()); info != nil {
+		return info
+	}
+	return parseRunInfo(legacyRunFilePath(configDir))
+}
+
+// parseRunInfo 读取并校验单个运行信息文件；不可用时返回 nil。
+func parseRunInfo(path string) *runInfo {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}
@@ -47,21 +79,26 @@ func readRunInfo(configDir string) *runInfo {
 }
 
 // writeRunInfo 原子写入运行信息文件。
-func writeRunInfo(configDir string, info *runInfo) error {
+func writeRunInfo(info *runInfo) error {
+	path := runFilePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
 	data, err := json.Marshal(info)
 	if err != nil {
 		return err
 	}
-	tmp := runFilePath(configDir) + ".tmp"
+	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, runFilePath(configDir))
+	return os.Rename(tmp, path)
 }
 
-// removeRunInfo 删除运行信息文件（不存在时忽略）。
+// removeRunInfo 删除运行信息文件（新旧位置都清，不存在时忽略）。
 func removeRunInfo(configDir string) {
-	_ = os.Remove(runFilePath(configDir))
+	_ = os.Remove(runFilePath())
+	_ = os.Remove(legacyRunFilePath(configDir))
 }
 
 // baseURL 返回本机回环地址上的服务根 URL（管理通道不依赖配置的监听地址）。

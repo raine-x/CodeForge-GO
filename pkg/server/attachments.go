@@ -76,7 +76,7 @@ func (s *Server) handleUploadFile(w http.ResponseWriter, r *http.Request) {
 	workspace := s.fs.Root()
 	root, err := openAttachmentWorkspace(workspace)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		writeErr(w, http.StatusBadRequest, "上传文件", err)
 		return
 	}
 	defer root.Close()
@@ -86,7 +86,7 @@ func (s *Server) handleUploadFile(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, &limit) {
 			status = http.StatusRequestEntityTooLarge
 		}
-		writeJSON(w, status, map[string]any{"error": err.Error()})
+		writeErr(w, status, "上传文件", err)
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBody)
 	defer r.Body.Close()

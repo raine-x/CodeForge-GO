@@ -926,6 +926,10 @@ check('拖拽 / 点档后落盘记忆',
 check('关闭档显示为「关闭」',
   /if \(thinkingVal === 'none'\) return '关闭';/.test(uiSrc) &&
   /if \(!v \|\| v === '0' \|\| v === 'none'\) return '关闭';/.test(uiSrc));
+check('思考档位枚举首字母大写（Minimal/Low/Medium/High）',
+  /function capitalizeFirst\(s\)/.test(uiSrc) &&
+  /return val \? capitalizeFirst\(val\) : 'Medium';/.test(uiSrc) &&
+  /return v === 'none' \? '关闭' : capitalizeFirst\(v\);/.test(uiSrc));
 
 // ---------- 归档页：项目级恢复（与侧栏「归档」对称） ----------
 // 侧栏 ⋯ 的「归档」一次点掉整组会话；归档页必须能一次恢复整组，
@@ -1399,6 +1403,177 @@ check('超时时长取自 upstreamTimeout，不写死（写死会随超时调整
   /WithTimeout\(r\.Context\(\), upstreamTimeout\)/.test(modelsGoSrc) &&
   !/请求超时（30s）/.test(discoverGoSrc) && !/请求超时（30s）/.test(modelsGoSrc));
 
+// ---------- 错误处理与兜底（2026-09-21）----------
+const rootDir = path.join(__dirname, '..', '..');
+const errsSrc = fs.readFileSync(path.join(rootDir, 'pkg', 'errs', 'errs.go'), 'utf8');
+const llmOpenAISrc = fs.readFileSync(path.join(rootDir, 'pkg', 'llm', 'openai.go'), 'utf8');
+const llmAnthropicSrc = fs.readFileSync(path.join(rootDir, 'pkg', 'llm', 'anthropic.go'), 'utf8');
+const apiHandlersSrc = fs.readFileSync(path.join(rootDir, 'pkg', 'server', 'api_handlers.go'), 'utf8');
+const wsHandlerSrc2 = fs.readFileSync(path.join(rootDir, 'pkg', 'server', 'ws_handler.go'), 'utf8');
+const webProxySrc = fs.readFileSync(path.join(rootDir, 'pkg', 'tools', 'builtin', 'web_proxy.go'), 'utf8');
+const webProxyWinSrc = fs.readFileSync(path.join(rootDir, 'pkg', 'tools', 'builtin', 'web_proxy_windows.go'), 'utf8');
+
+group('错误处理：翻译层 / 统一出口 / 兜底');
+
+check('错误翻译层存在（成因 + 建议 + 可重试性）',
+  /func Classify\(err error\) Kind/.test(errsSrc) &&
+  /func Cause\(k Kind\) string/.test(errsSrc) &&
+  /func Hint\(k Kind\) string/.test(errsSrc) &&
+  /func Retryable\(k Kind\) bool/.test(errsSrc));
+
+check('⚠️ 流被截断单独归类（不再被误报成「文件读错」）',
+  /errors\.Is\(err, io\.ErrUnexpectedEOF\)/.test(errsSrc) &&
+  /KindStreamCut/.test(errsSrc) &&
+  /传到一半/.test(errsSrc));
+
+check('⚠️ FriendlyOr 只补系统故障，不动业务层写好的中文说明',
+  /func FriendlyOr\(action string, err error\) string/.test(errsSrc) &&
+  /if Classify\(err\) == KindUnknown \{\s*\n\s*return err\.Error\(\)/.test(errsSrc));
+
+check('取消类错误不可重试（用户点了停止还自动重试最招人烦）',
+  /case KindCanceled:\s*\n\s*return ""/.test(errsSrc) &&
+  /Retryable\(KindCanceled\)/.test(fs.readFileSync(path.join(rootDir, 'pkg', 'errs', 'errs_test.go'), 'utf8')));
+
+check('服务端所有错误响应走统一出口 writeErr（不再裸抛 err.Error()）',
+  /func writeErr\(w http\.ResponseWriter, status int, action string, err error\)/.test(apiHandlersSrc) &&
+  /errs\.FriendlyOr\(action, err\)/.test(apiHandlersSrc) &&
+  !/map\[string\]any\{"error": err\.Error\(\)\}/.test(apiHandlersSrc));
+
+check('WS 层错误同样翻译后才下发',
+  /func \(c \*wsClient\) sendErr\(action string, err error\)/.test(wsHandlerSrc2) &&
+  !/c\.send\(map\[string\]any\{"type": "error", "error": err\.Error\(\)\}\)/.test(wsHandlerSrc2));
+
+check('⚠️ LLM 流「未产出内容就断」时自动重试（本次故障的直接兜底）',
+  /func pumpStream\(/.test(llmOpenAISrc) &&
+  /if emitted \|\| !errs\.Retryable\(kind\) \|\| ctx\.Err\(\) != nil/.test(llmOpenAISrc) &&
+  /consume\(ctx, r, out\)/.test(llmOpenAISrc));
+
+check('⚠️ 已产出内容后不重试（避免重复输出 / 重复执行工具）',
+  /emitted = true/.test(llmOpenAISrc) &&
+  /// 一旦已经吐出正文或工具调用/.test(llmOpenAISrc) &&
+  /return emitted, err/.test(llmOpenAISrc));
+
+check('anthropic 与 openai 共用同一套重试骨架（避免两边漂移）',
+  /pumpStream\(ctx, p\.retry, resp, reopen,/.test(llmAnthropicSrc) &&
+  /return emitted, err/.test(llmAnthropicSrc));
+
+check('⚠️ 系统代理的绕过列表被读取（ProxyOverride，此前被整个忽略）',
+  /func systemProxyRaw\(\) \(string, \[\]string\)/.test(webProxyWinSrc) &&
+  /GetStringValue\("ProxyOverride"\)/.test(webProxyWinSrc));
+
+check('回环地址无条件绕过代理（交给代理永远是错的）',
+  /func shouldBypassProxy\(host string, bypass \[\]string\) bool/.test(webProxySrc) &&
+  /ip\.IsLoopback\(\)/.test(webProxySrc) &&
+  /h == "localhost" \|\| h == "::1"/.test(webProxySrc));
+
+check('ProxyOverride 的各类通配规则都被支持',
+  /p == "<local>"/.test(webProxySrc) &&
+  /strings\.HasPrefix\(p, "\*\."\)/.test(webProxySrc) &&
+  /strings\.HasSuffix\(p, "\*"\)/.test(webProxySrc));
+
+// ---------- 上下文超窗：按时压缩 + 撞墙自救（2026-09-21）----------
+const agentGoSrc = fs.readFileSync(path.join(rootDir, 'pkg', 'agent', 'agent.go'), 'utf8');
+const agentHistSrc = fs.readFileSync(path.join(rootDir, 'pkg', 'agent', 'history.go'), 'utf8');
+const agentCtxSrc = fs.readFileSync(path.join(rootDir, 'pkg', 'agent', 'context.go'), 'utf8');
+
+group('上下文超窗：按时压缩 + 撞墙自救');
+
+check('「输入+输出超过上下文窗口」单独归类（不再当普通 400 直接抛给用户）',
+  /KindContextOverflow/.test(errsSrc) &&
+  /func isContextOverflowMessage\(msg string\) bool/.test(errsSrc) &&
+  /maximum context length/.test(errsSrc) &&
+  /reduce the length of the input/.test(errsSrc));
+
+check('超窗不可「原样重试」（同一请求再发一次还是超窗，必须压缩后重发）',
+  /上下文超窗同理：不改变请求内容，重发没有意义/.test(errsSrc) &&
+  /KindContextOverflow/.test(errsSrc));
+
+check('⚠️ 撞墙后自动收紧压缩线重试，而不是整轮白跑',
+  /errs\.Classify\(err\) == errs\.KindContextOverflow && attempt <= maxOverflowShrinks/.test(agentGoSrc) &&
+  /shrink \*= overflowShrinkRatio/.test(agentGoSrc) &&
+  /maxOverflowShrinks = 2/.test(agentCtxSrc) &&
+  /overflowShrinkRatio = 0\.7/.test(agentCtxSrc));
+
+check('自救过程会告知用户（否则界面只是突然多出一段摘要）',
+  /上游报告上下文超窗，正在压缩历史后重试/.test(agentGoSrc));
+
+check('⚠️ 估算器用上游真实用量校准（这才是「在合适的时间压缩」）',
+  /func \(s \*Session\) calibrateTokenFactor\(realInput int\)/.test(agentHistSrc) &&
+  /tokenFactor float64/.test(agentHistSrc) &&
+  /s\.calibrateTokenFactor\(u\.InputTokens\)/.test(agentHistSrc));
+
+check('校准只放大不缩小（宁可早压，漏压的代价是整轮失败）',
+  /if f < 1 \{[\s\S]{0,60}?f = 1/.test(agentHistSrc) &&
+  /只放大不缩小/.test(agentHistSrc));
+
+check('校准系数有上限（避免异常用量把压缩线压得过低、每轮无谓压缩）',
+  /maxTokenFactor = 2\.0/.test(agentCtxSrc) &&
+  /if f > maxTokenFactor \{/.test(agentHistSrc));
+
+check('压缩判定改用校准后的估算，而不是裸估算',
+  /used := sess\.calibratedEstimate\(view\)/.test(agentGoSrc) &&
+  /sess\.calibratedEstimate\(messages\) > budget/.test(agentGoSrc));
+
+check('每次请求前记录估算基准（含系统提示与工具定义，口径才对得上）',
+  /sess\.reqEstimate = EstimateTokens\(messages\) \+ overhead/.test(agentGoSrc));
+
+// ---------- 上下文占用实时刷新（2026-09-21）----------
+const wsPushSrc = fs.readFileSync(path.join(rootDir, 'pkg', 'server', 'ws_handler.go'), 'utf8');
+
+group('上下文占用：轮次进行中也实时刷新');
+
+check('⚠️ 轮次进行中就推送上下文占用（不再等本轮 idle 才跳一下）',
+  /func pushesContextOn\(t string\) bool/.test(wsPushSrc) &&
+  /if pushesContextOn\(ev\.Type\) \{\s*\n\s*c\.send\(c\.srv\.contextUsage\(sessionID\)\)/.test(wsPushSrc));
+
+check('刷新时机覆盖占用变化的全过程（发话 / 步骤 / 工具结果 / 压缩回落）',
+  /case agent\.EventUser, agent\.EventStep, agent\.EventToolResult, agent\.EventCompress:/.test(wsPushSrc));
+
+check('⚠️ 高频 delta 事件不触发刷新（每秒上百条，会白烧 CPU）',
+  !/agent\.EventText,/.test(wsPushSrc) &&
+  /刻意不选 delta 类事件/.test(wsPushSrc));
+
+check('实时读取会话是安全的（emit 在 agent 自己的 goroutine 里同步调用）',
+  /emit 是 agent 在\*\*自己的 goroutine 里同步调用\*\*的/.test(wsPushSrc));
+
+check('前端进度条有过渡动画（频繁更新才不会一跳一跳）',
+  /\.ctx-fill\s*\{[^}]*transition:\s*width/.test(css));
+
+// ---------- 压缩状态持久化 + 切换前先压缩（2026-09-21）----------
+const storeGoSrc = fs.readFileSync(path.join(rootDir, 'pkg', 'store', 'store.go'), 'utf8');
+const storeSessSrc = fs.readFileSync(path.join(rootDir, 'pkg', 'store', 'sessions.go'), 'utf8');
+const serverModelsSrc = fs.readFileSync(path.join(rootDir, 'pkg', 'server', 'models.go'), 'utf8');
+
+group('压缩状态持久化 + 切换模型前先压缩');
+
+check('⚠️ 压缩状态落盘（否则重启即丢，重开同一会话立刻又超限）',
+  /ALTER TABLE sessions ADD COLUMN compressed_up_to/.test(storeGoSrc) &&
+  /ALTER TABLE sessions ADD COLUMN summary_text/.test(storeGoSrc) &&
+  /CompressedUpTo int/.test(storeSessSrc) &&
+  /SummaryText    string/.test(storeSessSrc));
+
+check('存取两侧都带上压缩状态',
+  /compressed_up_to, summary_text/.test(storeSessSrc) &&
+  /SET title = \?, updated_at = \?, compressed_up_to = \?, summary_text = \?/.test(storeSessSrc) &&
+  /CompressedUpTo: s\.compressedUpTo/.test(agentHistSrc) &&
+  /compressedUpTo: row\.CompressedUpTo/.test(agentHistSrc));
+
+check('恢复后立即自愈越界状态（历史可能被回退或整体替换过）',
+  /s\.normalizeCompression\(\)\s*\n\s*h\.cache\[id\] = s/.test(agentHistSrc));
+
+check('⚠️ 切换模型装不下时**先压缩**，不再直接拦下来',
+  /if _, err := s\.agent\.CompressNow\(r\.Context\(\), req\.SessionID\); err != nil/.test(serverModelsSrc) &&
+  /已尝试压缩上下文，但仍放不进该模型的窗口/.test(serverModelsSrc));
+
+check('⚠️ 超窗判定用压缩后的送模量，不用原始历史（否则刚压好也被拦）',
+  /func \(a \*Agent\) SessionOverflowFor\(sess \*Session, ctxIn int\) int/.test(agentGoSrc) &&
+  /used := sess\.calibratedEstimate\(a\.requestView\(sess\)\)/.test(agentGoSrc) &&
+  /s\.agent\.SessionOverflowFor\(sess, m\.CtxIn\)/.test(serverModelsSrc));
+
+check('提示文案里的占用是压缩后量（不误导用户）',
+  /func \(a \*Agent\) RequestViewTokens\(sess \*Session\) int/.test(agentGoSrc) &&
+  /humanTokens\(s\.agent\.RequestViewTokens\(sess2\)\)/.test(serverModelsSrc));
+
 group('自定义背景图可见性');
 check('不透明底色只挂在 html 上，body 透明',
   /html\s*\{\s*background:\s*var\(--bg\);\s*\}/.test(css) &&
@@ -1548,6 +1723,8 @@ check('浅色主题保持原色 #d6336c（未改成变量、未改值）',
   /#model-level\s*\{[^}]*color:\s*#d6336c/.test(css));
 check('深色主题单独提亮',
   /body\.bg-dark #model-level\s*\{[^}]*color:\s*#/.test(css));
+check('深色主题下滑条档位气泡文字钉回深色（body.bg-dark .fs-tip）',
+  /body\.bg-dark\s+\.fs-tip\s*\{\s*color:\s*#1f2430;?\s*\}/.test(css));
 
 // ⚠️ 用户明确要求：**不要动浅色主题的配色**。
 // 之前我擅自按 WCAG 把这几个值都压暗了，被要求全部撤回 —— 这组断言锁住原值。

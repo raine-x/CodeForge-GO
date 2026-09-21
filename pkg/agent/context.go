@@ -60,6 +60,24 @@ const (
 	summaryTimeout = 2 * time.Minute
 	// summaryFallbackMaxTokens 是摘要请求的输出上限兜底。
 	summaryFallbackMaxTokens = 4096
+
+	// maxOverflowShrinks 是「上游报上下文超窗」后，压得更狠再试的最大次数。
+	//
+	// 为什么需要它：压缩判定用的是**估算**，而估算器对代码/JSON 会低估
+	//（代码约 3–3.5 字符/token，估算按 4 字符/token 计），压缩线又只留 5% 余量。
+	// 于是会出现「判定没超、真请求超窗」—— 此时把预算收紧重发通常就过了。
+	// 压缩是幂等的，多压一次的代价远小于整轮任务白跑。
+	maxOverflowShrinks = 2
+
+	// overflowShrinkRatio 是每次收紧压缩线时乘的系数。
+	// 0.7 一次就能腾出 30% 空间，两轮下来足够应付绝大多数低估。
+	overflowShrinkRatio = 0.7
+
+	// maxTokenFactor 是估算器校准系数的上限。
+	//
+	// 防止某次异常用量（上游把缓存 token 也算进 input 之类）把系数顶到离谱的
+	// 高度，导致压缩线被压得过低、每轮都在无谓地压缩。
+	maxTokenFactor = 2.0
 	// summaryOutputCap 是摘要请求输出上限的绝对上限（不沿用模型的大输出上限）。
 	summaryOutputCap = 8192
 )

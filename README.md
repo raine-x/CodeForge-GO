@@ -43,7 +43,8 @@ make windows linux-amd64 android-arm64
 
 > **模型统一在「设置 → 模型」里管理**（服务端模型库 `config/models.yaml`，首次启动会把
 > 当前生效模型自动种入列表）。对话框旁的模型名只是「当前生效项」的展示，列表的增删改查
-> 一律走设置页；密钥明文只存在服务端（`models.yaml` / `local.yaml`，均 0600 且被 gitignore），
+> 一律走设置页；密钥明文只存在服务端（`models.yaml` / `providers.yaml` 与用户级
+> `state.yaml`，均 0600 且都不入库），
 > 前端只拿到 `key_set` 布尔值。也可任选其一手工配置：
 
 ```bash
@@ -66,7 +67,8 @@ llm:
   model: "z-ai/glm-5.3-free"
 ```
 
-也可以启动后在界面「设置」中填写 —— 保存时会自动写入 `config/local.yaml`，前端只显示掩码。
+也可以启动后在界面「设置」中填写 —— 保存时写入**用户级运行状态** `~/.codeforge/state.yaml`
+（程序不再改写 `config/local.yaml`，那是你的手写覆盖文件），前端只显示掩码。
 
 ### 3. 启动
 
@@ -106,7 +108,7 @@ CodeForge 已启动：http://127.0.0.1:8420/
 
 浏览器会自动打开 `http://127.0.0.1:8420/`（加 `-no-open` 可禁用）。
 
-> **工作区选择会记住**：在界面选择工作区后，绝对路径自动写回 `config/local.yaml` 的
+> **工作区选择会记住**：在界面选择工作区后，绝对路径自动写进 `~/.codeforge/state.yaml` 的
 > `agent.work_dir`，重启后自动恢复，不必每次重新选。目录被删时启动会打告警并按
 > 「未选择工作区」处理；也可以启动时用 `-workdir <目录>` 显式指定。
 
@@ -177,7 +179,8 @@ chmod +x codeforge-linux-amd64        # arm64 换成 codeforge-linux-arm64（默
   `http://<服务器IP>:8420/` —— 记得先把 `server.host` 改成 `0.0.0.0`。
 - 自动开浏览器依次尝试 `xdg-open` → `open`（macOS），都没有时会提示手动访问。
 - `codeforge stop` / `restart` 在各平台通用：优先向实例发带令牌的 `POST /api/shutdown` 优雅关闭，
-  失败再按 `codeforge.run` 里的 PID 强制结束（PID 失效时按端口定位，POSIX 上依次尝试 `lsof` / `ss`）。
+  失败再按 `~/.codeforge/run.json` 里的 PID 强制结束（PID 失效时按端口定位，POSIX 上依次尝试 `lsof` / `ss`）。
+  该文件只描述当前这一个进程，退出即删。
 
 ### Android Termux arm64
 
@@ -202,7 +205,7 @@ chmod +x codeforge-android-arm64
 └── .env                      # 只放 API Key 即可
 ```
 
-启动后 API Key 也可以直接在界面「设置」里填，会写入 `config/local.yaml`（前端只显示掩码）。
+启动后 API Key 也可以直接在界面「设置」里填，会写入用户级 `~/.codeforge/state.yaml`（前端只显示掩码）。
 
 ---
 
@@ -239,11 +242,32 @@ CodeForge-go/
 
 遵循「**密钥不入库、忽略文件可重建**」原则。
 
+### 分层与写入者
+
+**每个文件只有一个写入者** —— 这是这套配置结构的硬规则。合并次序是
+`default.yaml → local.yaml → ~/.codeforge/state.yaml`（后者覆盖前者），
+所以界面上的改动永远赢过手写的静态覆盖，而手写的 `local.yaml` 不会被程序改写。
+
+| 文件 | 位置 | 写入者 | 是否入库 |
+|---|---|---|---|
+| `default.yaml` | `config/` | 代码 / Git | ✅ |
+| `plugins.yaml` | `config/` | 开发者（同时 `go:embed` 为内建默认） | ✅ |
+| `local.yaml` | `config/` | **用户手工编辑** | ❌ |
+| `models.yaml`、`providers.yaml` | `config/` | 设置页 | ❌（含密钥） |
+| `.env` | 项目根 | 用户（含 pytest 在线用例用的 `LLM_*`） | ❌（含密钥） |
+| `state.yaml` | `~/.codeforge/` | **程序**（运行状态：当前模型/工作区/外观/开关） | 不在仓库内 |
+| `run.json` | `~/.codeforge/` | 程序（仅描述当前进程，退出即删） | 不在仓库内 |
+| `data.db` | `~/.codeforge/` | 程序（会话、记忆，跨工作区共享） | 不在仓库内 |
+
+> 模型/供应商目录与 `plugins.yaml` 不合并成一个文件，是为了守住密钥边界：
+> `plugins.yaml` 必须进 Git 并被 `go:embed` 打进二进制（裸 exe 才自带 MCP 服务），
+> 而 `models.yaml` / `providers.yaml` 含明文密钥必须被忽略 —— 同一份文件做不到两件事。
+
 ### 被忽略的内容（`.gitignore`）
 
 | 模式 | 说明 |
 |---|---|
-| `config/local.yaml`、`config/*.local.yaml` | 本地配置覆盖（当前生效模型）；界面保存密钥时写入 |
+| `config/local.yaml`、`config/*.local.yaml` | 本地配置覆盖，**由用户编辑**（程序只读，不再写入） |
 | `config/models.yaml` | **模型库**（设置页统一管理），含各模型密钥明文，0600 |
 | `.env`、`.env.*`（保留 `*.example`） | 环境变量文件 |
 | `*apikey*`、`*api_key*`、`*api-key*` | 命名约定兜底 |
