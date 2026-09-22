@@ -1513,12 +1513,20 @@ body.bg-dark .msg-user.msg-steer .bubble { border-left-color: #f6b8ce; }
   align-self: flex-start;
   font-size: 13px;
   color: var(--text-dim);
-  cursor: pointer;
+  /* 默认**不**摆出「可点」的样子：只有真能点开的卡片才给手型与悬停底色，
+     否则读取/搜索/命令这些卡片看着能点、点了没反应。 */
+  cursor: default;
   padding: 3px 8px;
   margin-left: -8px;
   border-radius: 8px;
 }
-.msg-tool:hover { background: var(--bg-elev-2); color: var(--text); }
+/* 能点开 diff 的卡片（.clickable）与可展开详情的重试提示（.retry）才是可点击的。 */
+.msg-tool.clickable, .msg-tool.retry { cursor: pointer; }
+.msg-tool.clickable:hover, .msg-tool.retry:hover { background: var(--bg-elev-2); color: var(--text); }
+.msg-tool.clickable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
 /* 自动重试提示：样式同工具条目，文字用警示色；点击展开错误原因 */
 .msg-tool.retry { color: #b45309; cursor: pointer; }
 .msg-tool.retry:hover { background: var(--bg-elev-2); color: #92400e; }
@@ -2607,6 +2615,40 @@ body.bg-dark .fs-tip {
 .diff .ctx { color: var(--text-dim); display: block; }
 .diff .hunk { color: var(--accent); display: block; }
 .diff .file { color: var(--text-dim); display: block; font-weight: 600; }
+
+/* ---------- diff 面板：点击工具卡片查看这次改动改在哪 ---------- */
+/* 逐行配色直接复用上面的 .diff .add/.del/.ctx/.hunk/.file，这里只做外壳：
+   把高度放开（340px 看不全一个改动块），并让头部固定、正文自己滚。 */
+.diff-modal {
+  width: min(900px, 100%);
+  max-height: 88vh;
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+}
+.diff-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.diff-title {
+  flex: 1; min-width: 0;
+  font-size: 12px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.diff-meta { font-size: 11px; color: var(--text-dim); white-space: nowrap; }
+.diff-close {
+  flex: none;
+  border: none; background: transparent;
+  color: var(--text-dim); font-size: 14px; line-height: 1;
+  padding: 4px 6px; border-radius: 6px; cursor: pointer;
+}
+.diff-close:hover { background: var(--bg-elev-2); color: var(--text); }
+.diff-note { padding: 10px 14px 0; font-size: 12px; color: var(--text-dim); }
+.diff-body {
+  border: none; border-radius: 0; margin: 0;
+  flex: 1; min-height: 140px; max-height: 72vh;
+}
 
 .muted { color: var(--text-dim); }
 .hidden { display: none !important; }

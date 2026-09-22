@@ -138,6 +138,47 @@ func (s *Session) normalizeCompression() {
 	}
 }
 
+// repairDanglingToolUse 给末尾「没有结果」的工具调用补一条说明性 tool_result。
+//
+// 只在**最后一条消息**是含 tool_use 的助手消息时才动手 —— 那正是「工具执行到
+// 一半进程被杀 / 被强杀」留下的形状。此时会话末尾挂着没有结果的 tool_use，
+// 而上游对消息序列有硬约束（每个 tool_use 必须紧跟同 ID 的结果），带着它续跑
+// 会被 400 拒绝，用户看到的却只是「模型又报错了」。
+//
+// 补一条「未执行」的结果，而不是把这条调用删掉：删掉等于连「模型决定做过什么」
+// 一起抹了，而续跑恰恰需要它当上下文 —— 2026-09-22 用户投诉的正是「打断后记录
+// 被抹掉」，不该在这里制造第二处同类丢失。
+//
+// 返回补上的工具调用 ID；无需修复时返回 nil。
+func (s *Session) repairDanglingToolUse() []string {
+	if s == nil || len(s.Messages) == 0 {
+		return nil
+	}
+	last := s.Messages[len(s.Messages)-1]
+	if last.Role != llm.RoleAssistant {
+		return nil
+	}
+	// 同一条消息里可能并存正文与多个 tool_use；只有真正没有结果的才算残缺。
+	replied := map[string]bool{}
+	for _, b := range last.Content {
+		if b.Type == llm.BlockToolResult {
+			replied[b.ToolUseID] = true
+		}
+	}
+	var fixed []string
+	for _, b := range last.Content {
+		if b.Type != llm.BlockToolUse || b.ID == "" || replied[b.ID] {
+			continue
+		}
+		fixed = append(fixed, b.ID)
+	}
+	for _, id := range fixed {
+		s.Messages = append(s.Messages, llm.ToolResultMessage(id,
+			"（本轮在工具执行完成前被中断，该工具没有产出结果）", true))
+	}
+	return fixed
+}
+
 // History 负责会话历史的持久化（SQLite）与缓存。
 //
 // workspace 语义：会话按工作区隔离。workspace 为空（未选择工作区）时，

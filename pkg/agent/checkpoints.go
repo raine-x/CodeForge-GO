@@ -87,6 +87,43 @@ func (a *Agent) CheckpointSteps(sessionID string) []CheckpointStep {
 	return out
 }
 
+// CheckpointFor 返回某会话某路径的检查点，供「这条改动到底改了什么」的查看。
+//
+// step >= 0：取该步骤上的那一条（实时卡片知道自己的步骤号，最精确）；
+// step < 0 ：取该路径**最早**的一条 —— 也就是「这个文件在本次会话里被第一次改动
+// 之前是什么样」。历史回放场景前端拿不到步骤号，用它与当前文件对比，
+// 得到的是累计改动（接口会注明对比基准，不假装是当时那一次编辑）。
+//
+// 只按会话内**已记录**的路径查找：查不到就不给 diff —— 这样这个读取口
+// 天然被限制在「本次会话确实改过」的文件上，不会退化成任意路径读取。
+func (a *Agent) CheckpointFor(sessionID, path string, step int) (store.CheckpointRow, bool) {
+	if a.memoryStore == nil || strings.TrimSpace(path) == "" {
+		return store.CheckpointRow{}, false
+	}
+	rows, err := a.memoryStore.ListCheckpoints(sessionID)
+	if err != nil {
+		return store.CheckpointRow{}, false
+	}
+	var earliest store.CheckpointRow
+	found := false
+	for _, r := range rows {
+		if r.Path != path {
+			continue
+		}
+		if step >= 0 {
+			if r.Step == step {
+				return r, true
+			}
+			continue
+		}
+		if !found || r.Step < earliest.Step {
+			earliest = r
+			found = true
+		}
+	}
+	return earliest, found
+}
+
 // RewindFiles 把工作区文件恢复到「第 toStep 步开始之前」的样子。
 //
 // 逐条按步骤倒序恢复，而不是「每个路径取最早的快照写一次」：

@@ -32,6 +32,7 @@ const (
 	EventEdit        = "edit"     // 历史被编辑重发截断（前端据此丢弃下方旧内容）
 	EventSteer       = "steer"    // 运行中收到的转向指令已并入上下文（下一个步骤边界生效）
 	EventRewind      = "rewind"   // 文件已按检查点回滚
+	EventInfo        = "info"     // 一般性提示（纯告知，不改变任何状态）
 	EventDone        = "done"
 	EventError       = "error"
 )
@@ -51,6 +52,7 @@ type Event struct {
 	Attempt     int               `json:"attempt,omitempty"`      // 重试类事件：即将进行的第几次尝试（1-based）
 	MaxAttempts int               `json:"max_attempts,omitempty"` // 重试类事件：含首次请求在内的总尝试次数
 	DiffStats   *DiffStats        `json:"diff_stats,omitempty"`   // 编辑类工具的 +/- 行数（供前端绿增红减展示）
+	Diff        string            `json:"diff,omitempty"`         // 编辑类工具的 unified diff（供前端「点击查看改动位置」）
 	Compress    *CompressInfo     `json:"compress,omitempty"`     // 上下文压缩明细（仅 EventCompress 携带）
 	Rewind      *RewindResult     `json:"rewind,omitempty"`       // 文件回滚结果（仅 EventRewind 携带）
 }
@@ -74,20 +76,31 @@ type CompressInfo struct {
 	Reason      string `json:"reason,omitempty"` // 回退原因（Degraded 时）
 }
 
-// diffStatsFor 对支持 PreviewDiff 的工具调用统计 +/- 行数。
-// 返回 nil 表示该工具或该次调用不产生 diff。
-func (a *Agent) diffStatsFor(tc llm.ToolCall) *DiffStats {
+// diffPreviewMaxLines 是随 tool_call 事件下发的 diff 行数上限。
+//
+// 整份文件重写时 diff 可能上千行，不能无上限地塞进 WS 帧；超出部分截断并**明确标注**，
+// 而不是静默丢掉（用户点开面板时要看得出「这里还有更多」）。
+const diffPreviewMaxLines = 400
+
+// previewFor 对支持 PreviewDiff 的工具调用算出 unified diff 与 +/- 统计。
+//
+// 一次算两用：统计供卡片的「+N/-M」徽标，diff 文本供「点击查看改动位置」的面板。
+// 此前只留统计、把已经算好的 diff 丢掉，于是想看改动就得让前端再猜一次
+// （2026-09-22：卡片只显示「运行 xxx」，鼠标放上去是一堆原始参数）。
+//
+// 返回 (diff, stats)；该工具不支持 diff 或本次无差异时返回 ("", nil)。
+func (a *Agent) previewFor(tc llm.ToolCall) (string, *DiffStats) {
 	tool, ok := a.registry.Get(tc.Name)
 	if !ok {
-		return nil
+		return "", nil
 	}
 	dp, ok := tool.(tools.DiffProvider)
 	if !ok {
-		return nil
+		return "", nil
 	}
 	diff, err := dp.PreviewDiff(tc.Input)
 	if err != nil || diff == "" {
-		return nil
+		return "", nil
 	}
 	st := &DiffStats{}
 	for _, line := range strings.Split(diff, "\n") {
@@ -98,7 +111,22 @@ func (a *Agent) diffStatsFor(tc llm.ToolCall) *DiffStats {
 			st.Removed++
 		}
 	}
-	return st
+	return clipDiff(diff, diffPreviewMaxLines), st
+}
+
+// clipDiff 按行数截断 diff；被截掉时补一行说明，绝不静默丢内容。
+func clipDiff(diff string, maxLines int) string {
+	if maxLines <= 0 {
+		return diff
+	}
+	lines := strings.Split(diff, "\n")
+	if len(lines) <= maxLines {
+		return diff
+	}
+	kept := make([]string, 0, maxLines+1)
+	kept = append(kept, lines[:maxLines]...)
+	kept = append(kept, fmt.Sprintf("…（改动过大，仅显示前 %d 行；完整内容请直接打开该文件查看）", maxLines))
+	return strings.Join(kept, "\n")
 }
 
 // Emitter 是事件发送回调。
@@ -524,6 +552,17 @@ func (a *Agent) RunWithImages(ctx context.Context, sessionID, input string, imag
 		return fmt.Errorf("会话不存在: %s", sessionID)
 	}
 
+	// 续跑前的历史自愈：上一轮若在「工具执行到一半」被强杀，末尾会挂着一条
+	// 没有结果的 tool_use，上游对消息序列有硬约束，带着它请求会被 400 拒绝。
+	// 补一条说明性结果（而不是删掉调用记录）——见 Session.repairDanglingToolUse。
+	if fixed := sess.repairDanglingToolUse(); len(fixed) > 0 {
+		log.Printf("[agent] 会话=%s 补上 %d 条没有结果的工具调用记录（上一轮在工具执行中被中断）",
+			sessionID, len(fixed))
+		emit(Event{Type: EventInfo,
+			Text: fmt.Sprintf("已补上 %d 条被打断的工具调用记录，接着往下跑", len(fixed))})
+		a.save(sess, true)
+	}
+
 	message := llm.TextMessage(llm.RoleUser, input)
 	message.Content = append(message.Content, images...)
 	sess.Messages = append(sess.Messages, message)
@@ -595,6 +634,9 @@ func (a *Agent) EditAndResend(ctx context.Context, sessionID string, back int, n
 //
 // 返回的 text 永远是实际送进历史的那段文本（重试时即原文），WS 层要靠它
 // 重建前端视图。
+//
+// 会在截断之后、跑循环之前 emit 一次 EventEdit（前端据此把视图退到截断点）。
+// 顺序很关键：晚于新一轮内容发出的话，前端重建视图会把新回复一起清掉。
 func (a *Agent) RerunFrom(ctx context.Context, sessionID string, back int, newText string, emit Emitter) (int, string, error) {
 	limit := a.MaxSteps()
 	sess, ok := a.history.Get(sessionID)
@@ -649,6 +691,15 @@ func (a *Agent) RerunFrom(ctx context.Context, sessionID string, back int, newTe
 	}
 
 	a.lastUserInput = text
+
+	// ⚠️ 截断的信号必须**在新一轮内容之前**发出。
+	//
+	// 早先这里不发，由 WS 层在 RerunFrom 返回之后补发 —— 而 RerunFrom 内部已经把
+	// 整轮跑完了，新回复早就流到屏幕上。前端收到「历史已截断」再去重建视图，
+	// 就把刚流出的回复连同更早的历史一起清掉，屏幕上只剩一条错误信息
+	//（2026-09-22 用户反馈：「界面上之前的记录被一条错误覆盖」）。
+	emit(Event{Type: EventEdit, Step: idx, Text: text})
+
 	if err := a.runLoopWithLimit(ctx, sess, emit, true, limit); err != nil {
 		return idx, text, err
 	}
@@ -970,6 +1021,9 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 			tc := tc0
 			tc.Name = a.registry.ResolveWire(tc0.Name)
 			decision := a.executor.Evaluate(tc.Name, tc.Input)
+			// diff 与统计一次算出：统计给卡片的「+N/-M」徽标，
+			// diff 文本给「点击查看改动位置」的面板（见 previewFor）。
+			diff, stats := a.previewFor(tc)
 			emit(Event{
 				Type:       EventToolCall,
 				ToolCallID: tc.ID,
@@ -977,7 +1031,8 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 				ToolInput:  tc.Input,
 				Decision:   string(decision.Decision),
 				Reason:     decision.Reason,
-				DiffStats:  a.diffStatsFor(tc),
+				DiffStats:  stats,
+				Diff:       diff,
 			})
 
 			// 注入会话运行域：后台任务 / 检查点 / 任务清单等按会话归属的行为

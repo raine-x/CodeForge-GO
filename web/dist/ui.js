@@ -1107,7 +1107,32 @@
       activeToolEl = null;
     }
   }
-  function addTool(text, detail, diffStats) {
+  // 会改动文件的工具：只有这类卡片有「改动位置」可看，点开就是 diff。
+  const DIFF_TOOLS = { edit_file: 1, write_file: 1, delete_file: 1 };
+
+  // toolFilePath 取出这次调用改动的文件路径；不是改文件的工具返回空串。
+  function toolFilePath(name, input) {
+    name = typeof name === 'string' ? name : '';
+    const local = name.indexOf('.') > 0 ? name.slice(name.indexOf('.') + 1) : name;
+    if (!DIFF_TOOLS[local]) return '';
+    let o = input;
+    if (typeof o === 'string') {
+      try { o = JSON.parse(o); } catch (_) { return ''; }
+    }
+    if (!o || typeof o !== 'object') return '';
+    return String(o.path || '').trim();
+  }
+
+  // 工具卡片。
+  //
+  // opts.stats  {added, removed} → 卡片上的 +N/-M 徽标
+  // opts.diff   现成的 unified diff（实时卡片有；历史回放没有）
+  // opts.path   改动文件路径（历史回放的卡片点开时用它去服务端取 diff）
+  //
+  // ⚠️ 刻意**不**把工具参数塞进 title：以前 title = JSON.stringify(input)，
+  // 鼠标一放上去就是一大坨原始参数（2026-09-22 反馈）。想看改了什么，点开 diff 面板。
+  function addTool(text, opts) {
+    opts = opts || {};
     settleActiveTool();
     const d = document.createElement('div');
     d.className = 'msg-tool running';
@@ -1115,23 +1140,169 @@
     sp.className = 'tool-spinner';
     d.appendChild(sp);
     d.appendChild(document.createTextNode(text));
-    if (detail) d.title = detail;
     // 编辑类工具：追加 +新增 / -删除 行数（绿增红减，等宽数字）
-    if (diffStats && (diffStats.added > 0 || diffStats.removed > 0)) {
+    const stats = opts.stats;
+    if (stats && (stats.added > 0 || stats.removed > 0)) {
       d.appendChild(document.createTextNode(' '));
       const add = document.createElement('span');
       add.className = 'diffstat add';
-      add.textContent = '+' + diffStats.added;
+      add.textContent = '+' + stats.added;
       const del = document.createElement('span');
       del.className = 'diffstat del';
-      del.textContent = '-' + diffStats.removed;
+      del.textContent = '-' + stats.removed;
       d.appendChild(add);
       d.appendChild(del);
+    }
+    // 改过文件的卡片：可点击查看改动位置。
+    // diff 文本有就直接用；没有（历史回放的卡片）就记住路径，点击时再向服务端取。
+    if (opts.diff || opts.path) {
+      d._diff = opts.diff || '';
+      d._path = opts.path || '';
+      d.classList.add('clickable');
+      d.setAttribute('role', 'button');
+      d.setAttribute('tabindex', '0');
+      d.title = '点击查看这次改动的位置';
+      d.addEventListener('click', function () { openToolDiff(d); });
+      d.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Spacebar') {
+          ev.preventDefault();
+          openToolDiff(d);
+        }
+      });
     }
     ensureCol().appendChild(d);
     activeToolEl = d;
     scrollBottom();
   }
+  // ---------- diff 面板：这次改动到底改在哪 ----------
+  //
+  // 打开方式：点「编辑/写入/删除文件」的工具卡片。数据来源两种：
+  //   ① 实时卡片 —— tool_call 事件里就带着 diff（服务端 previewFor 顺手算出来的，
+  //      与卡片上的 +N/-M 同源，不会自相矛盾）；
+  //   ② 历史回放的卡片 —— diff 不随历史持久化，按路径向 /api/diff 取：
+  //      用检查点里的「改动前内容」与当前文件对比。接口会注明对比基准（compare=current），
+  //      因为那可能是**累计**改动而不是当时那一次编辑，面板必须把这点说清楚。
+  const DIFF_RENDER_MAX_LINES = 2000;
+
+  // diffLineKind 判定一行 unified diff 的类型（纯函数，便于单测）。
+  // ⚠️ 顺序要紧：'+++' / '---' 必须先判，否则文件头会被当成增删行染色。
+  function diffLineKind(line) {
+    if (line.indexOf('+++') === 0 || line.indexOf('---') === 0) return 'file';
+    if (line.indexOf('@@') === 0) return 'hunk';
+    if (line[0] === '+') return 'add';
+    if (line[0] === '-') return 'del';
+    return 'ctx';
+  }
+
+  let diffOverlay = null;
+  let diffPanelOpen = false;
+  let diffTitleEl = null, diffMetaEl = null, diffNoteEl = null, diffBodyEl = null;
+
+  function ensureDiffPanel() {
+    if (diffOverlay) return;
+    diffOverlay = document.createElement('div');
+    diffOverlay.id = 'diff-overlay';
+    diffOverlay.className = 'overlay hidden';
+    diffOverlay.innerHTML =
+      '<div class="modal diff-modal">' +
+      '<div class="diff-head">' +
+      '<span id="diff-title" class="diff-title mono"></span>' +
+      '<span id="diff-meta" class="diff-meta"></span>' +
+      '<button type="button" id="diff-close" class="diff-close" title="关闭">✕</button>' +
+      '</div>' +
+      '<div id="diff-note" class="diff-note hidden"></div>' +
+      '<pre id="diff-body" class="diff diff-body"></pre>' +
+      '</div>';
+    document.body.appendChild(diffOverlay);
+    diffTitleEl = diffOverlay.querySelector('#diff-title');
+    diffMetaEl = diffOverlay.querySelector('#diff-meta');
+    diffNoteEl = diffOverlay.querySelector('#diff-note');
+    diffBodyEl = diffOverlay.querySelector('#diff-body');
+    diffOverlay.querySelector('#diff-close').addEventListener('click', closeDiffPanel);
+    // 点遮罩空白处也关（点内容区不关）
+    diffOverlay.addEventListener('click', function (ev) {
+      if (ev.target === diffOverlay) closeDiffPanel();
+    });
+  }
+
+  function showDiffPanel(info) {
+    ensureDiffPanel();
+    diffPanelOpen = true;
+    diffOverlay.classList.remove('hidden');
+    fillDiffPanel(info);
+  }
+
+  function closeDiffPanel() {
+    diffPanelOpen = false;
+    if (diffOverlay) diffOverlay.classList.add('hidden');
+  }
+
+  function fillDiffPanel(info) {
+    info = info || {};
+    if (!diffTitleEl) return;
+    diffTitleEl.textContent = info.path || '改动';
+    diffTitleEl.title = info.path || '';
+    const bits = [];
+    if (info.loading) bits.push('读取中…');
+    if (typeof info.added === 'number' && (info.added || info.removed)) {
+      bits.push('+' + info.added + ' -' + (info.removed || 0));
+    }
+    if (info.compare === 'current') bits.push('与当前文件对比');
+    diffMetaEl.textContent = bits.join(' · ');
+    diffNoteEl.textContent = info.note || '';
+    diffNoteEl.classList.toggle('hidden', !info.note);
+    renderDiffBody(info.diff || '');
+  }
+
+  function renderDiffBody(diff) {
+    if (!diffBodyEl) return;
+    diffBodyEl.textContent = '';
+    if (!diff) {
+      diffBodyEl.appendChild(document.createTextNode('（没有可显示的改动）'));
+      return;
+    }
+    const lines = diff.split('\n');
+    const capped = lines.length > DIFF_RENDER_MAX_LINES;
+    const shown = capped ? lines.slice(0, DIFF_RENDER_MAX_LINES) : lines;
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < shown.length; i++) {
+      const span = document.createElement('span');
+      // 直接复用 .diff 已有的逐行配色（.add/.del/.ctx/.hunk/.file），不另造一套。
+      span.className = diffLineKind(shown[i]);
+      span.textContent = shown[i] + '\n';
+      frag.appendChild(span);
+    }
+    if (capped) {
+      const span = document.createElement('span');
+      span.className = 'ctx';
+      span.textContent = '…（内容过多，仅显示前 ' + DIFF_RENDER_MAX_LINES + ' 行）\n';
+      frag.appendChild(span);
+    }
+    diffBodyEl.appendChild(frag);
+  }
+
+  // 点开一张工具卡片：有现成 diff 直接用，否则按路径向服务端取。
+  async function openToolDiff(el) {
+    const path = (el && el._path) || '';
+    const inline = (el && el._diff) || '';
+    showDiffPanel({ path: path, diff: inline, loading: !inline && !!path });
+    if (inline || !path) return;
+    try {
+      const r = await fetch('/api/diff?session_id=' + encodeURIComponent(sessionID) +
+        '&path=' + encodeURIComponent(path));
+      const d = await r.json();
+      if (!diffPanelOpen) return; // 用户已经关掉了：别再往里填
+      fillDiffPanel({
+        path: d.path || path, diff: d.diff || '', note: d.note || '',
+        added: d.added, removed: d.removed, compare: d.compare
+      });
+    } catch (e) {
+      if (diffPanelOpen) {
+        fillDiffPanel({ path: path, diff: '', note: '取 diff 失败：' + (e.message || '服务不可达') });
+      }
+    }
+  }
+
   function addError(text) {
     const d = document.createElement('div');
     d.className = 'msg-error';
@@ -1284,16 +1455,17 @@
   function removeRetry() {
     if (retryEl) { retryEl.remove(); retryEl = null; }
   }
-  // 未回复打断的重试圆环
+  // 未回复打断的「继续」圆环
   function showRetryRing() {
     if (retryRingEl) return;
     retryRingEl = document.createElement('button');
     retryRingEl.type = 'button';
     retryRingEl.className = 'retry-ring';
-    retryRingEl.title = '重试这一轮（保留原提问，回退未完成的改动）';
-    retryRingEl.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 4v6h6M23 20v-6h-6"/></svg>';
+    retryRingEl.title = '继续这一轮（保留已完成的记录，不回退文件）';
+    // 图标用「向右的箭头」而不是刷新循环：这里的动作是**接着往下跑**，不是重来。
+    retryRingEl.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h15M13 6l6 6-6 6"/></svg>';
     retryRingEl.addEventListener('click', function () {
-      sendRetryRequest(retryBack);
+      sendContinueRequest();
     });
     ensureCol().appendChild(retryRingEl);
     scrollBottom();
@@ -1302,35 +1474,18 @@
     if (retryRingEl) { retryRingEl.remove(); retryRingEl = null; }
   }
 
-  // 断点重试：把「未完成那一轮」之后的内容从视图截掉，通知服务端按原提问重跑。
-  // 与编辑重发同一套截断 / 文件回退逻辑，差别只是不改写用户消息——
-  // 被打断的对话里，提问本身往往没错，覆盖掉它就丢掉了用户真正说的话。
-  function sendRetryRequest(back) {
-    if (running) { addInfo('正在处理中，请稍后再试'); return; }
-    if (!wsReady) { addError('未连接到服务，请稍候重试'); return; }
-    if (back < 0) back = 0;
-    sending = true;
+  // 打断 / 报错 / 刷新重连后接着跑：追加一句「继续」，让模型从断点往下走。
+  //
+  // ⚠️ 这里刻意**不**再走旧的「断点重试」（截断该轮 + 回退文件）：那套语义会把
+  // 已经跑完的工具调用与结果从历史里删掉、并把改过的文件退回原样 —— 用户看到的
+  // 就是「操作记录全没了」（2026-09-22 反馈）。打断之后该做的是接着跑，不是重来；
+  // 真要重来，「重新生成」与「编辑重发」才是那条显式的破坏性入口。
+  //
+  // 复用 sendAsUserText：走的是与用户手打一句「继续」完全相同的链路
+  //（别名展开 / 气泡 / 发送 / lastUserText），不另开一条会漂移的旁路。
+  function sendContinueRequest() {
     removeRetryRing();
-    // 先记住这条提问的原文：截断会把它一起删掉，而服务端的 edit 事件要等
-    // 这一轮跑完才到——中间这段时间屏幕上不该是空的。
-    const keepText = editableMessageText(back);
-    // 先在前端把未完成那一轮的残缺回复删掉：既立刻给出反馈，也避免等服务端
-    // 事件回来的间隙里旧内容与新回复混排。服务端随后会重放历史。
-    truncateAfterEditableMessage(back);
-    if (keepText) addUser(keepText);
-    if (!wsSend({
-      type: 'retry',
-      session_id: sessionID,
-      back: back,
-      rollback_files: true,
-      thinking: thinkingVal
-    })) {
-      sending = false;
-      addError('未连接到服务，请稍候重试');
-      return;
-    }
-    composerSnap = false;
-    showThinking();
+    sendAsUserText('继续');
   }
 
   // ---------- 可复用操作选择面板（ActionPanel）：输入框上方多选 / 用户输入 / 多页 ----------
@@ -2713,8 +2868,9 @@
           } else if (b.type === 'tool_use') {
             settleActiveTool();
             closeText();
-            addTool(toolLabel(b.name, b.input),
-              b.input ? JSON.stringify(b.input, null, 2) : '');
+            // 回放出来的卡片：不传参数详情（不再有「鼠标一放一堆参数」），
+            // 只记下文件路径 —— 点开时向 /api/diff 取那次改动（见 openToolDiff）。
+            addTool(toolLabel(b.name, b.input), { path: toolFilePath(b.name, b.input) });
           } else if (b.type === 'tool_result') {
             settleActiveTool(); // 工具已完成：无 spinner
           }
@@ -3152,15 +3308,25 @@
           }
           break;
         case 'edit':
-          // 历史已被截断到这条用户消息：把视图清到该点，重新流式渲染新回复。
-          // 服务端紧接着会发 busy + 新一轮事件，这里只需把「下方旧内容」清干净。
+          // 历史已被截断到这条用户消息。这里**只重置流式状态**，不碰已有节点：
+          // 紧接着服务端会补发一帧 history 权威快照，由 replayHistory 按库里的样子
+          // 重建视图（编辑点之前的历史、各条工具卡片都会保留）。
+          //
+          // ⚠️ 旧实现在这里 messagesEl.innerHTML = '' 清空整列、只留这一条提问 ——
+          // 那会把编辑点之前的历史一并抹掉，用户看到的就是「操作记录全没了」
+          //（2026-09-22 反馈）。
           if (!ev.session_id || ev.session_id === sessionID) {
-            beginEditedView(ev.text || '');
+            resetStreamRefs();
           }
           break;
         case 'rewind':
           // 文件已按检查点回滚：给一条可见反馈（含还原/删除/失败计数）。
           if (ev.result) addInfo(describeRewind(ev.result));
+          break;
+        case 'info':
+          // 服务端的一般性提示（纯告知，不改状态）：如「已补上 N 条被打断的工具调用记录」。
+          // 只画当前视图会话的，后台会话的提示不该插进这一屏。
+          if (ev.text && (!ev.session_id || ev.session_id === sessionID)) addInfo(ev.text);
           break;
         case 'context':
           // 上下文占用只画当前视图会话的（后台会话结束也会下发它自己的 context）
@@ -3258,9 +3424,13 @@ case 'busy':
           foldReason();
           closeText();
           const name = ev.tool_name || '工具';
-          addTool(toolLabel(name, ev.tool_input),
-            ev.tool_input ? JSON.stringify(ev.tool_input, null, 2) : '',
-            ev.diff_stats);
+          // stats 与 diff 同源（服务端 previewFor 一次算出）：徽标 +N/-M 与点开的
+          // diff 面板不会互相矛盾。改过文件的卡片可点开看改动位置。
+          addTool(toolLabel(name, ev.tool_input), {
+            stats: ev.diff_stats,
+            diff: ev.diff,
+            path: toolFilePath(name, ev.tool_input)
+          });
           break;
         }
         case 'subagent': {
@@ -3532,9 +3702,14 @@ case 'idle': {
 
   function sendEditRequest(back, text, snap) {
     sending = true;
-    // 先在前端把「被编辑消息之后」的内容删掉：既立刻给出反馈，也避免等
-    // 服务端事件回来之前旧内容仍在屏幕上与新回复混排。服务端随后还会重放历史。
+    // 先在前端把「被编辑消息之后」的内容删掉：既立刻给出反馈，也避免等服务端
+    // 事件回来之前旧内容仍在屏幕上与新回复混排。服务端随后会重放历史。
+    //
+    // 截断会连被编辑的那条用户气泡一起删掉，而服务端的 history 快照要等一个往返
+    // 才到 —— 中间这段时间屏幕上不该是空的，所以立刻按编辑后的文本把气泡放回去。
+    // 快照到达时 replayHistory 会先清空整列再重建，因此不会重复。
     truncateAfterEditableMessage(back);
+    if (text) addUser(text);
     if (!wsSend({
       type: 'edit_user_message',
       session_id: snap.session,
@@ -3551,25 +3726,6 @@ case 'idle': {
     exitEditMode(true);
     composerSnap = false;
     showThinking();
-  }
-
-  // 取第 (back+1) 条用户消息的原文（与 truncateAfterEditableMessage 同一套倒序遍历）。
-  // dataset.rawText 是发送时的原文：提及高亮会把 @路径 缩成文件名，拿渲染结果不对。
-  function editableMessageText(back) {
-    const col = ensureCol();
-    let remaining = back + 1;
-    let node = col.lastChild;
-    while (node) {
-      if (node.classList && node.classList.contains('msg-user')) {
-        remaining--;
-        if (remaining <= 0) {
-          const bubble = node.querySelector('.bubble');
-          return bubble ? (bubble.dataset.rawText || '') : '';
-        }
-      }
-      node = node.previousSibling;
-    }
-    return '';
   }
 
   // 删除界面中「被编辑那条用户消息之后」的全部节点（含那条消息自身的旧气泡，
@@ -3608,20 +3764,20 @@ case 'idle': {
   // 服务端给的「未完成轮次」重试锚点（back；-1 = 上一轮已完整结束，不需要提示）。
   let retryBack = -1;
 
-  // 服务端确认历史已截断到被编辑的那条消息：把聊天列清空，只留这条消息，
-  // 后续的流式事件会把新回复画在它下面 —— 视觉上就是「覆盖掉下面的内容」。
-  function beginEditedView(text) {
-    composerEpoch++;
-    messagesEl.innerHTML = '';
-    msgCol = null; currentTextEl = null; textBuffer = '';
+  // 重置「当前流式元素」的引用，**不动任何已渲染的节点**。
+  //
+  // 用在历史被截断（edit 帧）之后：这些引用指向的节点马上会随 history 快照一起
+  // 作废，必须先清掉，否则后续事件会去找已经不在文档里的节点（切走→切回最容易触发）。
+  //
+  // ⚠️ 刻意不在这里清空聊天列：视图交给随后的 history 权威快照重建。
+  // 旧实现（beginEditedView）在这里 messagesEl.innerHTML = ''，会把编辑点**之前**
+  // 的历史一并抹掉 —— 那正是「操作记录全没了」的来源（2026-09-22 反馈）。
+  function resetStreamRefs() {
+    currentTextEl = null; textBuffer = '';
     reasonEl = null; reasonBuffer = ''; reasonPinned = false;
     thinkingEl = null; activeToolEl = null; retryEl = null; pendingToolEl = null;
     subagentCards.clear();
     lastReply = '';
-    if (text) addUser(text);
-    lastUserText = text;
-    followTail = true;   // 视图整体重建 = 从零开始看，回到跟随态
-    syncComposerMode();
   }
 
   // 把回滚结果转成一句人话（文件为空时说明「没有需要回退的改动」）。
@@ -4494,7 +4650,12 @@ case 'idle': {
   // 空着才是打断。任何弹层（设置、新建项目、终端选择、文件选择、@ 面板、更多菜单）
   // 开着时一律让位：那些界面的 Esc 优先，这里不能抢。
   document.addEventListener('keydown', function (e) {
-    if (e.key !== 'Escape' || !running || atPop || moreOpen) return;
+    if (e.key !== 'Escape') return;
+    // diff 面板开着时，Esc 只关面板、不打断任务：面板是「看改动」的界面，
+    // 顺手把正在跑的任务停掉是灾难性的误操作。用 diffPanelOpen 而不是
+    // getElementById('diff-overlay')：面板是懒创建的，首次打开前那个节点还不存在。
+    if (diffPanelOpen) { e.preventDefault(); closeDiffPanel(); return; }
+    if (!running || atPop || moreOpen) return;
     if (['settings-overlay', 'newproj-overlay', 'termux-overlay', 'picker-overlay']
       .some(function (id) {
         const el = document.getElementById(id);

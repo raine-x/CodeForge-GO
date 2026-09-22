@@ -56,7 +56,8 @@ function loadRenderer() {
     extractFunction(src, 'wsDisplayName'),
     extractFunction(src, 'retryReasonBrief'),
     extractFunction(src, 'describeLLMError'),
-    'module.exports = { renderMD: renderMD, toolLabel: toolLabel, countLines: countLines, fmtTokens: fmtTokens, wsDisplayName: wsDisplayName, retryReasonBrief: retryReasonBrief, describeLLMError: describeLLMError };',
+    extractFunction(src, 'diffLineKind'),
+    'module.exports = { renderMD: renderMD, toolLabel: toolLabel, countLines: countLines, fmtTokens: fmtTokens, wsDisplayName: wsDisplayName, retryReasonBrief: retryReasonBrief, describeLLMError: describeLLMError, diffLineKind: diffLineKind };',
   ].join('\n');
   return new Function('module', code + '\nreturn module.exports;')({});
 }
@@ -83,7 +84,7 @@ function check(name, cond) {
 // ---------------------------------------------------------------------------
 // 开始
 // ---------------------------------------------------------------------------
-let renderMD, toolLabel, countLines, fmtTokens, wsDisplayName, retryReasonBrief, describeLLMError;
+let renderMD, toolLabel, countLines, fmtTokens, wsDisplayName, retryReasonBrief, describeLLMError, diffLineKind;
 try {
   const api = loadRenderer();
   renderMD = api.renderMD;
@@ -93,6 +94,7 @@ try {
   wsDisplayName = api.wsDisplayName;
   retryReasonBrief = api.retryReasonBrief;
   describeLLMError = api.describeLLMError;
+  diffLineKind = api.diffLineKind;
 } catch (err) {
   console.error('无法从 ui.js 加载 renderMD：' + err.message);
   process.exit(1);
@@ -1188,9 +1190,15 @@ check('发送前先清掉「该条之后」的界面内容（新回复覆盖下�
 check('清空按 back 精确停在被编辑那条用户消息',
   /let remaining = back \+ 1;/.test(uiSrc) &&
   /if \(remaining <= 0\) break;/.test(uiSrc));
-check('服务端 edit 事件触发视图重建（只保留被编辑的那条）',
-  uiSrc.includes("case 'edit':") && uiSrc.includes('function beginEditedView') &&
-  /if \(text\) addUser\(text\);/.test(uiSrc));
+check('服务端 edit 事件只重置流式引用，视图交给随后的 history 快照重建',
+  uiSrc.includes("case 'edit':") &&
+  uiSrc.includes('function resetStreamRefs') &&
+  // 旧做法是 beginEditedView 里 messagesEl.innerHTML = '' 清空整列 ——
+  // 那会把编辑点**之前**的历史一并抹掉（2026-09-22 反馈），已移除。
+  !uiSrc.includes('function beginEditedView') &&
+  // 服务端必须在 EventEdit 时补一帧 history 权威快照，前端才有得重建。
+  /agent\.EventEdit[\s\S]{0,220}?c\.srv\.historyEvent/.test(
+    fs.readFileSync(path.join(__dirname, '../..', 'pkg/server/ws_handler.go'), 'utf8')));
 
 check('编辑条样式存在且与输入区同族',
   /\.edit-bar \{/.test(css) && /\.edit-bar-btn\.primary \{/.test(css) &&
@@ -1226,9 +1234,12 @@ check('scroll 回调据「是否贴近底部」判定跟随态（不靠滚动方
   /function isNearBottom\(\)[\s\S]{0,160}?scrollHeight - messagesEl\.scrollTop - messagesEl\.clientHeight <= FOLLOW_NEAR_BOTTOM/.test(uiSrc));
 check('用户重新发送消息即恢复跟随（否则发问后看不到回复）',
   /followTail = true;[\s\S]{0,260}?addUser\(p\.display\)/.test(uiSrc));
-check('回放历史 / 编辑重建视图后恢复跟随',
+check('回放历史后恢复跟随；截断信号只重置流式引用、不清空聊天列',
   extractFunction(uiSrc, 'replayHistory').includes('followTail = true') &&
-  extractFunction(uiSrc, 'beginEditedView').includes('followTail = true'));
+  // 历史被截断（edit 帧）时**不得**再清空整列：旧实现就是这么把编辑点之前的
+  // 历史一并抹掉，用户看到「操作记录全没了」（2026-09-22 反馈）。
+  !extractFunction(uiSrc, 'resetStreamRefs').includes('innerHTML') &&
+  /case 'edit':[\s\S]{0,900}?resetStreamRefs\(\);/.test(uiSrc));
 check('清空视图（新建/归档/删除）也回到跟随态',
   /function syncComposerMode\(\)[\s\S]{0,320}?if \(empty\) \{[\s\S]{0,80}?followTail = true;/.test(uiSrc));
 check('右下角箭头只在不在底部时显示',
@@ -1250,6 +1261,38 @@ check('留白随卡片尺寸变化（ResizeObserver）+ 折叠后重算',
   /function applyTodoCollapsed\(\)[\s\S]{0,600}?requestAnimationFrame\(function \(\) \{ syncComposerPadding\(\); \}\)/.test(uiSrc));
 check('不用 CSS 平滑滚动（避免与跟随态滚底打架）',
   /#messages\s*\{[^}]*scroll-behavior:\s*auto/.test(css));
+
+// ---------- 工具卡片与 diff 面板 ----------
+// 需求（2026-09-22）：工具卡片不再把原始参数堆在 hover 提示里（以前 title 就是
+// JSON.stringify(input)）；改过文件的卡片点击可打开 diff 看改动位置。
+group('工具卡片与 diff 面板');
+check('工具卡片不再把原始参数塞进 hover 提示',
+  !/if \(detail\) d\.title = detail/.test(uiSrc) &&
+  !/addTool\([\s\S]{0,160}?JSON\.stringify/.test(uiSrc));
+check('只有改文件的工具卡片可点击（edit/write/delete）',
+  /const DIFF_TOOLS = \{ edit_file: 1, write_file: 1, delete_file: 1 \};/.test(uiSrc) &&
+  extractFunction(uiSrc, 'toolFilePath').includes('DIFF_TOOLS'));
+check('可点击卡片键盘可达（role / tabindex / Enter）',
+  extractFunction(uiSrc, 'addTool').includes("setAttribute('role', 'button')") &&
+  extractFunction(uiSrc, 'addTool').includes("setAttribute('tabindex', '0')") &&
+  extractFunction(uiSrc, 'addTool').includes("ev.key === 'Enter'"));
+check('diff 行分类：文件头优先于增删行（否则 --- / +++ 会被染成增删）',
+  diffLineKind('--- a.txt') === 'file' && diffLineKind('+++ a.txt') === 'file' &&
+  diffLineKind('+added') === 'add' && diffLineKind('-removed') === 'del' &&
+  diffLineKind('@@ -1,3 +1,4 @@') === 'hunk' && diffLineKind(' context') === 'ctx');
+check('diff 面板逐行复用 .diff 的配色类',
+  extractFunction(uiSrc, 'renderDiffBody').includes('diffLineKind(') &&
+  /class="diff diff-body"/.test(uiSrc) &&
+  /\.diff \.add\s*\{/.test(css) && /\.diff \.del\s*\{/.test(css));
+check('diff 面板 Esc 只关面板、不误打断任务',
+  /if \(diffPanelOpen\) \{ e\.preventDefault\(\); closeDiffPanel\(\); return; \}/.test(uiSrc));
+check('历史回放的卡片按路径向 /api/diff 取 diff',
+  extractFunction(uiSrc, 'openToolDiff').includes("'/api/diff?session_id='"));
+check('回放的卡片只带路径、不带 diff 文本（diff 不随历史持久化）',
+  /addTool\(toolLabel\(b\.name, b\.input\), \{ path: toolFilePath\(b\.name, b\.input\) \}\)/.test(uiSrc));
+check('样式契约：只有可点击卡片给手型',
+  /\.msg-tool\s*\{[^}]*cursor:\s*default/.test(css) &&
+  /\.msg-tool\.clickable, \.msg-tool\.retry \{ cursor: pointer; \}/.test(css));
 
 // ---------- 背景图：不透明底色必须在 html 上 ----------
 // 故障：选好图却看不见。#bg-layer 是 body 的子节点、靠 z-index:-1 沉底，

@@ -326,6 +326,13 @@ func TestNthLastPlainUserIndex(t *testing.T) {
 // 编辑重发：截断 + 内部回退压缩态（不动 usage 累计）
 // ---------------------------------------------------------------------------
 
+// noopEmit 是测试用的空发射器。
+//
+// 真实调用方（WS 层）永远传真实 emitter；传 nil 会让「任何一次 emit」直接 panic，
+// 于是用例的正确性就依赖「还没跑到 emit 就失败了」这种脆弱前提 —— RerunFrom 现在
+// 会在截断后立刻 emit 一次 EventEdit，这个前提就不再成立。
+func noopEmit(Event) {}
+
 // 编辑第 N 条用户消息：历史截断到该条，其后内容全部丢弃。
 func TestEditResendTruncatesHistory(t *testing.T) {
 	ag, h, _ := newCheckpointAgent(t)
@@ -341,7 +348,7 @@ func TestEditResendTruncatesHistory(t *testing.T) {
 	// 编辑「第二问」（倒数第 2 条纯文本 → back=1）。不真跑模型，
 	// 只验证截断与替换逻辑，所以用一个会立刻失败的 provider。
 	ag.provider = nil
-	idx, _ := ag.EditAndResend(context.Background(), sess.ID, 1, "改后的第二问", nil)
+	idx, _ := ag.EditAndResend(context.Background(), sess.ID, 1, "改后的第二问", noopEmit)
 
 	if idx != 2 {
 		t.Fatalf("期望定位到下标 2，得到 %d", idx)
@@ -369,7 +376,7 @@ func TestEditResendRewindsCompressionState(t *testing.T) {
 	sess.summaryText = "旧摘要"
 	ag.provider = nil
 
-	if _, _ = ag.EditAndResend(context.Background(), sess.ID, 0, "改后", nil); sess.compressedUpTo != 0 {
+	if _, _ = ag.EditAndResend(context.Background(), sess.ID, 0, "改后", noopEmit); sess.compressedUpTo != 0 {
 		t.Errorf("压缩游标应复位为 0，得到 %d", sess.compressedUpTo)
 	}
 	if sess.summaryText != "" {
@@ -387,7 +394,7 @@ func TestEditResendKeepsUsageCounters(t *testing.T) {
 	sess.AddUsage(llm.Usage{InputTokens: 1000, OutputTokens: 200, CachedTokens: 300})
 	ag.provider = nil
 
-	_, _ = ag.EditAndResend(context.Background(), sess.ID, 0, "改后", nil)
+	_, _ = ag.EditAndResend(context.Background(), sess.ID, 0, "改后", noopEmit)
 
 	if sess.usageIn != 1000 {
 		t.Errorf("usageIn 不应被清零，得到 %d", sess.usageIn)
@@ -405,7 +412,7 @@ func TestEditResendRejectsEmptyText(t *testing.T) {
 	ag, h, _ := newCheckpointAgent(t)
 	sess := seedSessionWith(t, h, []llm.Message{userText("q1"), assistantText("a1")})
 
-	if _, err := ag.EditAndResend(context.Background(), sess.ID, 0, "   ", nil); err == nil {
+	if _, err := ag.EditAndResend(context.Background(), sess.ID, 0, "   ", noopEmit); err == nil {
 		t.Fatal("空文本应报错")
 	}
 }
@@ -415,7 +422,7 @@ func TestEditResendRejectsOutOfRangeBack(t *testing.T) {
 	ag, h, _ := newCheckpointAgent(t)
 	sess := seedSessionWith(t, h, []llm.Message{userText("只有一问"), assistantText("答")})
 
-	if _, err := ag.EditAndResend(context.Background(), sess.ID, 5, "改后", nil); err == nil {
+	if _, err := ag.EditAndResend(context.Background(), sess.ID, 5, "改后", noopEmit); err == nil {
 		t.Fatal("越界 back 应报错")
 	}
 	if len(sess.Messages) != 2 {
@@ -431,7 +438,7 @@ func TestEditResendPreservesNonTextBlocks(t *testing.T) {
 	sess := seedSessionWith(t, h, []llm.Message{msg})
 
 	ag.provider = nil
-	_, _ = ag.EditAndResend(context.Background(), sess.ID, 0, "改后文本", nil)
+	_, _ = ag.EditAndResend(context.Background(), sess.ID, 0, "改后文本", noopEmit)
 
 	kept := sess.Messages[0]
 	if kept.Content[0].Text != "改后文本" {
@@ -591,7 +598,7 @@ func TestRerunFromKeepsOriginalText(t *testing.T) {
 	})
 
 	ag.provider = nil
-	idx, text, err := ag.RerunFrom(context.Background(), sess.ID, 0, "", nil)
+	idx, text, err := ag.RerunFrom(context.Background(), sess.ID, 0, "", noopEmit)
 	if err == nil {
 		t.Fatal("provider=nil 应直接失败，这里只关心失败前的截断与文本")
 	}

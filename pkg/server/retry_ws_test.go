@@ -126,6 +126,101 @@ func TestRetryEmitsEditEvenWhenRunFails(t *testing.T) {
 	}
 }
 
+// 截断重跑时，「历史已截断」的信号必须在**新一轮内容之前**到达，
+// 并且随后补一帧 history 权威快照（前端据此重建视图）。
+//
+// 2026-09-22 反馈：旧实现把 edit 帧放在整轮跑完之后才发 —— 那时新回复早就流到
+// 屏幕上了，前端收到信号再去清空重建，就把刚流出的回复连同更早的历史一起抹掉，
+// 屏幕上只剩一条错误信息（「之前的记录被一条错误覆盖」）。
+//
+// 这条用例把「顺序」本身当成契约钉住：edit → history → 新一轮内容。
+func TestTruncationSignalsArriveBeforeNewContent(t *testing.T) {
+	provider := &gateProvider{gates: make(chan chan string, 4)}
+	deps := newTestDepsAtProvider(t, "", provider)
+	ts := httptest.NewServer(deps.newServer().Routes())
+	t.Cleanup(ts.Close)
+
+	conn := steerDial(t, ts, steerJar(t, ts))
+
+	const question = "被打断的提问"
+	sendWS(t, conn, map[string]any{"type": "user_message", "text": question})
+	waitGate(t, provider)
+	frames := collectUntil(t, conn, "busy")
+	sessionID := frameValue(frames, "session_id")
+	if sessionID == "" {
+		t.Fatal("没有从事件流里拿到会话 ID")
+	}
+
+	// 打断，让这一轮停在「还没回复」的状态。
+	sendWS(t, conn, map[string]any{"type": "cancel"})
+	collectUntil(t, conn, "checkpoints")
+
+	// 断点重试：这一轮会成功并流出正文，正好用来检验「信号 vs 内容」的先后。
+	sendWS(t, conn, map[string]any{
+		"type": "retry", "session_id": sessionID, "back": 0, "rollback_files": true,
+	})
+	waitGate(t, provider) <- "重跑后的回复"
+	all := collectUntil(t, conn, "idle")
+
+	editAt, historyAt, firstTextAt := -1, -1, -1
+	for i, f := range all {
+		switch f["type"] {
+		case "edit":
+			if editAt < 0 {
+				editAt = i
+			}
+		case "history":
+			if historyAt < 0 {
+				historyAt = i
+			}
+		case "text":
+			if firstTextAt < 0 {
+				firstTextAt = i
+			}
+		}
+	}
+	seq := types(all)
+	if editAt < 0 {
+		t.Fatalf("缺少 edit 帧：%v", seq)
+	}
+	if historyAt < 0 {
+		t.Fatalf("截断后必须补一帧 history 快照（前端靠它重建视图）：%v", seq)
+	}
+	if historyAt != editAt+1 {
+		t.Errorf("history 应紧跟 edit（edit@%d history@%d）：%v", editAt, historyAt, seq)
+	}
+	if firstTextAt >= 0 && editAt > firstTextAt {
+		t.Errorf("edit 帧必须在新一轮正文之前到达（edit@%d text@%d）：%v", editAt, firstTextAt, seq)
+	}
+
+	// 快照必须是**截断后**的历史：只剩这一条提问，后面没有未完成的回复。
+	msgs, _ := all[historyAt]["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("截断后的快照应只剩 1 条消息，实际 %d 条：%v", len(msgs), seq)
+	}
+	if !historyHasUserText(msgs, question) {
+		t.Errorf("快照里应保留用户原话 %q，实际：%+v", question, msgs)
+	}
+}
+
+// historyHasUserText 判断快照里是否存在角色为 user、文本等于 want 的消息。
+func historyHasUserText(msgs []any, want string) bool {
+	for _, raw := range msgs {
+		m, _ := raw.(map[string]any)
+		if role, _ := m["role"].(string); role != "user" {
+			continue
+		}
+		blocks, _ := m["content"].([]any)
+		for _, rb := range blocks {
+			b, _ := rb.(map[string]any)
+			if txt, _ := b["text"].(string); txt == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // findCheckpoint 在帧序列里找属于本会话的 checkpoints 帧，返回它的 retry_back。
 // 第二个返回值表示「是否找到过 checkpoints 帧」（没找到说明收尾事件丢了）。
 func findCheckpoint(frames []map[string]any, sessionID string) (int, bool) {

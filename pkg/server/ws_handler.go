@@ -184,12 +184,9 @@ func (c *wsClient) dispatch(msg wsMessage) {
 					emit(agent.Event{Type: agent.EventRewind, Text: "已回退文件改动", Rewind: res})
 				}
 			}
-			idx, editErr := c.srv.agent.EditAndResend(ctx, msg.SessionID, msg.Back, msg.Text, emit)
-			// 回放新视图：前端需要知道历史被截断到哪里，才能丢弃下方旧内容。
-			// 失败也要补这一帧，否则截断已经发生、提问却没被放回屏幕。
-			if idx >= 0 {
-				emit(agent.Event{Type: agent.EventEdit, Step: idx, Text: msg.Text})
-			}
+			// edit 帧由 RerunFrom 自己在「截断之后、跑循环之前」发出，
+			// 这里不能再补：晚了会覆盖刚流出的新回复（见 RerunFrom 注释）。
+			_, editErr := c.srv.agent.EditAndResend(ctx, msg.SessionID, msg.Back, msg.Text, emit)
 			return editErr
 		})
 
@@ -217,12 +214,8 @@ func (c *wsClient) dispatch(msg wsMessage) {
 					emit(agent.Event{Type: agent.EventRewind, Text: "已回退文件改动", Rewind: res})
 				}
 			}
-			idx, text, rerunErr := c.srv.agent.RerunFrom(ctx, msg.SessionID, back, "", emit)
-			// 即使重跑失败也要回放视图：截断已经发生，不补这一帧，用户的提问就会
-			// 从屏幕上消失、只剩错误信息——断点重试的全部意义就是保住提问。
-			if idx >= 0 {
-				emit(agent.Event{Type: agent.EventEdit, Step: idx, Text: text})
-			}
+			// edit 帧由 RerunFrom 自己在「截断之后、跑循环之前」发出，这里不能再补。
+			_, _, rerunErr := c.srv.agent.RerunFrom(ctx, msg.SessionID, back, "", emit)
 			return rerunErr
 		})
 
@@ -266,7 +259,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 			return
 		}
 		// 内存缓存换成用户想继续的那条（后续 user_message 直接续聊）
-		c.send(map[string]any{"type": "history", "session_id": sess.ID, "title": sess.Title, "messages": sess.Messages})
+		c.send(c.srv.historyEvent(sess.ID))
 		c.send(c.srv.contextUsage(sess.ID))
 		c.send(c.srv.todoEvent(sess.ID))       // 切会话：回放该会话的任务清单
 		c.send(c.srv.checkpointEvent(sess.ID)) // 回放可编辑白名单（编辑按钮的数据源）
@@ -375,6 +368,18 @@ func (c *wsClient) run(sessionID, thinking, trigger, label string, agentFn func(
 	// 若改成另起 goroutine 去轮询，就必须先给 Session 加锁。
 	emit := func(ev agent.Event) {
 		if ev.Type == agent.EventError && ctx.Err() != nil {
+			return
+		}
+		// 历史刚被截断（编辑重发 / 断点重试）：除了转发这一帧，还要下发一份
+		// **权威快照**，让前端按库里的样子重建视图。
+		//
+		// 为什么不能只靠前端自己删：截断点由服务端算（按「最近 N 条纯文本提问」定位），
+		// 前端只能靠 DOM 里的 .msg-user 倒着数，两边口径会漂；而且前端「清空整列只留
+		// 这一条提问」的旧做法会把**编辑点之前的历史**也一起抹掉，看起来就像记录丢了
+		//（2026-09-22 反馈）。给快照就没有猜的余地。
+		if ev.Type == agent.EventEdit {
+			c.send(ev)
+			c.send(c.srv.historyEvent(sessionID))
 			return
 		}
 		c.send(ev)
@@ -561,6 +566,24 @@ func (s *Server) todoEvent(sessionID string) map[string]any {
 	}
 }
 
+// historyEvent 构造「会话历史快照」帧。
+//
+// 与 load_session 下发的是同一种帧（前端统一走 replayHistory 重建视图），
+// 区别只在触发时机：load_session 是用户切会话，这里是**历史刚被截断**。
+// 会话不存在时返回空消息列表的合法帧，前端渲染成空态即可，不必报错。
+func (s *Server) historyEvent(sessionID string) map[string]any {
+	sess, ok := s.agent.History().Get(sessionID)
+	if !ok {
+		return map[string]any{"type": "history", "session_id": sessionID, "messages": []any{}}
+	}
+	return map[string]any{
+		"type":       "history",
+		"session_id": sess.ID,
+		"title":      sess.Title,
+		"messages":   sess.Messages,
+	}
+}
+
 // checkpointEvent 构造推送给前端的「检查点列表」事件帧（回滚菜单的数据源）。
 // 列表按步骤聚合（时间 + 文件数），前端据此列出候选回滚点。
 func (s *Server) checkpointEvent(sessionID string) map[string]any {
@@ -569,9 +592,13 @@ func (s *Server) checkpointEvent(sessionID string) map[string]any {
 		"session_id": sessionID,
 		"steps":      s.agent.CheckpointSteps(sessionID),
 		"editables":  s.agent.EditableUserMessages(sessionID, editableUserMessageLimit),
-		// retry_back：最后一轮「没有完整结束」时可重试的锚点（back），否则 -1。
-		// 前端据此在打断 / 报错 / 刷新页面后挂出重试圆环——判据在服务端算，
+		// retry_back：最后一轮「没有完整结束」的锚点（back），否则 -1。
+		// 前端据此在打断 / 报错 / 刷新页面后挂出**「继续」**按钮 —— 判据在服务端算，
 		// 页面刷新后视图是无状态的，前端自己猜不出来。
+		//
+		// ⚠️ 字段名保留 retry_back 是为了不改协议；语义已从「重试（截断重跑）」
+		// 改为「继续（追加接着跑）」：点它发的是普通用户消息，不截断、不回退文件。
+		// 破坏性的重来入口只剩「重新生成」与「编辑重发」（2026-09-22）。
 		"retry_back": s.agent.UnfinishedTurnBack(sessionID),
 	}
 }
