@@ -75,7 +75,7 @@ func TestRunWithImagesHistoryAndRegenerate(t *testing.T) {
 				llm.TextMessage(llm.RoleAssistant, "old answer"))
 			loaded.compressedUpTo = len(loaded.Messages)
 			loaded.summaryText = "stale summary"
-			a.lastUserInput = "stale input"
+			loaded.SetLastUserInput("stale input")
 			if err := a.Regenerate(context.Background(), sess.ID, emit); err != nil {
 				t.Fatal(err)
 			}
@@ -83,7 +83,7 @@ func TestRunWithImagesHistoryAndRegenerate(t *testing.T) {
 				t.Fatal("regenerate did not issue one request")
 			}
 			assertHistoryUnchanged(t, want, p.requests[1].Messages)
-			if len(loaded.Messages) != 2 || a.lastUserInput != input {
+			if len(loaded.Messages) != 2 || loaded.LastUserInput() != input {
 				t.Fatal("regenerate did not restore real user turn")
 			}
 		})
@@ -190,7 +190,7 @@ func TestCompressPreservesCurrentImagesAcrossToolLoop(t *testing.T) {
 func TestRunWithImagesOverBudget(t *testing.T) {
 	p := &imageRequestProvider{}
 	a := newEmitTestAgent(t, p)
-	a.cfg.ContextTokenBudget = requestOverhead(a.systemPrompt(), a.registry.DefinitionsFor(nil)) + 1000
+	a.cfg.ContextTokenBudget = requestOverhead(a.systemPrompt(""), a.registry.DefinitionsFor(nil)) + 1000
 	sess, err := a.history.Create("", "budget")
 	if err != nil {
 		t.Fatal(err)

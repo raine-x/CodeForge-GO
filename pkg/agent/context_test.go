@@ -328,7 +328,7 @@ func TestRunLoopCompressesRequestOverhead(t *testing.T) {
 	// 预算按当前真实的请求开销给：历史单独放得下（B > 历史），
 	// 但扣掉「系统提示词 + 工具定义」的固定开销后放不下 —— 这正是要验证的口径。
 	// 写成绝对数值的话，提示词或工具描述一加长就会撞上「开销已占满预算」的上限告警。
-	overhead := requestOverhead(a.systemPrompt(), a.registry.DefinitionsFor(nil))
+	overhead := requestOverhead(a.systemPrompt(""), a.registry.DefinitionsFor(nil))
 	a.cfg.ContextTokenBudget = EstimateTokens(messages) + overhead/2
 	var compressed bool
 	err := a.runLoopWithPersistence(context.Background(), sess, func(ev Event) {

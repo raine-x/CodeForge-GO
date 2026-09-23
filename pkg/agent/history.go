@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	"codeforge/pkg/llm"
@@ -26,13 +27,29 @@ type SessionMeta struct {
 }
 
 // Session 是一次完整会话。
+//
+// 并发约定（2026-09-23 补齐）：mu 守护 Messages / Title / 压缩态 / 用量 /
+// lastUserInput 等全部可变字段。写者只有「持有运行权的循环 goroutine」
+// （同会话互斥见 Agent.beginRunWait），读者可以是任意 goroutine（其它连接的
+// historyEvent、ContextStat、REST 处理器）。跨 goroutine 读一律走带锁的
+// 快照方法（SnapshotForRender / UsageSnapshot / compressionState），
+// 不要直接读字段。
 type Session struct {
+	mu        sync.RWMutex
 	ID        string
 	Workspace string
 	Title     string
 	CreatedAt time.Time
 	UpdatedAt time.Time
 	Messages  []llm.Message
+
+	// lastUserInput 是本会话最近一条用户输入（技能触发词匹配用）。
+	// 必须挂在 Session 上：挂在 Agent 上会被并发会话互相覆盖。
+	lastUserInput string
+
+	// saveWarned 记录「持久化失败已告知用户」：DB 故障期间每步都会失败，
+	// 只在第一次推 info 提示，避免刷屏（见 Agent.save）。
+	saveWarned bool
 
 	// ---- 上下文压缩缓存（刻意不持久化：摘要可从 Messages 重新生成）----
 	//
@@ -72,14 +89,108 @@ type Session struct {
 }
 
 // AddUsage 累计一次请求的用量（供上下文统计展示「已使用总 / 缓存命中 / 未命中」）。
+// 调用方不止属主循环：子智能体 goroutine 也会把消耗并到父会话上，必须加锁。
 func (s *Session) AddUsage(u llm.Usage) {
 	if s == nil {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.usageIn += u.InputTokens
 	s.usageHit += u.CachedTokens
 	s.usageOut += u.OutputTokens
 	s.calibrateTokenFactor(u.InputTokens)
+}
+
+// mergeUsage 把别的会话（子智能体）的用量并进本会话的计费口径。
+//
+// 刻意**不**做估算器校准（对比 AddUsage）：tokenFactor 是「本会话自己的
+// 估算 vs 上游真实」配出来的比值，拿子会话的真实值去除父会话的 reqEstimate
+// 是张冠李戴，会把系数带偏。子会话有它自己的 Session，校准在它那边完成。
+func (s *Session) mergeUsage(in, hit, out int) {
+	if s == nil || (in == 0 && hit == 0 && out == 0) {
+		return
+	}
+	s.mu.Lock()
+	s.usageIn += in
+	s.usageHit += hit
+	s.usageOut += out
+	s.mu.Unlock()
+}
+
+// UsageSnapshot 返回用量三元组的快照（跨 goroutine 读走这里）。
+func (s *Session) UsageSnapshot() (in, hit, out int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.usageIn, s.usageHit, s.usageOut
+}
+
+// SetLastUserInput 记录本会话最近一条用户输入。
+func (s *Session) SetLastUserInput(text string) {
+	s.mu.Lock()
+	s.lastUserInput = text
+	s.mu.Unlock()
+}
+
+// LastUserInput 返回本会话最近一条用户输入。
+func (s *Session) LastUserInput() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastUserInput
+}
+
+// appendMessages 追加消息到历史（写者须为持有运行权的循环 goroutine）。
+func (s *Session) appendMessages(msgs ...llm.Message) {
+	s.mu.Lock()
+	s.Messages = append(s.Messages, msgs...)
+	s.mu.Unlock()
+}
+
+// setReqEstimate 记录「上一次真正发给上游的请求」的估算总量。
+func (s *Session) setReqEstimate(n int) {
+	s.mu.Lock()
+	s.reqEstimate = n
+	s.mu.Unlock()
+}
+
+// SnapshotForRender 返回（标题, 消息切片副本），供其它 goroutine 序列化/回放。
+// 副本只拷切片头一层：Message/Block 均按只读使用，与 llm 适配器的约定一致。
+func (s *Session) SnapshotForRender() (string, []llm.Message) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	msgs := append([]llm.Message(nil), s.Messages...)
+	return s.Title, msgs
+}
+
+// TitleSnapshot 返回标题快照（跨 goroutine 只读标题时用，避免整份消息拷贝）。
+func (s *Session) TitleSnapshot() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Title
+}
+
+// markSaveWarned 标记「持久化失败已告知」，返回本次是否需要提示（仅第一次）。
+func (s *Session) markSaveWarned() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.saveWarned {
+		return false
+	}
+	s.saveWarned = true
+	return true
+}
+
+// countAssistantMessages 统计助手消息条数。
+// 每完成一步 ReAct 恰好追加一条助手消息，因此它同时是「已完成的步骤数」——
+// 检查点的会话级步骤号（stepBase + 本轮第几步）就靠它对齐消息位置。
+func countAssistantMessages(msgs []llm.Message) int {
+	n := 0
+	for _, m := range msgs {
+		if m.Role == llm.RoleAssistant {
+			n++
+		}
+	}
+	return n
 }
 
 // calibrateTokenFactor 用上游回报的真实输入 tokens 校准估算器。
@@ -100,19 +211,41 @@ func (s *Session) calibrateTokenFactor(realInput int) {
 	s.tokenFactor = f
 }
 
-// calibratedEstimate 返回按校准系数放大后的估算（无校准数据时等于 EstimateTokens）。
+// calibratedEstimate 返回按校准系数放大后的估算。
+//
+// 尚未校准（tokenFactor <= 0，例如刚重启、新会话）时使用**保守**的
+// uncalibratedTokenFactor，而不是 1.0 —— 估算口径对代码/JSON 稳定低估约 10%，
+// 用 1.0 会让重启后的第一次请求带着超窗的体量发出去
+// （「每次启动的第一次老是炸上下文」，2026-09-21 反馈）。
+// 拿到第一次真实用量后系数就会被真实比值取代。
 func (s *Session) calibratedEstimate(msgs []llm.Message) int {
 	n := EstimateTokens(msgs)
-	if s != nil && s.tokenFactor > 1 {
-		n = int(math.Round(float64(n) * s.tokenFactor))
+	if n <= 0 {
+		return n
 	}
-	return n
+	// tokenFactor 会被子智能体 goroutine 经 AddUsage 校准（父会话计数合并），
+	// 读它要持锁。
+	f := uncalibratedTokenFactor
+	s.mu.RLock()
+	if s.tokenFactor > 0 {
+		f = s.tokenFactor
+	}
+	s.mu.RUnlock()
+	if f <= 1 {
+		return n
+	}
+	return int(math.Round(float64(n) * f))
 }
 
 // compressionState 返回（是否处于压缩态、被摘要覆盖的消息条数）。
 // 越界（历史被 Regenerate 截断或整体替换）时按未压缩处理。
 func (s *Session) compressionState() (bool, int) {
-	if s == nil || s.compressedUpTo <= 0 || strings.TrimSpace(s.summaryText) == "" {
+	if s == nil {
+		return false, 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.compressedUpTo <= 0 || strings.TrimSpace(s.summaryText) == "" {
 		return false, 0
 	}
 	if s.compressedUpTo > len(s.Messages) {
@@ -128,6 +261,8 @@ func (s *Session) normalizeCompression() {
 	if s == nil {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.compressedUpTo < 0 {
 		s.compressedUpTo = 0
 	}
@@ -151,7 +286,12 @@ func (s *Session) normalizeCompression() {
 //
 // 返回补上的工具调用 ID；无需修复时返回 nil。
 func (s *Session) repairDanglingToolUse() []string {
-	if s == nil || len(s.Messages) == 0 {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.Messages) == 0 {
 		return nil
 	}
 	last := s.Messages[len(s.Messages)-1]
@@ -183,7 +323,12 @@ func (s *Session) repairDanglingToolUse() []string {
 //
 // workspace 语义：会话按工作区隔离。workspace 为空（未选择工作区）时，
 // 会话挂在空串下、只与空工作区互通；切换工作区即切换数据视图。
+// mu 守护 cache：WS 每连接一个 dispatch goroutine、run goroutine、REST 处理器
+// 都会读写它，map 并发读写是进程级 fatal，不是普通数据竞争。
+// 锁序固定为 h.mu → Session.mu（Get 持 h.mu 时调 normalizeCompression），
+// 反向持锁会死锁。
 type History struct {
+	mu    sync.RWMutex
 	st    *store.Store
 	cache map[string]*Session
 }
@@ -203,13 +348,18 @@ func (h *History) Create(workspace, title string) (*Session, error) {
 	if err := h.st.CreateSession(s.ID, workspace, s.Title, now); err != nil {
 		return nil, err
 	}
+	h.mu.Lock()
 	h.cache[s.ID] = s
+	h.mu.Unlock()
 	return s, nil
 }
 
 // Get 读取一个会话（优先命中缓存）。
 func (h *History) Get(id string) (*Session, bool) {
-	if s, ok := h.cache[id]; ok {
+	h.mu.RLock()
+	s, ok := h.cache[id]
+	h.mu.RUnlock()
+	if ok {
 		return s, true
 	}
 	row, ok, err := h.st.GetSession(id)
@@ -220,7 +370,7 @@ func (h *History) Get(id string) (*Session, bool) {
 	if err != nil {
 		return nil, false
 	}
-	s := &Session{
+	sess := &Session{
 		ID:        row.ID,
 		Workspace: row.Workspace,
 		Title:     row.Title,
@@ -231,18 +381,28 @@ func (h *History) Get(id string) (*Session, bool) {
 		// 越界由 normalizeCompression 兜底（历史可能被回退/整体替换过）。
 		compressedUpTo: row.CompressedUpTo,
 		summaryText:    row.SummaryText,
+		// 恢复校准系数：这是「每次启动第一次不炸上下文」的关键 ——
+		// 归零的话第一次请求会用乐观估算判定，把超窗的请求直接发出去。
+		tokenFactor: row.TokenFactor,
 	}
-	s.normalizeCompression()
-	h.cache[id] = s
-	return s, true
+	sess.normalizeCompression()
+	h.mu.Lock()
+	h.cache[id] = sess
+	h.mu.Unlock()
+	return sess, true
 }
 
 // Save 持久化一个会话（内存缓存对象 → SQLite）。
 func (h *History) Save(id string) error {
+	h.mu.RLock()
 	s, ok := h.cache[id]
+	h.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("会话不存在: %s", id)
 	}
+	// Save 会改 UpdatedAt/Title 并通读 Messages 序列化，持写锁覆盖全程。
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.UpdatedAt = time.Now()
 	if s.Title == "" || s.Title == "新会话" {
 		if t := firstUserText(s); t != "" {
@@ -259,6 +419,9 @@ func (h *History) Save(id string) error {
 		// 压缩状态一并落盘，否则重启后被摘要覆盖的历史会原样重发、立刻超窗
 		CompressedUpTo: s.compressedUpTo,
 		SummaryText:    s.summaryText,
+		// 校准系数也落盘：不存则重启归零，第一次请求用最乐观的估算判定，
+		// 于是「每次启动的第一次都炸上下文」（2026-09-21 反馈）。
+		TokenFactor: s.tokenFactor,
 	})
 }
 
@@ -287,7 +450,9 @@ func (h *History) List(workspace string, archived bool) []SessionMeta {
 
 // Archive 归档一个会话。
 func (h *History) Archive(id string) error {
+	h.mu.Lock()
 	delete(h.cache, id) // 归档会话从活跃缓存移除（避免继续续聊）
+	h.mu.Unlock()
 	return h.st.ArchiveSession(id)
 }
 
@@ -325,16 +490,26 @@ func (h *History) Latest(workspace string) string {
 
 // Rename 重命名会话。
 func (h *History) Rename(id, title string) error {
-	if s, ok := h.cache[id]; ok {
+	h.mu.RLock()
+	s, ok := h.cache[id]
+	h.mu.RUnlock()
+	if ok {
+		s.mu.Lock()
 		s.Title = title
+		s.mu.Unlock()
 	}
 	return h.st.RenameSession(id, title)
 }
 
 // SetWorkspace 更新会话归属的工作区（空工作区会话选中工作区后挂靠）。
 func (h *History) SetWorkspace(id, workspace string) error {
-	if s, ok := h.cache[id]; ok {
+	h.mu.RLock()
+	s, ok := h.cache[id]
+	h.mu.RUnlock()
+	if ok {
+		s.mu.Lock()
 		s.Workspace = workspace
+		s.mu.Unlock()
 	}
 	return h.st.SetSessionWorkspace(id, workspace)
 }
@@ -370,17 +545,27 @@ func (h *History) WorkspaceName(workspace string) string {
 
 // Delete 删除一个会话。
 func (h *History) Delete(id string) error {
+	h.mu.Lock()
 	delete(h.cache, id)
+	h.mu.Unlock()
 	return h.st.DeleteSession(id)
 }
 
 // DeleteWorkspace 删除整个项目（工作区）下的全部会话，并清掉缓存中属于该项目的会话。
+//
+// Workspace 字段本身也受 Session.mu 保护（SetWorkspace 会改它），
+// 所以判断归属要连 s.mu 一起读 —— 锁序 h.mu → s.mu，与 Get 一致。
 func (h *History) DeleteWorkspace(workspace string) error {
+	h.mu.Lock()
 	for id, s := range h.cache {
-		if s.Workspace == workspace {
+		s.mu.RLock()
+		match := s.Workspace == workspace
+		s.mu.RUnlock()
+		if match {
 			delete(h.cache, id)
 		}
 	}
+	h.mu.Unlock()
 	return h.st.DeleteWorkspace(workspace)
 }
 

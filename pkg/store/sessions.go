@@ -29,6 +29,12 @@ type SessionRow struct {
 	// 所以只能存下来复用，不能指望每次重启重算。
 	CompressedUpTo int
 	SummaryText    string
+
+	// TokenFactor 是估算器校准系数（真实 input / 本地估算），0 表示尚未校准。
+	//
+	// 必须落盘：不存的话每次重启归零，重启后第一次请求用最乐观的估算判定，
+	// 于是「每次启动的第一次都炸上下文」（2026-09-21 反馈）。
+	TokenFactor float64
 }
 
 // SessionMetaRow 是会话元信息。
@@ -56,12 +62,13 @@ func (s *Store) CreateSession(id, workspace, title string, now time.Time) error 
 // GetSession 读取会话元信息（不含消息）。
 func (s *Store) GetSession(id string) (*SessionRow, bool, error) {
 	row := s.db.QueryRow(
-		`SELECT id, workspace, title, created_at, updated_at, compressed_up_to, summary_text
+		`SELECT id, workspace, title, created_at, updated_at,
+		        compressed_up_to, summary_text, token_factor
 		   FROM sessions WHERE id = ?`, id)
 	var r SessionRow
 	var created, updated int64
 	if err := row.Scan(&r.ID, &r.Workspace, &r.Title, &created, &updated,
-		&r.CompressedUpTo, &r.SummaryText); err != nil {
+		&r.CompressedUpTo, &r.SummaryText, &r.TokenFactor); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, false, nil
 		}
@@ -82,9 +89,11 @@ func (s *Store) SaveSession(sess SessionRow) error {
 	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.Exec(
-		`UPDATE sessions SET title = ?, updated_at = ?, compressed_up_to = ?, summary_text = ?
+		`UPDATE sessions
+		    SET title = ?, updated_at = ?, compressed_up_to = ?, summary_text = ?, token_factor = ?
 		  WHERE id = ?`,
-		sess.Title, sess.UpdatedAt.Unix(), sess.CompressedUpTo, sess.SummaryText, sess.ID); err != nil {
+		sess.Title, sess.UpdatedAt.Unix(), sess.CompressedUpTo, sess.SummaryText,
+		sess.TokenFactor, sess.ID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM messages WHERE session_id = ?`, sess.ID); err != nil {
@@ -96,8 +105,8 @@ func (s *Store) SaveSession(sess SessionRow) error {
 			return fmt.Errorf("序列化消息内容失败: %w", err)
 		}
 		if _, err := tx.Exec(
-			`INSERT INTO messages (session_id, seq, role, content) VALUES (?, ?, ?, ?)`,
-			sess.ID, i, string(m.Role), string(content)); err != nil {
+			`INSERT INTO messages (session_id, seq, role, content, origin) VALUES (?, ?, ?, ?, ?)`,
+			sess.ID, i, string(m.Role), string(content), m.Origin); err != nil {
 			return err
 		}
 	}
@@ -106,7 +115,8 @@ func (s *Store) SaveSession(sess SessionRow) error {
 
 // SessionMessages 读取会话的全部消息（按 seq 升序）。
 func (s *Store) SessionMessages(id string) ([]llm.Message, error) {
-	rows, err := s.db.Query(`SELECT role, content FROM messages WHERE session_id = ? ORDER BY seq`, id)
+	rows, err := s.db.Query(
+		`SELECT role, content, origin FROM messages WHERE session_id = ? ORDER BY seq`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -114,8 +124,8 @@ func (s *Store) SessionMessages(id string) ([]llm.Message, error) {
 
 	var msgs []llm.Message
 	for rows.Next() {
-		var role, content string
-		if err := rows.Scan(&role, &content); err != nil {
+		var role, content, origin string
+		if err := rows.Scan(&role, &content, &origin); err != nil {
 			return nil, err
 		}
 		var blocks []llm.ContentBlock
@@ -123,14 +133,14 @@ func (s *Store) SessionMessages(id string) ([]llm.Message, error) {
 			// 单条消息损坏不应拖垮整个会话：跳过并保留其余
 			continue
 		}
-		msgs = append(msgs, llm.Message{Role: llm.Role(role), Content: blocks})
+		msgs = append(msgs, llm.Message{Role: llm.Role(role), Content: blocks, Origin: origin})
 	}
 	return msgs, rows.Err()
 }
 
 // ListSessions 列出会话元信息（更新时间倒序）。
 // workspace 为空返回全部工作区；archived=false 只返回未归档，true 只返回已归档。
-// 顺带 LEFT JOIN workspace_names 带上项目显示名（没有自定义名时为 ''）。
+// 顺带 LEFT JOIN workspace_names 带上项目显示名（没有自定义名时为 ”）。
 func (s *Store) ListSessions(workspace string, archived bool) ([]SessionMetaRow, error) {
 	q := `SELECT s.id, s.workspace, COALESCE(n.name, ''), s.title, s.created_at, s.updated_at,
 	      s.archived_at, (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS cnt

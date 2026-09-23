@@ -208,13 +208,13 @@ func (a *Agent) lastCheckpointStep(sessionID string) int {
 
 // RewindAfterEdit 在「编辑重发」时回退被编辑消息之后的文件改动。
 //
-// 步骤归属的推定：检查点只记了「第几轮 ReAct 步骤」，消息只记了顺序，两者没有
-// 直接映射。这里用一条经验规则把它们接起来 —— 会话里的消息顺序是
-// 「提问 → (助手回复 + 工具调用/结果)* 」，所以第 k 条用户消息之后的内容，
-// 与「该消息之前已经产生过多少条消息」大致同构。
+// 步骤归属的精确对齐：检查点步骤号会话级单调（stepBase + 本轮第几步，见
+// runLoopWithLimit），每完成一步恰好追加一条助手消息，因此
+// 「目标用户消息之前的助手消息数 + 1」就是其后第一个新步骤号。
+// steer 注入的用户消息不占步骤 —— 旧的 (dropped+1)/2 近似口径会被它带偏。
 //
-// 保守起见取**最大**匹配：只要历史被截断到 idx，就把 idx 之后（含）可能产生的
-// 全部改动回退掉。宁可多退（用户能重跑）也不要少退（留下与上下文矛盾的半成品）。
+// 保守起见仍取**最大**匹配：从 idx 之后的第一个步骤起全部回退。
+// 宁可多退（用户能重跑）也不要少退（留下与上下文矛盾的半成品）。
 //
 // 无法定位目标消息（back 越界）时返回 (nil, nil)：只截断对话，不动文件。
 func (a *Agent) RewindAfterEdit(sessionID string, back int) (*RewindResult, error) {
@@ -225,27 +225,24 @@ func (a *Agent) RewindAfterEdit(sessionID string, back int) (*RewindResult, erro
 	if back < 0 {
 		back = 0
 	}
-	idx := nthLastPlainUserIndex(sess.Messages, back)
+	// 编辑重发由 WS dispatch 触发，可能与运行中的循环并发：读历史要持锁。
+	sess.mu.RLock()
+	// 与 EditableUserMessages / RerunFrom 同源：back 只数「真正的提问」，
+	// 否则同一个 back 在「定位消息」与「回退文件」两处会指向不同的消息。
+	idx := nthLastUserQuestionIndex(sess.Messages, back)
 	if idx < 0 {
+		sess.mu.RUnlock()
 		return nil, nil // 定位不到：跳过文件回滚
 	}
-
-	// 该用户消息之后被丢弃的消息条数 → 换算成要回退的步骤区间。
-	// 一轮 ReAct 的每个「助手回复 + 工具结果」对大致对应一步，取上界即可。
-	dropped := len(sess.Messages) - (idx + 1)
-	if dropped <= 0 {
+	if len(sess.Messages)-(idx+1) <= 0 {
+		sess.mu.RUnlock()
 		return nil, nil // 目标消息就是最后一条，其后没有改动
 	}
+	from := countAssistantMessages(sess.Messages[:idx+1]) + 1
+	sess.mu.RUnlock()
 	maxStep := a.lastCheckpointStep(sessionID)
-	if maxStep <= 0 {
-		return nil, nil // 从未记录过写操作
-	}
-	// 该消息本身所属的轮次也要算进去：它自己就可能带着工具调用（如 write_file）。
-	// 回退区间 = 从「截断点之后第一条消息」所在的步骤起算，用下界估算：
-	// 每 2 条被丢弃的消息 ≈ 1 步，再向上取整，且至少回退 1 步。
-	from := maxStep - (dropped+1)/2
-	if from < 1 {
-		from = 1
+	if maxStep <= 0 || from > maxStep {
+		return nil, nil // 该消息之后的轮次没有记录过写操作
 	}
 	return a.RewindFiles(sessionID, from)
 }

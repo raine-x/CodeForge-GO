@@ -110,6 +110,16 @@ func (s *Store) migrate() error {
 		// 所以必须存下来复用，而不是每次重启重算。
 		`ALTER TABLE sessions ADD COLUMN compressed_up_to INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sessions ADD COLUMN summary_text TEXT NOT NULL DEFAULT ''`,
+		// 估算器的校准系数也要落盘。
+		//
+		// 它是「上游真实 input tokens / 本地估算」的比值，是压缩判定的准确性来源。
+		// 不存的话**每次重启都归零**，于是重启后的第一次请求用最乐观的估算
+		//（代码/JSON 实际约 3–3.5 字符/token，估算按 4 计，稳定低估约 10%），
+		// 判定「没超预算」就把完整历史发出去，被上游 400 拒绝 ——
+		// 这正是「每次启动的第一次老是炸上下文」的成因（2026-09-21 反馈）。
+		//
+		// 0 表示「尚未校准」，读取侧会当作 1.0（不放大）。
+		`ALTER TABLE sessions ADD COLUMN token_factor REAL NOT NULL DEFAULT 0`,
 		// 任务清单：会话级 todo 表（todo_write 整体替换语义，见 sessions.go）
 		`CREATE TABLE IF NOT EXISTS session_todos (
 			session_id  TEXT NOT NULL,
@@ -138,6 +148,11 @@ func (s *Store) migrate() error {
 			FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id, step DESC)`,
+		// 消息来源标记（'' = 用户正常输入，'steer' = 运行中转向注入的指令）。
+		//
+		// 不落盘的话重启后就分不清哪句是提问、哪句是插话：界面回放会把插话
+		// 渲染成普通用户消息，「重新生成 / 编辑重发」也可能定位到插话上。
+		`ALTER TABLE messages ADD COLUMN origin TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, q := range stmts {
 		if _, err := s.db.Exec(q); err != nil {

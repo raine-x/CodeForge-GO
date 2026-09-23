@@ -1416,9 +1416,14 @@
   }
 
   // 上游瞬时故障自动重试提示：样式同「编辑文件」类文字条目，点击展开/收起完整错误原因。
+  //
+  // ⚠️ 与下面的 resumeRingEl 是两件事，名字刻意不共用 retry：
+  //   retry*   = 上游自己重试，前端只是把「正在重试」透出来；
+  //   resume*  = 这一轮没跑完（打断 / 报错 / 刷新），由用户点一下**接着跑**。
+  // 后者发的是普通用户消息「继续」，不截断历史、不回退文件。
   let retryEl = null;
-  // 未回复打断的重试圆环：用户在模型未回复前点击打断，显示圆环，点击重新发送
-  let retryRingEl = null;
+  // 未回复打断的「继续」圆环：用户在模型未回复前点击打断，显示圆环，点击接着跑。
+  let resumeRingEl = null;
   let hasModelReplied = false; // 标记模型是否已开始回复（收到 text/reasoning/tool_call）
   function addRetry(reason, attempt, maxAttempts) {
     const brief = retryReasonBrief(reason);
@@ -1456,22 +1461,22 @@
     if (retryEl) { retryEl.remove(); retryEl = null; }
   }
   // 未回复打断的「继续」圆环
-  function showRetryRing() {
-    if (retryRingEl) return;
-    retryRingEl = document.createElement('button');
-    retryRingEl.type = 'button';
-    retryRingEl.className = 'retry-ring';
-    retryRingEl.title = '继续这一轮（保留已完成的记录，不回退文件）';
+  function showResumeRing() {
+    if (resumeRingEl) return;
+    resumeRingEl = document.createElement('button');
+    resumeRingEl.type = 'button';
+    resumeRingEl.className = 'resume-ring';
+    resumeRingEl.title = '继续这一轮（保留已完成的记录，不回退文件）';
     // 图标用「向右的箭头」而不是刷新循环：这里的动作是**接着往下跑**，不是重来。
-    retryRingEl.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h15M13 6l6 6-6 6"/></svg>';
-    retryRingEl.addEventListener('click', function () {
+    resumeRingEl.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h15M13 6l6 6-6 6"/></svg>';
+    resumeRingEl.addEventListener('click', function () {
       sendContinueRequest();
     });
-    ensureCol().appendChild(retryRingEl);
+    ensureCol().appendChild(resumeRingEl);
     scrollBottom();
   }
-  function removeRetryRing() {
-    if (retryRingEl) { retryRingEl.remove(); retryRingEl = null; }
+  function removeResumeRing() {
+    if (resumeRingEl) { resumeRingEl.remove(); resumeRingEl = null; }
   }
 
   // 打断 / 报错 / 刷新重连后接着跑：追加一句「继续」，让模型从断点往下走。
@@ -1484,7 +1489,7 @@
   // 复用 sendAsUserText：走的是与用户手打一句「继续」完全相同的链路
   //（别名展开 / 气泡 / 发送 / lastUserText），不另开一条会漂移的旁路。
   function sendContinueRequest() {
-    removeRetryRing();
+    removeResumeRing();
     sendAsUserText('继续');
   }
 
@@ -2860,7 +2865,11 @@
           if (b.type === 'text') {
             if (m.role === 'user') {
               closeText();
-              addUser(b.text || '');
+              // origin=steer 是「运行中转向」注入的插话：回放时仍按转向渲染。
+              // 否则切会话/重启后它就成了一条普通提问 —— 用户分不清自己当时
+              // 是在插话还是在提问，编辑/重发按钮的落点也跟着含糊。
+              if (m.origin === 'steer') addSteer(b.text || '', true);
+              else addUser(b.text || '');
               lastUserText = b.text || '';
             } else {
               appendText(b.text || ''); // 助手段落：markdown 渲染
@@ -3302,9 +3311,9 @@
             // 最后一轮没跑完（打断 / 报错 / 刷新后重新连上）时，服务端给出可重试锚点。
             // 页面刷新后视图是无状态的，只能靠服务端判；run 结束后的 checkpoints
             // 一定在 idle 之后到达，所以这里直接按结果挂/摘圆环即可。
-            retryBack = Math.max(-1, Number(ev.retry_back));
-            if (retryBack >= 0 && !running) showRetryRing();
-            else removeRetryRing();
+            resumeBack = Math.max(-1, Number(ev.resume_back));
+            if (resumeBack >= 0 && !running) showResumeRing();
+            else removeResumeRing();
           }
           break;
         case 'edit':
@@ -3340,7 +3349,7 @@ case 'busy':
           lastReply = '';
           hasModelReplied = false; // 新一轮开始：重置回复标记
           removeRetry();
-          removeRetryRing();
+          removeResumeRing();
           resetSubagentCards();
           sendBtn.classList.add('running');
           sendBtn.title = '点击打断';
@@ -3380,7 +3389,7 @@ case 'busy':
           break;
         case 'reasoning':
           hasModelReplied = true;
-          removeRetryRing();
+          removeResumeRing();
           runReason += ev.text || '';
           if (runAway()) break;
           removeThinking();
@@ -3390,7 +3399,7 @@ case 'busy':
           break;
         case 'text':
           hasModelReplied = true;
-          removeRetryRing();
+          removeResumeRing();
           runReason = '';
           runText += ev.text || '';
           if (runAway()) { foldReason(); break; }
@@ -3471,7 +3480,7 @@ case 'busy':
           }
           removeThinking();
           removeRetry();
-          removeRetryRing();
+          removeResumeRing();
           settleActiveTool();
           if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
           foldReason();
@@ -3484,7 +3493,7 @@ case 'idle': {
           const backHome = !runAway();
           removeThinking();
           removeRetry();
-          removeRetryRing();
+          removeResumeRing();
           settleActiveTool();
           if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
           foldReason();
@@ -3762,7 +3771,7 @@ case 'idle': {
   // 最近一次收到的检查点列表（回滚菜单的数据源；空数组 = 没有可回滚的步骤）。
   let checkpointSteps = [];
   // 服务端给的「未完成轮次」重试锚点（back；-1 = 上一轮已完整结束，不需要提示）。
-  let retryBack = -1;
+  let resumeBack = -1;
 
   // 重置「当前流式元素」的引用，**不动任何已渲染的节点**。
   //
@@ -3962,7 +3971,10 @@ case 'idle': {
 
   // 转向气泡：与普通用户消息同一角色（模型看到的就是用户插话），
   // 但标注「转向」并说明何时生效，避免用户以为任务被打断了。
-  function addSteer(text) {
+  //
+  // merged=true 用于**历史回放**：回放出来的插话必然已经并入过上下文
+  //（它就在历史里），再写「下一步生效」是错的。
+  function addSteer(text, merged) {
     const row = document.createElement('div');
     row.className = 'msg-user msg-steer';
     const b = document.createElement('div');
@@ -3970,7 +3982,9 @@ case 'idle': {
     b.dataset.rawText = text;
     const tag = document.createElement('span');
     tag.className = 'steer-tag';
-    tag.textContent = '转向 · 下一步生效，不打断当前任务';
+    tag.textContent = merged
+      ? '转向 · 已并入上下文，本步起生效'
+      : '转向 · 下一步生效，不打断当前任务';
     b.appendChild(tag);
     const body = document.createElement('div');
     renderUserText(body, text);
@@ -3994,7 +4008,7 @@ case 'idle': {
       if (runAway()) addInfo('已请求打断正在后台运行的任务');
       wsSend({ type: 'cancel' });
       // 未回复的打断：显示重试圆环，点击可从用户输入重新开始（保留上下文）
-      if (!hasModelReplied) showRetryRing();
+      if (!hasModelReplied) showResumeRing();
       return;
     }
     const raw = String(override === undefined ? input.value : override).trim();
@@ -4665,7 +4679,7 @@ case 'idle': {
     if (String(input.value || '').trim()) { steerNow(); return; }
     if (runAway()) addInfo('已请求打断正在后台运行的任务');
     wsSend({ type: 'cancel' });
-    if (!hasModelReplied) showRetryRing();
+    if (!hasModelReplied) showResumeRing();
   });
   // 左侧分类导航（nav-back / nav-models 无 data-page，各自单独绑定）
   settingsOverlay.querySelectorAll('.nav-item[data-page]').forEach(function (item) {

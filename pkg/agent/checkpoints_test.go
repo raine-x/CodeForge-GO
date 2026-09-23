@@ -617,19 +617,19 @@ func TestRerunFromKeepsOriginalText(t *testing.T) {
 }
 
 // 已完成的轮次不该被判定为「未完成」——有终稿就算跑完了。
-func TestUnfinishedTurnBackCompleted(t *testing.T) {
+func TestUnfinishedTurnAnchorCompleted(t *testing.T) {
 	ag, h, _ := newCheckpointAgent(t)
 	sess := seedSessionWith(t, h, []llm.Message{
 		userText("q1"),
 		assistantText("a1"),
 	})
-	if got := ag.UnfinishedTurnBack(sess.ID); got != -1 {
+	if got := ag.UnfinishedTurnAnchor(sess.ID); got != -1 {
 		t.Errorf("已完成的轮次应返回 -1，得到 %d", got)
 	}
 }
 
 // 各种「没跑完」的形状都应给出可重试锚点。
-func TestUnfinishedTurnBackIncomplete(t *testing.T) {
+func TestUnfinishedTurnAnchorIncomplete(t *testing.T) {
 	ag, h, _ := newCheckpointAgent(t)
 
 	cases := map[string][]llm.Message{
@@ -651,7 +651,7 @@ func TestUnfinishedTurnBackIncomplete(t *testing.T) {
 	for name, msgs := range cases {
 		t.Run(name, func(t *testing.T) {
 			s := seedSessionWith(t, h, msgs)
-			if got := ag.UnfinishedTurnBack(s.ID); got != 0 {
+			if got := ag.UnfinishedTurnAnchor(s.ID); got != 0 {
 				t.Errorf("未完成轮次应返回 0，得到 %d", got)
 			}
 		})
@@ -660,7 +660,7 @@ func TestUnfinishedTurnBackIncomplete(t *testing.T) {
 
 // 有工具调用但也回了正文：只要还没给「无工具调用的终稿」就算未完成
 // （ReAct 循环中途打断正是最常见的断点场景）。
-func TestUnfinishedTurnBackToolThenText(t *testing.T) {
+func TestUnfinishedTurnAnchorToolThenText(t *testing.T) {
 	ag, h, _ := newCheckpointAgent(t)
 	sess := seedSessionWith(t, h, []llm.Message{
 		userText("q1"),
@@ -670,7 +670,7 @@ func TestUnfinishedTurnBackToolThenText(t *testing.T) {
 		}),
 		llm.ToolResultMessage("t1", "内容", false),
 	})
-	if got := ag.UnfinishedTurnBack(sess.ID); got != 0 {
+	if got := ag.UnfinishedTurnAnchor(sess.ID); got != 0 {
 		t.Errorf("工具中途打断应返回 0，得到 %d", got)
 	}
 
@@ -679,15 +679,15 @@ func TestUnfinishedTurnBackToolThenText(t *testing.T) {
 	if err := h.Save(sess.ID); err != nil {
 		t.Fatal(err)
 	}
-	if got := ag.UnfinishedTurnBack(sess.ID); got != -1 {
+	if got := ag.UnfinishedTurnAnchor(sess.ID); got != -1 {
 		t.Errorf("给了终稿后应返回 -1，得到 %d", got)
 	}
 }
 
 // 不存在的会话返回 -1（别把空历史当成「可重试」）。
-func TestUnfinishedTurnBackMissingSession(t *testing.T) {
+func TestUnfinishedTurnAnchorMissingSession(t *testing.T) {
 	ag, _, _ := newCheckpointAgent(t)
-	if got := ag.UnfinishedTurnBack("不存在"); got != -1 {
+	if got := ag.UnfinishedTurnAnchor("不存在"); got != -1 {
 		t.Errorf("不存在的会话应返回 -1，得到 %d", got)
 	}
 }

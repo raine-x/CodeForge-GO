@@ -297,3 +297,37 @@ func TestMigrateSessions(t *testing.T) {
 		t.Fatalf("重复迁移应导入 0 条，实际 %d", n)
 	}
 }
+
+// 消息来源标记（Origin）必须落盘：不存的话重启后分不清哪句是提问、
+// 哪句是运行中转向注入的插话 —— 界面回放会把插话渲染成普通用户消息，
+// 「重新生成 / 编辑重发」也可能定位到插话上。
+func TestMessageOriginRoundTrip(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now()
+	if err := s.CreateSession("s1", "", "来源", now); err != nil {
+		t.Fatal(err)
+	}
+	msgs := []llm.Message{
+		llm.TextMessage(llm.RoleUser, "重构 X"),
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: llm.BlockText, Text: "顺便改 b"}}, Origin: "steer"},
+	}
+	if err := s.SaveSession(SessionRow{
+		ID: "s1", Title: "来源", CreatedAt: now, UpdatedAt: now, Messages: msgs,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.SessionMessages("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("消息数期望 2，实际 %d", len(got))
+	}
+	if got[0].Origin != "" {
+		t.Errorf("正常提问不应带来源标记，实际 %q", got[0].Origin)
+	}
+	if got[1].Origin != "steer" {
+		t.Errorf("插话的来源标记必须回读一致，实际 %q", got[1].Origin)
+	}
+}

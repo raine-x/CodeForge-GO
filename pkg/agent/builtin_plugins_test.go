@@ -37,12 +37,12 @@ func TestBuiltinPluginSection(t *testing.T) {
 // systemPrompt 整链路：启用插件后基础提示词之外多出插件段。
 func TestSystemPromptWithPlugin(t *testing.T) {
 	a := &Agent{workDir: t.TempDir()}
-	base := a.systemPrompt()
+	base := a.systemPrompt("")
 	if strings.Contains(base, "内置插件") {
 		t.Fatal("未启用时不应包含插件段")
 	}
 	a.SetSkillCreatorEnabled(true)
-	if !strings.Contains(a.systemPrompt(), "内置插件：Skill Creator") {
+	if !strings.Contains(a.systemPrompt(""), "内置插件：Skill Creator") {
 		t.Error("启用后 systemPrompt 应包含 Skill Creator 插件段")
 	}
 }

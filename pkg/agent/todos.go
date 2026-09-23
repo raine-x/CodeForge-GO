@@ -51,7 +51,11 @@ func (a *Agent) TodoSection(sessionID string) string {
 
 // systemPromptFor 生成会话维度的 System Prompt：在 systemPrompt 基础上追加任务清单。
 func (a *Agent) systemPromptFor(sess *Session) string {
-	base := a.systemPrompt()
+	lastInput := ""
+	if sess != nil {
+		lastInput = sess.LastUserInput()
+	}
+	base := a.systemPrompt(lastInput)
 	if sess == nil {
 		return base
 	}

@@ -99,7 +99,7 @@ func (r *SubagentRunner) runOne(ctx context.Context, task tools.SubagentTask, po
 	prompt := subagentPrompt(task, policy)
 	sess := &Session{ID: "subagent-" + task.ID, Workspace: r.parent.workDir, Messages: nil}
 	sess.Messages = append(sess.Messages, llm.TextMessage(llm.RoleUser, prompt))
-	child.lastUserInput = prompt
+	sess.SetLastUserInput(prompt)
 
 	// 注入子智能体路径围栏：工具层强制只允许访问 task.Paths 范围内的路径。
 	ctx = tools.WithSubagentScope(ctx, tools.SubagentScope{Allowed: task.Paths, Mode: task.Mode})
@@ -124,6 +124,11 @@ func (r *SubagentRunner) runOne(ctx context.Context, task tools.SubagentTask, po
 				Detail: fmt.Sprintf("正在调用 %s", ev.ToolName)})
 		}
 	})
+	// 用量先并回父会话再判成败：子会话 persist=false，不落历史，
+	// 用量不并回来就随会话一起蒸发，左下角统计会系统性低估委派类任务的花费。
+	// 失败的子任务同样花了 token，一并计入。
+	r.mergeUsage(ctx, sess)
+
 	// 先算出 summary 再发终态事件：completed 事件要携带摘要给前端展示。
 	result.Summary = strings.TrimSpace(summary.String())
 	if err != nil {
@@ -139,6 +144,24 @@ func (r *SubagentRunner) runOne(ctx context.Context, task tools.SubagentTask, po
 	emitEvent(tools.SubagentEvent{ID: task.ID, Mode: task.Mode, Status: "completed",
 		Detail: "子任务完成", Summary: truncateTail(result.Summary, 300)})
 	return result
+}
+
+// mergeUsage 把子会话的用量并回发起委派的父会话。
+//
+// 父会话 ID 从 ctx 的会话运行域取（主循环在工具调用前注入，见
+// tools.WithSession）；取不到时（脱离会话的调用）静默跳过 —— 用量只是统计口径，
+// 不该因为它让子任务失败。
+func (r *SubagentRunner) mergeUsage(ctx context.Context, child *Session) {
+	sc, ok := tools.SessionFrom(ctx)
+	if !ok || sc.SessionID == "" {
+		return
+	}
+	parent, ok := r.parent.history.Get(sc.SessionID)
+	if !ok {
+		return
+	}
+	in, hit, out := child.UsageSnapshot()
+	parent.mergeUsage(in, hit, out)
 }
 
 // modeLabel 返回子任务模式的中文标签。

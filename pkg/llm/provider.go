@@ -56,6 +56,15 @@ type ContentBlock struct {
 type Message struct {
 	Role    Role           `json:"role"`
 	Content []ContentBlock `json:"content"`
+
+	// Origin 标记这条消息的**来源**（空串 = 用户正常输入）。
+	//
+	// 对上游无意义（构造请求时只看 Role/Content），它解决的是本地问题：
+	// 「运行中转向」注入的指令在历史里与正常提问长得一模一样，导致
+	// 重新生成 / 编辑重发 / 回退可能定位到一句中途插话上，界面回放也分不清
+	// 哪句是提问、哪句是插话。取值由 agent 层定义（见 agent.OriginSteer），
+	// 本包只做透传与持久化。
+	Origin string `json:"origin,omitempty"`
 }
 
 // TextMessage 构造一条纯文本消息。

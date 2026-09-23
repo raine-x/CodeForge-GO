@@ -189,3 +189,97 @@ func containsStr(list []string, want string) bool {
 	}
 	return false
 }
+
+// ---------------------------------------------------------------------------
+// steer 消息的身份标记（Origin）
+//
+// 插话与「真正的提问」在历史里长得一样，导致三处误判：重新生成 / 编辑重发
+// 会把插话当成最后一条提问，界面回放也把插话渲染成普通提问。
+// ---------------------------------------------------------------------------
+
+func steerText(s string) llm.Message {
+	m := llm.TextMessage(llm.RoleUser, s)
+	m.Origin = OriginSteer
+	return m
+}
+
+// 定位函数必须跳过插话：只认真正的提问。
+func TestUserQuestionLocatorsSkipSteer(t *testing.T) {
+	msgs := []llm.Message{
+		userText("q1"), assistantText("a1"),
+		steerText("顺便改 b"), assistantText("a2"),
+	}
+	if got := lastUserQuestionIndex(msgs); got != 0 {
+		t.Errorf("最后一条提问应为 q1（下标 0），实际 %d", got)
+	}
+	if got := lastPlainUserIndex(msgs); got != 2 {
+		t.Errorf("压缩切点口径不变：最后一条纯文本发言仍是插话（下标 2），实际 %d", got)
+	}
+	if got := nthLastUserQuestionIndex(msgs, 0); got != 0 {
+		t.Errorf("n=0 期望 0，得到 %d", got)
+	}
+	if got := nthLastUserQuestionIndex(msgs, 1); got != -1 {
+		t.Errorf("插话不计数，n=1 应越界为 -1，得到 %d", got)
+	}
+}
+
+// 可编辑白名单不得包含插话：前端给它挂编辑按钮没有意义，
+// 且 back 序号必须与 RerunFrom 同源，否则点第 back 条会改错消息。
+func TestEditableUserMessagesExcludesSteer(t *testing.T) {
+	a, h, _ := newCheckpointAgent(t)
+	sess := seedSessionWith(t, h, []llm.Message{
+		userText("q1"), assistantText("a1"),
+		steerText("顺便改 b"), assistantText("a2"),
+	})
+	got := a.EditableUserMessages(sess.ID, 5)
+	if len(got) != 1 {
+		t.Fatalf("插话不该出现在可编辑白名单里，实际 %d 条：%+v", len(got), got)
+	}
+	if got[0].Text != "q1" || got[0].Back != 0 {
+		t.Errorf("白名单应只剩 q1（back=0），实际 %+v", got[0])
+	}
+}
+
+// 「重新生成」应回到真正的提问，而不是落到中途插入的指令上。
+func TestRegenerateTargetsLastQuestionNotSteer(t *testing.T) {
+	a := newEmitTestAgent(t, maxStepsProvider(func(context.Context, llm.Request) (<-chan llm.StreamEvent, error) {
+		return okStream("答"), nil
+	}))
+	sess, err := a.History().Create("", "转向后重新生成")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess.Messages = []llm.Message{
+		userText("重构 X"), assistantText("好"),
+		steerText("顺便改 b"), assistantText("已改 b"),
+	}
+
+	if err := a.Regenerate(context.Background(), sess.ID, func(Event) {}); err != nil {
+		t.Fatalf("重新生成失败: %v", err)
+	}
+	_, msgs := sess.SnapshotForRender()
+	if len(msgs) != 2 {
+		t.Fatalf("应从提问重跑（插话一并丢弃），实际 %d 条：%+v", len(msgs), msgs)
+	}
+	if msgs[0].Content[0].Text != "重构 X" || msgs[1].Content[0].Text != "答" {
+		t.Fatalf("历史不符：%+v", msgs)
+	}
+}
+
+// 插话经 appendSteers 并入时必须带上标记（它是标记的唯一写入口）。
+func TestAppendSteersMarksOrigin(t *testing.T) {
+	a, h, _ := newCheckpointAgent(t)
+	sess := seedSessionWith(t, h, []llm.Message{userText("q1"), assistantText("a1")})
+	a.appendSteers(sess, []string{"换个思路"}, func(Event) {})
+
+	msgs := sess.Messages
+	if len(msgs) != 3 {
+		t.Fatalf("应并入一条消息，实际 %d 条", len(msgs))
+	}
+	if msgs[2].Origin != OriginSteer {
+		t.Errorf("插话必须带 OriginSteer 标记，实际 %q", msgs[2].Origin)
+	}
+	if msgs[2].Content[0].Text != "换个思路" {
+		t.Errorf("内容不得被改写，实际 %q", msgs[2].Content[0].Text)
+	}
+}

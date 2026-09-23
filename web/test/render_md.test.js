@@ -1311,6 +1311,28 @@ check('回放时单块渲染失败被隔离（否则整次回放中断、高亮�
   /catch \(err\) \{\s*console\.warn\('\[replay\]/.test(uiSrc));
 check('renderSessions 仍挂在 replayHistory 末尾（高亮的落点）',
   /renderSessions\(sessionsCache\); \/\/ 高亮切换后的 active/.test(uiSrc));
+// 「运行中转向」注入的插话在历史里带 origin=steer：回放时必须仍渲染成转向气泡，
+// 否则切会话/重启后它就成了一条普通提问（用户分不清插话与提问，
+// 后端也只把 origin 为空的纯文本消息当作「真正的提问」，两侧口径要一致）。
+check('回放时带 origin=steer 的消息仍按转向渲染',
+  /if \(m\.origin === 'steer'\) addSteer\(b\.text \|\| '', true\)/.test(uiSrc));
+check('回放出来的转向标记写「已并入」（它本来就在历史里）',
+  /function addSteer\(text, merged\)/.test(uiSrc) &&
+  /merged\s*\n?\s*\? '转向 · 已并入上下文，本步起生效'/.test(uiSrc));
+
+// ---------- 命名：retry* 与 resume* 是两件事 ----------
+// retry*  = 上游自己重试，前端只把「正在重试」透出来；
+// resume* = 这一轮没跑完（打断/报错/刷新），用户点一下接着跑（发一句「继续」）。
+// 二者曾共用 retry 前缀（协议字段还叫 retry_back），名字与行为不符，
+// 长期共存会误导后续维护（2026-09-23 收口）。
+group('「继续」与「上游重试」的命名区分');
+check('「继续」圆环用 resume 前缀，不再与上游重试提示共用 retry',
+  /function showResumeRing\(\)/.test(uiSrc) &&
+  /function removeResumeRing\(\)/.test(uiSrc) &&
+  /let resumeRingEl = null/.test(uiSrc) &&
+  !/retryRing/.test(uiSrc) && !/retryBack/.test(uiSrc));
+check('继续圆环的样式类跟着改名（.resume-ring，不留 .retry-ring）',
+  /\.resume-ring\s*\{/.test(css) && !/\.retry-ring/.test(css));
 
 // ---------- 模型 / 供应商管理（2026-09-20 改造）----------
 group('模型与供应商管理');
@@ -1558,10 +1580,17 @@ check('压缩判定改用校准后的估算，而不是裸估算',
   /sess\.calibratedEstimate\(messages\) > budget/.test(agentGoSrc));
 
 check('每次请求前记录估算基准（含系统提示与工具定义，口径才对得上）',
-  /sess\.reqEstimate = EstimateTokens\(messages\) \+ overhead/.test(agentGoSrc));
+  /sess\.setReqEstimate\(EstimateTokens\(messages\) \+ overhead\)/.test(agentGoSrc));
 
 // ---------- 上下文占用实时刷新（2026-09-21）----------
 const wsPushSrc = fs.readFileSync(path.join(rootDir, 'pkg', 'server', 'ws_handler.go'), 'utf8');
+
+// checkpoints 帧的锚点字段：名字必须是 resume_back。它的语义是「用户点一下接着跑」，
+// 而不是「重试（截断重跑）」—— 名字与行为不符会误导后续维护（2026-09-23 改名）。
+check('checkpoints 帧用 resume_back，而不是语义已变的 retry_back',
+  /"resume_back": s\.agent\.UnfinishedTurnAnchor\(sessionID\)/.test(wsPushSrc) &&
+  // 只看字段本身，注释里提到旧名是允许的（那正是改名的缘由）。
+  !/"retry_back"\s*:/.test(wsPushSrc));
 
 group('上下文占用：轮次进行中也实时刷新');
 
@@ -1601,8 +1630,9 @@ check('存取两侧都带上压缩状态',
   /CompressedUpTo: s\.compressedUpTo/.test(agentHistSrc) &&
   /compressedUpTo: row\.CompressedUpTo/.test(agentHistSrc));
 
+// 载入后先自愈再入缓存（中间隔着 cache 的加锁代码，用 [\s\S] 跨越）。
 check('恢复后立即自愈越界状态（历史可能被回退或整体替换过）',
-  /s\.normalizeCompression\(\)\s*\n\s*h\.cache\[id\] = s/.test(agentHistSrc));
+  /sess\.normalizeCompression\(\)[\s\S]{0,120}?h\.cache\[id\] = sess/.test(agentHistSrc));
 
 check('⚠️ 切换模型装不下时**先压缩**，不再直接拦下来',
   /if _, err := s\.agent\.CompressNow\(r\.Context\(\), req\.SessionID\); err != nil/.test(serverModelsSrc) &&
@@ -1616,6 +1646,51 @@ check('⚠️ 超窗判定用压缩后的送模量，不用原始历史（否则
 check('提示文案里的占用是压缩后量（不误导用户）',
   /func \(a \*Agent\) RequestViewTokens\(sess \*Session\) int/.test(agentGoSrc) &&
   /humanTokens\(s\.agent\.RequestViewTokens\(sess2\)\)/.test(serverModelsSrc));
+
+// ---------- 摘要分块：单条切开 + 失败减半（2026-09-21）----------
+group('摘要分块：超大单条切开 + 单块失败减半重试');
+
+check('⚠️ 超大单条历史按字符切开（否则单条顶满一块，减半也没用）',
+  /func nextChunk\(msgs \[\]llm\.Message, idx, end, budget int, pending string\) \(string, int, string\)/.test(agentCtxSrc) &&
+  /func splitByTokens\(s string, budget int\) \(string, string\)/.test(agentCtxSrc) &&
+  /单条就超预算 → 切开，剩下的留给下一次/.test(agentCtxSrc));
+
+check('⚠️ 单块摘要失败时减半重试，而不是回退机械压缩（= 丢弃历史）',
+  /if chunkBudget > floor \{[\s\S]{0,120}?chunkBudget \/= 2/.test(agentCtxSrc) &&
+  /continue \/\/ idx \/ pending 不前进，用更小的块重来/.test(agentCtxSrc) &&
+  /不要直接截断，可以分块压缩啊/.test(agentCtxSrc));
+
+check('收缩下限按初始预算比例算（否则预算小的时候减半一次就触底）',
+  /func summarizeChunkFloor\(initial int\) int/.test(agentCtxSrc) &&
+  /summaryChunkFloorDiv = 8/.test(agentCtxSrc) &&
+  /summarizeChunkFloor\(chunkBudget\)/.test(agentCtxSrc));
+
+check('用户主动打断时不重试（摘要自身超时则要重试，用父 ctx 区分）',
+  /if ctx\.Err\(\) != nil \{[\s\S]{0,80}?return cur, err/.test(agentCtxSrc) &&
+  /必须用\*\*父\*\* ctx 判断/.test(agentCtxSrc));
+
+check('摘要彻底失败时仍回退机械压缩（最后的保命手段，不能卡死整轮）',
+  /func \(a \*Agent\) degradedCompress/.test(agentGoSrc) &&
+  /摘要不可用，已回退机械压缩/.test(agentGoSrc) &&
+  /ci\.degraded/.test(uiSrc));
+
+// ---------- 「每次启动的第一次老是炸上下文」（2026-09-21）----------
+group('每次启动的第一次不该炸上下文');
+
+check('⚠️ 校准系数落盘（不存则重启归零，第一次请求用最乐观的估算判定）',
+  /ALTER TABLE sessions ADD COLUMN token_factor REAL NOT NULL DEFAULT 0/.test(storeGoSrc) &&
+  /TokenFactor float64/.test(storeSessSrc) &&
+  /token_factor/.test(storeSessSrc) &&
+  /TokenFactor: s\.tokenFactor/.test(agentHistSrc) &&
+  /tokenFactor: row\.TokenFactor/.test(agentHistSrc));
+
+check('⚠️ 未校准时用保守系数，而不是 1.0（1.0 正是「第一次炸」的成因）',
+  /uncalibratedTokenFactor = 1\.15/.test(agentCtxSrc) &&
+  /f := uncalibratedTokenFactor[\s\S]{0,120}?if s\.tokenFactor > 0 \{\s*\n\s*f = s\.tokenFactor/.test(agentHistSrc));
+
+check('⚠️ 压缩一发生就立刻落盘（中途被打断也不该丢）',
+  /compressedBefore := sess\.compressedUpTo/.test(agentGoSrc) &&
+  /if sess\.compressedUpTo != compressedBefore \{\s*\n\s*a\.save\(sess, persist/.test(agentGoSrc));
 
 group('自定义背景图可见性');
 check('不透明底色只挂在 html 上，body 透明',

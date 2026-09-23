@@ -1578,7 +1578,7 @@ body.bg-dark .msg-user.msg-steer .bubble { border-left-color: #f6b8ce; }
 }
 
 /* ---------- 重试圆环：未回复打断后显示，点击重新发送 ---------- */
-.retry-ring {
+.resume-ring {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1592,9 +1592,9 @@ body.bg-dark .msg-user.msg-steer .bubble { border-left-color: #f6b8ce; }
   opacity: 0.9;
   transition: opacity .15s, transform .1s;
 }
-.retry-ring:hover { opacity: 1; transform: scale(1.1); }
-.retry-ring:active { transform: scale(0.95); }
-.retry-ring svg { width: 14px; height: 14px; }
+.resume-ring:hover { opacity: 1; transform: scale(1.1); }
+.resume-ring:active { transform: scale(0.95); }
+.resume-ring svg { width: 14px; height: 14px; }
 
 /* ---------- 子智能体进度卡片 ---------- */
 /* 每个子任务一行卡片：徽标（模式·ID）+ 标签 + 单行进度；终态变色 */

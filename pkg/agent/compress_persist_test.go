@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"codeforge/config"
@@ -220,5 +222,166 @@ func TestRequestViewTokensIsCompressedSize(t *testing.T) {
 	}
 	if view <= 0 {
 		t.Error("送模量不该为 0")
+	}
+}
+
+// ---------- 摘要单块失败 → 减半重试，而不是回退机械压缩 ----------
+
+// 2026-09-21 反馈：界面上出现「上下文超出阈值，已临时压缩历史（210.7k → 52.8k
+// tokens）。摘要不可用，已回退机械压缩」—— 机械压缩是**直接丢弃**历史，
+// 用户的原话是「不要直接截断，可以分块压缩啊」。
+//
+// 本用例模拟「块太大导致摘要失败」：第一次大块必失败，减半后应成功。
+func TestSummarizeChunkFailureShrinksInsteadOfDegrading(t *testing.T) {
+	var summaryCalls int32
+	var firstSize, laterSize int
+
+	a := newEmitTestAgent(t, maxStepsProvider(func(_ context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+		if !isSummaryRequest(req) {
+			// 对话请求：正常收尾
+			return okStream("好的"), nil
+		}
+		size := EstimateTokens(req.Messages)
+		n := atomic.AddInt32(&summaryCalls, 1)
+		if n == 1 {
+			firstSize = size
+		}
+		// 模拟「块太大 → 摘要超时」：超过阈值就失败
+		const failAbove = 4000
+		if size > failAbove {
+			return nil, errors.New("摘要超时或中断: context deadline exceeded")
+		}
+		laterSize = size
+		return okStream("这是摘要内容。"), nil
+	}))
+	sess := seedLongSession(t, a)
+
+	var degraded bool
+	err := a.Run(context.Background(), sess.ID, "继续", func(ev Event) {
+		if ev.Type == EventCompress && ev.Compress != nil && ev.Compress.Degraded {
+			degraded = true
+		}
+	})
+
+	if degraded {
+		t.Errorf("单块失败后应减半重试，不该回退机械压缩（= 丢弃历史）；摘要调用 %d 次，首次 %d tokens，末次 %d tokens",
+			atomic.LoadInt32(&summaryCalls), firstSize, laterSize)
+	}
+	if err != nil {
+		t.Fatalf("压缩重试后本轮应能正常完成: %v", err)
+	}
+	if n := atomic.LoadInt32(&summaryCalls); n < 2 {
+		t.Errorf("应至少重试一次（大块失败 → 减半重来），实际摘要请求 %d 次", n)
+	}
+	if laterSize >= firstSize {
+		t.Errorf("重试时块应变小：第一次 %d tokens → 后来 %d tokens", firstSize, laterSize)
+	}
+}
+
+// 摘要彻底不可用（一直失败）时，仍要回退机械压缩 —— 这是最后的保命手段，
+// 不能因为「宁可丢历史也不报错」把整轮卡死。
+func TestSummarizePersistentFailureStillDegrades(t *testing.T) {
+	var summaryCalls int32
+	a := newEmitTestAgent(t, maxStepsProvider(func(_ context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+		if !isSummaryRequest(req) {
+			return okStream("好的"), nil
+		}
+		atomic.AddInt32(&summaryCalls, 1)
+		return nil, errors.New("上游持续故障")
+	}))
+	sess := seedLongSession(t, a)
+
+	err := a.Run(context.Background(), sess.ID, "继续", func(Event) {})
+	if err != nil {
+		t.Fatalf("摘要持续失败时应回退机械压缩并继续，而不是整轮失败: %v", err)
+	}
+	// 减半重试到下限为止
+	if n := atomic.LoadInt32(&summaryCalls); n < 2 {
+		t.Errorf("应重试到下限，实际摘要请求 %d 次", n)
+	}
+}
+
+// 估算器校准系数必须跨重启保留 —— 这是「每次启动第一次不炸上下文」的关键。
+//
+// 2026-09-21 反馈：「每次启动的第一次老是炸上下文」。
+// 成因：tokenFactor 不落盘 → 重启归零 → 第一次请求用最乐观的估算判定
+// （代码/JSON 实际约 3–3.5 字符/token，估算按 4 计，稳定低估约 10%），
+// 判定「没超预算」就把完整历史发出去，被上游 400 拒绝。
+func TestTokenFactorSurvivesRestart(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "data.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+
+	h1 := NewHistory(st)
+	sess, err := h1.Create("", "factor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess.Messages = append(sess.Messages, llm.TextMessage(llm.RoleUser, "内容"))
+	sess.tokenFactor = 1.42 // 实测校准出来的系数
+	if err := h1.Save(sess.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟重启
+	h2 := NewHistory(st)
+	got, ok := h2.Get(sess.ID)
+	if !ok {
+		t.Fatal("重启后应能读回会话")
+	}
+	if got.tokenFactor != 1.42 {
+		t.Errorf("校准系数应保留 1.42，实际 %v（归零会导致第一次请求炸上下文）", got.tokenFactor)
+	}
+}
+
+// 未校准过的会话读回来应当是 0（= 不放大），不能变成 NaN 之类。
+func TestTokenFactorDefaultIsZero(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "data.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+
+	h := NewHistory(st)
+	sess, _ := h.Create("", "fresh")
+	if err := h.Save(sess.ID); err != nil {
+		t.Fatal(err)
+	}
+	h2 := NewHistory(st)
+	got, _ := h2.Get(sess.ID)
+	if got.tokenFactor != 0 {
+		t.Errorf("未校准应为 0，实际 %v", got.tokenFactor)
+	}
+	if got.calibratedEstimate([]llm.Message{llm.TextMessage(llm.RoleUser, "abc")}) <= 0 {
+		t.Error("系数为 0 时估算不该变成 0 或负数")
+	}
+}
+
+// 校准系数落盘后，重启回来的第一次判定就该是「保守」的。
+func TestCalibrationAffectsEstimateAfterRestart(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "data.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+
+	a1 := newEmitTestAgentWithStore(t, st)
+	sess, _ := a1.History().Create("", "calib")
+	for i := 0; i < 20; i++ {
+		sess.Messages = append(sess.Messages, llm.TextMessage(llm.RoleUser, strings.Repeat("内容。", 50)))
+	}
+	sess.tokenFactor = 1.3
+	if err := a1.History().Save(sess.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	a2 := newEmitTestAgentWithStore(t, st)
+	got, _ := a2.History().Get(sess.ID)
+	raw := EstimateTokens(got.Messages)
+	calibrated := got.calibratedEstimate(got.Messages)
+	if calibrated <= raw {
+		t.Errorf("重启后估算应按系数放大：raw=%d calibrated=%d", raw, calibrated)
 	}
 }

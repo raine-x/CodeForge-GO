@@ -160,6 +160,11 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		if msg.SessionID == "" {
 			return
 		}
+		// 打断旧任务必须**同步**发生在启动新 goroutine 之前（dispatch 串行）：
+		// 放进 run() 里再 stop，两条快速连续的消息会让两个 goroutine 都先跑过
+		// stop()（cancel 还是 nil），随后第二个覆盖第一个的 cancel ——
+		// 第一个循环从此无法打断，且两个循环并发写同一会话。
+		c.stop()
 		go c.run(msg.SessionID, msg.Thinking, "重新生成", "", func(ctx context.Context, emit func(agent.Event)) error {
 			return c.srv.agent.Regenerate(ctx, msg.SessionID, emit)
 		})
@@ -171,6 +176,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		if msg.SessionID == "" || strings.TrimSpace(msg.Text) == "" {
 			return
 		}
+		c.stop() // 同 regenerate：先同步打断，再启动新 goroutine
 		go c.run(msg.SessionID, msg.Thinking, "编辑重发", msg.Text, func(ctx context.Context, emit func(agent.Event)) error {
 			rollback := msg.RollbackFiles == nil || *msg.RollbackFiles
 			if rollback {
@@ -201,6 +207,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		if back < 0 {
 			back = 0
 		}
+		c.stop() // 同 regenerate：先同步打断，再启动新 goroutine
 		go c.run(msg.SessionID, msg.Thinking, "断点重试", "", func(ctx context.Context, emit func(agent.Event)) error {
 			rollback := msg.RollbackFiles == nil || *msg.RollbackFiles
 			if rollback {
@@ -301,6 +308,7 @@ func (c *wsClient) startUserMessage(msg wsMessage) {
 		}
 		sessionID = sess.ID
 	}
+	c.stop() // 同步打断旧任务后再起新轮（否则两条连发消息会让两轮并存）
 	go c.run(sessionID, msg.Thinking, "用户消息", msg.Text, func(ctx context.Context, emit func(agent.Event)) error {
 		images, err := readAttachmentImages(ws, msg.Attachments)
 		if err != nil {
@@ -489,7 +497,8 @@ func (c *wsClient) sessionLabel(sessionID string) string {
 	if !ok {
 		return ""
 	}
-	return clipText(strings.TrimSpace(sess.Title), 40)
+	// 走快照：本函数由通知路径调用，与运行中的循环 / 设置页改名并发。
+	return clipText(strings.TrimSpace(sess.TitleSnapshot()), 40)
 }
 
 // contextUsage 汇总指定会话的上下文占用，供前端底部进度条展示。
@@ -571,16 +580,20 @@ func (s *Server) todoEvent(sessionID string) map[string]any {
 // 与 load_session 下发的是同一种帧（前端统一走 replayHistory 重建视图），
 // 区别只在触发时机：load_session 是用户切会话，这里是**历史刚被截断**。
 // 会话不存在时返回空消息列表的合法帧，前端渲染成空态即可，不必报错。
+//
+// 必须走快照：本函数由别的连接（切会话查看）或同连接的收尾阶段调用，
+// 与运行中的循环并发；直接序列化 sess.Messages 会边读边写。
 func (s *Server) historyEvent(sessionID string) map[string]any {
 	sess, ok := s.agent.History().Get(sessionID)
 	if !ok {
 		return map[string]any{"type": "history", "session_id": sessionID, "messages": []any{}}
 	}
+	title, messages := sess.SnapshotForRender()
 	return map[string]any{
 		"type":       "history",
 		"session_id": sess.ID,
-		"title":      sess.Title,
-		"messages":   sess.Messages,
+		"title":      title,
+		"messages":   messages,
 	}
 }
 
@@ -592,14 +605,15 @@ func (s *Server) checkpointEvent(sessionID string) map[string]any {
 		"session_id": sessionID,
 		"steps":      s.agent.CheckpointSteps(sessionID),
 		"editables":  s.agent.EditableUserMessages(sessionID, editableUserMessageLimit),
-		// retry_back：最后一轮「没有完整结束」的锚点（back），否则 -1。
+		// resume_back：最后一轮「没有完整结束」的锚点（back），否则 -1。
 		// 前端据此在打断 / 报错 / 刷新页面后挂出**「继续」**按钮 —— 判据在服务端算，
 		// 页面刷新后视图是无状态的，前端自己猜不出来。
 		//
-		// ⚠️ 字段名保留 retry_back 是为了不改协议；语义已从「重试（截断重跑）」
-		// 改为「继续（追加接着跑）」：点它发的是普通用户消息，不截断、不回退文件。
-		// 破坏性的重来入口只剩「重新生成」与「编辑重发」（2026-09-22）。
-		"retry_back": s.agent.UnfinishedTurnBack(sessionID),
+		// ⚠️ 名字必须是 resume 而不是 retry：这个动作是「追加一句『继续』接着跑」，
+		// 不截断历史、不回退文件。破坏性的重来入口只剩「重新生成」与「编辑重发」
+		//（2026-09-22 改的语义；字段名到 2026-09-23 才跟上，此前叫 retry_back，
+		// 名字与行为不符，长期共存会误导后续维护）。
+		"resume_back": s.agent.UnfinishedTurnAnchor(sessionID),
 	}
 }
 

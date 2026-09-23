@@ -38,6 +38,17 @@ const (
 	chunkRatioNum = 1
 	chunkRatioDen = 2
 
+	// minSummaryChunk 是摘要块预算收缩的**绝对下限**（tokens）。
+	//
+	// 单块失败（多半是摘要超时：块越大越慢）时会把预算减半重试，
+	// 但收缩空间按初始预算的比例给（见 summaryChunkFloor）——
+	// 只用绝对值的话，预算本来就小的时候减半一次就触底，重试形同虚设
+	//（2026-09-21 单测实测踩到）。
+	minSummaryChunk = 1000
+
+	// summaryChunkFloorDiv 决定收缩下限相对**初始**块预算的比例（1/8）。
+	summaryChunkFloorDiv = 8
+
 	// summaryMaxRunes 是摘要正文的长度上限（字符），提示词里也会告知模型。
 	summaryMaxRunes = 6000
 	// transcriptBlockRunes 是单条消息在摘要输入里的截断上限。
@@ -78,6 +89,17 @@ const (
 	// 防止某次异常用量（上游把缓存 token 也算进 input 之类）把系数顶到离谱的
 	// 高度，导致压缩线被压得过低、每轮都在无谓地压缩。
 	maxTokenFactor = 2.0
+
+	// uncalibratedTokenFactor 是**尚未校准**时使用的保守系数。
+	//
+	// 为什么不能直接用 1.0（不放大）：估算口径对代码/JSON 稳定低估约 10%
+	//（代码约 3–3.5 字符/token，估算按 4 计），而压缩线只留 5% 余量。
+	// 重启后第一次请求若按 1.0 判定，就会出现「判定没超、真请求超窗」——
+	// 这正是「每次启动的第一次老是炸上下文」的直接成因（2026-09-21 反馈）。
+	//
+	// 1.15 覆盖了实测的低估幅度；拿到第一次真实用量后就会被真实比值取代，
+	// 所以只影响「重启后第一炮」，不会长期把压缩线压得过低。
+	uncalibratedTokenFactor = 1.15
 	// summaryOutputCap 是摘要请求输出上限的绝对上限（不沿用模型的大输出上限）。
 	summaryOutputCap = 8192
 )
@@ -325,9 +347,31 @@ func isPlainUserText(m llm.Message) bool {
 }
 
 // lastPlainUserIndex 返回最后一条「用户纯文本发言」的下标，无则 -1。
+//
+// 注意：它把「运行中转向」注入的指令也算作发言 —— 这是压缩切点想要的
+//（插话本身是合法的切点）。要定位「真正的提问」请用 isUserQuestion 那组。
 func lastPlainUserIndex(msgs []llm.Message) int {
 	for i := len(msgs) - 1; i >= 0; i-- {
 		if isPlainUserText(msgs[i]) {
+			return i
+		}
+	}
+	return -1
+}
+
+// isUserQuestion 判断一条消息是否为「用户真正提出的问题」。
+//
+// 与 isPlainUserText 的唯一区别是排除「运行中转向」注入的指令：插话是运行
+// 途中追加的要求，不是这一轮的提问。按它定位会把「重新生成 / 编辑重发」
+// 落到一句插话上，也会让界面把插话渲染成普通提问。
+func isUserQuestion(m llm.Message) bool {
+	return isPlainUserText(m) && m.Origin != OriginSteer
+}
+
+// lastUserQuestionIndex 返回最后一条「真正的用户提问」的下标，无则 -1。
+func lastUserQuestionIndex(msgs []llm.Message) int {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if isUserQuestion(msgs[i]) {
 			return i
 		}
 	}
@@ -556,37 +600,142 @@ func (a *Agent) CompressNow(ctx context.Context, sessionID string) (CompressInfo
 	}, nil
 }
 
+// summarizeChunkFloor 返回块预算的收缩下限：初始预算的 1/8，
+// 但不低于 minSummaryChunk。
+//
+// 为什么按比例：只用绝对下限的话，预算本来就小的会话减半一次就触底，
+// 「减半重试」等于没做（2026-09-21 单测实测踩到）。
+// 按比例则无论初始预算是 6k 还是 60k，都有 3 次左右的收缩空间。
+func summarizeChunkFloor(initial int) int {
+	f := initial / summaryChunkFloorDiv
+	if f < minSummaryChunk {
+		f = minSummaryChunk
+	}
+	return f
+}
+
+// transcriptTokens 估算一段渲染文本的 tokens（与 EstimateTokens 同口径）。
+func transcriptTokens(s string) int {
+	if s == "" {
+		return 0
+	}
+	return EstimateTokens([]llm.Message{{Content: []llm.ContentBlock{{Type: llm.BlockText, Text: s}}}})
+}
+
+// splitByTokens 把 s 切成「约 budget tokens 的前缀」与剩余部分。
+// 按 rune 边界切，不会切坏多字节字符。
+func splitByTokens(s string, budget int) (string, string) {
+	if budget <= 0 || s == "" {
+		return s, ""
+	}
+	total := transcriptTokens(s)
+	if total <= budget {
+		return s, ""
+	}
+	runes := []rune(s)
+	// 按 token 占比等比估 rune 数，再留一点余量（估算本身有误差）。
+	n := len(runes) * budget / total
+	if n < 1 {
+		n = 1
+	}
+	if n >= len(runes) {
+		n = len(runes) - 1
+	}
+	return string(runes[:n]), string(runes[n:])
+}
+
+// nextChunk 从 (idx, pending) 处取出一个不超过 budget 的历史片段。
+//
+// 返回 (片段文本, 下一个 idx, 未消费完的半条消息)。
+//
+// ⚠️ 单条历史超过 budget 时**按字符切开**，剩余部分留到下一次 ——
+// 这就是「分块压缩」的本意。
+//
+// 此前只按消息条数切块：一条消息再大也整条塞进一块，于是渲染时被
+// transcriptBlockRunes 截到 4000 字的单条（一次读进整份大文件、跑一条输出
+// 巨大的命令都很常见）**本身就顶满一个块**，块预算再怎么减半也没用，
+// 最终整体回退机械压缩、历史被直接丢弃
+// （2026-09-21 反馈：「不要直接截断，可以分块压缩啊」）。
+func nextChunk(msgs []llm.Message, idx, end, budget int, pending string) (string, int, string) {
+	var sb strings.Builder
+	used := 0
+
+	// 先消费上一轮剩下的半条。
+	if pending != "" {
+		head, rest := splitByTokens(pending, budget)
+		sb.WriteString(head)
+		used += transcriptTokens(head)
+		if rest != "" {
+			// 半条就装满一个块：本次到此为止，别再塞新消息。
+			return sb.String(), idx, rest
+		}
+	}
+
+	for idx < end {
+		line := renderMessage(msgs[idx])
+		cost := transcriptTokens(line)
+		if used > 0 && used+cost > budget {
+			break
+		}
+		if used == 0 && cost > budget {
+			// 单条就超预算 → 切开，剩下的留给下一次。
+			head, rest := splitByTokens(line, budget)
+			sb.WriteString(head)
+			return sb.String(), idx + 1, rest
+		}
+		sb.WriteString(line)
+		used += cost
+		idx++
+	}
+	return sb.String(), idx, ""
+}
+
 // summarizeRange 把 msgs[start:end] 并入既有摘要，返回新摘要。
 //
 // 历史体量可能远超模型窗口，因此按块滚动摘要：每块都把「已有摘要」作为背景带上，
 // 逐块累积，保证任何单次请求都不超窗。
+//
+// ⚠️ 单块失败时**把块减半重试**，而不是整体放弃。
+//
+// 早先任何一块出错都会立刻 return err，调用方随即回退到机械压缩 ——
+// 而机械压缩是**直接丢弃**历史（只保留最近若干条）。用户看到的就是
+// 「摘要不可用，已回退机械压缩」+ 对话内容凭空消失
+// （2026-09-21 反馈：「不要直接截断，可以分块压缩啊」）。
+//
+// 块失败最常见的原因是**摘要超时**（summaryTimeout 2 分钟，块越大越慢，
+// 本模型单块可达 60k tokens）—— 把块切小往往立刻就过了。
+// 所以这里宁可多发几次请求，也不要把整段历史丢掉。
 func (a *Agent) summarizeRange(ctx context.Context, prev string, msgs []llm.Message, start, end int) (string, error) {
 	chunkBudget := a.summarizeChunkBudget()
+	floor := summarizeChunkFloor(chunkBudget)
 	cur := strings.TrimSpace(prev)
 
-	for i := start; i < end; {
-		var sb strings.Builder
-		used := 0
-		j := i
-		for j < end {
-			line := renderMessage(msgs[j])
-			cost := EstimateTokens([]llm.Message{{Content: []llm.ContentBlock{{Type: llm.BlockText, Text: line}}}})
-			if j > i && used+cost > chunkBudget {
-				break
-			}
-			sb.WriteString(line)
-			used += cost
-			j++
+	idx, pending := start, ""
+	for idx < end || pending != "" {
+		text, nextIdx, nextPending := nextChunk(msgs, idx, end, chunkBudget, pending)
+		if strings.TrimSpace(text) == "" {
+			break // 取不出内容：防死循环（理论上不会发生）
 		}
-		if j == i {
-			return cur, fmt.Errorf("单条历史超过摘要块上限")
-		}
-		next, err := a.summarizeChunk(ctx, cur, sb.String())
+
+		next, err := a.summarizeChunk(ctx, cur, text)
 		if err != nil {
+			// 父 context 结束（用户主动打断 / 整轮被取消）→ 不再重试，重试最招人烦。
+			//
+			// ⚠️ 必须用**父** ctx 判断，不能用错误类型：摘要自身超时
+			//（summaryTimeout，2 分钟）返回的也是 DeadlineExceeded，
+			// 而那属于「块太大、跑不完」，恰恰应该减半重试。
+			if ctx.Err() != nil {
+				return cur, err
+			}
+			if chunkBudget > floor {
+				chunkBudget /= 2
+				log.Printf("[compress] 会话摘要单块失败（%v），块预算降至 %d tokens 后重试", err, chunkBudget)
+				continue // idx / pending 不前进，用更小的块重来
+			}
 			return cur, err
 		}
 		cur = next
-		i = j
+		idx, pending = nextIdx, nextPending
 	}
 	return cur, nil
 }

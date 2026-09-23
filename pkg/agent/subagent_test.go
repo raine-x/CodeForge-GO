@@ -1,11 +1,94 @@
 package agent
 
 import (
+	"context"
 	"strings"
 	"testing"
 
+	"codeforge/pkg/llm"
 	"codeforge/pkg/tools"
 )
+
+// usageProvider 每轮都上报一次用量，用于验证「子智能体的花费有没有进统计」。
+type usageProvider struct{ usage llm.Usage }
+
+func (p *usageProvider) Name() string { return "usage-stub" }
+
+func (p *usageProvider) Stream(context.Context, llm.Request) (<-chan llm.StreamEvent, error) {
+	ch := make(chan llm.StreamEvent, 3)
+	ch <- llm.StreamEvent{Type: llm.EventUsage, Usage: &p.usage}
+	ch <- llm.StreamEvent{Type: llm.EventTextDelta, Text: "结论"}
+	ch <- llm.StreamEvent{Type: llm.EventMessageStop}
+	close(ch)
+	return ch, nil
+}
+
+// TestSubagentUsageMergesIntoParent 委派子任务的上游用量必须并回父会话。
+//
+// 子会话 persist=false、不落历史，用量若不并回来就随会话一起蒸发 ——
+// 左下角统计会系统性低估委派类任务的花费（注释里写明 usage 是「上游真实计费口径」）。
+func TestSubagentUsageMergesIntoParent(t *testing.T) {
+	a := newEmitTestAgent(t, &usageProvider{usage: llm.Usage{
+		InputTokens: 300, CachedTokens: 100, OutputTokens: 20}})
+	parent, err := a.History().Create("", "父会话")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := tools.WithSession(context.Background(),
+		tools.SessionScope{SessionID: parent.ID, Step: 1})
+	if _, err := NewSubagentRunner(a).RunSubagents(ctx, []tools.SubagentTask{
+		{ID: "t1", Prompt: "探索 pkg/agent", Mode: "explore", Paths: []string{"pkg/agent"}},
+	}); err != nil {
+		t.Fatalf("委派失败: %v", err)
+	}
+
+	in, hit, out := parent.UsageSnapshot()
+	if in != 300 || hit != 100 || out != 20 {
+		t.Fatalf("子智能体用量应并回父会话，实际 in=%d hit=%d out=%d", in, hit, out)
+	}
+}
+
+// TestMergeUsageDoesNotCalibrate 并用量不得顺手校准父会话的估算器：
+// tokenFactor 是「本会话自己的估算 vs 上游真实」配出来的比值，
+// 拿子会话的真实值去除父会话的 reqEstimate 是张冠李戴。
+func TestMergeUsageDoesNotCalibrate(t *testing.T) {
+	a, h, _ := newCheckpointAgent(t)
+	parent, err := h.Create("", "父会话")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 父会话刚发过一次「估算 10 token」的请求：若走 AddUsage，1000 的输入
+	// 会被当成 100 倍偏差写进 tokenFactor（并被上限截断成 maxTokenFactor）。
+	parent.setReqEstimate(10)
+
+	child := &Session{ID: "subagent-t1"}
+	child.AddUsage(llm.Usage{InputTokens: 1000, CachedTokens: 400, OutputTokens: 50})
+
+	ctx := tools.WithSession(context.Background(),
+		tools.SessionScope{SessionID: parent.ID, Step: 1})
+	NewSubagentRunner(a).mergeUsage(ctx, child)
+
+	in, hit, out := parent.UsageSnapshot()
+	if in != 1000 || hit != 400 || out != 50 {
+		t.Fatalf("用量应累加，实际 in=%d hit=%d out=%d", in, hit, out)
+	}
+	parent.mu.RLock()
+	factor := parent.tokenFactor
+	parent.mu.RUnlock()
+	if factor != 0 {
+		t.Fatalf("并用量不得校准父会话的估算系数，实际 %v", factor)
+	}
+}
+
+// TestMergeUsageWithoutSessionScope 没有会话运行域时静默跳过：用量只是统计口径，
+// 不该因为它让子任务失败。
+func TestMergeUsageWithoutSessionScope(t *testing.T) {
+	a, _, _ := newCheckpointAgent(t)
+	child := &Session{ID: "subagent-t1"}
+	child.AddUsage(llm.Usage{InputTokens: 10})
+	NewSubagentRunner(a).mergeUsage(context.Background(), child) // 不得 panic
+}
 
 func TestValidateSubagentTasksLimitAndModes(t *testing.T) {
 	tasks := make([]tools.SubagentTask, MaxSubagents+1)

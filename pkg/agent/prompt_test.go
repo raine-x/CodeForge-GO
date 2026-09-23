@@ -108,6 +108,13 @@ func TestDefaultSystemPromptHasTaskWorkflow(t *testing.T) {
 		"清单未全部完成前不要结束回合", // todo 不做完不收尾（Cursor 任务纪律）
 		"修复后复验", // 修完必须重跑失败的那条验证
 		"拿到证据",  // 验证是拿证据，不是走过场
+		// 以下钉住从 Claude Code / Cursor 提示词迁移来的增强纪律，防止精简时删掉：
+		"任务说明要自含", // 委派子智能体：它看不到本会话上下文（general-purpose）
+		"搜索广度",    // 委派时指明 快速/适中/彻底多角度（Explore thoroughness）
+		"同类功能作参照", // 探索找参照实现、沿调用路径走一遍（Plan）
+		"依赖先后",    // 规划排依赖与顺序、预判风险点（Plan）
+		"父目录位置正确", // 命令新建目录/文件前先确认落点（Cursor Shell 纪律）
+		"不留半成品",   // 不镀金也不留半成品（general-purpose）
 	} {
 		if !strings.Contains(p, want) {
 			t.Errorf("任务工作流缺少 %q", want)

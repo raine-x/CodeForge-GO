@@ -134,17 +134,16 @@ type Emitter func(Event)
 
 // Agent 是 ReAct 主循环引擎。
 type Agent struct {
-	cfg           config.AgentConfig
-	maxSteps      atomic.Int64
-	provider      llm.Provider
-	executor      *tools.Executor
-	registry      *tools.Registry
-	history       *History
-	workDir       string
-	llmCfg        config.LLMConfig // 请求参数（MaxTokens/Temperature 等），热切换后更新
-	memoryStore   *store.Store     // 用户记忆存储（与 History 共用同一 SQLite 库）
-	lastUserInput string           // 本轮用户输入（技能触发词匹配用）
-	builtinOn     map[string]bool  // 内置插件启用表（key = 插件 ID）
+	cfg         config.AgentConfig
+	maxSteps    atomic.Int64
+	provider    llm.Provider
+	executor    *tools.Executor
+	registry    *tools.Registry
+	history     *History
+	workDir     string
+	llmCfg      config.LLMConfig // 请求参数（MaxTokens/Temperature 等），热切换后更新
+	memoryStore *store.Store     // 用户记忆存储（与 History 共用同一 SQLite 库）
+	builtinOn   map[string]bool  // 内置插件启用表（key = 插件 ID）
 
 	// 子智能体运行策略（并发上限 / 能力限制），设置页可热更新；
 	// nil 表示使用 DefaultSubagentPolicy()。用锁保护是因为它会在
@@ -381,9 +380,16 @@ func (a *Agent) ContextStat(sess *Session) ContextStat {
 	if sess == nil {
 		return st
 	}
+	// 可能被任意 goroutine 调用（其它连接的占用刷新、REST）：读快照要持锁。
+	// 注意不要在持锁期间再调带锁的方法（如 compressionState），读锁不可重入。
+	sess.mu.RLock()
+	defer sess.mu.RUnlock()
 	st.Raw = EstimateTokens(sess.Messages)
 	st.Messages = len(sess.Messages)
-	st.Compressed, st.Summarized = sess.compressionState()
+	if sess.compressedUpTo > 0 && strings.TrimSpace(sess.summaryText) != "" &&
+		sess.compressedUpTo <= len(sess.Messages) {
+		st.Compressed, st.Summarized = true, sess.compressedUpTo
+	}
 	st.Used = EstimateTokens(a.requestView(sess))
 	st.OverBudget = st.Used > budget
 	st.TotalTokens = sess.usageIn + sess.usageOut
@@ -434,8 +440,10 @@ func (a *Agent) prepareMessagesBudget(ctx context.Context, sess *Session, emit E
 		return a.degradedCompress(sess, view, used, budget, split, emit)
 	}
 
+	sess.mu.Lock()
 	sess.summaryText = summary
 	sess.compressedUpTo = split
+	sess.mu.Unlock()
 	a.forgetReads(sess.ID)
 
 	next := a.requestView(sess)
@@ -518,7 +526,10 @@ func (a *Agent) requestView(sess *Session) []llm.Message {
 // systemPrompt 返回本轮使用的 System Prompt。
 // 在基础提示词之后动态拼装：用户记忆 / 项目说明（AGENTS.md、CLAUDE.md）/
 // 技能索引与命中内容 —— 均按当前工作区隔离，无内容则整段省略。
-func (a *Agent) systemPrompt() string {
+//
+// lastInput 是本会话最近一条用户输入（技能触发词匹配用）：按会话传入，
+// 不放在 Agent 字段上 —— 并发会话会互相覆盖。
+func (a *Agent) systemPrompt(lastInput string) string {
 	base := LoadSystemPrompt(a.cfg.SystemPromptFile, a.workDir)
 
 	var extras []string
@@ -531,7 +542,7 @@ func (a *Agent) systemPrompt() string {
 	if sec := a.builtinPluginSection(); sec != "" {
 		extras = append(extras, sec)
 	}
-	if secs := a.skillSections(a.lastUserInput); len(secs) > 0 {
+	if secs := a.skillSections(lastInput); len(secs) > 0 {
 		extras = append(extras, secs...)
 	}
 	if len(extras) == 0 {
@@ -547,6 +558,14 @@ func (a *Agent) Run(ctx context.Context, sessionID, input string, emit Emitter) 
 
 func (a *Agent) RunWithImages(ctx context.Context, sessionID, input string, images []llm.ContentBlock, emit Emitter) error {
 	limit := a.MaxSteps()
+	// 同会话互斥（跨连接）：WS 的 stop 只能停本连接的旧任务，两个标签页可同时
+	// 驱动同一会话。后到者等前者在步骤边界退出，拿不到就报错 —— 否则两个循环
+	// 并发改写同一份历史并各自全量覆盖写库（docs/修改.md 记录的 cancel-不-join 隐患）。
+	if err := a.beginRunWait(ctx, sessionID); err != nil {
+		return err
+	}
+	defer a.endRun(sessionID)
+
 	sess, ok := a.history.Get(sessionID)
 	if !ok {
 		return fmt.Errorf("会话不存在: %s", sessionID)
@@ -560,14 +579,14 @@ func (a *Agent) RunWithImages(ctx context.Context, sessionID, input string, imag
 			sessionID, len(fixed))
 		emit(Event{Type: EventInfo,
 			Text: fmt.Sprintf("已补上 %d 条被打断的工具调用记录，接着往下跑", len(fixed))})
-		a.save(sess, true)
+		a.save(sess, true, emit)
 	}
 
 	message := llm.TextMessage(llm.RoleUser, input)
 	message.Content = append(message.Content, images...)
-	sess.Messages = append(sess.Messages, message)
+	sess.appendMessages(message)
 	emit(Event{Type: EventUser, Text: input})
-	a.lastUserInput = input // 供 systemPrompt 里技能触发词匹配
+	sess.SetLastUserInput(input) // 供 systemPrompt 里技能触发词匹配
 
 	return a.runLoopWithLimit(ctx, sess, emit, true, limit)
 }
@@ -576,13 +595,22 @@ func (a *Agent) RunWithImages(ctx context.Context, sessionID, input string, imag
 // （丢弃其后的助手回复与工具结果），随后基于同一条提问重跑循环。
 func (a *Agent) Regenerate(ctx context.Context, sessionID string, emit Emitter) error {
 	limit := a.MaxSteps()
+	if err := a.beginRunWait(ctx, sessionID); err != nil {
+		return err
+	}
+	defer a.endRun(sessionID)
+
 	sess, ok := a.history.Get(sessionID)
 	if !ok {
 		return fmt.Errorf("会话不存在: %s", sessionID)
 	}
 
-	idx := lastPlainUserIndex(sess.Messages)
+	sess.mu.Lock()
+	// 只认「真正的提问」：steer 插话不是这一轮的提问，按它重跑等于把
+	// 用户的「重新生成」落到一句中途指令上。
+	idx := lastUserQuestionIndex(sess.Messages)
 	if idx < 0 {
+		sess.mu.Unlock()
 		return fmt.Errorf("没有可重新生成的用户消息")
 	}
 	sess.Messages = sess.Messages[:idx+1]
@@ -596,7 +624,8 @@ func (a *Agent) Regenerate(ctx context.Context, sessionID string, emit Emitter) 
 			input.WriteString(block.Text)
 		}
 	}
-	a.lastUserInput = input.String()
+	sess.mu.Unlock()
+	sess.SetLastUserInput(input.String())
 
 	return a.runLoopWithLimit(ctx, sess, emit, true, limit)
 }
@@ -639,6 +668,11 @@ func (a *Agent) EditAndResend(ctx context.Context, sessionID string, back int, n
 // 顺序很关键：晚于新一轮内容发出的话，前端重建视图会把新回复一起清掉。
 func (a *Agent) RerunFrom(ctx context.Context, sessionID string, back int, newText string, emit Emitter) (int, string, error) {
 	limit := a.MaxSteps()
+	if err := a.beginRunWait(ctx, sessionID); err != nil {
+		return -1, "", err
+	}
+	defer a.endRun(sessionID)
+
 	sess, ok := a.history.Get(sessionID)
 	if !ok {
 		return -1, "", fmt.Errorf("会话不存在: %s", sessionID)
@@ -648,16 +682,23 @@ func (a *Agent) RerunFrom(ctx context.Context, sessionID string, back int, newTe
 		back = 0
 	}
 
-	idx := nthLastPlainUserIndex(sess.Messages, back)
+	sess.mu.Lock()
+	// back 序号与 EditableUserMessages 同源（都只数「真正的提问」），
+	// 前端点第 back 条必然落到同一条消息上。
+	idx := nthLastUserQuestionIndex(sess.Messages, back)
 	if idx < 0 {
+		sess.mu.Unlock()
 		return -1, "", fmt.Errorf("找不到可编辑的用户消息（仅支持最近 %d 条纯文本提问）", back+1)
 	}
 
 	// 截断到该条用户消息：其后的一切（助手回复 / 工具调用与结果）全部丢弃。
 	sess.Messages = sess.Messages[:idx+1]
+	sess.mu.Unlock()
 
 	// 内部回退压缩态：游标落在截断点之外时整段复位（与 Regenerate 同一处理）。
+	// normalizeCompression 自带锁，不能在持锁状态下调用。
 	sess.normalizeCompression()
+	sess.mu.Lock()
 	if sess.compressedUpTo > idx {
 		sess.compressedUpTo = 0
 		sess.summaryText = ""
@@ -689,8 +730,9 @@ func (a *Agent) RerunFrom(ctx context.Context, sessionID string, back int, newTe
 		}
 		sess.Messages[idx] = msg
 	}
+	sess.mu.Unlock()
 
-	a.lastUserInput = text
+	sess.SetLastUserInput(text)
 
 	// ⚠️ 截断的信号必须**在新一轮内容之前**发出。
 	//
@@ -706,20 +748,25 @@ func (a *Agent) RerunFrom(ctx context.Context, sessionID string, back int, newTe
 	return idx, text, nil
 }
 
-// UnfinishedTurnBack 判断「最后一轮是否没有完整结束」，并给出断点重试的锚点。
+// UnfinishedTurnAnchor 判断「最后一轮是否没有完整结束」，并给出**「继续」**的锚点。
+//
+// 名字刻意不叫 retry：调用方拿到锚点后做的事是「追加一句『继续』接着跑」，
+// 不截断历史、不回退文件（破坏性的重来走「重新生成」/「编辑重发」）。
 //
 // 判据只看历史形状，不依赖任何内存态（页面刷新、进程重启后都能算）：
 //   - 存在最后一条用户纯文本发言，且它之后**没有**任何「纯文本、无工具调用」的
 //     助手终稿 → 该轮未完成（打断 / 上游报错 / 崩溃 / 刚发出尚未回复），返回 0；
-//   - 已有这样的终稿 → 返回 -1，表示不需要提示重试。
+//   - 已有这样的终稿 → 返回 -1，表示这一轮已经收尾，不需要提示继续。
 //
 // 返回的是 back（距最后一条用户消息的距离），目前只有 0 / -1 两种取值：
-// 断点重试只认「最后一轮」，更早的轮次用「编辑」按钮即可。
-func (a *Agent) UnfinishedTurnBack(sessionID string) int {
+// 只认「最后一轮」，更早的轮次用「编辑」按钮即可。
+func (a *Agent) UnfinishedTurnAnchor(sessionID string) int {
 	sess, ok := a.history.Get(sessionID)
 	if !ok {
 		return -1
 	}
+	sess.mu.RLock()
+	defer sess.mu.RUnlock()
 	idx := lastPlainUserIndex(sess.Messages)
 	if idx < 0 {
 		return -1
@@ -754,11 +801,13 @@ type UserMessageRef struct {
 	Text  string `json:"text"`  // 纯文本内容
 }
 
-// EditableUserMessages 返回最近的 n 条「用户纯文本发言」，按**时间正序**排列
+// EditableUserMessages 返回最近的 n 条「用户真正的提问」，按**时间正序**排列
 // （最后一条在末尾）。前端只给最近 n 条挂编辑按钮，这里就是那份白名单。
 //
 // 只认纯文本发言（isPlainUserText）：带 tool_result 的 user 消息是工具回填，
 // 不是用户说的话，改它没有意义也会破坏消息序列的合法性。
+// 另外排除 steer 插话（isUserQuestion）：插话不该被改写重发，
+// 且白名单与 RerunFrom 的 back 序号必须同源，否则点第 back 条会改错消息。
 func (a *Agent) EditableUserMessages(sessionID string, n int) []UserMessageRef {
 	sess, ok := a.history.Get(sessionID)
 	if !ok {
@@ -767,10 +816,12 @@ func (a *Agent) EditableUserMessages(sessionID string, n int) []UserMessageRef {
 	if n <= 0 {
 		return nil
 	}
+	sess.mu.RLock()
+	defer sess.mu.RUnlock()
 	var out []UserMessageRef
 	back := 0
 	for i := len(sess.Messages) - 1; i >= 0 && len(out) < n; i-- {
-		if !isPlainUserText(sess.Messages[i]) {
+		if !isUserQuestion(sess.Messages[i]) {
 			continue
 		}
 		var sb strings.Builder
@@ -792,12 +843,25 @@ func (a *Agent) EditableUserMessages(sessionID string, n int) []UserMessageRef {
 // nthLastPlainUserIndex 返回倒数第 n 条「用户纯文本发言」的下标（n 从 0 起），
 // 越界返回 -1。n=0 等价于 lastPlainUserIndex。
 func nthLastPlainUserIndex(msgs []llm.Message, n int) int {
+	return nthLastUserIndex(msgs, n, isPlainUserText)
+}
+
+// nthLastUserQuestionIndex 返回倒数第 n 条「真正的用户提问」的下标（n 从 0 起）。
+//
+// 「编辑重发」的 back 序号必须与 EditableUserMessages 给出的白名单同源：
+// 两处都用这一组，前端点第 back 条就必然落到同一条消息上。
+func nthLastUserQuestionIndex(msgs []llm.Message, n int) int {
+	return nthLastUserIndex(msgs, n, isUserQuestion)
+}
+
+// nthLastUserIndex 是上面两个函数的公共实现（倒序数第 n 条满足 pred 的消息）。
+func nthLastUserIndex(msgs []llm.Message, n int, pred func(llm.Message) bool) int {
 	if n < 0 {
 		return -1
 	}
 	seen := 0
 	for i := len(msgs) - 1; i >= 0; i-- {
-		if !isPlainUserText(msgs[i]) {
+		if !pred(msgs[i]) {
 			continue
 		}
 		if seen == n {
@@ -833,14 +897,19 @@ func (a *Agent) injectSteers(sess *Session, emit Emitter, persist bool) {
 		return
 	}
 	a.appendSteers(sess, texts, emit)
-	a.save(sess, persist)
+	a.save(sess, persist, emit)
 }
 
 // appendSteers 把指令作为用户消息并入历史并广播事件（落盘由调用方负责）。
+//
+// 消息带 OriginSteer 标记：它在历史里必须与「真正的提问」可区分，
+// 否则重新生成 / 编辑重发会定位到一句中途插话上，界面回放也分不清两者。
 func (a *Agent) appendSteers(sess *Session, texts []string, emit Emitter) {
 	for _, t := range texts {
-		sess.Messages = append(sess.Messages, llm.TextMessage(llm.RoleUser, t))
-		a.lastUserInput = t // 技能触发词按最新一条用户输入匹配
+		msg := llm.TextMessage(llm.RoleUser, t)
+		msg.Origin = OriginSteer
+		sess.appendMessages(msg)
+		sess.SetLastUserInput(t) // 技能触发词按最新一条用户输入匹配
 	}
 	log.Printf("[steer] 会话=%s 已并入 %d 条中途指令", sess.ID, len(texts))
 	emit(Event{Type: EventSteer, Text: strings.Join(texts, "\n")})
@@ -853,17 +922,25 @@ func (a *Agent) appendSteers(sess *Session, texts []string, emit Emitter) {
 const maxEmptyTurnRetries = 1
 
 func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitter, persist bool, limit int) error {
-	a.beginRun(sess.ID)
-	defer a.endRun(sess.ID)
+	// 运行权（同会话互斥）由公开入口在进循环前获取：Run / Regenerate / RerunFrom
+	// 调 beginRunWait；子智能体的临时循环（runLoopEphemeral）不注册 —— 它的会话
+	// 不进缓存、不接受转向，没有互斥对象。
+	//
 	// 连续空回合计数（判据与提示见循环内）：任意一轮产出正文或工具调用就归零。
 	emptyTurns := 0
+	// 步骤号会话级单调：每完成一步恰好追加一条助手消息，因此以「已有助手消息数」
+	// 为基准，本轮第 k 步 = stepBase + k。若每轮都从 1 重新计数，后续轮回的同号
+	// 检查点会被 (会话,步骤,路径) 主键的 INSERT OR IGNORE 静默丢弃，回滚映射
+	// 也随之失真（RewindAfterEdit 靠步骤号对齐消息位置）。
+	stepBase := countAssistantMessages(sess.Messages)
 	for step := 1; step <= limit; step++ {
+		sessStep := stepBase + step
 		if err := ctx.Err(); err != nil {
-			a.save(sess, persist)
+			a.save(sess, persist, emit)
 			return err
 		}
 		a.injectSteers(sess, emit, persist)
-		emit(Event{Type: EventStep, Step: step})
+		emit(Event{Type: EventStep, Step: sessStep})
 		system := a.systemPromptFor(sess)
 		definitions := a.registry.DefinitionsFor(a.exposureFn())
 		overhead := requestOverhead(system, definitions)
@@ -886,9 +963,10 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 			base := a.compressBudget() - overhead
 			budget := int(float64(base) * shrink)
 			if budget <= 0 {
-				a.save(sess, persist)
+				a.save(sess, persist, emit)
 				return fmt.Errorf("系统提示词和工具定义已占满上下文预算，请减少提示词或工具数量")
 			}
+			compressedBefore := sess.compressedUpTo
 			messages := a.prepareMessagesBudget(ctx, sess, func(ev Event) {
 				if ev.Compress != nil {
 					ev.Compress.Before += overhead
@@ -897,11 +975,17 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 				}
 				emit(ev)
 			}, budget)
+			// 压缩一旦发生就**立刻落盘**：本轮若中途被打断（进程被杀、用户打断、
+			// 上游长时间无响应），压缩成果不该跟着丢 —— 否则下次启动又要重压一遍，
+			// 用户看到的就是「每次启动的第一次都炸上下文」（2026-09-21 反馈）。
+			if sess.compressedUpTo != compressedBefore {
+				a.save(sess, persist, emit)
+			}
 			if sess.calibratedEstimate(messages) > budget {
 				messages = a.degradedCompress(sess, messages, sess.calibratedEstimate(messages), budget, sess.compressedUpTo, emit)
 			}
 			if sess.calibratedEstimate(messages) > budget {
-				a.save(sess, persist)
+				a.save(sess, persist, emit)
 				return fmt.Errorf("压缩后仍超过上下文预算，请缩短输入或减少工具定义")
 			}
 			req := llm.Request{
@@ -915,7 +999,7 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 			// 记下本次请求的估算总量，供拿到上游真实用量后校准估算器
 			//（见 Session.calibrateTokenFactor）。必须**含**系统提示与工具定义，
 			// 否则比值口径对不上，校准会偏。
-			sess.reqEstimate = EstimateTokens(messages) + overhead
+			sess.setReqEstimate(EstimateTokens(messages) + overhead)
 
 			// 注入重试通知：上游瞬时故障自动重试时，向前端透出「请求失败，正在重试…」。
 			// 连「第几次 / 共几次」一起带上 —— 只给一句笼统的「正在重试」，用户无法判断
@@ -945,16 +1029,16 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 			}
 			// 不在这里 emit：错误返回给调用方后，WS 层（ws_handler.run）会统一
 			// 下发一次 error 事件；这里再 emit 就会显示两遍（如 402 余额不足）。
-			a.save(sess, persist)
+			a.save(sess, persist, emit)
 			return err
 		}
 
 		turn, err := a.consumeStream(ctx, sess, stream, emit)
 		if err != nil {
-			if turn != nil && turn.Text != "" {
-				sess.Messages = append(sess.Messages, llm.TextMessage(llm.RoleAssistant, turn.Text))
-			}
-			a.save(sess, persist)
+			// 半截的一轮也要入账：正文早就通过 EventText 实时推给前端了，
+			// 丢掉就会出现「界面上显示着一段历史里不存在的回复」，刷新后凭空消失。
+			a.recordPartialTurn(sess, turn, partialTurnReason(ctx, err))
+			a.save(sess, persist, emit)
 			return err
 		}
 
@@ -976,7 +1060,7 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 			})
 		}
 		if len(blocks) > 0 {
-			sess.Messages = append(sess.Messages, llm.AssistantBlocksMessage(blocks))
+			sess.appendMessages(llm.AssistantBlocksMessage(blocks))
 		}
 
 		if turn.Text != "" || len(turn.ToolCalls) > 0 {
@@ -989,7 +1073,7 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 			// 所以并入之后继续跑下一轮，让指令一定有落点。
 			if texts := a.drainSteer(sess.ID); len(texts) > 0 {
 				a.appendSteers(sess, texts, emit)
-				a.save(sess, persist)
+				a.save(sess, persist, emit)
 				continue
 			}
 			// 空回合：既没正文也没工具调用。思考型上游偶尔只回 reasoning_content，
@@ -1005,14 +1089,14 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 						Attempt: emptyTurns, MaxAttempts: maxEmptyTurnRetries + 1})
 					continue
 				}
-				a.save(sess, persist)
+				a.save(sess, persist, emit)
 				if turn.ReasoningLen > 0 {
 					return fmt.Errorf("模型连续 %d 次只返回思考、没有正文也没有工具调用，本轮中止。"+
 						"重发一句「继续」通常就能接上；反复出现请调大设置里的「输出上限」或换个模型", emptyTurns)
 				}
 				return fmt.Errorf("模型连续 %d 次返回空内容，本轮中止。可重发这句，或换个模型重试", emptyTurns)
 			}
-			a.save(sess, persist)
+			a.save(sess, persist, emit)
 			emit(Event{Type: EventDone})
 			return nil
 		}
@@ -1037,13 +1121,13 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 
 			// 注入会话运行域：后台任务 / 检查点 / 任务清单等按会话归属的行为
 			// 依赖 sessionID 与 step（见 pkg/tools/session.go）。
-			toolCtx := tools.WithSession(ctx, tools.SessionScope{SessionID: sess.ID, Step: step})
+			toolCtx := tools.WithSession(ctx, tools.SessionScope{SessionID: sess.ID, Step: sessStep})
 			// 注入检查点槽：写工具在动文件前把旧内容上报，按 (会话,步骤,路径) 落库，
 			// 使「回退到某一步之前」成为可能（Plan.md #4）。persist=false 的临时
 			// 子智能体循环不记录：它不落历史，回滚点也无从对应。
 			if persist {
 				toolCtx = tools.WithCheckpointSink(toolCtx, func(ev tools.CheckpointEvent) {
-					a.recordCheckpoint(sess.ID, step, ev)
+					a.recordCheckpoint(sess.ID, sessStep, ev)
 				})
 			}
 			res, _ := a.executor.Execute(toolCtx, tc.Name, tc.Input)
@@ -1052,16 +1136,16 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 			}
 			emit(Event{Type: EventToolResult, ToolCallID: tc.ID, ToolName: tc.Name, Result: res})
 
-			sess.Messages = append(sess.Messages, llm.ToolResultMessage(tc.ID, renderToolResult(res), !res.Success))
+			sess.appendMessages(llm.ToolResultMessage(tc.ID, renderToolResult(res), !res.Success))
 			if err := ctx.Err(); err != nil {
-				a.save(sess, persist)
+				a.save(sess, persist, emit)
 				return err
 			}
 		}
-		a.save(sess, persist)
+		a.save(sess, persist, emit)
 	}
 
-	a.save(sess, persist)
+	a.save(sess, persist, emit)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1071,12 +1155,90 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 // save 持久化会话（persist=false 的临时子智能体会话直接跳过）。
 // 失败不再静默吞掉：历史版本用 `_ = a.history.Save(...)`，一旦 SQLite 写入
 // 失败（锁冲突、缓存被换出等）就会「对话消失但界面正常」，排查时毫无线索。
-func (a *Agent) save(sess *Session, persist bool) {
+//
+// 传入 emit 时，失败会向用户推一条 info 提示（每会话只报第一次，避免 DB
+// 故障期间每一步都刷一条）：「界面正常但内容没存上」必须让人看得见。
+func (a *Agent) save(sess *Session, persist bool, emit ...Emitter) {
 	if !persist {
 		return
 	}
 	if err := a.history.Save(sess.ID); err != nil {
 		log.Printf("[agent] 会话持久化失败（会话=%s）：%v", sess.ID, err)
+		if len(emit) > 0 && emit[0] != nil && sess.markSaveWarned() {
+			emit[0](Event{Type: EventInfo,
+				Text: "会话保存失败，本次对话内容可能不会被持久化（详见服务端日志）"})
+		}
+	}
+}
+
+// partialTurnReason 生成「半截回合」里工具结果位上的说明文案。
+//
+// 这些工具调用从未真正执行过，结果位必须写清原因：一是让模型知道刚才那次
+// 调用没成（续跑时不会以为自己已经拿到了结果），二是让用户在历史回放里
+// 看得出这一轮是被打断的。
+func partialTurnReason(ctx context.Context, err error) string {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "本轮被用户打断，该工具调用未执行"
+	}
+	return fmt.Sprintf("本轮因上游/传输错误中止，该工具调用未执行：%v", err)
+}
+
+// recordPartialTurn 把被打断的一轮（正文 + 已拼装完的工具调用）记入历史。
+//
+// 两个理由：
+//  1. 正文早已通过 EventText 推给前端 —— 不入账就是「界面显示着一段历史里
+//     不存在的回复」，刷新即消失，用户会以为丢消息；
+//  2. 已拼装完成的 tool_use 若不配 tool_result，历史就是一条违反上游硬约束的
+//     序列（tool_use 必须紧跟配对的 tool_result），下一轮请求会被严格上游直接
+//     400。它们从未执行，所以一律补「未执行」错误结果。
+//
+// 没有任何内容（连正文都没有）时不写空消息，保持历史干净。
+func (a *Agent) recordPartialTurn(sess *Session, turn *llm.AssistantTurn, reason string) {
+	if sess == nil || turn == nil {
+		return
+	}
+	// 上游用思考签名时（Gemini 3），签名是工具调用的一部分：被截断的那次调用
+	// 很可能还没等到签名就断了，而缺签名的 tool_use 回送会被上游直接 400
+	//（INVALID_ARGUMENT: Function call is missing a thought_signature）。
+	// 判据：本轮只要有一条带签名，就说明上游确实在用签名 —— 那么不带签名的那些
+	// 宁可丢弃（回到「只留正文」的老行为），也不要写进历史换来一次 400。
+	needSig := false
+	for _, tc := range turn.ToolCalls {
+		if tc.ThoughtSig != "" {
+			needSig = true
+			break
+		}
+	}
+
+	blocks := make([]llm.ContentBlock, 0, len(turn.ToolCalls)+1)
+	if strings.TrimSpace(turn.Text) != "" {
+		blocks = append(blocks, llm.ContentBlock{Type: llm.BlockText, Text: turn.Text})
+	}
+	recorded := make([]llm.ToolCall, 0, len(turn.ToolCalls))
+	for _, tc0 := range turn.ToolCalls {
+		if needSig && tc0.ThoughtSig == "" {
+			continue
+		}
+		// 与正常路径一致：上游看到的是清洗后的 wire 名，历史里存注册名。
+		tc := tc0
+		if a.registry != nil {
+			tc.Name = a.registry.ResolveWire(tc0.Name)
+		}
+		blocks = append(blocks, llm.ContentBlock{
+			Type:       llm.BlockToolUse,
+			ID:         tc.ID,
+			Name:       tc.Name,
+			Input:      tc.Input,
+			ThoughtSig: tc.ThoughtSig,
+		})
+		recorded = append(recorded, tc)
+	}
+	if len(blocks) == 0 {
+		return
+	}
+	sess.appendMessages(llm.AssistantBlocksMessage(blocks))
+	for _, tc := range recorded {
+		sess.appendMessages(llm.ToolResultMessage(tc.ID, reason, true))
 	}
 }
 
@@ -1151,13 +1313,12 @@ streamLoop:
 		}
 	}
 
-	if err := ctx.Err(); err != nil {
-		return turn, err
-	}
-	if errMsg != "" {
-		return turn, fmt.Errorf("%s", errMsg)
-	}
-
+	// 先把已拼装的工具调用装好，再判错。
+	//
+	// 顺序很关键：上游中途报错 / 用户打断时，这些调用已经生成完毕（参数可能被
+	// 截断，用 "{}" 兜底），调用方要拿它们入账（见 recordPartialTurn）——
+	// 提前返回会让「界面上正在生成的工具卡片」在历史里凭空消失，
+	// 续跑时模型也不知道自己刚才想干什么。
 	for _, id := range order {
 		p := parts[id]
 		args := strings.TrimSpace(p.args.String())
@@ -1170,6 +1331,13 @@ streamLoop:
 			Input:      json.RawMessage(args),
 			ThoughtSig: strings.TrimSpace(p.sig.String()),
 		})
+	}
+
+	if err := ctx.Err(); err != nil {
+		return turn, err
+	}
+	if errMsg != "" {
+		return turn, fmt.Errorf("%s", errMsg)
 	}
 	return turn, nil
 }

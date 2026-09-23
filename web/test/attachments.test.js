@@ -39,7 +39,7 @@ function harness() {
     sendBtn: { classList: { add() {}, remove() {} } },
     sessionsCache: [], loadSessionList() {}, messagesEl: {}, subagentCards: new Map(),
     syncComposerMode() {}, renderSessions() {}, scrollBottom() {},
-    removeThinking() {}, removeRetry() {}, removeRetryRing() {}, showRetryRing() {}, settleActiveTool() {}, foldReason() {}, closeText() {},
+    removeThinking() {}, removeRetry() {}, removeResumeRing() {}, showResumeRing() {}, settleActiveTool() {}, foldReason() {}, closeText() {},
     resetSubagentCards() {}, syncRunBadges() {}, maybeShowPlanActions() {},
     // submitMessage 开头会问「现在是不是编辑态」——这里只测附件路径，
     // 编辑重发由 checkpoints 测试覆盖，本框架恒为非编辑态。

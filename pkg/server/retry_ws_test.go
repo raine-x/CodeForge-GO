@@ -12,9 +12,9 @@ import (
 // 打断后用「断点重试」续上：服务端应保留原提问重跑，而不是要求用户重打一遍。
 //
 // 覆盖三件事：
-//  1. 打断收尾后下发的 checkpoints 帧带 retry_back=0（前端据此挂重试圆环）；
+//  1. 打断收尾后下发的 checkpoints 帧带 resume_back=0（前端据此挂重试圆环）；
 //  2. retry 事件流里的 edit 帧文本 == 用户原话（不能被空文本覆盖）；
-//  3. 重跑完成后 retry_back 变回 -1（这一轮完整结束了，圆环该摘掉）。
+//  3. 重跑完成后 resume_back 变回 -1（这一轮完整结束了，圆环该摘掉）。
 func TestRetryAfterInterruptKeepsUserText(t *testing.T) {
 	provider := &gateProvider{gates: make(chan chan string, 4)}
 	deps := newTestDepsAtProvider(t, "", provider)
@@ -43,7 +43,7 @@ func TestRetryAfterInterruptKeepsUserText(t *testing.T) {
 	// 收尾的 checkpoints 必须指出「这一轮没跑完」。
 	cp := collectUntil(t, conn, "checkpoints")
 	if back, _ := findCheckpoint(cp, sessionID); back != 0 {
-		t.Fatalf("未完成轮次应给 retry_back=0，得到 %v", back)
+		t.Fatalf("未完成轮次应给 resume_back=0，得到 %v", back)
 	}
 
 	// 断点重试：不改文本，服务端按原提问重跑。
@@ -66,7 +66,7 @@ func TestRetryAfterInterruptKeepsUserText(t *testing.T) {
 	collectUntil(t, conn, "idle")
 	done := collectUntil(t, conn, "checkpoints")
 	if back, ok := findCheckpoint(done, sessionID); ok && back != -1 {
-		t.Errorf("已完成的轮次 retry_back 应为 -1，得到 %v", back)
+		t.Errorf("已完成的轮次 resume_back 应为 -1，得到 %v", back)
 	}
 }
 
@@ -97,7 +97,7 @@ func TestRetryEmitsEditEvenWhenRunFails(t *testing.T) {
 
 	// 这一轮因为上游故障没跑完：服务端应当给出可重试锚点。
 	if back, _ := findCheckpoint(first, sessionID); back != 0 {
-		t.Fatalf("失败轮次应给 retry_back=0，得到 %v", back)
+		t.Fatalf("失败轮次应给 resume_back=0，得到 %v", back)
 	}
 
 	// 重试同样会失败，但 edit 帧必须照发。
@@ -122,7 +122,7 @@ func TestRetryEmitsEditEvenWhenRunFails(t *testing.T) {
 	}
 	// 失败的轮次仍然可重试：圆环不该因为一次失败就消失。
 	if back, ok := findCheckpoint(frames, sessionID); ok && back != 0 {
-		t.Errorf("失败后 retry_back 应仍为 0，得到 %v", back)
+		t.Errorf("失败后 resume_back 应仍为 0，得到 %v", back)
 	}
 }
 
@@ -221,7 +221,7 @@ func historyHasUserText(msgs []any, want string) bool {
 	return false
 }
 
-// findCheckpoint 在帧序列里找属于本会话的 checkpoints 帧，返回它的 retry_back。
+// findCheckpoint 在帧序列里找属于本会话的 checkpoints 帧，返回它的 resume_back。
 // 第二个返回值表示「是否找到过 checkpoints 帧」（没找到说明收尾事件丢了）。
 func findCheckpoint(frames []map[string]any, sessionID string) (int, bool) {
 	for _, f := range frames {
@@ -231,7 +231,7 @@ func findCheckpoint(frames []map[string]any, sessionID string) (int, bool) {
 		if sid, _ := f["session_id"].(string); sid != sessionID && sid != "" {
 			continue
 		}
-		back, ok := f["retry_back"].(float64)
+		back, ok := f["resume_back"].(float64)
 		if !ok {
 			return -2, true
 		}

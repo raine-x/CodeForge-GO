@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -53,20 +54,36 @@ func TestCalibrateTokenFactorIgnoresMissingData(t *testing.T) {
 	}
 }
 
-// 校准后的估算 = 裸估算 × 系数；没校准时等于裸估算。
+// 校准后的估算 = 裸估算 × 系数。
+//
+// ⚠️ **未校准**时用的是保守系数（uncalibratedTokenFactor），不是 1.0 ——
+// 估算口径对代码/JSON 稳定低估约 10%，用 1.0 会让重启后的第一次请求
+// 带着超窗的体量发出去（「每次启动的第一次老是炸上下文」，2026-09-21 反馈）。
 func TestCalibratedEstimate(t *testing.T) {
 	msgs := []llm.Message{llm.TextMessage(llm.RoleUser, strings.Repeat("a", 400))}
 	base := EstimateTokens(msgs)
 
+	// 未校准：应放大到保守系数（实现用四舍五入，不是截断）
 	raw := &Session{}
-	if got := raw.calibratedEstimate(msgs); got != base {
-		t.Errorf("未校准时应等于裸估算 %d，实际 %d", base, got)
+	wantUncal := int(math.Round(float64(base) * uncalibratedTokenFactor))
+	if got := raw.calibratedEstimate(msgs); got != wantUncal {
+		t.Errorf("未校准时应按保守系数 %v 放大为 %d，实际 %d",
+			uncalibratedTokenFactor, wantUncal, got)
+	}
+	if got := raw.calibratedEstimate(msgs); got <= base {
+		t.Error("未校准时也不该退回裸估算（那正是「第一次炸上下文」的成因）")
 	}
 
+	// 已校准：用真实比值
 	cal := &Session{tokenFactor: 1.5}
 	want := int(float64(base) * 1.5)
 	if got := cal.calibratedEstimate(msgs); got != want {
 		t.Errorf("校准后应为 %d，实际 %d", want, got)
+	}
+
+	// 空消息不该算出 0 或负数
+	if got := raw.calibratedEstimate(nil); got != 0 {
+		t.Errorf("空消息应为 0，实际 %d", got)
 	}
 }
 
