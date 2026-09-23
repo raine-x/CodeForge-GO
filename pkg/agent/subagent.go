@@ -95,9 +95,13 @@ func (r *SubagentRunner) RunSubagents(ctx context.Context, tasks []tools.Subagen
 
 func (r *SubagentRunner) runOne(ctx context.Context, task tools.SubagentTask, policy SubagentPolicy) tools.SubagentResult {
 	result := tools.SubagentResult{ID: task.ID, Mode: task.Mode, Status: "completed"}
-	child := r.parent.newSubagent(task.Mode)
+	// 工作目录取一次快照，子智能体与子会话共用同一个版本（见 newSubagentIn）：
+	// 本函数跑在 per-task goroutine 上，直接读 r.parent.workDir 会与设置页的
+	// 热切换并发（string 是两字头，撕裂读会拿到野指针）。
+	workDir := r.parent.WorkDir()
+	child := r.parent.newSubagentIn(task.Mode, workDir)
 	prompt := subagentPrompt(task, policy)
-	sess := &Session{ID: "subagent-" + task.ID, Workspace: r.parent.workDir, Messages: nil}
+	sess := &Session{ID: "subagent-" + task.ID, Workspace: workDir, Messages: nil}
 	sess.Messages = append(sess.Messages, llm.TextMessage(llm.RoleUser, prompt))
 	sess.SetLastUserInput(prompt)
 
@@ -182,6 +186,15 @@ func truncateTail(s string, n int) string {
 }
 
 func (a *Agent) newSubagent(mode string) *Agent {
+	return a.newSubagentIn(mode, a.WorkDir())
+}
+
+// newSubagentIn 是 newSubagent 的显式工作目录版本。
+//
+// 调用方需要「子智能体的配置」与「子会话的 Workspace」来自同一个版本时走这个：
+// 两次分别取 WorkDir() 会读到两次热更新的中间态，于是子智能体的落盘根目录
+// 与它自己的会话 Workspace 分属两个工作区。
+func (a *Agent) newSubagentIn(mode string, workDir string) *Agent {
 	registry := tools.NewRegistry()
 	allowed := subagentToolSetPolicy(mode, a.SubagentPolicy())
 	for _, tool := range a.registry.List() {
@@ -198,12 +211,12 @@ func (a *Agent) newSubagent(mode string) *Agent {
 	if cfg.MaxSteps > 8 || cfg.MaxSteps <= 0 {
 		cfg.MaxSteps = 8
 	}
-	child := New(cfg, a.llmCfg, a.provider, executor, a.history, a.workDir)
+	// 四个热更新字段各取一次快照：子智能体在别的 goroutine 上跑，
+	// 而设置页随时可能热替换它们（见 Agent.rtMu）。child 此时尚未共享出去，
+	// 写它自己的字段不需要加锁。
+	child := New(cfg, a.llmCfgSnapshot(), a.providerSnapshot(), executor, a.history, workDir)
 	child.memoryStore = a.memoryStore
-	child.builtinOn = map[string]bool{}
-	for k, v := range a.builtinOn {
-		child.builtinOn[k] = v
-	}
+	child.builtinOn = a.builtinOnSnapshot()
 	return child
 }
 

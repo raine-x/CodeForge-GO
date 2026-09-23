@@ -37,7 +37,7 @@ type Skill struct {
 
 // skillsDir 返回当前工作区的技能目录。
 func (a *Agent) skillsDir() string {
-	return filepath.Join(a.workDir, ".codeforge", "skills")
+	return filepath.Join(a.WorkDir(), ".codeforge", "skills")
 }
 
 // loadSkills 扫描并解析工作区全部技能（enabled 缺省视为 true）。

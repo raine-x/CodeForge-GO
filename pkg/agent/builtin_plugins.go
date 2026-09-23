@@ -71,33 +71,52 @@ func ListBuiltinPlugins() []BuiltinPlugin { return builtinPlugins() }
 // 开：systemPrompt 注入插件说明 + create_skill 工具可用（main.go 负责注册工具）；
 // 关：两者都没有，模型无从使用。
 func (a *Agent) SetSkillCreatorEnabled(on bool) {
+	a.setBuiltinOn(BuiltinSkillCreator.ID, on)
+}
+
+// setBuiltinOn 是启用表的唯一写入口（见 Agent.rtMu）。
+//
+// ⚠️ 必须持锁：设置页切插件开关走的是 HTTP 处理器 goroutine，而运行中的循环
+// 正在 builtinPluginSection 里读这张 map —— 裸读写是
+// `fatal error: concurrent map read and map write`，整个进程直接死。
+func (a *Agent) setBuiltinOn(id string, on bool) {
+	a.rtMu.Lock()
+	defer a.rtMu.Unlock()
 	if a.builtinOn == nil {
 		a.builtinOn = map[string]bool{}
 	}
-	a.builtinOn[BuiltinSkillCreator.ID] = on
+	a.builtinOn[id] = on
+}
+
+// builtinOnSnapshot 返回启用表的副本（读者走这里，别直接读 map）。
+func (a *Agent) builtinOnSnapshot() map[string]bool {
+	a.rtMu.RLock()
+	defer a.rtMu.RUnlock()
+	out := make(map[string]bool, len(a.builtinOn))
+	for k, v := range a.builtinOn {
+		out[k] = v
+	}
+	return out
 }
 
 // SetMultiAgentEnabled 同步多智能体插件的提示词开关；工具注册由启动层负责。
 func (a *Agent) SetMultiAgentEnabled(on bool) {
-	if a.builtinOn == nil {
-		a.builtinOn = map[string]bool{}
-	}
-	a.builtinOn[BuiltinMultiAgent.ID] = on
+	a.setBuiltinOn(BuiltinMultiAgent.ID, on)
 }
 
 // SetPlanEnabled 同步计划模式插件的提示词开关（不注册工具，纯 System Prompt 注入）。
 func (a *Agent) SetPlanEnabled(on bool) {
-	if a.builtinOn == nil {
-		a.builtinOn = map[string]bool{}
-	}
-	a.builtinOn[BuiltinPlan.ID] = on
+	a.setBuiltinOn(BuiltinPlan.ID, on)
 }
 
 // builtinPluginSection 生成启用的内置插件注入段（含使用约定与工作流提醒要求）。
+//
+// 读启用表走快照：设置页随时可能改它（见 setBuiltinOn）。
 func (a *Agent) builtinPluginSection() string {
+	enabled := a.builtinOnSnapshot()
 	var sb string
 	for _, p := range builtinPlugins() {
-		if !a.builtinOn[p.ID] {
+		if !enabled[p.ID] {
 			continue
 		}
 		sb += fmt.Sprintf(

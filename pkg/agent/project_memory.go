@@ -25,13 +25,15 @@ const projectDocMaxRunes = 8000
 // 两个文件都存在时全部注入（AGENTS.md 在前）、内容相同的只注一份；
 // 都没有返回空串。workDir 为空（未选工作区）时不扫描。
 func (a *Agent) projectMemorySection() string {
-	if a.workDir == "" {
+	// 取一次快照：判空与拼接路径必须用同一个值（切工作区会改它）。
+	workDir := a.WorkDir()
+	if workDir == "" {
 		return ""
 	}
 	var parts []string
 	var seen []string
 	for _, name := range projectDocNames {
-		data, err := os.ReadFile(filepath.Join(a.workDir, name))
+		data, err := os.ReadFile(filepath.Join(workDir, name))
 		if err != nil {
 			continue
 		}

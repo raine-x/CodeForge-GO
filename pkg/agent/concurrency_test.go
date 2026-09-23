@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"codeforge/config"
 	"codeforge/pkg/llm"
 )
 
@@ -235,5 +236,174 @@ func TestHistoryConcurrentCacheOps(t *testing.T) {
 
 	if _, ok := h.Get(sess.ID); !ok {
 		t.Error("并发操作后会话应仍可读取")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 热更新字段与运行中循环的并发（2026-09-23）
+//
+// 设置页的四类改动走 HTTP 处理器 goroutine：应用模型（SetProvider +
+// SetLLMConfig）、切工作区（SetWorkDir）、切内置插件开关（Set*Enabled），
+// 而运行中的循环在同一个进程里读它们（provider.Stream / 请求参数 /
+// System Prompt 组装 / 技能与记忆路径）。
+//
+// 其中 builtinOn 是 map：裸读写撞上就是
+// `fatal error: concurrent map read and map write`，整个进程直接死、无法 recover。
+// ---------------------------------------------------------------------------
+
+// hotUpdateProvider 每轮都返回一段文本，让循环快速走完一步。
+func hotUpdateProvider() llm.Provider {
+	return maxStepsProvider(func(context.Context, llm.Request) (<-chan llm.StreamEvent, error) {
+		return okStream("答"), nil
+	})
+}
+
+// 内置插件开关：读侧（System Prompt 组装）与写侧（设置页）直接对撞。
+//
+// 这是上面那条的**确定性**版本：读者是紧循环的真实读路径（systemPromptFor
+// 里就会走到 builtinOnSnapshot），写者是紧循环的开关切换。刻意不加任何
+// 额外负载，让两侧的迭代频率都足够高 —— 反向验证过：去掉 setBuiltinOn 的锁，
+// 本用例稳定崩在 `fatal error: concurrent map iteration and map write`
+//（栈顶就是 builtinOnSnapshot ← builtinPluginSection ← systemPrompt）。
+func TestBuiltinPluginToggleWhileReading(t *testing.T) {
+	a := newEmitTestAgent(t, hotUpdateProvider())
+	sess, err := a.History().Create("", "插件开关")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = a.systemPromptFor(sess)
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			a.SetSkillCreatorEnabled(true)
+			a.SetMultiAgentEnabled(true)
+			a.SetPlanEnabled(true)
+		}
+	}()
+
+	// 跑一小会儿真实循环，让「正在跑的任务」这条路径也一起被压。
+	_ = a.Run(context.Background(), sess.ID, "跑一轮", func(Event) {})
+	close(stop)
+	wg.Wait()
+}
+
+// 热更新与运行并发时不得崩：四个字段全部走锁 + 快照。
+//
+// ⚠️ 本机没有 C 编译器（-race 依赖 cgo），这是确定性压力用例而非竞态检测器：
+// 它能把「裸 map 并发读写」这类必然致命的问题逼出来（反向验证过：把
+// setBuiltinOn 的锁去掉，本用例稳定崩在 concurrent map read and map write），
+// 但证明不了「没有任何数据竞争」。
+//
+// 结构是「多个紧循环读者 + 一个紧循环写者」而不是「跑几轮 Run」：
+// 单轮 Run 只组装一次 System Prompt，读窗口太窄，压不出并发（实测踩过这个坑）。
+func TestHotUpdateWhileRunning(t *testing.T) {
+	a := newEmitTestAgent(t, hotUpdateProvider())
+	sess, err := a.History().Create("", "热更新")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// 读者：运行中的循环每一步都要组装 System Prompt（读 builtinOn / workDir），
+	// 每发一次请求还要取 llmCfg 与 provider。
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = a.systemPromptFor(sess)
+				_ = a.llmCfgSnapshot()
+				_ = a.providerSnapshot()
+			}
+		}()
+	}
+
+	// 写者：模拟设置页的四类改动（应用模型 / 切工作区 / 切插件开关）。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			a.SetLLMConfig(config.LLMConfig{MaxTokens: 4096, Temperature: 0.7})
+			a.SetProvider(hotUpdateProvider())
+			a.SetWorkDir("/tmp/热更新")
+			a.SetSkillCreatorEnabled(true)
+			a.SetMultiAgentEnabled(true)
+			a.SetPlanEnabled(true)
+			_ = a.WorkDir()
+			_ = a.builtinOnSnapshot()
+		}
+	}()
+
+	// 顺带跑几轮真实循环：热更新撞上「正在跑的任务」是最典型的场景。
+	for i := 0; i < 5; i++ {
+		if err := a.Run(context.Background(), sess.ID, "跑一轮", func(Event) {}); err != nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("第 %d 轮失败: %v", i, err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// 快照语义：设置页改了之后，读者必须看到**整份**新值，而不是新旧混合。
+func TestHotUpdateSnapshotIsConsistent(t *testing.T) {
+	a := &Agent{}
+	a.SetLLMConfig(config.LLMConfig{MaxTokens: 1000, Temperature: 0.1})
+	if got := a.llmCfgSnapshot(); got.MaxTokens != 1000 || got.Temperature != 0.1 {
+		t.Fatalf("快照应为整份配置，实际 %+v", got)
+	}
+
+	// 未设置的字段要有稳定默认，不能让调用方拿到半份配置。
+	a.SetWorkDir("/tmp/ws")
+	if got := a.WorkDir(); got != "/tmp/ws" {
+		t.Fatalf("WorkDir 应为 /tmp/ws，实际 %q", got)
+	}
+	if got := a.builtinOnSnapshot(); len(got) != 0 {
+		t.Fatalf("未开启任何插件时应为空表，实际 %+v", got)
+	}
+	a.SetPlanEnabled(true)
+	// 快照是副本：改内部表不得影响已发出的快照。
+	snap := a.builtinOnSnapshot()
+	a.SetPlanEnabled(false)
+	if !snap[BuiltinPlan.ID] {
+		t.Fatal("快照必须是副本，不能随源表变化")
+	}
+	if a.builtinOnSnapshot()[BuiltinPlan.ID] {
+		t.Fatal("关掉后快照应为 false")
 	}
 }

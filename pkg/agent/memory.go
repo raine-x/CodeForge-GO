@@ -29,7 +29,7 @@ func (a *Agent) loadMemories() []store.MemoryRow {
 	if a.memoryStore == nil {
 		return nil
 	}
-	list, err := a.memoryStore.ListMemories(a.workDir)
+	list, err := a.memoryStore.ListMemories(a.WorkDir())
 	if err != nil {
 		return nil
 	}
@@ -41,7 +41,7 @@ func (a *Agent) AddMemory(content string) (int64, error) {
 	if a.memoryStore == nil {
 		return 0, fmt.Errorf("记忆存储未初始化")
 	}
-	return a.memoryStore.AddMemory(a.workDir, strings.TrimSpace(content))
+	return a.memoryStore.AddMemory(a.WorkDir(), strings.TrimSpace(content))
 }
 
 // ListMemories 返回当前工作区全部记忆（REST 用）。

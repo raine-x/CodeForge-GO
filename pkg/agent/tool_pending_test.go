@@ -75,7 +75,7 @@ func TestConsumeStreamEmitsPendingOnToolUseStart(t *testing.T) {
 // mustStream 构造一个已填充的流通道供 consumeStream 消费（provider.Stream 已在 stub 内完成）。
 func mustStream(t *testing.T, a *Agent, sess *Session) <-chan llm.StreamEvent {
 	t.Helper()
-	p := a.provider.(*pendingProvider)
+	p := a.providerSnapshot().(*pendingProvider)
 	ch := make(chan llm.StreamEvent, len(p.events)+2)
 	go func() {
 		defer close(ch)

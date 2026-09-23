@@ -480,7 +480,10 @@ func MarshalMessages(msgs []llm.Message) string {
 // 与主循环的区别：不带工具（模型不能调用工具）、temperature=0（求稳定）、
 // 独立超时。因此这个调用不会递归触发压缩。
 func (a *Agent) summarizeChunk(ctx context.Context, prev, transcript string) (string, error) {
-	if a.provider == nil {
+	// 适配器取一次快照：判空与调用必须落在同一个值上（设置页随时可能热替换，
+	// 分两次读会「判空通过、调用时已换成 nil」）。
+	provider := a.providerSnapshot()
+	if provider == nil {
 		return "", fmt.Errorf("LLM 适配器未就绪")
 	}
 
@@ -496,7 +499,7 @@ func (a *Agent) summarizeChunk(ctx context.Context, prev, transcript string) (st
 	cctx, cancel := context.WithTimeout(ctx, summaryTimeout)
 	defer cancel()
 
-	stream, err := a.provider.Stream(cctx, llm.Request{
+	stream, err := provider.Stream(cctx, llm.Request{
 		System:      fmt.Sprintf(summarySystemPrompt, summaryMaxRunes),
 		Messages:    []llm.Message{llm.TextMessage(llm.RoleUser, sb.String())},
 		MaxTokens:   a.summaryMaxTokens(),
@@ -754,7 +757,7 @@ func (a *Agent) summarizeChunkBudget() int {
 // 取「模型输出上限」但夹在合理区间：不能沿用可能高达 128k 的输出上限
 // （摘要用不到，且会挤压输入空间），也不能太小导致摘要被截断。
 func (a *Agent) summaryMaxTokens() int {
-	n := a.llmCfg.MaxTokens
+	n := a.llmCfgSnapshot().MaxTokens
 	if n <= 0 {
 		n = summaryFallbackMaxTokens
 	}

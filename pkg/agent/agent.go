@@ -136,14 +136,32 @@ type Emitter func(Event)
 type Agent struct {
 	cfg         config.AgentConfig
 	maxSteps    atomic.Int64
-	provider    llm.Provider
 	executor    *tools.Executor
 	registry    *tools.Registry
 	history     *History
-	workDir     string
-	llmCfg      config.LLMConfig // 请求参数（MaxTokens/Temperature 等），热切换后更新
-	memoryStore *store.Store     // 用户记忆存储（与 History 共用同一 SQLite 库）
-	builtinOn   map[string]bool  // 内置插件启用表（key = 插件 ID）
+	memoryStore *store.Store // 用户记忆存储（与 History 共用同一 SQLite 库）
+
+	// rtMu 守护「运行期可替换」的状态：provider / llmCfg / workDir / builtinOn。
+	//
+	// 这四者都由设置页的 HTTP 处理器热更新（应用模型 → SetProvider + SetLLMConfig；
+	// 切换工作区 → SetWorkDir；切换内置插件开关 → Set*Enabled），而运行中的循环会
+	// 在同一个进程里读它们（provider.Stream、请求参数、System Prompt 组装、
+	// 技能与记忆的落盘路径）。没有这把锁的后果与 History.cache 同级：
+	// builtinOn 是 map，设置页切一下插件开关撞上运行中的提示词组装就是
+	// `fatal error: concurrent map read and map write`，整个进程直接死、无法 recover；
+	// provider 是接口值（两字宽），撕裂读会让 Stream 调到野指针上。
+	//
+	// 写者只有 Set* 系列，读者一律走下面的快照方法（llmCfgSnapshot /
+	// providerSnapshot / WorkDir / builtinOnSnapshot），**不要直接读字段**。
+	//
+	// 注：subMu / exposeMu 是同因的旧锁（各自只守一个字段），新加的热更新字段
+	// 请统一挂到 rtMu，不要再开第三把。
+	rtMu sync.RWMutex
+
+	provider  llm.Provider     // 见 rtMu
+	workDir   string           // 见 rtMu
+	llmCfg    config.LLMConfig // 请求参数（MaxTokens/Temperature 等），见 rtMu
+	builtinOn map[string]bool  // 内置插件启用表（key = 插件 ID），见 rtMu
 
 	// 子智能体运行策略（并发上限 / 能力限制），设置页可热更新；
 	// nil 表示使用 DefaultSubagentPolicy()。用锁保护是因为它会在
@@ -195,16 +213,49 @@ func (a *Agent) SetMaxSteps(n int) { a.maxSteps.Store(int64(n)) }
 func (a *Agent) MaxSteps() int { return int(a.maxSteps.Load()) }
 
 // SetLLMConfig 热更新请求参数（MaxTokens/Temperature 等，随模型应用/保存切换）。
-func (a *Agent) SetLLMConfig(c config.LLMConfig) { a.llmCfg = c }
+func (a *Agent) SetLLMConfig(c config.LLMConfig) {
+	a.rtMu.Lock()
+	a.llmCfg = c
+	a.rtMu.Unlock()
+}
+
+// llmCfgSnapshot 返回请求参数的快照。
+//
+// 取值必须成对：MaxTokens 与 Temperature 要来自**同一个**配置版本，
+// 逐字段读两次会读到两次热更新的中间态（比如新模型的输出上限配旧模型的温度）。
+func (a *Agent) llmCfgSnapshot() config.LLMConfig {
+	a.rtMu.RLock()
+	defer a.rtMu.RUnlock()
+	return a.llmCfg
+}
 
 // History 返回会话历史管理器。
 func (a *Agent) History() *History { return a.history }
 
 // SetProvider 热替换 LLM 适配器（用于前端修改配置后即时生效）。
-func (a *Agent) SetProvider(p llm.Provider) { a.provider = p }
+func (a *Agent) SetProvider(p llm.Provider) {
+	a.rtMu.Lock()
+	a.provider = p
+	a.rtMu.Unlock()
+}
+
+// providerSnapshot 返回当前 LLM 适配器。
+//
+// 必须整体取接口值：接口是「类型指针 + 数据指针」两字宽，边写边读会撕裂成
+// 一个不存在的组合，Stream 调用随之崩在野指针上。取值只做一次，别在同一个
+// 请求里读两遍（中途被热替换会让两次调用落到不同适配器上）。
+func (a *Agent) providerSnapshot() llm.Provider {
+	a.rtMu.RLock()
+	defer a.rtMu.RUnlock()
+	return a.provider
+}
 
 // SetWorkDir 热切换工作目录（用于前端切换工作区后即时生效）。
-func (a *Agent) SetWorkDir(dir string) { a.workDir = dir }
+func (a *Agent) SetWorkDir(dir string) {
+	a.rtMu.Lock()
+	a.workDir = dir
+	a.rtMu.Unlock()
+}
 
 // SetSubagentPolicy 热更新子智能体运行策略（设置 → 子智能体改动即时生效）。
 // 策略会在下一个子智能体被创建 / 下一次委派校验时生效。
@@ -226,7 +277,12 @@ func (a *Agent) SubagentPolicy() SubagentPolicy {
 }
 
 // WorkDir 返回当前工作目录（会话/记忆的 workspace 隔离键）。
-func (a *Agent) WorkDir() string { return a.workDir }
+// 切工作区会在运行期间改写它，因此取值要持锁（读者一律走这里）。
+func (a *Agent) WorkDir() string {
+	a.rtMu.RLock()
+	defer a.rtMu.RUnlock()
+	return a.workDir
+}
 
 // SetExposure 设定工具可见面过滤：pick 返回 true 的工具会被下发给 LLM，
 // false 的工具隐藏（模型收不到定义，通常也不会去调用）。nil 恢复为暴露全部。
@@ -274,7 +330,7 @@ func (a *Agent) inputWindow() int {
 	if w <= 0 {
 		return 0
 	}
-	reserve := a.llmCfg.MaxTokens
+	reserve := a.llmCfgSnapshot().MaxTokens
 	if reserve <= 0 {
 		reserve = summaryFallbackMaxTokens
 	}
@@ -530,7 +586,7 @@ func (a *Agent) requestView(sess *Session) []llm.Message {
 // lastInput 是本会话最近一条用户输入（技能触发词匹配用）：按会话传入，
 // 不放在 Agent 字段上 —— 并发会话会互相覆盖。
 func (a *Agent) systemPrompt(lastInput string) string {
-	base := LoadSystemPrompt(a.cfg.SystemPromptFile, a.workDir)
+	base := LoadSystemPrompt(a.cfg.SystemPromptFile, a.WorkDir())
 
 	var extras []string
 	if sec := MemorySection(a.loadMemories()); sec != "" {
@@ -988,12 +1044,15 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 				a.save(sess, persist, emit)
 				return fmt.Errorf("压缩后仍超过上下文预算，请缩短输入或减少工具定义")
 			}
+			// 一次取齐请求参数：MaxTokens 与 Temperature 必须来自同一个配置版本
+			//（逐字段读两次会读到热更新的中间态），且取值要走快照（见 Agent.rtMu）。
+			llmCfg := a.llmCfgSnapshot()
 			req := llm.Request{
 				System:      system,
 				Messages:    messages,
 				Tools:       definitions,
-				MaxTokens:   a.llmCfg.MaxTokens,   // 来自模型条目「输出上限」/配置，不再硬编码
-				Temperature: a.llmCfg.Temperature, // 同上
+				MaxTokens:   llmCfg.MaxTokens,   // 来自模型条目「输出上限」/配置，不再硬编码
+				Temperature: llmCfg.Temperature, // 同上
 				Thinking:    ThinkingFromCtx(ctx),
 			}
 			// 记下本次请求的估算总量，供拿到上游真实用量后校准估算器
@@ -1008,7 +1067,10 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 				emit(Event{Type: EventRetry, Error: reason, Attempt: attempt, MaxAttempts: maxAttempts})
 			})
 
-			s, err := a.provider.Stream(hookCtx, req)
+			// 适配器整体取一次：接口值边写边读会撕裂（见 providerSnapshot）。
+			// 这一步还可能是「拿不到 stream 就重试」的循环，重试时重新取，
+			// 让设置页刚切换的模型立刻生效。
+			s, err := a.providerSnapshot().Stream(hookCtx, req)
 			if err == nil {
 				stream = s
 				break
