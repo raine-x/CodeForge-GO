@@ -57,6 +57,14 @@ type Session struct {
 	// 只在本次运行内有效：ContinueTurn 入口置位、出口清空，不落库、不进 Messages。
 	continueHint string
 
+	// goal 是目标模式的账本（nil = 没开启目标）。目标模式在 @goal_mode 触发后
+	// 由 goal_verify 置位，判定通过才清空 —— 这样「目标未验证通过就不许宣布完成」
+	// 这件事对模型是**每步可见的事实**，而不是要靠它自己记住的约定。
+	//
+	// 刻意与其它会话字段共用 s.mu：同一把锁保护整份会话状态，
+	// 免得出现「两处状态各有一把锁」的错觉（那种结构迟早会漏掉一把）。
+	goal *GoalState
+
 	// saveWarned 记录「持久化失败已告知用户」：DB 故障期间每步都会失败，
 	// 只在第一次推 info 提示，避免刷屏（见 Agent.save）。
 	saveWarned bool

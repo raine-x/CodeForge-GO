@@ -1121,6 +1121,16 @@
       }
       case 'save_memory': return '保存了记忆';
       case 'todo_write':  return '更新了任务清单';
+      case 'goal_verify': {
+        // 显示判定与轮次：目标模式的价值就在于「判定是可见的」，
+        // 只写一句「验证了目标」等于把证据藏起来 —— 那和没有验证没有区别。
+        const g = (input && typeof input === 'object') ? input : {};
+        const verdict = String(g.verdict || '').toUpperCase();
+        const label = { PASS: '目标已验证通过', FAIL: '目标未达成', BLOCKED: '无法观察，未判定', SKIP: '无可观察面' }[verdict]
+          || '验证了目标';
+        const rd = g.round ? '（第 ' + g.round + '/' + (g.max_rounds || '?') + ' 轮）' : '';
+        return '使用插件 目标模式：' + label + rd;
+      }
       case 'web_fetch': {
         // 内置 web_fetch 用 {url}；远程 MCP（Parallel）用 {urls:[…]}，两者都取首个地址
         let shown = '';
@@ -1415,7 +1425,11 @@
     const label = card.querySelector('.sub-label');
     const detail = card.querySelector('.sub-detail');
     card.dataset.status = status;
-    badge.textContent = (sa.mode === 'implement' ? '实现' : '探索') + ' · ' + id;
+    // mode → 徽标文案。加 verify（目标模式的审查者复用同一套卡片）：
+    // 原来只有 implement/探索两个分支，`verify` 会被显示成「探索」——
+    // 卡片上写着「探索 · goal-verify」比不写还让人困惑。
+    const MODE_LABEL = { implement: '实现', explore: '探索', verify: '验证' };
+    badge.textContent = (MODE_LABEL[sa.mode] || '探索') + ' · ' + id;
     if (sa.detail) detail.textContent = sa.detail;
     if (sa.summary) card.title = sa.summary; // 悬浮查看摘要全文
     // 终态标头：完成/失败替换 detail 行文案
@@ -5469,6 +5483,47 @@ case 'idle': {
         sw.appendChild(track);
         row.appendChild(main);
         row.appendChild(sw);
+        // 插件可选带一个数值项（当前只有目标模式的自循环轮数）。
+        // 这里按服务端给的描述符通用渲染，不按插件 id 硬编码 ——
+        // 以后服务端加一项，前端不用再改。
+        if (p.setting && typeof p.setting.min === 'number') {
+          const st = p.setting;
+          const wrap = document.createElement('div');
+          wrap.className = 'bp-setting';
+          const lab = document.createElement('span');
+          lab.textContent = st.label || '参数';
+          const num = document.createElement('input');
+          num.type = 'number';
+          num.min = String(st.min);
+          num.max = String(st.max);
+          num.step = '1';
+          num.value = String(st.value);
+          if (st.unit) num.title = '单位：' + st.unit;
+          const save = function () {
+            let v = parseInt(num.value, 10);
+            if (isNaN(v)) { num.value = String(st.value); return; }
+            v = Math.max(st.min, Math.min(st.max, v));
+            num.value = String(v);
+            if (v === st.value) return;
+            fetch('/api/builtin-plugins', {
+              method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ id: p.id, value: v })
+            }).then(function (r) { return r.json(); }).then(function (d2) {
+              if (d2.ok) { st.value = v; num.value = String(v); }
+              else { num.value = String(st.value); addError('保存失败：' + (d2.error || '未知原因')); }
+            }).catch(function () { num.value = String(st.value); });
+          };
+          num.addEventListener('change', save);
+          wrap.appendChild(lab);
+          wrap.appendChild(num);
+          if (st.unit) {
+            const u = document.createElement('span');
+            u.className = 'bp-setting-unit';
+            u.textContent = st.unit;
+            wrap.appendChild(u);
+          }
+          row.appendChild(wrap);
+        }
         box.appendChild(row);
       });
     }).catch(function () {

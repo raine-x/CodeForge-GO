@@ -374,6 +374,12 @@ func (c *wsClient) run(sessionID, thinking, trigger, label string, agentFn func(
 		}
 		c.send(c.srv.todoEvent(sid))
 	})
+	// 注册目标模式账本：goal_verify 要把判定记到**本轮这个会话**上。
+	// 装错会话的话，注入的「目标未通过」提示段永远为空，那条强约束静默失效 ——
+	// 而失效的表现恰恰是「看起来一切正常，就是不验证」。
+	if ledger, ok := c.srv.agent.GoalLedgerFor(sessionID); ok {
+		ctx = tools.WithGoalLedger(ctx, ledger)
+	}
 	// 注入思考强度（low/medium/high），由 LLM 适配器转换为厂商参数。
 	if thinking != "" {
 		ctx = agent.WithThinking(ctx, thinking)

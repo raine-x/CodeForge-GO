@@ -187,6 +187,12 @@ func modeLabel(mode string) string {
 	if mode == "implement" {
 		return "实现"
 	}
+	// verify：目标模式的审查者复用同一套子智能体进度卡（见 goal_runner.go）。
+	// 不加这个分支的话它会被显示成「探索」—— 卡片上写着「探索 · goal-verify」
+	// 比不写更让人困惑。
+	if mode == "verify" {
+		return "验证"
+	}
 	return "探索"
 }
 

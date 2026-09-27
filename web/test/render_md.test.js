@@ -271,6 +271,16 @@ const termuxSrc = goFile('pkg/server/termux.go');
 const appearanceSrc = goFile('pkg/server/appearance.go');
 const toolsSrc = goFile('pkg/tools/tool.go') + goFile('pkg/tools/scope.go');
 const appearanceCode = goCode('pkg/server/appearance.go');
+const goalSrc = goFile('pkg/tools/goal.go');
+const toolsGoalSrc = goalSrc;
+const toolsBuiltinSrc = goFile('pkg/tools/builtin/goal.go');
+const executorSrc = goFile('pkg/tools/executor.go');
+const configSrc = goFile('config/config.go');
+const mainSrc = goFile('cmd/agent/main.go');
+const bpHandlerSrc = goFile('pkg/server/builtin_plugins_handler.go');
+const bpSrc = goFile('pkg/agent/builtin_plugins.go');
+const goalRunnerSrc = goFile('pkg/agent/goal_runner.go');
+
 // 剥掉 ui.js 的行注释（同一理由：注释里会引用被替换掉的旧写法）
 const uiCode = uiSrc.replace(/^\s*\/\/.*$/gm, '');
 
@@ -2287,6 +2297,79 @@ check('初始化时就应用样式（不是只挂 handler 等点按钮才生效�
   // 与液态玻璃 initLiquidGlass 同形：进入即读 localStorage 并落到 DOM 上，
   // 所以页面加载完第一眼就是选中的外观，不会先闪一下默认样式。
   /\(function initComposerBox\(\)\s*\{\s*const seg[\s\S]{0,200}?applyComposerBox\(localStorage/.test(uiSrc));
+
+group('目标模式（Goal Mode）2026-09-27');
+
+check('插件已注册：BuiltinGoalMode.ID = goal_mode',
+  /ID:\s*"goal_mode"/.test(bpSrc) &&
+  /BuiltinSkillCreator, BuiltinMultiAgent, BuiltinPlan, BuiltinGoalMode/.test(bpSrc));
+
+check('工具名与前端文案同源（goal_verify）',
+  /func \(t \*GoalVerifyTool\) Name\(\) string \{ return "goal_verify" \}/.test(toolsBuiltinSrc) &&
+  /case 'goal_verify'/.test(uiSrc));
+
+check('仅 @goal_mode 注入（非常驻）',
+  /func GoalTriggered\(input string\) bool/.test(toolsGoalSrc) &&
+  /triggered := tools\.GoalTriggered\(lastInput\)/.test(bpSrc));
+
+check('注入条件含「目标已开启」——否则自循环第二轮起约束消失',
+  /if !triggered && !goal\.Open\(\) \{/.test(bpSrc));
+
+check('注入点在 systemPromptFor（按会话），不是 systemPrompt',
+  /if sec := a\.goalPluginSection\(lastInput, sess\)/.test(todosSrc) &&
+  /func \(a \*Agent\) systemPromptFor\(sess \*Session\)/.test(todosSrc));
+
+check('WS 层把账本装进 ctx（装错会话 → 强约束静默失效）',
+  /if ledger, ok := c\.srv\.agent\.GoalLedgerFor\(sessionID\); ok \{/.test(wsSrc) &&
+  /ctx = tools\.WithGoalLedger\(ctx, ledger\)/.test(wsSrc));
+
+check('工具执行时取不到账本就报错，而不是静默通过',
+  /tools\.Err\("取不到当前会话的目标账本/.test(toolsBuiltinSrc));
+
+check('main.go 注册 goal_verify + 目标模式开关',
+  /goalTool = builtin\.RegisterGoalVerify\(registry, goalVerifier\)/.test(mainSrc) &&
+  /ag\.SetGoalModeEnabled\(true\)/.test(mainSrc));
+
+check('热切换：注销工具时 SetGoalModeEnabled(false) 同步',
+  /registry\.Unregister\("goal_verify"\)/.test(mainSrc) &&
+  /ag\.SetGoalModeEnabled\(on\)/.test(mainSrc));
+
+check('设置项走通用 setting 描述符（前端不按插件 id 硬编码）',
+  /func \(s \*Server\) builtinSetting\(id string\) \*builtinSettingDesc/.test(bpHandlerSrc) &&
+  /item\["setting"\] = set/.test(bpHandlerSrc) &&
+  /if \(p\.setting && typeof p\.setting\.min === 'number'\)/.test(uiSrc));
+
+check('轮数夹在 [1, 20] 且有硬顶常量',
+  /GoalModeMaxRoundsCap = 20/.test(configSrc) &&
+  /if n > GoalModeMaxRoundsCap/.test(configSrc));
+
+check('审查者白名单不含任何写工具（有测试锁住，这里锁住白名单定义）',
+  /var goalVerifierTools = \[\]string\{[\s\S]*?"run_command",\s*\n\}/.test(goalRunnerSrc) &&
+  !/goalVerifierTools = \[\]string\{[^}]*write_file/.test(goalRunnerSrc));
+
+check('审查者用的是真审计（自主执行命令必须留痕）',
+  /a\.executor\.Audit\(\)/.test(goalRunnerSrc) &&
+  /func \(e \*Executor\) Audit\(\) \*security\.AuditLogger/.test(executorSrc));
+
+check('预算用尽：不跑审查、不判 PASS、明确要求人工介入',
+  /if before\.Open\(\) && before\.Exhausted\(\)/.test(toolsBuiltinSrc) &&
+  /不要宣布完成/.test(toolsBuiltinSrc) &&
+  /人工介入/.test(toolsBuiltinSrc));
+
+check('审批卡能看出是验证子任务（复用 SubagentIdentityFrom）',
+  /tools\.WithSubagentScope\(ctx, tools\.SubagentScope\{[\s\S]*?TaskID:\s*GoalVerifierID/.test(goalRunnerSrc) &&
+  /const GoalVerifierID = "goal-verify"/.test(goalRunnerSrc));
+
+check('进度事件复用子智能体卡（不发 todo，避免污染真实任务清单）',
+  /sink, hasSink := tools\.SubagentSinkFrom\(ctx\)/.test(goalRunnerSrc) &&
+  /emitEvent\("started", "开始验证目标", ""\)/.test(goalRunnerSrc) &&
+  /emitEvent\("completed", "判定 "/.test(goalRunnerSrc) &&
+  !/WithTodoSink/.test(goalRunnerSrc) &&
+  /const MODE_LABEL = \{ implement: '实现', explore: '探索', verify: '验证' \}/.test(uiSrc));
+
+check('modeLabel 认识 verify（否则卡片显示「探索 · goal-verify」）',
+  /if mode == "verify" \{/.test(subagentSrc) &&
+  /return "验证"/.test(subagentSrc));
 
 console.log('\n' + '-'.repeat(52));
 if (failures.length) {

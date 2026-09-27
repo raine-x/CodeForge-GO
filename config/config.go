@@ -167,6 +167,15 @@ type BuiltinPluginsConfig struct {
 	MultiAgent *bool `yaml:"multi_agent"`
 	// Plan：计划模式（@plan 触发，只读产出结构化项目计划书）。
 	Plan *bool `yaml:"plan"`
+	// GoalMode：目标模式（@goal_mode 触发，自主验证目标是否达成）。
+	GoalMode *bool `yaml:"goal_mode"`
+	// GoalModeMaxRounds：目标模式的自循环轮数上限（一次任务内最多验几次）。
+	//
+	// 为什么是轮数而不是时长：轮数是**语义**上限 —— 「验 5 次都不过就停下来问人」
+	// 这句话对用户是可预期的，而「最多跑 N 分钟」在模型快慢不同的机器上完全不可预期。
+	// 单轮耗时由审查者自己的步数预算与工具超时兜底（见 tools.TimeoutPolicy），
+	// 不在这里限制。
+	GoalModeMaxRounds int `yaml:"goal_mode_max_rounds"`
 }
 
 // NotifyConfig 是「任务完成」系统通知（Windows Toast / Linux notify-send）的开关与节流。
@@ -207,6 +216,35 @@ func (c BuiltinPluginsConfig) MultiAgentEnabled() bool {
 func (c BuiltinPluginsConfig) PlanEnabled() bool {
 	return c.Plan == nil || *c.Plan
 }
+
+// GoalModeEnabled 缺省开启，写 false 才关闭。
+func (c BuiltinPluginsConfig) GoalModeEnabled() bool {
+	return c.GoalMode == nil || *c.GoalMode
+}
+
+// GoalModeRounds 返回自循环轮数上限，缺省 5。
+//
+// 上下界都要夹：0/负数会让 goal_verify 第一次就判定「预算耗尽」（功能形同虚设），
+// 而一个填进来的 9999 等于没有上限 —— 那是自我循环烧 token 的入口。
+func (c BuiltinPluginsConfig) GoalModeRounds() int {
+	n := c.GoalModeMaxRounds
+	if n <= 0 {
+		return GoalModeDefaultRounds
+	}
+	if n > GoalModeMaxRoundsCap {
+		return GoalModeMaxRoundsCap
+	}
+	return n
+}
+
+// 目标模式轮数上下界。
+const (
+	// GoalModeDefaultRounds 是未配置时的轮数。
+	GoalModeDefaultRounds = 5
+	// GoalModeMaxRoundsCap 是允许配到的上限。设它是为了给「设置页被填成 9999」
+	// 一道硬闸：用户能调，但调不出一个无上限的自我循环。
+	GoalModeMaxRoundsCap = 20
+)
 
 // SubagentConcurrencyCap 是子智能体并发上限的硬上限：配置可以调小，但不能突破它。
 // pkg/agent 的 MaxSubagents 直接引用本常量，保证「设置页显示的上限」与

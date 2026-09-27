@@ -73,11 +73,16 @@ type StateSubagents struct {
 }
 
 // StateBuiltinPlugins 是内置插件开关，同样只用指针 + omitempty：
-// 三个都为 nil 时整段省略，不留下任何 null。
+// 都为 nil 时整段省略，不留下任何 null。
+//
+// GoalModeMaxRounds 例外，用值类型 —— 0 与「没配」含义不同（0 会被 GoalModeRounds
+// 归一成缺省值 5），而 omitempty 会把 0 一起吞掉，那正好是要表达的状态。
 type StateBuiltinPlugins struct {
-	SkillCreator *bool `yaml:"skill_creator,omitempty"`
-	MultiAgent   *bool `yaml:"multi_agent,omitempty"`
-	Plan         *bool `yaml:"plan,omitempty"`
+	SkillCreator      *bool `yaml:"skill_creator,omitempty"`
+	MultiAgent        *bool `yaml:"multi_agent,omitempty"`
+	Plan              *bool `yaml:"plan,omitempty"`
+	GoalMode          *bool `yaml:"goal_mode,omitempty"`
+	GoalModeMaxRounds int   `yaml:"goal_mode_max_rounds,omitempty"`
 }
 
 // State 是程序自有的运行状态投影。
@@ -126,11 +131,14 @@ func (c *Config) stateProjection() State {
 		}
 	}
 	if c.BuiltinPlugins.SkillCreator != nil || c.BuiltinPlugins.MultiAgent != nil ||
-		c.BuiltinPlugins.Plan != nil {
+		c.BuiltinPlugins.Plan != nil || c.BuiltinPlugins.GoalMode != nil ||
+		c.BuiltinPlugins.GoalModeMaxRounds != 0 {
 		s.BuiltinPlugins = &StateBuiltinPlugins{
-			SkillCreator: c.BuiltinPlugins.SkillCreator,
-			MultiAgent:   c.BuiltinPlugins.MultiAgent,
-			Plan:         c.BuiltinPlugins.Plan,
+			SkillCreator:      c.BuiltinPlugins.SkillCreator,
+			MultiAgent:        c.BuiltinPlugins.MultiAgent,
+			Plan:              c.BuiltinPlugins.Plan,
+			GoalMode:          c.BuiltinPlugins.GoalMode,
+			GoalModeMaxRounds: c.BuiltinPlugins.GoalModeMaxRounds,
 		}
 	}
 	return s

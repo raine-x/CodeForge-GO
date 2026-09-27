@@ -7,7 +7,12 @@
 // 插件三元信息：名称（Name）、调用时机（WhenToUse）、使用说明（Instructions）。
 package agent
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+
+	"codeforge/pkg/tools"
+)
 
 // BuiltinPlugin 描述一个内置插件。
 type BuiltinPlugin struct {
@@ -59,9 +64,31 @@ var BuiltinPlan = BuiltinPlugin{
 		"计划书必须具体到可直接照做。若输入是普通对话而非计划任务，回复简短说明不需要计划即可，不要强套格式。",
 }
 
+// BuiltinGoalMode 是「目标模式」插件：让智能体在宣布完成之前，由一个独立的
+// 审查者真的把效果跑出来看，判定不通过就带着证据回来。
+//
+// 与 Plan 的关键差别：Plan 是**常驻注入**（开关一开，模型任何时候都能看到），
+// 目标模式**只在用户输入 @goal_mode 之后注入**（见 goalPluginSection）。
+// 理由：目标模式是强约束 —— 「目标未验证通过就不许宣布完成」——
+// 若常驻挂着，模型会在与验证无关的闲聊/小任务里也去走这套流程。
+var BuiltinGoalMode = BuiltinPlugin{
+	ID:      "goal_mode",
+	Name:    "目标模式",
+	Purpose: "在宣布完成之前由独立审查者真的把改动跑起来验证，判定不通过就带着证据回来（@goal_mode 触发）",
+	WhenToUse: "只有用户输入了 @goal_mode（或 @目标模式）时才使用；没有这个触发词就不要调用目标验证。" +
+		"触发后：动手改完必须验证一次，没通过就按发现清单修完再验，直到验证通过或预算用尽",
+	Instructions: "使用步骤：" +
+		"1) 先把「达成即算完成」写成一句可判定的话（要具体到能观察），作为验证目标；" +
+		"2) 动手改，不要先宣布完成；" +
+		"3) 调用目标验证工具，由独立审查者实际运行改动并给出带证据的结论；" +
+		"4) 若未通过：按返回的发现清单修复，再验证一次（预算有限，别原地打转）；" +
+		"5) 验证通过后才可如实告知用户结果，并附上审查者的证据；" +
+		"6) 预算用尽仍未通过：停止自循环，把问题与证据交回用户，说明需要人工介入。",
+}
+
 // builtinPlugins 列出全部内置插件定义（新增内置插件时在此追加）。
 func builtinPlugins() []BuiltinPlugin {
-	return []BuiltinPlugin{BuiltinSkillCreator, BuiltinMultiAgent, BuiltinPlan}
+	return []BuiltinPlugin{BuiltinSkillCreator, BuiltinMultiAgent, BuiltinPlan, BuiltinGoalMode}
 }
 
 // ListBuiltinPlugins 导出全部内置插件定义（设置页列表用）。
@@ -107,6 +134,63 @@ func (a *Agent) SetMultiAgentEnabled(on bool) {
 // SetPlanEnabled 同步计划模式插件的提示词开关（不注册工具，纯 System Prompt 注入）。
 func (a *Agent) SetPlanEnabled(on bool) {
 	a.setBuiltinOn(BuiltinPlan.ID, on)
+}
+
+// SetGoalModeEnabled 同步目标模式插件的提示词开关（工具注册由启动层负责）。
+func (a *Agent) SetGoalModeEnabled(on bool) {
+	a.setBuiltinOn(BuiltinGoalMode.ID, on)
+}
+
+// GoalLedgerFor 返回某会话的目标账本。
+//
+// 由服务端在每轮 run 的 ctx 上装（tools.WithGoalLedger），装的必须是**本轮那个
+// 会话**的账本 —— 记到别处的话，注入的提示段永远为空，
+// 「目标未通过就不许宣布完成」这条约束就静默失效了。
+func (a *Agent) GoalLedgerFor(sessionID string) (GoalLedger, bool) {
+	sess, ok := a.history.Get(sessionID)
+	if !ok {
+		return nil, false
+	}
+	return sess, true
+}
+
+// goalPluginSection 生成本轮的目标模式注入段（空串 = 本轮不注入）。
+//
+// 注入条件 = 插件开关开 **且**（本轮输入含 @goal_mode **或** 目标已开启）。
+//
+// ⚠️ 两个条件缺一不可：
+//   - 只看触发词 → 自循环第二轮起（输入里已没有 @goal_mode）约束就消失了，
+//     而恰恰是第二轮之后模型最容易「我改好了」就直接宣布完成；
+//   - 只看目标开启 → 用户开过目标模式后，本会话**每一轮**（包括后续无关的闲聊）
+//     都会被塞进「不许宣布完成」，太吵。
+//
+// 注入走 systemPromptFor（按会话）而不是 systemPrompt：账本是按会话的，
+// 而 systemPrompt 拿不到 sess。
+func (a *Agent) goalPluginSection(lastInput string, sess *Session) string {
+	if !a.builtinOnSnapshot()[BuiltinGoalMode.ID] {
+		return ""
+	}
+	if sess == nil {
+		return ""
+	}
+	goal := sess.Goal()
+	triggered := tools.GoalTriggered(lastInput)
+	if !triggered && !goal.Open() {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf(
+		"## 内置插件：%s\n- 能力：%s\n- 调用时机：%s\n- %s\n"+
+			"- 工作流提醒：一旦决定使用该插件，先在回复中说明「使用插件 %s」，再调用其工具；"+
+			"不要在不符合调用时机时调用。\n",
+		BuiltinGoalMode.Name, BuiltinGoalMode.Purpose, BuiltinGoalMode.WhenToUse,
+		BuiltinGoalMode.Instructions, BuiltinGoalMode.Name))
+	// 目标开着就把账本状态一并注入：轮次与剩余额度必须**每步可见**，
+	// 否则模型会在同一状态下反复自我确认，或在预算用尽后继续硬撑。
+	if sec := goal.PromptSection(); sec != "" {
+		sb.WriteString("\n" + sec)
+	}
+	return sb.String()
 }
 
 // builtinPluginSection 生成启用的内置插件注入段（含使用约定与工作流提醒要求）。

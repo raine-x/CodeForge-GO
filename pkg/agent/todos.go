@@ -64,6 +64,11 @@ func (a *Agent) systemPromptFor(sess *Session) string {
 	if sec := a.TodoSection(sess.ID); sec != "" {
 		extras = append(extras, sec)
 	}
+	// 目标模式段放在这里而不是 systemPrompt：账本是**按会话**的，注入条件要看
+	// sess.Goal() 与本轮输入，systemPrompt 拿不到 sess（见 goalPluginSection）。
+	if sec := a.goalPluginSection(lastInput, sess); sec != "" {
+		extras = append(extras, sec)
+	}
 	if hint := sess.ContinueHint(); hint != "" {
 		extras = append(extras, hint)
 	}

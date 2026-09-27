@@ -192,6 +192,16 @@ type Agent struct {
 	exposeMu sync.RWMutex
 	exposure func(name string) bool
 
+	// promptOverride 非空时**整体替换**系统提示词的基础部分（见 systemPrompt）。
+	// 只给「角色完全不同的子智能体」用 —— 目标模式的审查者不是「主智能体 +
+	// 一点额外约束」，而是一个独立 judge。
+	//
+	// 刻意**不加锁**、只能在 child 尚未共享时写死：目前唯一使用者是
+	// newGoalVerifier（建好即设，之后只被它自己那个 goroutine 用）。
+	// 与 subagent.go 里 child.builtinOn 同一档约定 —— 那种「建好即写」是安全的；
+	// 真正需要持锁的是会被设置页并发写的字段（那才是 rtMu 的由来）。
+	promptOverride string
+
 	// 中途转向（steering）：按会话暂存「运行中新收到的用户指令」，
 	// 在下一个步骤边界并入历史。见 steer.go。
 	// 三个字段都由 runMu 保护；map 延迟建表，因为部分调用方直接构造 Agent 字面量。
@@ -593,7 +603,17 @@ func (a *Agent) requestView(sess *Session) []llm.Message {
 //
 // lastInput 是本会话最近一条用户输入（技能触发词匹配用）：按会话传入，
 // 不放在 Agent 字段上 —— 并发会话会互相覆盖。
+// systemPrompt 组装本步的系统提示词。
+//
+// promptOverride 非空时**整体替换**基础提示词（技能正文、项目记忆、内置插件段
+// 一律不再拼）。它只给「角色完全不同的子智能体」用 —— 目标模式的审查者
+// 不是「主智能体 + 一点额外约束」，而是一个独立 judge：它不该看到
+// 「你可以创建技能 / 可以委派子智能体」这类与它实授工具集不符的说明
+// （措辞与工具不一致会让模型反复尝试调用不存在的工具直到步数耗尽）。
 func (a *Agent) systemPrompt(lastInput string) string {
+	if p := a.promptOverride; p != "" {
+		return p
+	}
 	base := LoadSystemPrompt(a.cfg.SystemPromptFile, a.WorkDir())
 
 	var extras []string

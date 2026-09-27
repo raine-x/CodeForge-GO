@@ -56,6 +56,14 @@ func (e *Executor) SetApprover(a Approver) { e.approver = a }
 // Policy 返回当前安全策略引擎（供 /api/perm 查询与热切换）。
 func (e *Executor) Policy() *security.Policy { return e.policy }
 
+// Audit 返回底层审计日志器（可能为 nil）。
+//
+// 存在的理由：派生执行器时要能**继承真审计**。子智能体那套传的是 nil
+// （pkg/agent/subagent.go），因为子任务的动作都由主智能体在别处留痕；
+// 但目标模式的审查者会**自主执行命令**（起服务、跑测试），那些命令必须
+// 进 audit.jsonl —— 否则「智能体自己跑了什么」无从追溯。
+func (e *Executor) Audit() *security.AuditLogger { return e.audit }
+
 // Evaluate 仅做安全判定，不执行工具。
 func (e *Executor) Evaluate(name string, args json.RawMessage) Decision {
 	action := extractAction(name, args)
@@ -233,9 +241,36 @@ type runOutcome struct {
 	err error
 }
 
+// timeoutFor 决定本次执行的兜底超时。
+//
+// 默认对所有工具都是 e.timeout（120s）。工具若实现 TimeoutPolicy，可以按入参
+// 申请更长的阈值 —— 目前只有 goal_verify 需要：它一次调用内部要跑一整轮审查者
+// 子智能体（多次 LLM 往返，还可能起服务等它起来），120s 必然砍断。
+//
+// 三条纪律：
+//   - 只允许**放宽**，不允许收紧。收紧留给工具自己（轮数/步数），
+//     统一在这里收紧会让「默认 120s 防失控」这条兜底被单个工具悄悄拆掉。
+//   - 拿不到正数就回落默认值，不返回 0 —— context.WithTimeout(0) 是立即超时，
+//     一次误判就会让工具秒失败，比超时更难查。
+//   - cctx 仍然派生自 ctx，用户点停止照样立刻中断（见 TimeoutPolicy 的注释）。
+func (e *Executor) timeoutFor(tool Tool, args json.RawMessage) time.Duration {
+	tp, ok := tool.(TimeoutPolicy)
+	if !ok {
+		return e.timeout
+	}
+	d := tp.ToolTimeout(args)
+	if d <= 0 {
+		return e.timeout
+	}
+	if d < e.timeout {
+		return e.timeout
+	}
+	return d
+}
+
 // run 在独立 goroutine 中执行工具，实现超时控制与 panic 恢复。
 func (e *Executor) run(ctx context.Context, tool Tool, args json.RawMessage) (*ToolResult, error) {
-	cctx, cancel := context.WithTimeout(ctx, e.timeout)
+	cctx, cancel := context.WithTimeout(ctx, e.timeoutFor(tool, args))
 	defer cancel()
 
 	ch := make(chan runOutcome, 1)

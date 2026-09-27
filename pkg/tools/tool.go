@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // Tool 代表 Agent 可调用的统一工具接口。
@@ -118,6 +119,21 @@ type DiffProvider interface {
 // 「读过」的事实已经不成立，登记必须随之作废，否则压缩后凭记忆整体重写照样放行。
 type ReadGate interface {
 	ForgetReads(sessionID string)
+}
+
+// TimeoutPolicy 由「单次调用耗时远超常规」的工具实现，申请自己的执行超时。
+//
+// 为什么需要它：Executor.run 给**所有**工具套同一个 e.timeout（默认 120s，见
+// NewExecutor）。那是防工具失控的兜底，但对「一次调用内部要跑多轮 LLM、可能还要
+// 起服务等它起来」的长任务必然不够 —— 120s 一到，工具连同它发起的嵌套 LLM 请求
+// 一起被砍掉，调用方只看到「工具执行超时或被取消」，什么也没发生。
+//
+// ⚠️ 放宽的是**单个工具的兜底阈值**，不是取消机制：cctx 仍然派生自调用方的 ctx，
+// 所以用户点停止 / 会话被取消时照样立刻中断。不要在这里实现业务超时 ——
+// 业务上限属于工具自己的事（轮数、步数）。
+type TimeoutPolicy interface {
+	// ToolTimeout 返回本次调用的执行超时；返回 0 或负数表示沿用执行器默认值。
+	ToolTimeout(args json.RawMessage) time.Duration
 }
 
 // ---------------------------------------------------------------------------

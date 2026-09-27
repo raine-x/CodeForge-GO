@@ -212,6 +212,7 @@ func openBrowserAt(target string) {
 		log.Printf("自动打开浏览器失败：%v", err)
 	}
 }
+
 // stopInstanceCmd 停止运行中的实例并输出结果。返回是否实际停止了进程。
 func stopInstanceCmd(configDir string) bool {
 	port := 0
@@ -405,6 +406,25 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 		log.Printf("内置插件已启用：Plan 计划模式（输入 @plan 出计划书；config: builtin_plugins.plan=false 可关闭）")
 	}
 
+	// 内置插件：目标模式（@goal_mode 触发，自主验证目标是否达成）。
+	//
+	// 审查者与工具必须一起注册：工具执行时要能从 ctx 取到账本（服务端装配），
+	// 缺任一方都会得到「内部错误」而不是可用功能。
+	goalVerifier := agent.NewGoalVerifier(ag)
+	var goalTool *builtin.GoalVerifyTool
+	applyGoalRounds := func() {
+		if goalTool != nil {
+			goalTool.SetMaxRounds(cfg.BuiltinPlugins.GoalModeRounds())
+		}
+	}
+	if cfg.BuiltinPlugins.GoalModeEnabled() {
+		goalTool = builtin.RegisterGoalVerify(registry, goalVerifier)
+		applyGoalRounds()
+		ag.SetGoalModeEnabled(true)
+		log.Printf("内置插件：目标模式已启用（@goal_mode 触发，自循环最多 %d 轮；关闭：config: builtin_plugins.goal_mode=false）",
+			cfg.BuiltinPlugins.GoalModeRounds())
+	}
+
 	// 归档自动清理：启动即清一次 + 每天定时（归档满 10 天即删）
 	purgeArchived := func() {
 		if n, err := st.DeleteArchivedOlderThan(10); err != nil {
@@ -453,6 +473,21 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 		if id == agent.BuiltinPlan.ID {
 			// Plan 计划模式无专属工具：只同步 System Prompt 注入开关
 			ag.SetPlanEnabled(on)
+		}
+		if id == agent.BuiltinGoalMode.ID {
+			// 目标模式：注册/注销 goal_verify 工具 + 同步提示词开关。
+			// ⚠️ 工具与审查者是一对：工具执行时要能从 ctx 取到账本，
+			// 两者必须同进同出，否则会出现「开关显示开着、调用却报内部错误」。
+			if on {
+				if _, ok := registry.Get("goal_verify"); !ok {
+					goalTool = builtin.RegisterGoalVerify(registry, goalVerifier)
+					applyGoalRounds() // 注册时就得把轮数同步进 schema/描述
+				}
+			} else {
+				registry.Unregister("goal_verify")
+				goalTool = nil
+			}
+			ag.SetGoalModeEnabled(on)
 		}
 	})
 	if err := srv.Start(); err != nil {
