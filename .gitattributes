@@ -1,0 +1,10 @@
+# ============================================================== 行尾约定
+# Shell 脚本必须以 LF 入库。
+#
+# 本仓库同时在 Windows（PowerShell / cf.cmd）与 Termux（Android）上开发，
+# 而 Windows 的 core.autocrlf 默认为 true —— 缺少这条规则时，某台机器
+# 把带 CRLF 的工作区文件提交上去，Termux 上就会得到
+# `#!/usr/bin/env bash\r`，表现为「bad interpreter: No such file or directory」：
+# 脚本内容完全正确，却在目标平台上根本跑不起来，且报错完全指不到原因。
+# 固定 eol=lf 后，blob 里的行尾与各机器的 autocrlf 设置无关。
+*.sh text eol=lf

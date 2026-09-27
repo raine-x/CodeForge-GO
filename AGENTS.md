@@ -7,6 +7,10 @@
 `bin/codeforge-linux-arm64` **不在默认编译范围内**（2026-09-20 起）：需要时用 `make linux-arm64` 单独出，或明确点名要求编译。
 使用 `CGO_ENABLED=0`、`-trimpath` 和 `-ldflags "-s -w"`。编译失败须如实说明，不得宣称已完成编译。
 
+`cf-termux.sh` 是 Termux 上的**本机**编译入口（拉最新代码 → 编译 → 启动），
+与 `make android-arm64` 的桌面交叉编译互补：脚本刻意不覆盖 `GOOS/GOARCH`，
+因为 Termux 的 `go env` 本来就报 `android/<本机架构>`。改编译参数时两处要一起改。
+
 ## 测试用例 / 临时文件 / 断言的位置
 
 所有测试用例、临时文件、断言都不许散落在仓库里，必须放到约定的位置：
@@ -36,7 +40,7 @@ pkg/tools/builtin/workspace_test.go
 ### 临时文件
 
 仓库根目录只允许放项目文件（`go.mod`、`Makefile`、`README.md`、`cf.cmd`、
-`.gitignore`、`.env*`、`AGENTS.md`、`pytest.ini`）。
+`cf-termux.sh`、`.gitignore`、`.env*`、`AGENTS.md`、`pytest.ini`）。
 调试用的 `.py` / `.js` / `.log` / `.tmp` / `.bak` 一律放 `test/`，并在收尾时清理。
 
 > `.gitignore` 已忽略 `*.tmp`、`*.log`、`config/local.yaml`、`config/models.yaml`、
