@@ -5057,6 +5057,41 @@ case 'idle': {
     });
   })();
 
+  // ---------- 输入框外观：黑 / 白 / 透明（localStorage 记忆，默认黑色） ----------
+  //
+  // 只切 class，不碰 inline style：外观是 CSS 里按 .cbox-* 重映射主题变量实现的
+  // （见 app.css 的「输入框外观」段），JS 这边没有第二份真相。
+  //
+  // 白名单而非黑名单：localStorage 是用户可改的，存了别的东西时
+  // 落回默认值（黑色），而不是给 #composer 挂一个谁都不认识的 class。
+  const CBOX_STYLES = ['black', 'white', 'clear'];
+  const CBOX_DEFAULT = 'black';
+  function applyComposerBox(v) {
+    const box = document.getElementById('composer');
+    if (!box) return;
+    const style = CBOX_STYLES.indexOf(v) >= 0 ? v : CBOX_DEFAULT;
+    CBOX_STYLES.forEach(function (s) { box.classList.toggle('cbox-' + s, s === style); });
+    const seg = document.getElementById('composer-seg');
+    if (seg) {
+      seg.querySelectorAll('button').forEach(function (b) {
+        b.classList.toggle('active', b.dataset.cbox === style);
+      });
+    }
+  }
+  (function initComposerBox() {
+    const seg = document.getElementById('composer-seg');
+    if (!seg) return;
+    applyComposerBox(localStorage.getItem('cf_composer_box') || CBOX_DEFAULT);
+    seg.querySelectorAll('button').forEach(function (b) {
+      b.addEventListener('click', function () {
+        const v = b.dataset.cbox;
+        if (CBOX_STYLES.indexOf(v) < 0) return;
+        localStorage.setItem('cf_composer_box', v);
+        applyComposerBox(v);
+      });
+    });
+  })();
+
   // ---------- 外观：对话框宽度/高度滑条（CSS 变量即时生效，localStorage 记忆） ----------
   function applyComposerSize(w, h) {
     document.documentElement.style.setProperty('--composer-max-w', w + 'px');

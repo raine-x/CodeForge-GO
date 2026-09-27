@@ -2029,6 +2029,52 @@ body.bg-dark .msg-user.msg-steer .bubble { border-left-color: #f6b8ce; }
 /* 镜像层里的 @提及 与消息流同样用主色；但要撤掉气泡那套 word-break: break-all（会错行） */
 .input-mirror .at-mention { word-break: normal; overflow-wrap: break-word; }
 
+/* ---------- 输入框外观（设置 → 外观 → 输入框外观）：黑 / 白 / 透明 ----------
+   实现方式是**在卡片上重映射主题变量**，而不是逐个给后代写颜色覆盖。
+   自定义属性会继承，卡片里所有吃主题色的东西（.input-mirror 的正文、
+   placeholder、@提及高亮、.icon-btn / .perm-btn / .act-model / #send-btn、
+   锚在卡片里的 .popup）会一起跟着变 —— 逐个枚举漏一个就是一处白底白字。
+
+   ⚠️ 本节存在的头号理由：输入文字**不是 textarea 画的**。textarea 自身
+   color: transparent（只留光标），字由 .input-mirror 用 var(--text) 画。
+   所以只换背景不换前景，浅色主题下就会白底白字 —— 一个看不出来的改动。 */
+#composer.cbox-black {
+  --bg-elev: #1a1e27;
+  --bg-elev-2: #101319;         /* #composer 的底色取的就是它 */
+  --border: #2b3242;
+  --text: #eef0f6;
+  --text-dim: #98a1b2;
+  --accent: #7aa2ff;
+  --accent-dim: #1c2740;
+  --accent-solid: #4468e8;      /* 实心按钮不能跟着 --accent 提亮，否则白字对比度不够 */
+  --on-accent: #ffffff;
+  --ok: #34d399;
+  --warn: #fbbf24;
+  --danger: #f87171;
+  /* 原阴影是浅色主题调的 rgba(31,36,48,.06)，落在近黑底上等于没有 —— 补一点黑投影 */
+  box-shadow: 0 2px 14px rgba(0, 0, 0, .55);
+}
+#composer.cbox-white {
+  --bg-elev: #f2f4f8;
+  --bg-elev-2: #ffffff;
+  --border: #dde1e9;
+  --text: #1f2430;
+  --text-dim: #6b7280;
+  --accent: #4373f5;
+  --accent-dim: #e8eefc;
+  --accent-solid: #4373f5;
+  --on-accent: #ffffff;
+  --ok: #16a34a;
+  --warn: #d97706;
+  --danger: #dc2626;
+}
+/* 透明档刻意**不重映射任何变量**：文字、placeholder、@提及继续跟随主题，
+   于是它在浅色与深色主题下都自洽。已实测：设了背景图时 syncBgTheme 会按
+   图片亮度自动翻 body.bg-dark，透明档的对比度因此不需要额外处理。
+   只把填充去掉 —— 描边留着（border 取 var(--border)，自动跟随主题），
+   否则有背景图时输入区会跟背景糊在一起、看不出哪里能点。 */
+#composer.cbox-clear { background: transparent; }
+
 /* 底部操作栏 */
 .composer-bottom {
   display: flex; align-items: center; justify-content: space-between;

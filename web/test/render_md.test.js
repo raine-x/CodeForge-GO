@@ -2237,6 +2237,57 @@ check('--text-dim / --accent / --accent-dim / --ok / --warn / --danger 均为原
 check('没有给文字加 text-shadow（会产生重影，用户明确否掉）',
   !/text-shadow/.test(css));
 
+group('输入框外观：黑 / 白 / 透明（2026-09-27）');
+
+check('设置 → 外观 有「输入框外观」三档分段控件',
+  /id="composer-seg"/.test(htmlSrc) &&
+  /data-cbox="black"[^>]*>黑色</.test(htmlSrc) &&
+  /data-cbox="white"[^>]*>白色</.test(htmlSrc) &&
+  /data-cbox="clear"[^>]*>透明</.test(htmlSrc));
+
+check('没有「跟随主题」这一档（用户明确只要三档）',
+  !/data-cbox="(auto|theme|default)"/.test(htmlSrc) &&
+  !/跟随主题/.test(htmlSrc));
+
+check('黑/白两档在卡片上重映射主题变量（不是逐个覆盖后代颜色）',
+  // 逐个枚举后代必然漏一处 —— 漏的那处就是白底白字。
+  // 变量重映射让 .input-mirror / placeholder / @提及 / icon-btn / send-btn 一起变。
+  /#composer\.cbox-black\s*\{[\s\S]*?--text:\s*#eef0f6/.test(css) &&
+  /#composer\.cbox-white\s*\{[\s\S]*?--text:\s*#1f2430/.test(css));
+
+check('两档都重映射了 --text-dim 与 --accent（@提及高亮跟着变）',
+  /#composer\.cbox-black\s*\{[\s\S]*?--text-dim:[\s\S]*?--accent:/.test(css) &&
+  /#composer\.cbox-white\s*\{[\s\S]*?--text-dim:[\s\S]*?--accent:/.test(css));
+
+check('黑/白档都重映射了 --bg-elev-2（#composer 的底色取的就是它）',
+  /#composer\.cbox-black\s*\{[\s\S]*?--bg-elev-2:[\s\S]*?\}/.test(css) &&
+  /#composer\.cbox-white\s*\{[\s\S]*?--bg-elev-2:[\s\S]*?\}/.test(css) &&
+  /#composer\s*\{[\s\S]*?background:\s*var\(--bg-elev-2\)/.test(css));
+
+check('实心按钮填充用 --accent-solid 而非 --accent（白字对比度）',
+  /#composer\.cbox-black\s*\{[\s\S]*?--accent-solid:[\s\S]*?--on-accent:/.test(css));
+
+check('透明档只去掉填充、不重映射任何变量（文字继续跟随主题）',
+  /#composer\.cbox-clear\s*\{\s*background:\s*transparent;\s*\}/.test(css) &&
+  !/#composer\.cbox-clear\s*\{[^}]*--/.test(css));
+
+check('黑档补了黑投影（原浅色阴影落在近黑底上等于没有）',
+  /#composer\.cbox-black\s*\{[\s\S]*?box-shadow:[\s\S]*?rgba\(0,\s*0,\s*0/.test(css));
+
+check('JS 用白名单校验后落回默认，不给 #composer 挂野 class',
+  /const CBOX_STYLES = \['black', 'white', 'clear'\]/.test(uiSrc) &&
+  /CBOX_STYLES\.indexOf\(v\) >= 0 \? v : CBOX_DEFAULT/.test(uiSrc));
+
+check('默认黑色，且写入 localStorage（不落服务端）',
+  /const CBOX_DEFAULT = 'black'/.test(uiSrc) &&
+  /localStorage\.setItem\('cf_composer_box'/.test(uiSrc) &&
+  /fetch\('\/api\/appearance'[\s\S]{0,80}cf_composer_box/.test(uiSrc) === false);
+
+check('初始化时就应用样式（不是只挂 handler 等点按钮才生效）',
+  // 与液态玻璃 initLiquidGlass 同形：进入即读 localStorage 并落到 DOM 上，
+  // 所以页面加载完第一眼就是选中的外观，不会先闪一下默认样式。
+  /\(function initComposerBox\(\)\s*\{\s*const seg[\s\S]{0,200}?applyComposerBox\(localStorage/.test(uiSrc));
+
 console.log('\n' + '-'.repeat(52));
 if (failures.length) {
   console.log('失败 ' + failures.length + ' 项 / 通过 ' + passed + ' 项：');
