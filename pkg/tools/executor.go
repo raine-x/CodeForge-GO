@@ -67,32 +67,49 @@ func (e *Executor) Evaluate(name string, args json.RawMessage) Decision {
 }
 
 // decide 是 Execute 用的完整判定：策略引擎 + 按模式的越界处理，二者结论一致。
-// 第三个返回值表示「判定放行且需跳过工具内部围栏」（auto/readonly 的越界放行）。
+// 第三个返回值是「本次调用是否指向工作区之外」，Execute 用它决定要不要给这一次
+// 执行注入围栏豁免（见 Execute 里 ScopeApproved 的两处注入）。
 func (e *Executor) decide(tool Tool, name, action string, args json.RawMessage) (security.Decision, string, bool) {
 	d, reason := e.policy.Evaluate(name, action, string(args))
 	return e.escalate(tool, name, args, d, reason)
 }
 
-// escalate 把「越界但被策略放行」的判定按权限模式分流：
+// scopeNote 是越界时对用户披露的说明。
+//
+// ⚠️ 它必须出现在**每一次**越界审批的 reason 里。早先 escalate 在判定非 Allow 时
+// 直接返回，于是默认配置（permission_mode=ask + write_file/edit_file/delete_file/
+// run_command/web_* 都在 ask 规则里）下这些工具**先**拿到 Ask、越界检查压根没跑，
+// 审批弹窗只说「命中规则：write_file」—— 用户完全看不出这一步要跳出工作区，
+// 而批准后 ScopeApproved 又会让工具内部的 checkScope 一并跳过。
+const scopeNote = "目标越出工作区范围，需人工审批（任何权限模式下越界访问都必须手动批准）"
+
+// escalate 处理「目标越出工作区」的情况，按权限模式分流：
 //   - auto（自主）：全部自动通过，不弹审批 —— 自主模式不请求人工确认；
 //   - readonly（只读）：只读工具（含声明 IsReadOnly 的探索/搜索类工具）
 //     区内外都放行；非只读工具维持拒绝，不升级为审批；
-//   - 其余模式（ask 等）：越界强制升级为 Ask（既有行为保持）。
+//   - 其余模式（ask 等）：越界强制升级为 Ask。
 //
-// Deny 与既有 Ask 维持原判。auto 放行越界时由 Execute 注入 ScopeApproved
-// 标记（escalate 无 ctx），使工具内部围栏同步跳过拦截。
+// 第三个返回值是「是否越界」，与「是否放行」**刻意分开**：前者决定要不要给这一次
+// 执行注入围栏豁免，后者只决定策略结论。
+//
+// Deny 维持原判（黑名单优先级最高，审批不能解锁）。
+//
+// ⚠️ 越界检查**必须对任何 incoming decision 都跑**。早先写成
+// `if d != Allow { return }`，而默认配置下危险的那批工具本来就是 Ask ——
+// 于是 ScopeChecker 从未被问，越界披露与围栏收紧双双失效。
 func (e *Executor) escalate(tool Tool, name string, args json.RawMessage, d security.Decision, reason string) (security.Decision, string, bool) {
-	if d != security.Allow {
+	sc, ok := tool.(ScopeChecker)
+	outOfScope := ok && sc.OutsideScope(args)
+	if !outOfScope {
 		return d, reason, false
 	}
-	sc, ok := tool.(ScopeChecker)
-	if !ok || !sc.OutsideScope(args) {
-		return d, reason, false
+	if d == security.Deny {
+		return d, reason, true
 	}
 	switch e.policy.Mode() {
 	case security.ModeAuto:
-		// 自主模式不弹审批：标记本次调用放行，让工具内部围栏一并跳过拦截。
-		return security.Allow, "自主模式自动放行（越界访问不再请求审批）：" + name, true
+		// 自主模式不弹审批：放行本次调用，Execute 会一并注入围栏豁免。
+		return security.Allow, "自主模式自动放行（越界访问不再请求审批）", true
 	case security.ModeReadOnly:
 		if security.IsReadOnlyTool(name) {
 			return security.Allow, "只读模式放行只读工具：" + name, true
@@ -100,9 +117,14 @@ func (e *Executor) escalate(tool Tool, name string, args json.RawMessage, d secu
 		if rt, ok := tool.(ReadOnlyTool); ok && rt.IsReadOnly() {
 			return security.Allow, "只读模式放行声明的只读工具：" + name, true
 		}
-		return security.Deny, "只读模式禁止非只读工具：" + name, false
+		return security.Deny, "只读模式禁止非只读工具：" + name, true
 	default:
-		return security.Ask, "目标越出工作区范围，需人工审批（任何权限模式下越界访问都必须手动批准）", false
+		if d == security.Allow {
+			return security.Ask, scopeNote, true
+		}
+		// 原本就是 Ask（多半命中了 ask 规则）：**并入**越界说明而不是丢掉原原因。
+		// 两段都在弹窗里，用户既知道「为什么需要审批」，也知道「它要跳出工作区」。
+		return security.Ask, reason + "；" + scopeNote, true
 	}
 }
 
@@ -115,14 +137,8 @@ func (e *Executor) Execute(ctx context.Context, name string, args json.RawMessag
 	}
 
 	action := extractAction(name, args)
-	decision, reason, scopeApproved := e.decide(tool, name, action, args)
+	decision, reason, outOfScope := e.decide(tool, name, action, args)
 	entry := security.AuditEntry{Tool: name, Action: action, Decision: string(decision)}
-
-	// auto/readonly 模式下越界被自动放行：注入放行标记，让工具内部围栏
-	// （FS.ResolveChecked）对这一次执行跳过越界拦截。
-	if scopeApproved {
-		ctx = WithScopeApproved(ctx)
-	}
 
 	switch decision {
 	case security.Deny:
@@ -145,6 +161,14 @@ func (e *Executor) Execute(ctx context.Context, name string, args json.RawMessag
 			return Err("该操作需要人工审批，但当前无可用审批通道"), nil
 		}
 		req := ApprovalRequest{Tool: name, Action: action, Reason: reason, Detail: string(args)}
+		// 子智能体发起的审批带上子任务身份：并行委派时界面上会同时挂多张卡片，
+		// 没有这个字段它们长得一模一样，用户批错那张照样授权一次真实的写入。
+		// 用 SubagentIdentityFrom 而不是 SubagentScopeFrom：后者的 ok 依赖
+		// len(Allowed)>0（围栏语义），而 explore 子任务不必声明 paths。
+		if id, mode, ok := SubagentIdentityFrom(ctx); ok {
+			req.SubagentID = id
+			req.SubagentMode = mode
+		}
 		if dp, ok := tool.(DiffProvider); ok {
 			if diff, err := dp.PreviewDiff(args); err == nil {
 				req.Diff = diff
@@ -167,8 +191,17 @@ func (e *Executor) Execute(ctx context.Context, name string, args json.RawMessag
 			_ = e.audit.Log(entry)
 			return Err("用户拒绝了该操作"), nil
 		}
-		// 人工已批准本次调用：注入放行标记，工具内部围栏（FS.ResolveChecked）
-		// 对这一次执行跳过越界拦截；未批准的越界调用在此前已被拒绝。
+		// ⚠️ 只有「这次审批确实放行了一个越界目标」才注入围栏豁免。
+		// 早先这里对**任何**被批准的 Ask 都注入，于是「因命中 ask 规则而批准的一次
+		// 区内操作」会顺带把工具内部的 checkScope 关掉（FS.ResolveChecked 见
+		// ScopeApproved 即跳过）—— 工作区围栏等于形同虚设。
+		if outOfScope {
+			ctx = WithScopeApproved(ctx)
+		}
+	}
+
+	// auto / readonly 模式自动放行越界：同样只对这一次调用豁免围栏。
+	if outOfScope && decision == security.Allow {
 		ctx = WithScopeApproved(ctx)
 	}
 

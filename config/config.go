@@ -101,7 +101,13 @@ type PluginSecurityPolicy struct {
 
 // PluginConfig 描述一个插件的加载配置。
 type PluginConfig struct {
-	Name           string               `yaml:"name"`
+	// Name 是插件的**内部标识**：工具注册名是「Name.工具名」，增删改查也都按它定位。
+	// 不要拿它当界面文案展示 —— 见 DisplayName。
+	Name string `yaml:"name"`
+	// DisplayName 是界面显示名（别名），如「并行搜索」而不是 parallel_search。
+	// 留空时界面回退到 Name。沿用技能（Skill.DisplayName）与模型（ModelEntry.Name）
+	// 的同一套约定：标识与文案分开，改文案不影响工具路由。
+	DisplayName    string               `yaml:"display_name"`
 	Type           string               `yaml:"type"` // mcp | mcp-http | http | wasm | native
 	Enabled        bool                 `yaml:"enabled"`
 	Description    string               `yaml:"description"`
@@ -111,6 +117,14 @@ type PluginConfig struct {
 	Endpoint       string               `yaml:"endpoint"`
 	Path           string               `yaml:"path"`
 	SecurityPolicy PluginSecurityPolicy `yaml:"security_policy"`
+}
+
+// Label 返回该插件的界面显示名：优先别名，没有别名才回退到内部标识。
+func (p PluginConfig) Label() string {
+	if d := strings.TrimSpace(p.DisplayName); d != "" {
+		return d
+	}
+	return p.Name
 }
 
 // Config 是全局配置聚合。

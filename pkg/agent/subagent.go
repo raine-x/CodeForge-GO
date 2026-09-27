@@ -114,7 +114,13 @@ func (r *SubagentRunner) runOne(ctx context.Context, task tools.SubagentTask, po
 	sess.SetLastUserInput(prompt)
 
 	// 注入子智能体路径围栏：工具层强制只允许访问 task.Paths 范围内的路径。
-	ctx = tools.WithSubagentScope(ctx, tools.SubagentScope{Allowed: task.Paths, Mode: task.Mode})
+	// TaskID 一并带上：并行委派时界面上会有多张一模一样的审批卡，
+	// 用户需要能看出「这张是哪个子任务要的」（见 tools.SubagentScope.TaskID）。
+	ctx = tools.WithSubagentScope(ctx, tools.SubagentScope{
+		Allowed: task.Paths,
+		Mode:    task.Mode,
+		TaskID:  task.ID,
+	})
 
 	// 事件流：把子智能体的实时进度转发给前端（无 sink 时静默丢弃）。
 	sink, hasSink := tools.SubagentSinkFrom(ctx)

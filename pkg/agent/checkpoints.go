@@ -96,6 +96,15 @@ func (a *Agent) CheckpointSteps(sessionID string) []CheckpointStep {
 //
 // 只按会话内**已记录**的路径查找：查不到就不给 diff —— 这样这个读取口
 // 天然被限制在「本次会话确实改过」的文件上，不会退化成任意路径读取。
+//
+// ⚠️ 路径按**三级容错**匹配（见 pathMatchers）。原因：前端回放卡片带的是
+// **模型传入的原始路径**（历史里存的也是原始 Input），而检查点存的是
+// FS.Resolve 之后的**绝对路径**。工具 schema 明确允许相对路径，于是
+// `pkg/x.go`、`./pkg/x.go`、Windows 下大小写不同的写法全都精确匹配不上 ——
+// 点开只会得到一句「可能已被回退」的假话。
+//
+// 容错**不放宽安全边界**：三级都只在「该会话已记录的路径」里找，
+// 绝不会去读一个没被改过的文件。
 func (a *Agent) CheckpointFor(sessionID, path string, step int) (store.CheckpointRow, bool) {
 	if a.memoryStore == nil || strings.TrimSpace(path) == "" {
 		return store.CheckpointRow{}, false
@@ -104,10 +113,23 @@ func (a *Agent) CheckpointFor(sessionID, path string, step int) (store.Checkpoin
 	if err != nil {
 		return store.CheckpointRow{}, false
 	}
+	// 逐级放宽：精确 → 绝对化 → 边界后缀。命中即止（后一级更宽松，容易选错文件）。
+	for _, match := range pathMatchers(path, a.WorkDir()) {
+		if row, ok := pickCheckpoint(rows, match, step); ok {
+			return row, true
+		}
+	}
+	return store.CheckpointRow{}, false
+}
+
+// pickCheckpoint 在 rows 里按 match 选一行：指定 step 就精确到那一步，
+// 否则取该路径**最早**的一条（累计改动的对比基准）。
+func pickCheckpoint(rows []store.CheckpointRow, match func(string) bool, step int) (store.CheckpointRow, bool) {
 	var earliest store.CheckpointRow
 	found := false
+	var distinct string // 后缀匹配时记录命中的**不同**存储路径，用于发现歧义
 	for _, r := range rows {
-		if r.Path != path {
+		if !match(r.Path) {
 			continue
 		}
 		if step >= 0 {
@@ -117,11 +139,41 @@ func (a *Agent) CheckpointFor(sessionID, path string, step int) (store.Checkpoin
 			continue
 		}
 		if !found || r.Step < earliest.Step {
-			earliest = r
-			found = true
+			earliest, found = r, true
+		}
+		if distinct == "" {
+			distinct = r.Path
+		} else if distinct != r.Path {
+			// 同一个后缀命中了两个不同的文件：宁可报「没匹配到」也不给一份
+			// 张冠李戴的 diff（用户看不出那是另一个文件）。
+			return store.CheckpointRow{}, false
 		}
 	}
 	return earliest, found
+}
+
+// pathMatchers 按「由严到松」返回三级路径匹配器。
+//
+//	① 精确（Clean 后相等）
+//	② 绝对化：相对路径按工作区根展开 —— 覆盖 `pkg/x.go`、`./pkg/x.go`
+//	③ 边界后缀（大小写无关、分隔符无关）：覆盖 Windows 大小写差异、
+//	   斜杠反斜杠混用。**必须落在分隔符边界上**，否则 `partA` 会误配 `partA2`
+//	   （与 scopesOverlap 同一口径）。
+func pathMatchers(path, root string) []func(string) bool {
+	want := filepath.Clean(path)
+	out := []func(string) bool{
+		func(p string) bool { return p == want },
+	}
+	if !filepath.IsAbs(want) && root != "" {
+		abs := filepath.Clean(filepath.Join(root, want))
+		out = append(out, func(p string) bool { return p == abs })
+	}
+	lower := strings.ToLower(filepath.ToSlash(want))
+	out = append(out, func(p string) bool {
+		lp := strings.ToLower(filepath.ToSlash(p))
+		return lp == lower || strings.HasSuffix(lp, "/"+lower)
+	})
+	return out
 }
 
 // RewindFiles 把工作区文件恢复到「第 toStep 步开始之前」的样子。

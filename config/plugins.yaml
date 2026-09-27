@@ -1,5 +1,6 @@
 plugins:
     - name: parallel_search
+      display_name: 并行搜索
       type: mcp-http
       enabled: true
       description: Parallel Search MCP（无需注册/API Key）：web_search 返回压缩摘录、web_fetch 抓取网页 Markdown；默认联网搜索来源
@@ -12,6 +13,7 @@ plugins:
         requires_approval: false
         allowed_actions: []
     - name: exa_search
+      display_name: 语义搜索（Exa）
       type: mcp-http
       enabled: false
       description: Exa MCP（免费，无需 Key）：语义搜索，工具 web_search_exa / web_fetch_exa，适合「找相似内容」而非精确事实查询；与 parallel_search 二选一或并用（https://mcp.exa.ai/mcp）
@@ -24,6 +26,7 @@ plugins:
         requires_approval: false
         allowed_actions: []
     - name: github_tools
+      display_name: GitHub 仓库
       type: mcp
       enabled: false
       description: GitHub 仓库操作工具（官方 MCP Server）
@@ -39,6 +42,7 @@ plugins:
         requires_approval: false
         allowed_actions: []
     - name: sql_runner
+      display_name: SQL 查询
       type: http
       enabled: false
       description: 通过 HTTP Webhook 执行 SQL 查询
@@ -51,6 +55,7 @@ plugins:
         requires_approval: false
         allowed_actions: []
     - name: wasm_calc
+      display_name: 计算沙盒
       type: wasm
       enabled: false
       description: WASM 沙盒中的轻量计算工具

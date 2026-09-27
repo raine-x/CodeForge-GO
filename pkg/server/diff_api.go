@@ -44,10 +44,14 @@ func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
 
 	cp, ok := s.agent.CheckpointFor(sessionID, path, step)
 	if !ok {
+		// ⚠️ 文案不能说「可能已被回退」：绝大多数未命中是**路径写法不同**
+		// （模型传相对路径 / Windows 大小写差异），而那条改动其实好好地记着。
+		// 说成「已被回退」是对用户说了假话。
 		writeJSON(w, http.StatusOK, map[string]any{
 			"path": path,
 			"diff": "",
-			"note": "这条改动没有可用的记录（可能已被回退，或不属于本会话）",
+			"note": "按这个路径没匹配到本会话的改动记录（路径写法与实际记录不一致，" +
+				"或该文件已被回退 / 不属于本会话）",
 		})
 		return
 	}

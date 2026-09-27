@@ -271,6 +271,15 @@
               <span id="retry-result" class="mf-test-result"></span>
             </div>
           </div>
+          <div class="settings-card">
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">界面</div>
+                <div class="row-desc">重新加载当前页面，用于界面显示异常时自救。会话、记忆与设置都已落盘，刷新不会丢；<b>正在运行的任务会被打断</b>（连接一断服务端就取消该轮），已经改过的文件不会回退。资源不走浏览器缓存，刷新后一定拿到当前版本</div>
+              </div>
+              <button type="button" id="reload-page" class="btn">刷新页面</button>
+            </div>
+          </div>
         </section>
         <section id="page-memory" class="settings-page">
           <h2>记忆</h2>
@@ -420,7 +429,8 @@
                 </div>
               </div>
               <div class="form-grid">
-                <label class="f-field"><span>名称</span><input id="mcp-f-name" type="text" placeholder="如 filesystem / parallel_search"></label>
+                <label class="f-field"><span>名称<i class="f-hint">内部标识，工具以「名称.工具名」注册；不要改</i></span><input id="mcp-f-name" type="text" placeholder="如 filesystem / parallel_search"></label>
+                <label class="f-field"><span>显示名称<i class="f-hint">界面里展示的别名，留空则显示上面的名称</i></span><input id="mcp-f-display" type="text" placeholder="如 文件系统 / 并行搜索"></label>
                 <label class="f-field"><span>类型</span>
                   <select id="mcp-f-type">
                     <option value="mcp">本地（stdio · 命令启动）</option>

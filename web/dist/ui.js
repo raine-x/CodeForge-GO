@@ -920,7 +920,8 @@
     row.className = 'msg-user';
     const b = document.createElement('div');
     b.className = 'bubble';
-    // 原文存在 dataset 上：编辑按钮要靠它与服务端下发的白名单（按文本匹配）对上号。
+    // 原文存在 dataset 上：编辑按钮要靠它与服务端下发的白名单（按 back 匹配）对上号，
+    // 提交编辑时也靠它回填输入框。
     // 用 textContent 的渲染结果反推是不行的 —— 提及高亮会把 @路径 缩成文件名。
     b.dataset.rawText = text;
     renderUserText(b, text);
@@ -929,34 +930,85 @@
     scrollBottom();
     syncComposerMode(); // 用户发出第一句话：输入卡片下放回底部
     syncUserEditButtons();
+    return row; // 调用方可能要回滚它（见 submitMessage 的乐观气泡）
   }
 
-  // 可编辑用户消息白名单：由服务端下发的 checkpoints 事件给出（back = 距最后一条的距离）。
+  // 可编辑用户消息白名单：由服务端下发的 checkpoints 事件给出（back = 距最后一条提问的距离）。
   // 前端不自己推断「哪几条能编辑」—— 白名单规则（最近 N 条、且必须是纯文本发言）
   // 只有服务端知道，两边各算一份必然会漂。
-  let editableByText = new Map(); // 文本 → back（同一文本重复出现时取最近的一条）
+  //
+  // ⚠️ 这里存的是 **back 的集合**，不是「文本 → back」的映射。
+  // 早先用 Map<text, back> 靠文本对号，重复提问时就废了：用户连着问两句一样的
+  // （「继续」「还是不行」这类高频动作），Map 只留一条、后写的覆盖先写的，于是
+  // **第一条**的编辑按钮也拿到最后那条的 back，点下去改错消息。
+  // back 本身就是位置（距最后一条提问的距离），按位置定位没有这个歧义。
+  let editableBacks = new Set();
   function setEditables(list) {
-    editableByText = new Map();
+    editableBacks = new Set();
     (list || []).forEach(function (it) {
-      if (it && typeof it.text === 'string' && typeof it.back === 'number') {
-        editableByText.set(it.text, it.back);
+      if (it && typeof it.back === 'number' && it.back >= 0) {
+        editableBacks.add(it.back);
       }
     });
     syncUserEditButtons();
   }
 
+  // userQuestionRows 返回视图里的「用户提问」行，按时间正序。
+  //
+  // 必须排除 .msg-steer：它同样带 .msg-user 类（视觉上也是一条用户消息），但插话
+  // 不是提问。服务端的 back 由 isUserQuestion（排除 OriginSteer）算出，这里不减
+  // 就会数错条数、点第 back 条时改错消息。
+  function userQuestionRows() {
+    return Array.prototype.slice.call(
+      messagesEl.querySelectorAll('.msg-user:not(.msg-steer)'));
+  }
+
+  // optimisticBubble 是「本次提交画上去、还没确认落库」的那条用户气泡。
+  //
+  // 服务端有两条在**落盘之前**就失败的路径：beginRunWait 等 15 秒仍拿不到运行权
+  // （另一个标签页在跑同一会话）、以及「会话不存在」。这两种情况下气泡不会被写进
+  // 历史，却留在界面上 —— 幻影 .msg-user 会让 userQuestionRows() 多一条，
+  // 于是 back = total-1-i 与服务端的 EditableUserMessages 错开一位，
+  // ✎ 按钮会改错消息（这正是 2026-09-27 修过一次的错位，此地是复发路径）。
+  //
+  // 判据用「服务端是否已下发 busy」而不是「气泡还在不在」：
+  // busy 到达即代表 RunWithImages 已经把用户消息追加进历史，此刻的 error 是
+  // 上游/工具层出的问题，**不该**回滚用户的话。
+  let optimisticBubble = null;
+
+  function lastAddedUserRow() {
+    const rows = userQuestionRows();
+    return rows.length ? rows[rows.length - 1] : null;
+  }
+
+  // dropOptimisticBubble 移除未落库的乐观气泡，并复位由它派生的一切。
+  function dropOptimisticBubble() {
+    if (!optimisticBubble) return false;
+    const el = optimisticBubble;
+    optimisticBubble = null;
+    if (!el.isConnected) return false; // 已被清屏 / 重建
+    el.remove();
+    // 少了一条用户消息 → back 序号全体前移，必须重挂编辑按钮，
+    // 否则用户会拿着错位的 ✎ 去编辑另一条消息。
+    editableBacks = new Set();
+    syncUserEditButtons();
+    return true;
+  }
+
   // 就地刷新每条用户消息上的编辑按钮显隐（历史回放、新消息、白名单更新都会走到这里）。
   function syncUserEditButtons() {
     // 只给当前正在查看的会话挂按钮：后台会话的历史不在视图里，也不该出现可点的编辑。
-    const rows = messagesEl.querySelectorAll('.msg-user');
-    rows.forEach(function (row) {
+    const rows = userQuestionRows();
+    const total = rows.length;
+    rows.forEach(function (row, i) {
       const bubble = row.querySelector('.bubble');
       if (!bubble) return;
       const btn = row.querySelector('.edit-btn');
       const raw = bubble.dataset.rawText || '';
-      const back = editableByText.get(raw);
+      // back = 距最后一条提问的距离，与服务端 nthLastUserQuestionIndex 同一口径。
+      const back = total - 1 - i;
       // 运行中不给编辑入口：这一轮的上下文正在被模型消费，就地改写会让事件与历史错位。
-      if (typeof back === 'number' && !running) {
+      if (editableBacks.has(back) && !running) {
         if (btn) {
           btn.dataset.back = String(back);
         } else {
@@ -1099,11 +1151,33 @@
   // 思考/正文时移除 spinner，让用户知道工具正在执行而不是卡死）。
   let activeToolEl = null;
   let pendingToolEl = null; // 「正在生成工具调用参数…」占位（tool_call 到达后移除）
-  function settleActiveTool() {
+  // settleActiveTool(failed)：把工具卡从「运行中」收尾。
+  //
+  // failed 为真时在卡片**末尾**追加 ⛔ 并加 denied 类 —— 工具失败、被安全策略拒绝、
+  // 或用户驳回了审批时，界面上必须有可辨识的标记。
+  //
+  // 以前这里只撤 spinner，于是 Deny（黑名单）、「未在文件中找到 old_string」、
+  // 「用户拒绝了该操作」全都渲染成和成功一模一样的卡片，而卡片文案在 tool_call
+  // 阶段就用过去式写死了（「编辑 x.go」），徽标 +N/-M 与可点开的 diff 用的还是
+  // **预演**结果 —— 用户点开能看到一份从未落盘的改动。
+  //
+  // 成功路径刻意**一行不改**（产品要求：成功什么都不动）。
+  function settleActiveTool(failed) {
     if (activeToolEl) {
       activeToolEl.classList.remove('running');
       const sp = activeToolEl.querySelector('.tool-spinner');
       if (sp) sp.remove();
+      if (failed) {
+        activeToolEl.classList.add('denied');
+        if (!activeToolEl.querySelector('.tool-denied')) {
+          const mark = document.createElement('span');
+          mark.className = 'tool-denied';
+          mark.textContent = '⛔';
+          mark.title = '该操作未执行：被安全策略拒绝、用户驳回审批，或工具执行失败';
+          activeToolEl.appendChild(document.createTextNode(' '));
+          activeToolEl.appendChild(mark);
+        }
+      }
       activeToolEl = null;
     }
   }
@@ -1727,14 +1801,22 @@
     const label = document.createElement('div');
     label.className = 'approval-text';
     // 审批可能来自后台运行的另一个会话：显式标注来源，避免被误认为当前会话的操作。
+    // 审批可能来自后台会话的同一会话：前端可能已切到别的会话查看，
     const fromOther = !!req.session_id && req.session_id !== sessionID;
+    // 子任务身份：一次委派最多并行 5 个子智能体（config.SubagentConcurrencyCap），
+    // 它们的审批会**同时**挂在界面上，而中文短语与 session_id 都相同 ——
+    // 没有这张标识，用户批错那张照样授权了一次真实的、不同的写入。
+    const subLabel = req.subagent_id
+      ? '（子任务 ' + req.subagent_id + (req.subagent_mode === 'implement' ? ' · 实现' : ' · 探索') + '）'
+      : '';
     if (fromOther) {
       const meta = sessionsCache.find(function (s) { return s.id === req.session_id; });
-      label.textContent = '需要审批（来自会话「' + ((meta && meta.title) || req.session_id) + '」）：' + toolPhrase(req.tool);
+      label.textContent = '需要审批（来自会话「' + ((meta && meta.title) || req.session_id) + '」' + subLabel + '）：' + toolPhrase(req.tool);
       wrap.classList.add('from-other');
     } else {
-      label.textContent = '需要审批：' + toolPhrase(req.tool);
+      label.textContent = '需要审批' + subLabel + '：' + toolPhrase(req.tool);
     }
+    if (req.subagent_id) wrap.classList.add('from-subagent');
     const tip = [req.reason, req.action ? '目标：' + req.action : ''].filter(Boolean).join('\n');
     if (tip) label.title = tip;
     const btns = document.createElement('div');
@@ -1744,9 +1826,14 @@
     const no = document.createElement('button');
     no.type = 'button'; no.className = 'approval-btn reject'; no.textContent = '拒绝';
     function decide(approved) {
+      // 过期卡片不能再点：请求早已结束（cancel / 报错 / 断线重连 / 被下一轮取代），
+      // 服务端 resolve 对未知 id 是**静默 no-op** —— 早先这里不查活性就直接把文案
+      // 改成「—— 已批准」，于是用户点了、看着像批了，其实什么都没发生。
+      if (wrap.classList.contains('expired')) return;
       wsSend({ type: 'hitl_decision', approval_id: req.approval_id, approved: approved });
       label.textContent += approved ? ' —— 已批准' : ' —— 已拒绝';
       ok.remove(); no.remove();
+      wrap.classList.add('decided');
     }
     ok.addEventListener('click', function () { decide(true); });
     no.addEventListener('click', function () { decide(false); });
@@ -1754,6 +1841,31 @@
     wrap.appendChild(label); wrap.appendChild(btns);
     ensureCol().appendChild(wrap);
     scrollBottom();
+  }
+
+  // expireApprovals 作废当前视图里所有待决审批条。
+  //
+  // 调用的四个时机 = 一轮任务/一次连接结束的全部路径：
+  //   busy  新一轮开始（上一轮的审批必然已失效）
+  //   idle  正常收尾
+  //   error 出错收尾
+  //   ready WebSocket 重连（旧连接上的审批随服务端 stop 一起作废）
+  //
+  // 纯前端处理，不改协议：服务端对未知 id 本来就是 no-op，不需要加 ack。
+  // 加 .expired 是为了既禁用按钮、又能让 decide() 识别「这张已经作废」。
+  function expireApprovals() {
+    const wraps = messagesEl.querySelectorAll('.msg-approval:not(.decided):not(.expired)');
+    wraps.forEach(function (wrap) {
+      wrap.classList.add('expired');
+      const label = wrap.querySelector('.approval-text');
+      if (label && label.textContent.indexOf('已失效') < 0) {
+        label.textContent += '（已失效）';
+      }
+      wrap.querySelectorAll('.approval-btns button').forEach(function (b) {
+        b.disabled = true;
+        b.title = '该审批请求已结束（任务被打断、出错或连接已重连）';
+      });
+    });
   }
 
   // ---------- WebSocket：接入真实模型 ----------
@@ -2380,9 +2492,7 @@
     if (!wsSend({ type: 'new_session', title: '' })) return;
     composerEpoch++;
     sessionChanging = true;
-    messagesEl.innerHTML = '';
-    msgCol = null; currentTextEl = null; textBuffer = '';
-    reasonEl = null; reasonBuffer = ''; lastReply = ''; lastUserText = '';
+    clearViewState(); // 新会话：连 lastUserText 一起清
     sessionID = ''; // 等服务端 session 事件回填
     syncComposerMode(); // 新会话为空：输入卡片回到居中
   }
@@ -2763,9 +2873,7 @@
     }).then(function () {
       if (s.id === sessionID) { // 归档的是当前会话：回到空态
         sessionID = '';
-        messagesEl.innerHTML = '';
-        msgCol = null; currentTextEl = null; textBuffer = '';
-        reasonEl = null; reasonBuffer = ''; lastReply = '';
+        clearViewState();
         syncComposerMode(); // 回到空态：输入卡片回到居中
       }
       loadSessionList();
@@ -2778,9 +2886,7 @@
     }).then(function () {
       if ((ws || '') === (workspaceRoot || '')) { // 当前工作区整组归档：清空
         sessionID = '';
-        messagesEl.innerHTML = '';
-        msgCol = null; currentTextEl = null; textBuffer = '';
-        reasonEl = null; reasonBuffer = ''; lastReply = '';
+        clearViewState();
         syncComposerMode(); // 回到空态：输入卡片回到居中
       }
       loadSessionList();
@@ -2791,9 +2897,7 @@
       .then(function () {
         if (s.id === sessionID) {
           sessionID = '';
-          messagesEl.innerHTML = '';
-          msgCol = null; currentTextEl = null; textBuffer = '';
-          reasonEl = null; reasonBuffer = ''; lastReply = '';
+          clearViewState();
           syncComposerMode(); // 回到空态：输入卡片回到居中
         }
         loadSessionList();
@@ -2812,9 +2916,7 @@
         if ((ws || '') === (workspaceRoot || '')) {
           workspaceRoot = '';
           sessionID = '';
-          messagesEl.innerHTML = '';
-          msgCol = null; currentTextEl = null; textBuffer = '';
-          reasonEl = null; reasonBuffer = ''; lastReply = '';
+          clearViewState();
         }
         loadSessionList();
       }).catch(function (err) { addError('删除项目失败：' + err.message); })
@@ -2845,23 +2947,29 @@
     if (!wsReady) return;
     composerEpoch++;
     sessionChanging = true;
+    // 记账：这一帧 history 是**我请求的**，必须放行（case 'history' 的守卫靠它）。
+    awaitingHistoryFor = id;
     if (running) sendBtn.title = '点击打断' + (id === runSessionID ? '' : '（正在运行的会话）');
     wsSend({ type: 'load_session', session_id: id });
   }
+
+  // awaitingHistoryFor = 「我发过 load_session，正在等的那一帧 history」的会话 id。
+  //
+  // 为什么需要它：`history` 帧有两类来源 ——
+  //   ① 我请求的（load_session 的回包）：**必须放行**，切会话就靠它；
+  //   ② 服务端主动推的（编辑重发时 EventEdit 之后补的那一帧）：如果当前视图已经
+  //      换成别的会话，无条件重建就会把整屏拽回去，用户点了 B 却看到 A。
+  // 光看 ev.session_id 分不出来（①的 session_id 也与当前视图不同，那正是切会话）。
+  // 所以要自己记账。
+  let awaitingHistoryFor = null;
 
   // 回放历史消息：服务端 history 事件 → 用渲染原语重建聊天列。
   // 审批条与 spinner 不重建（历史是既成事实）；末条助手回复带操作栏。
   function replayHistory(ev) {
     composerEpoch++;
     sessionChanging = false;
-    messagesEl.innerHTML = '';
-    msgCol = null; currentTextEl = null; textBuffer = '';
-    reasonEl = null; reasonBuffer = ''; reasonPinned = false;
-    // 视图重建 = 旧 DOM 全部作废：这些「当前元素」引用必须一起清空，
-    // 否则后续事件会去找已经不在文档里的节点（切走→切回最容易触发）。
-    thinkingEl = null; activeToolEl = null; retryEl = null; pendingToolEl = null;
-    subagentCards.clear();
-    lastReply = ''; lastUserText = '';
+    // 切会话保留 lastUserText（重新生成要用），其余引用一律作废
+    clearViewState({ keepLastUser: true });
     sessionID = ev.session_id || '';
 
     (ev.messages || []).forEach(function (m) {
@@ -2916,7 +3024,7 @@
     syncComposerMode(); // 空会话回放 → 居中；有历史 → 下放底部
     // 切会话后旧白名单属于上一个会话：先清掉，等 checkpoints 事件到达再挂按钮。
     // 各条消息的 dataset.rawText 也一并作废（气泡已被重建）。
-    editableByText = new Map();
+    editableBacks = new Set();
     syncUserEditButtons();
     renderSessions(sessionsCache); // 高亮切换后的 active
   }
@@ -2942,8 +3050,11 @@
         dot.title = p.enabled ? '运行中'
           : '已启用，但连接未建立（加载失败：请到 设置 → MCP 服务 检查端点/启动命令）';
         const nm = document.createElement('span');
-        nm.textContent = p.name + (p.enabled ? '' : '（加载失败）');
-        nm.title = (p.description || p.name) +
+        // 显示名优先（服务端已把「无别名」回退成 name 填好），标识只放进 title。
+        nm.textContent = (p.display_name || p.name) + (p.enabled ? '' : '（加载失败）');
+        nm.title = (p.display_name && p.display_name !== p.name
+          ? p.display_name + '（' + p.name + '）' : p.name) +
+          '：' + (p.description || '') +
           (p.endpoint ? '：' + p.endpoint : (p.command ? '：' + p.command + ' ' + (p.args || []).join(' ') : '')) +
           (p.enabled ? '（运行中）' : '（已启用但加载失败）');
         li.appendChild(dot);
@@ -2993,7 +3104,16 @@
         main.className = 'mi-main';
         const nm = document.createElement('div');
         nm.className = 'mi-name';
-        nm.textContent = icon + p.name + '　' + p.type;
+        // 显示名（中文别名）当主文案，英文标识退到小字行 —— 用户看到的是
+        // 「并行搜索」而不是 parallel_search。真要定位/改配置时标识仍在一眼可见处。
+        const label = p.display_name || p.name;
+        nm.textContent = icon + label + '　' + p.type;
+        if (p.display_name && p.display_name !== p.name) {
+          const alias = document.createElement('span');
+          alias.className = 'mi-alias';
+          alias.textContent = p.name;
+          nm.appendChild(alias);
+        }
         const meta = document.createElement('div');
         meta.className = 'mi-id';
         const detail = p.command
@@ -3053,6 +3173,8 @@
     const result = document.getElementById('mcp-f-result');
     function fail(msg) { result.className = 'mf-test-result fail'; result.textContent = msg; }
     const name = document.getElementById('mcp-f-name').value.trim();
+    // 显示名（别名）可留空：留空时服务端 Label() 回退到 name，界面就显示英文标识。
+    const displayName = document.getElementById('mcp-f-display').value.trim();
     const type = mcpTypeSel ? mcpTypeSel.value : 'mcp';
     const remote = type === 'mcp-http';
     const cmd = document.getElementById('mcp-f-cmd').value.trim();
@@ -3077,7 +3199,7 @@
     fetch('/api/plugins', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        name: name, type: type,
+        name: name, display_name: displayName, type: type,
         command: cmd, endpoint: endpoint,
         args: args ? args.split(/\s+/) : [],
         description: desc || (remote ? '远程 MCP 服务' : 'MCP 服务'),
@@ -3086,6 +3208,7 @@
     }).then(function (r) { return r.json(); }).then(function (d) {
       if (d.ok) {
         document.getElementById('mcp-f-name').value = '';
+        document.getElementById('mcp-f-display').value = '';
         document.getElementById('mcp-f-cmd').value = '';
         document.getElementById('mcp-f-endpoint').value = '';
         document.getElementById('mcp-f-args').value = '';
@@ -3292,6 +3415,12 @@
           sendBtn.classList.remove('running');
           sendBtn.title = '发送';
           renderSessions(ev.sessions || []);
+          // 旧连接上的待决审批全部作废（服务端 handleWS 的 defer 已 stop 掉那一轮）。
+          // 不作废的话，卡片会带着可点的按钮留在屏幕上，点了只会静默 no-op。
+          // 同理收尾本轮的可视元素：settleActiveTool 是唯一移除 .running +
+          // .tool-spinner 的函数，漏了就永久转圈（实测：一次网络抖动后再也不停）。
+          expireApprovals();
+          clearRunVisuals();
           if (!sessionID) restoreStartSession();
           break;
         case 'sessions':
@@ -3299,6 +3428,21 @@
           break;
         case 'history':
           // 权威快照到达：编辑重发的乐观改动已被库里的样子取代，pendingEdit 落地。
+          //
+          // ⚠️ 会话守卫（2026-09-27）：history 有两类来源 ——
+          //   ① 我请求的（load_session 回包）：必须放行，哪怕它的 session_id 与当前
+          //      视图不同 —— 那正是「正在切过去」；
+          //   ② 服务端主动推的（编辑重发 EventEdit 之后补的那一帧）：若当前视图
+          //      已经换成别的会话，无条件 replayHistory 会把整屏拽回去
+          //      （loadSession 允许运行中调用，窗口真实存在）。
+          // 靠 awaitingHistoryFor 记账区分；老服务端不带 session_id 时按原样放行。
+          if (ev.session_id && awaitingHistoryFor !== ev.session_id &&
+              ev.session_id !== sessionID) {
+            awaitingHistoryFor = null;
+            addInfo('另一个会话的历史更新已忽略（当前视图未切换）');
+            break;
+          }
+          awaitingHistoryFor = null;
           pendingEdit = false;
           replayHistory(ev);
           break;
@@ -3354,16 +3498,26 @@
           // 上下文占用只画当前视图会话的（后台会话结束也会下发它自己的 context）
           if (!ev.session_id || ev.session_id === sessionID) renderCtxUsage(ev);
           break;
-case 'busy':
+        case 'busy':
           sending = false;
           running = true;
           runSessionID = sessionID;
           runReason = ''; runText = '';
           lastReply = '';
           hasModelReplied = false; // 新一轮开始：重置回复标记
+          // busy 到达 = 服务端已把用户消息追加进历史 → 乐观气泡不再是幻影，清掉引用
+          // （节点本身留着，那是真实消息）。
+          optimisticBubble = null;
           removeRetry();
           removeResumeRing();
           resetSubagentCards();
+          // 上一轮的待决审批必然已失效（服务端 c.stop() 先执行才起新一轮）。
+          expireApprovals();
+          // ⚠️ 这里**不能**用 clearRunVisuals 全量：busy 紧接着要 showThinking()，
+          // 全量里的 removeThinking() 会把刚要建的提示拆掉。
+          // 只收尾「被取代的那一轮不会再来事件」的部分：工具卡与参数生成占位。
+          settleActiveTool();
+          if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
           sendBtn.classList.add('running');
           sendBtn.title = '点击打断';
           showThinking();
@@ -3469,7 +3623,10 @@ case 'busy':
           if (runAway()) break;
           if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
           removeThinking();
-          settleActiveTool(); // 工具已返回：撤掉 spinner
+          // 成功路径与以前完全一致（撤掉 spinner 即收尾）；只有失败才追加 ⛔。
+          // 判定读服务端下发的 result.success —— 卡片文案是过去式的，
+          // 不看这个字段的话拒绝与失败都会被渲染成成功。
+          settleActiveTool(!!(ev.result && ev.result.success === false));
           closeText();
           // 工具执行结束后，模型通常会再次被调用；在下一段 reasoning/text 到来前明确提示等待。
           if (running) showThinking();
@@ -3491,14 +3648,14 @@ case 'busy':
             addError('后台会话「' + ((emeta && emeta.title) || runSessionID) + '」出错：' + describeLLMError(ev.error));
             break;
           }
-          removeThinking();
-          removeRetry();
-          removeResumeRing();
-          settleActiveTool();
-          if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
+          expireApprovals();
+          clearRunVisuals();
           foldReason();
           closeText();
           addError(describeLLMError(ev.error || '未知错误'));
+          // 幻影气泡回滚：只在**没等到 busy** 时做 —— 收到 busy 就说明用户消息已经
+          // 落进历史，此刻的 error 是上游/工具层的问题，动它就是删掉用户真说过的话。
+          dropOptimisticBubble();
           // 编辑重发在「服务端截断之前」就失败（例如 back 定位不到那条消息）时，
           // 既不会有 edit 帧也不会有 history 帧 —— 界面停在乐观改动后的状态，
           // 与库里的实际历史对不上。主动拉一次会话，把视图拉回真相。
@@ -3511,11 +3668,8 @@ case 'busy':
 case 'idle': {
           sending = false;
           const backHome = !runAway();
-          removeThinking();
-          removeRetry();
-          removeResumeRing();
-          settleActiveTool();
-          if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
+          expireApprovals();
+          clearRunVisuals();
           foldReason();
           closeText();
           if (backHome && lastReply) addActions(lastReply);
@@ -3535,6 +3689,10 @@ case 'idle': {
             pendingEdit = false;
             restoreAfterFailedEdit();
           }
+          // 兜底：正常路径下 busy 已把 optimisticBubble 清成 null，这里是 no-op；
+          // 若这一轮压根没起步（没收到 busy），它就是条没落库的幻影 —— 移除，
+          // 否则多出来的 .msg-user 会让 ✎ 的 back 序号全体错位。
+          dropOptimisticBubble();
           break;
         }
       }
@@ -3652,6 +3810,23 @@ case 'idle': {
           picker.querySelector('#picker-path').textContent = data.path || '';
           list.innerHTML = '';
           const items = data.items || [];
+          // 「.. 返回上一级」置顶。
+          //
+          // 为什么由服务端给 parent 而不是前端切字符串：根目录（/ 与 C:\）、
+          // UNC 前缀、结尾分隔符这些规则各平台不同，前端自己拼会在 Termux /
+          // Windows 上错位。parent 为空串表示已在根上，此时不显示这一行。
+          //
+          // 少了它的话，选择器只能一路往下钻 —— 起点在 ~/storage/shared 之类的
+          // 深层目录时，想回到 ~ 或 / 就只能关掉重开（2026-09-27 反馈）。
+          const parent = data.parent || '';
+          if (parent && parent !== (data.path || '')) {
+            const up = document.createElement('div');
+            up.className = 'picker-item picker-up';
+            up.textContent = '📂 .. 返回上一级';
+            up.title = parent;
+            up.addEventListener('click', function () { browse(parent); });
+            list.appendChild(up);
+          }
           items.filter(function (it) { return it.is_dir; }).forEach(function (it) {
             const d = document.createElement('div');
             d.className = 'picker-item';
@@ -3674,8 +3849,13 @@ case 'idle': {
               list.appendChild(d);
             });
           }
-          if (!list.children.length) {
-            list.innerHTML = '<div class="picker-empty">' + (pickerMode === 'file' ? '此目录为空' : '无子目录') + '</div>';
+          // 空态提示要**排除「.. 返回上一级」**：它不是目录内容。
+          // 否则一个空目录会因为多了这一行而不再显示「无子目录」，
+          // 用户会以为列表漏了东西。
+          const real = list.querySelectorAll('.picker-item:not(.picker-up)');
+          if (!real.length) {
+            list.insertAdjacentHTML('beforeend',
+              '<div class="picker-empty">' + (pickerMode === 'file' ? '此目录为空' : '无子目录') + '</div>');
           }
         });
     }
@@ -3778,11 +3958,10 @@ case 'idle': {
 
   // 找出「倒数第 back 条用户提问」对应的 DOM 行。
   //
-  // ⚠️ 必须排除 .msg-steer：它同样带 .msg-user 类（视觉上也是一条用户消息），
-  // 但插话不是「提问」。服务端算 back 用的是 isUserQuestion（排除 OriginSteer），
-  // 前端把 steer 算进去就会数错条数，截错位置。
+  // 计数口径与服务端 nthLastUserQuestionIndex 一致（排除 steer 插话），
+  // 与 syncUserEditButtons 共用 userQuestionRows()，避免两处各算一份而漂移。
   function findEditableUserRow(back) {
-    const rows = ensureCol().querySelectorAll('.msg-user:not(.msg-steer)');
+    const rows = userQuestionRows();
     const i = rows.length - 1 - (Number(back) || 0);
     return (i >= 0 && i < rows.length) ? rows[i] : null;
   }
@@ -3842,9 +4021,10 @@ case 'idle': {
       }
       node = prev;
     }
-    // 清掉流式状态引用（它们指向已被删除的节点）
+    // 这些节点已被移除，指向它们的引用必须作废（与 clearViewState 同理）
     currentTextEl = null; textBuffer = '';
-    reasonEl = null; reasonBuffer = '';
+    reasonEl = null; reasonBuffer = ''; reasonPinned = false;
+    resumeRingEl = null;
     lastReply = '';
     scrollBottom();
   }
@@ -3873,8 +4053,49 @@ case 'idle': {
     currentTextEl = null; textBuffer = '';
     reasonEl = null; reasonBuffer = ''; reasonPinned = false;
     thinkingEl = null; activeToolEl = null; retryEl = null; pendingToolEl = null;
+    resumeRingEl = null; // 漏它 → 「继续」圆环在那之后再也挂不出来（showResumeRing 有 ref 守卫）
     subagentCards.clear();
     lastReply = '';
+  }
+
+  // ---------- 视图状态复位：清屏类操作只有这两个入口 ----------
+  //
+  // ⚠️ 为什么要抽出来：早先「清空聊天列」散落在 6 处（新建会话 / 归档会话 / 归档项目 /
+  // 删会话 / 删项目 / replayHistory），每处各自列一份要复位的引用。漏一项的代价很隐蔽
+  // —— 不抛异常，只是那个元素**从此不再出现**：
+  //   漏 thinkingEl     → 归档后再发消息，第一条回复的「等待模型响应」永远不出现
+  //                      （showThinking 撞上非空 ref 就静默 return）
+  //   漏 activeToolEl   → 工具卡永远转圈（settleActiveTool 是唯一清 .running 的函数）
+  //   漏 resumeRingEl   → 「继续」圆环永久挂不出来（showResumeRing 同款守卫）
+  //   漏 retryEl        → 「正在重试」横幅把文字写进已脱离文档的节点
+  // 清单式复位天然会漏，所以收敛成单一入口。
+
+  // clearRunVisuals 只复位「本轮运行态」的可视元素，不动消息列与文本节点。
+  // 用于 idle / error / busy / ready —— 这些是「一轮结束」或「被新一轮取代」，历史要留着。
+  function clearRunVisuals() {
+    removeThinking();
+    removeRetry();
+    removeResumeRing();
+    settleActiveTool();
+    if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
+    resetSubagentCards();
+  }
+
+  // clearViewState 清空整个聊天列（新建 / 归档 / 删除 / 切会话回放）。
+  // opts.keepLastUser：切会话保留 lastUserText（重新生成要用），归档/删除则连它一起清。
+  function clearViewState(opts) {
+    opts = opts || {};
+    messagesEl.innerHTML = '';
+    msgCol = null;
+    // 所有指向「已被 innerHTML='' 销毁的节点」的引用必须一起作废
+    currentTextEl = null; textBuffer = '';
+    reasonEl = null; reasonBuffer = ''; reasonPinned = false;
+    thinkingEl = null; activeToolEl = null; retryEl = null; pendingToolEl = null;
+    resumeRingEl = null;
+    subagentCards.clear();
+    lastReply = '';
+    optimisticBubble = null; // 视图整个没了，引用一并作废
+    if (!opts.keepLastUser) lastUserText = '';
   }
 
   // 把回滚结果转成一句人话（文件为空时说明「没有需要回退的改动」）。
@@ -4133,6 +4354,11 @@ case 'idle': {
       // 模型拿到的仍是 p.text（真实路径 / attachments 暂存路径）——显示与发送分离。
       addUser(p.display);
       p.notes.forEach(function (n) { addInfo(n); });
+      // 记下这条乐观气泡：服务端若在**落盘之前**就失败（另一标签页占着同一会话的
+      // 运行权 15 秒、或会话已不存在），它不会被写进历史，却会留在界面上。
+      // 幻影 .msg-user 会让 userQuestionRows() 多一条 → back = total-1-i 与服务端的
+      // EditableUserMessages 错开一位 → ✎ 按钮改错消息（同一类错位修过一次）。
+      optimisticBubble = lastAddedUserRow();
       // 不等服务端 busy 往返：用户消息发出后，模型尚未回复的空窗立即显示提示。
       showThinking();
     } catch (err) {
@@ -4738,6 +4964,30 @@ case 'idle': {
   settingsOverlay.addEventListener('click', function (e) {
     if (e.target === settingsOverlay) hideWithAnim(settingsOverlay); // 点空白关闭（窗口化时）
   });
+  // 设置 → 常规 → 界面：刷新当前页面。
+  //
+  // 定位成「自救出口」：界面显示异常（样式错乱、弹层卡住、WS 事件没处理）时
+  // 不用去猜该重启服务还是该清缓存。资源是 no-store（server.go 对静态资源设的），
+  // 所以普通 reload 一定拿到当前二进制内嵌的那份 ui.js / app.css。
+  //
+  // ⚠️ 必须在 running 时先确认：连接一断，服务端就取消该轮任务。
+  // 已经改过的文件不会回退（回退只有「回滚 / 编辑重发」两条显式入口才会做），
+  // 但这一轮模型的工作就此中断 —— 值得先问一句。
+  (function bindReloadPage() {
+    const btn = document.getElementById('reload-page');
+    if (!btn) return;
+    btn.addEventListener('click', function () {
+      if (running) {
+        const where = runAway() ? '另一个会话' : '当前会话';
+        if (!confirm('当前' + where + '还有任务在运行。\n刷新会断开连接并打断这一轮'
+          + '（已改过的文件不会回退）。\n\n仍要刷新吗？')) return;
+      }
+      if (pendingUploads) {
+        if (!confirm('还有文件正在上传，刷新会中断上传。\n\n仍要刷新吗？')) return;
+      }
+      location.reload();
+    });
+  })();
   // 「返回工作区」：左上角首项，退出设置（全屏下点空白不可达，这里是主出口）
   document.getElementById('nav-back').addEventListener('click', function () {
     hideWithAnim(settingsOverlay);

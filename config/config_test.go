@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -149,6 +150,31 @@ func TestDefaultPluginsBuiltin(t *testing.T) {
 	}
 	if parallel.Type != "mcp-http" || parallel.Endpoint != "https://search.parallel.ai/mcp" {
 		t.Errorf("parallel_search 配置不对: type=%q endpoint=%q", parallel.Type, parallel.Endpoint)
+	}
+	// 内建插件必须带中文别名：用户反馈「显示代号不好看」——
+	// 界面上要看到「并行搜索」而不是 parallel_search。
+	if parallel.Label() != "并行搜索" {
+		t.Errorf("parallel_search 的显示名期望「并行搜索」，实际 %q", parallel.Label())
+	}
+	for _, p := range plugins {
+		if strings.TrimSpace(p.DisplayName) == "" {
+			t.Errorf("内建插件 %q 缺 display_name（界面会露出英文代号）", p.Name)
+		}
+	}
+}
+
+// Label 优先别名、没有别名才回退到内部标识。
+func TestPluginLabelFallsBackToName(t *testing.T) {
+	for _, c := range []struct{ display, name, want string }{
+		{"并行搜索", "parallel_search", "并行搜索"},
+		{"", "my_tool", "my_tool"},
+		{"   ", "my_tool", "my_tool"},
+		{"  并行搜索  ", "parallel_search", "并行搜索"},
+	} {
+		got := PluginConfig{Name: c.name, DisplayName: c.display}.Label()
+		if got != c.want {
+			t.Errorf("Label(display=%q, name=%q) 期望 %q，实际 %q", c.display, c.name, c.want, got)
+		}
 	}
 }
 

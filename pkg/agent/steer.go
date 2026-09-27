@@ -24,6 +24,18 @@ const maxSteerPending = 8
 // 前端在历史回放时仍能把它渲染成转向样式而不是普通用户消息。
 const OriginSteer = "steer"
 
+// OriginPartial 是「被截断的一轮」的来源标记（llm.Message.Origin，只出现在助手消息上）。
+//
+// 为什么需要它：UnfinishedTurnAnchor 判断「最后一轮是否完整结束」，原先只看
+// 「有正文且没有工具调用」→ 判定为终稿。但用户**在模型流式吐字时按 Esc**
+// （最常见的打断姿势）会走 recordPartialTurn，落下一条**纯文本**助手消息 ——
+// 形状与真终稿一模一样，于是被误判成「已完成」，「继续」圆环永远挂不出来。
+// 带工具调用的半截轮次本来就因为 hasToolUse 而判为未完成，所以只有纯文本这条路是漏的。
+//
+// 它要落盘（页面刷新 / 进程重启后仍要算得出来），因此是稳定字符串，不能随手改。
+// 读它的地方只有 UnfinishedTurnAnchor；isUserQuestion 只作用于用户消息，不受影响。
+const OriginPartial = "partial"
+
 // SteerResult 是 Steer 的三态结论：调用方（WS 层）据此决定回什么。
 // 「没人接收」与「排不下」不能混成一件事 —— 前者该另起一轮，
 // 后者只能告诉用户等一下；静默丢弃或顺手另起一轮都会打断正在跑的任务。

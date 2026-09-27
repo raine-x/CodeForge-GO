@@ -169,7 +169,8 @@ func (p *Policy) Evaluate(toolName, action, payload string) (Decision, string) {
 	// 2) 自主模式：除黑名单外全部自动通过 —— 不走规则、不问插件强制审批、
 	// 不弹人工审批（越界的放行判定由执行器按模式处理，见 executor.escalate）。
 	if mode == ModeAuto {
-		return Allow, "自主模式自动放行：" + toolName
+		// ⚠️ 同 4) 的理由：reason 会进审批弹窗的悬停提示，不能带工具代号。
+		return Allow, "自主模式自动放行"
 	}
 
 	// 3) 插件声明的强制审批工具
@@ -182,7 +183,12 @@ func (p *Policy) Evaluate(toolName, action, payload string) (Decision, string) {
 	if mode != ModeReadOnly {
 		for _, r := range rules {
 			if matchAny(r.Tools, toolName) && matchAny(r.Actions, subject) {
-				return r.Decision, "命中规则：" + toolName
+				// ⚠️ 这里**刻意不带工具代号**（早先返回 "命中规则：" + toolName，
+				// 悬停提示里就出现了「命中规则：write_file」）。
+				// 项目自己的纪律是「工具代号是给系统调用的内部名称，界面显示的是中文」
+				// （见 agent/prompt.go 与 docs/hitl-approval-phrases.md）。
+				// 排查不受影响：AuditEntry 本来就单独记 Tool 字段。
+				return r.Decision, "命中安全规则（该操作需要人工确认）"
 			}
 		}
 	}

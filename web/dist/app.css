@@ -903,6 +903,12 @@ body.has-bg .settings-card { background: transparent; }
 .model-item + .model-item { border-top: 1px solid var(--border); }
 .mi-main { flex: 1; min-width: 0; }
 .mi-name { font-size: 13.5px; font-weight: 600; }
+/* 有别名时，内部标识退成同行末尾的小字：主文案是中文别名，标识仍一眼可见
+   （排查工具路由 / 改配置时要靠它）。 */
+.mi-name .mi-alias {
+  font-size: 11.5px; font-weight: 400; font-family: var(--mono);
+  color: var(--text-dim); margin-left: 6px;
+}
 .mi-id { font-size: 12px; color: var(--text-dim); font-family: var(--mono); margin-top: 2px; }
 .mi-badge {
   font-size: 11px; color: var(--text-dim);
@@ -1090,6 +1096,11 @@ body.has-bg .settings-card { background: transparent; }
 .form-grid { display: flex; flex-direction: column; gap: 14px; padding: 6px 0 2px; }
 .f-field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; color: var(--text-dim); }
 .f-field > span { font-weight: 600; }
+/* 字段名下的补充说明（「留空则…」「不要改」）。默认不换行也不撑高布局。 */
+.f-hint {
+  font-weight: 400; font-size: 11.5px; font-style: normal;
+  color: var(--text-dim); opacity: .8; margin-left: 6px;
+}
 .f-field input, .f-field select {
   border: 1px solid var(--border);
   background: var(--bg-elev-2); color: var(--text);
@@ -1580,6 +1591,18 @@ body.bg-dark .msg-user.msg-steer .bubble { border-left-color: #f6b8ce; }
 }
 @keyframes toolSpin { to { transform: rotate(360deg); } }
 
+/* 工具未执行（失败 / 被策略拒绝 / 审批被驳回）：卡片末尾的 ⛔ + 整卡转 danger 色。
+   卡片文案是过去式（「编辑 x.go」），没有这个标记就与成功卡片长得一模一样。 */
+.tool-denied {
+  margin-left: 5px;
+  font-size: 12.5px; line-height: 1;
+  flex: none;
+  color: var(--danger);
+}
+.msg-tool.denied { color: var(--danger); }
+.msg-tool.denied .diffstat.add { color: var(--text-dim); background: transparent; }
+.msg-tool.denied.clickable:hover { color: var(--danger); }
+
 /* 用户消息内 @提及（@技能名 / @文件名）：蓝色高亮 */
 .at-mention {
   color: var(--accent);
@@ -1699,6 +1722,9 @@ body.bg-dark .msg-user.msg-steer .bubble { border-left-color: #f6b8ce; }
 .approval-text { font-size: 13px; color: var(--text); }
 /* 审批来自后台运行的其它会话：用浅色边区分，提醒用户这不是当前会话的操作 */
 .msg-approval.from-other { border-color: var(--accent); background: var(--accent-dim); }
+/* 子智能体发起的审批：与主智能体的卡片区分开。并行委派时界面上会同时挂多张，
+   批错那张照样授权一次真实的、不同的写入 —— 必须一眼看出归属。 */
+.msg-approval.from-subagent { border-style: dashed; }
 .approval-btns { display: flex; gap: 8px; }
 .approval-btn {
   border: none; border-radius: 10px;
@@ -1708,6 +1734,12 @@ body.bg-dark .msg-user.msg-steer .bubble { border-left-color: #f6b8ce; }
 .approval-btn.approve { background: var(--accent-solid); color: var(--on-accent); }
 .approval-btn.approve:hover { filter: brightness(1.1); }
 .approval-btn.reject { background: var(--bg-elev-2); color: var(--text); border: 1px solid var(--border); }
+/* 已作废的审批条：任务被打断 / 出错 / 连接重连后，原请求在服务端已不存在。
+   必须一眼看出「这张点不动了」—— 否则用户点了会看到「已批准」而实际什么都没发生。 */
+.msg-approval.expired { opacity: .55; border-style: dashed; }
+.msg-approval.expired .approval-text { color: var(--text-dim); }
+.msg-approval.expired .approval-btn { opacity: .5; cursor: not-allowed; }
+.msg-approval.expired .approval-btn:hover { filter: none; }
 
 /* 思考中提示（浅灰 + 动态点） */
 .msg-thinking {
@@ -1880,11 +1912,15 @@ body.bg-dark .msg-user.msg-steer .bubble { border-left-color: #f6b8ce; }
 #composer-wrap.composer-no-anim { transition: none; }
 
 /* ---------- 内置目录选择器（系统对话框不可用时） ---------- */
+/* ⚠️ z-index 必须**高于** .settings-overlay(300)：选择器有不少入口就设在面板里
+   （设置 → 外观 → 选背景图），而它挂在 document.body 上、与设置面板是兄弟节点 ——
+   200 会被整个设置面板盖住，表现为「弹出了选择器却看不见 / 点不到」（2026-09-27 反馈）。
+   .top-banner(9999) 仍在其上是有意的：通知横幅任何时候都该看得见。 */
 #picker-overlay {
   position: fixed; inset: 0;
   background: rgba(31, 36, 48, .35);
   display: flex; align-items: center; justify-content: center;
-  z-index: 200;
+  z-index: 400;
 }
 #picker-overlay.hidden { display: none; }
 .picker-modal {
@@ -1913,6 +1949,16 @@ body.bg-dark .msg-user.msg-steer .bubble { border-left-color: #f6b8ce; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .picker-item:hover { background: var(--bg-elev-2); }
+/* 「.. 返回上一级」：与普通目录项区分开（它是导航不是目标），
+   并用分隔线标出「上面一行以上不属于当前目录」。 */
+.picker-item.picker-up {
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  margin-bottom: 4px;
+  padding-bottom: 10px;
+}
+.picker-item.picker-up:hover { color: var(--text); }
 /* 文件模式：选中项高亮（目录模式不用） */
 .picker-item.sel { background: var(--accent-dim); color: var(--accent); }
 .picker-empty { padding: 16px; text-align: center; font-size: 13px; color: var(--text-dim); }

@@ -269,6 +269,7 @@ const todosSrc = goFile('pkg/agent/todos.go');
 const wsSrc = goFile('pkg/server/ws_handler.go');
 const termuxSrc = goFile('pkg/server/termux.go');
 const appearanceSrc = goFile('pkg/server/appearance.go');
+const toolsSrc = goFile('pkg/tools/tool.go') + goFile('pkg/tools/scope.go');
 const appearanceCode = goCode('pkg/server/appearance.go');
 // 剥掉 ui.js 的行注释（同一理由：注释里会引用被替换掉的旧写法）
 const uiCode = uiSrc.replace(/^\s*\/\/.*$/gm, '');
@@ -532,10 +533,10 @@ check('页面加载自动回放历史时不做过渡（composer-no-anim）',
 check('ready 自动恢复前重新武装「直接落位」标记',
   // 落位标记由 restoreStartSession 统一设：不论走 ?s= 深链还是回退到最近会话，
   // 开场回放都不该让输入卡片滑一下。
-  /case 'ready':[\s\S]{0,400}?restoreStartSession\(\)/.test(uiSrc) &&
+  /case 'ready':[\s\S]{0,900}?restoreStartSession\(\)/.test(uiSrc) &&
   /function restoreStartSession\(\)\s*\{[\s\S]{0,200}?composerSnap\s*=\s*true;/.test(uiSrc));
 check('用户发言走平滑下放（submit 清掉落位标记后 addUser）',
-  /composerSnap\s*=\s*false;[\s\S]{0,300}?addUser\(p\.display\)/.test(uiSrc));
+  /composerSnap\s*=\s*false;[\s\S]{0,600}?addUser\(p\.display\)/.test(uiSrc));
 
 // ---------- 8. 输入框 @ 提及：技能 + 插件 ----------
 // 输入 @ 弹出面板，同时列「技能」和「内置插件」两组；不含 MCP 服务。
@@ -545,8 +546,209 @@ group('输入框 @ 提及：技能 + 内置插件');
 check('同时拉技能与内置插件列表（不含 MCP 服务）',
   /fetch\('\/api\/skills'\)/.test(uiSrc) && /fetch\('\/api\/builtin-plugins'\)/.test(uiSrc));
 
-// ---------- 8.5 ＋菜单 / @文件 stage / @高亮（2026-09-14） ----------
-group('＋菜单与 @文件');
+group('内置目录选择器：层级与层级可见性');
+
+check('选择器层级高于设置面板（否则从设置里弹出时看不见）',
+  // #picker-overlay 挂在 document.body 上、与 .settings-overlay 是兄弟节点；
+  // 早先 z-index 200 < 设置面板的 300，于是「设置 → 外观 → 选背景图」
+  // 弹出的选择器被整个设置面板盖住（2026-09-27 反馈）。
+  /#picker-overlay \{[\s\S]{0,200}?z-index: 400;/.test(css) &&
+  /\.settings-overlay \{[\s\S]{0,200}?z-index: 300;/.test(css));
+check('「.. 返回上一级」置顶，且由服务端给的 parent 驱动',
+  // 父目录在服务端算：根目录（/ 与 C:\）、UNC 前缀、结尾分隔符各平台规则不同，
+  // 前端自己切字符串会在 Termux / Windows 上错位。
+  /const parent = data\.parent \|\| '';/.test(uiSrc) &&
+  /parent && parent !== \(data\.path \|\| ''\)/.test(uiSrc) &&
+  /📂 \.\. 返回上一级/.test(uiSrc) &&
+  /className = 'picker-item picker-up'/.test(uiSrc) &&
+  /browse\(parent\)/.test(uiSrc));
+check('在根目录上不显示「..」（parent 为空即隐藏）',
+  /if \(parent && parent !== \(data\.path \|\| ''\)\) \{/.test(uiSrc));
+check('空态提示排除「..」那一行（否则空目录看起来像漏了内容）',
+  /querySelectorAll\('\.picker-item:not\(\.picker-up\)'\)/.test(uiSrc) &&
+  !/if \(!list\.children\.length\)/.test(uiSrc));
+check('「..」行有区分样式（是导航不是目标）',
+  /\.picker-item\.picker-up \{/.test(css));
+
+group('MCP 服务的显示别名');
+
+check('插件配置有 display_name（标识与文案分开）',
+  /DisplayName\s+string\s+`yaml:"display_name"`/.test(
+    fs.readFileSync(path.join(__dirname, '../..', 'config/config.go'), 'utf8')));
+check('Label 优先别名、无别名回退到标识',
+  /func \(p PluginConfig\) Label\(\) string/.test(
+    fs.readFileSync(path.join(__dirname, '../..', 'config/config.go'), 'utf8')));
+check('内建插件都配了中文别名（用户反馈「显示代号不好看」）',
+  /display_name: 并行搜索/.test(
+    fs.readFileSync(path.join(__dirname, '../..', 'config/plugins.yaml'), 'utf8')));
+check('接口下发 display_name，但仍原样下发 name 供定位',
+  /"display_name": p\.Label\(\)/.test(
+    fs.readFileSync(path.join(__dirname, '../..', 'pkg/server/api_handlers.go'), 'utf8')));
+check('侧栏与设置列表用显示名，标识退到 title / 小字',
+  /nm\.textContent = \(p\.display_name \|\| p\.name\)/.test(uiSrc) &&
+  /const label = p\.display_name \|\| p\.name;/.test(uiSrc) &&
+  /alias\.className = 'mi-alias'/.test(uiSrc) &&
+  /\.mi-name \.mi-alias \{/.test(css));
+check('启停 / 删除仍按内部标识（显示名只是文案，不能拿去定位）',
+  /togglePlugin\(p\.name, !p\.configured\)/.test(uiSrc) &&
+  /deletePlugin\(p\.name\)/.test(uiSrc));
+check('添加表单有「显示名称」字段并随请求提交',
+  /id="mcp-f-display"/.test(htmlSrc) &&
+  /display_name: displayName,/.test(uiSrc) &&
+  /document\.getElementById\('mcp-f-display'\)\.value = '';/.test(uiSrc));
+
+group('设置 → 常规：刷新页面');
+
+check('常规页有「界面」卡片与刷新按钮',
+  /id="reload-page"/.test(htmlSrc) &&
+  /<div class="row-title">界面<\/div>/.test(htmlSrc));
+check('点击后真的重载当前页面',
+  /function bindReloadPage\(\)/.test(uiSrc) &&
+  /location\.reload\(\);/.test(uiSrc));
+check('运行中刷新要先确认（连接一断服务端就取消该轮）',
+  /if \(running\) \{[\s\S]{0,400}?confirm\(/.test(uiSrc) &&
+  /打断这一轮/.test(uiSrc) &&
+  /已改过的文件不会回退/.test(uiSrc));
+check('上传中刷新也要确认',
+  /if \(pendingUploads\) \{[\s\S]{0,200}?confirm\(/.test(uiSrc));
+check('说明文字讲清「资源不走缓存」',
+  // 服务端对静态资源设的是 Cache-Control: no-store（pkg/server/server.go），
+  // 所以不需要 cache-busting 参数，普通 reload 就能拿到当前二进制内嵌的那份资源。
+  /资源不走浏览器缓存/.test(htmlSrc) &&
+  /Cache-Control", "no-store"/.test(
+    fs.readFileSync(path.join(__dirname, '../..', 'pkg/server/server.go'), 'utf8')));
+
+group('工具卡片的失败标记（⛔）');
+
+check('tool_result 必须读 result.success（不看就分不出失败）',
+  // 卡片文案在 tool_call 阶段就用过去式写死，徽标/diff 用的还是预演结果；
+  // 不看 result.success 的话 Deny、「未找到 old_string」、「用户拒绝」全渲染成成功。
+  /settleActiveTool\(!!\(ev\.result && ev\.result\.success === false\)\)/.test(uiSrc));
+check('失败时追加 ⛔ 且只追加一次', /className = 'tool-denied'/.test(uiSrc) &&
+  /textContent = '⛔'/.test(uiSrc) &&
+  /if \(!activeToolEl\.querySelector\('\.tool-denied'\)\)/.test(uiSrc));
+check('成功路径刻意一行不改（产品要求）',
+  // settleActiveTool 无参调用 = 成功收尾；只有显式传 true 才加 ⛔
+  /if \(failed\) \{/.test(uiSrc) &&
+  /activeToolEl\.classList\.remove\('running'\);/.test(uiSrc) &&
+  !/success === true/.test(uiSrc));
+check('失败卡片用 danger 色，且 +N 徽标去色（避免「绿色成功」的错觉）',
+  /\.msg-tool\.denied \{ color: var\(--danger\); \}/.test(css) &&
+  /\.msg-tool\.denied \.diffstat\.add \{[^}]*color: var\(--text-dim\)/.test(css));
+
+group('审批卡片的失效处理（⛔ 同批修复）');
+
+check('expireApprovals 作废待决审批（禁用按钮 + 标注已失效）',
+  uiSrc.includes('function expireApprovals()') &&
+  /\.msg-approval:not\(\.decided\):not\(\.expired\)/.test(uiSrc) &&
+  /wrap\.classList\.add\('expired'\)/.test(uiSrc) &&
+  /已失效/.test(uiSrc));
+check('decide 拒绝已失效的卡片（否则点了会谎报「已批准」）',
+  // 服务端 resolve 对未知 id 是静默 no-op，早先这里不查活性就改文案。
+  /if \(wrap\.classList\.contains\('expired'\)\) return;/.test(uiSrc) &&
+  /classList\.add\('decided'\)/.test(uiSrc));
+check('四个终止点都作废审批：idle / error / busy / ready',
+  uiCase('idle').includes('expireApprovals()') &&
+  uiCase('error').includes('expireApprovals()') &&
+  uiCase('busy').includes('expireApprovals()') &&
+  uiCase('ready').includes('expireApprovals()'));
+check('失效样式存在（一眼看出点不动了）',
+  /\.msg-approval\.expired \{[^}]*border-style: dashed/.test(css) &&
+  /\.msg-approval\.expired \.approval-btn \{[^}]*cursor: not-allowed/.test(css));
+
+group('视图状态复位：收敛成单一入口');
+
+check('清屏只有 clearViewState 一个入口（消除 6 处分散清单）',
+  uiSrc.includes('function clearViewState(opts)') &&
+  (uiSrc.match(/messagesEl\.innerHTML = '';/g) || []).length === 1 &&
+  // 唯一的内联清屏必须就在 clearViewState 里
+  /function clearViewState\(opts\)[\s\S]{0,400}?messagesEl\.innerHTML = '';/.test(uiSrc));
+check('clearViewState 作废全部指向已销毁节点的引用',
+  // 漏 thinkingEl → 归档后再发消息，「等待模型响应」永不出现（showThinking 有 ref 守卫）
+  // 漏 resumeRingEl → 「继续」圆环永久挂不出来（showResumeRing 同款守卫）
+  /function clearViewState\(opts\)[\s\S]{0,600}?thinkingEl = null; activeToolEl = null; retryEl = null; pendingToolEl = null;/.test(uiSrc) &&
+  /function clearViewState\(opts\)[\s\S]{0,600}?resumeRingEl = null;/.test(uiSrc) &&
+  /function clearViewState\(opts\)[\s\S]{0,700}?optimisticBubble = null;/.test(uiSrc));
+check('切会话保留 lastUserText，归档/删除才清（两处旧行为不同）',
+  /clearViewState\(\{ keepLastUser: true \}\)/.test(uiSrc) &&
+  /if \(!opts\.keepLastUser\) lastUserText = '';/.test(uiSrc));
+check('resetStreamRefs 也作废 resumeRingEl（edit 帧后视图即将重建）',
+  /function resetStreamRefs\(\)[\s\S]{0,400}?resumeRingEl = null;/.test(uiSrc));
+check('truncate 路径同样作废 resumeRingEl',
+  /function truncateAfterEditableMessage[\s\S]{0,700}?resumeRingEl = null;/.test(uiSrc));
+check('一轮收尾用 clearRunVisuals（idle/error/ready 共用）',
+  uiSrc.includes('function clearRunVisuals()') &&
+  uiCase('idle').includes('clearRunVisuals()') &&
+  uiCase('error').includes('clearRunVisuals()') &&
+  uiCase('ready').includes('clearRunVisuals()'));
+check('busy 不用 clearRunVisuals 全量（紧接着要 showThinking，会被拆掉）',
+  !uiCase('busy').includes('clearRunVisuals()') &&
+  uiCase('busy').includes('settleActiveTool()') &&
+  uiCase('busy').includes('pendingToolEl'));
+check('ready 必须收尾工具卡（漏了就是一次网络抖动后永久转圈）',
+  uiCase('ready').includes('clearRunVisuals()'));
+
+group('幻影气泡回滚（避免 ✎ 改错消息）');
+
+check('addUser 返回新建的行（供回滚）',
+  /function addUser\(text\)[\s\S]{0,700}?return row;/.test(uiSrc));
+check('提交时记下乐观气泡',
+  /optimisticBubble = lastAddedUserRow\(\);/.test(uiSrc));
+check('busy 到达即视为已落库、清掉引用（此刻的 error 不该删用户的话）',
+  /case 'busy':[\s\S]{0,700}?optimisticBubble = null;/.test(uiSrc));
+check('error 与 idle 收尾都回滚未落库的气泡',
+  uiCase('error').includes('dropOptimisticBubble()') &&
+  uiCase('idle').includes('dropOptimisticBubble()'));
+check('回滚后重挂编辑按钮（少一条用户消息 → back 序号全体前移）',
+  /function dropOptimisticBubble\(\)[\s\S]{0,500}?editableBacks = new Set\(\);[\s\S]{0,120}?syncUserEditButtons\(\);/.test(uiSrc));
+check('已脱离文档的气泡不重复移除',
+  /if \(!el\.isConnected\) return false;/.test(uiSrc));
+
+group('history 帧的会话守卫（防视图被拽到别的会话）');
+
+check('Agent Event 带 session_id（Agent 层不填，由 WS 层统一补）',
+  /SessionID\s+string\s+`json:"session_id,omitempty"`/.test(agentSrc) &&
+  /ev\.SessionID = sessionID/.test(wsSrc));
+check('前端记账「我请求的那一帧 history」',
+  uiSrc.includes('awaitingHistoryFor') &&
+  /awaitingHistoryFor = id;/.test(extractFunction(uiSrc, 'loadSession')));
+check('非请求触发且会话不匹配的 history 必须被丢弃',
+  // 场景：A 会话编辑重发 → 点 B → 服务端补的 historyEvent(A) 把整屏拽回 A。
+  /if \(ev\.session_id && awaitingHistoryFor !== ev\.session_id &&[\s\S]{0,80}?ev\.session_id !== sessionID\)/.test(uiSrc) &&
+  /另一个会话的历史更新已忽略/.test(uiSrc));
+check('请求触发的那一帧必须放行（切会话就靠它）',
+  /awaitingHistoryFor = null;\s*\n\s*pendingEdit = false;\s*\n\s*replayHistory\(ev\);/.test(uiSrc));
+check('老服务端不带 session_id 时按原样放行（不因升级卡住）',
+  /if \(ev\.session_id &&/.test(uiSrc));
+check('edit 帧的守卫终于生效（此前 session_id 恒为空，是死代码）',
+  uiCase('edit').includes('ev.session_id === sessionID') &&
+  uiCase('edit').includes('resetStreamRefs()'));
+
+group('子智能体审批的身份标识');
+
+check('SubagentScope 带 TaskID，Runner 注入时填上',
+  /TaskID string/.test(toolsSrc) &&
+  /tools\.WithSubagentScope\(ctx, tools\.SubagentScope\{[\s\S]{0,120}?TaskID:\s*task\.ID/.test(
+    fs.readFileSync(path.join(__dirname, '../..', 'pkg/agent/subagent.go'), 'utf8')));
+check('身份与围栏是两个 accessor（explore 不必声明 paths）',
+  // SubagentScopeFrom 的 ok 依赖 len(Allowed)>0；用它取身份会让无 paths 的
+  // explore 子任务把 TaskID 丢掉，审批卡退回「不知道是谁要的」。
+  /func SubagentIdentityFrom\(ctx context\.Context\) \(id, mode string, ok bool\)/.test(toolsSrc) &&
+  /SubagentIdentityFrom\(ctx\)/.test(
+    fs.readFileSync(path.join(__dirname, '../..', 'pkg/tools/executor.go'), 'utf8')));
+check('ApprovalRequest 带 subagent_id/mode（omitempty）',
+  /SubagentID string `json:"subagent_id,omitempty"`/.test(toolsSrc));
+check('hitl_request 帧透传子任务身份',
+  /"subagent_id":\s*req\.SubagentID/.test(wsSrc) &&
+  /"subagent_mode":\s*req\.SubagentMode/.test(wsSrc));
+check('审批卡显示「子任务 X · 探索/实现」',
+  /const subLabel = req\.subagent_id/.test(uiSrc) &&
+  /子任务 /.test(uiSrc) &&
+  /req\.subagent_mode === 'implement' \? ' · 实现' : ' · 探索'/.test(uiSrc));
+check('子智能体审批卡有区分样式（并行委派时多张并存）',
+  /\.msg-approval\.from-subagent \{[^}]*border-style: dashed/.test(css));
+
+// ---------- 8.5 ＋菜单 / @文件 stage / @高亮（2026-09-14） ----------group('＋菜单与 @文件');
 check('＋菜单含「当前目录的文件」入口（内置选择器·文件模式）',
   /more-browse-workspace/.test(uiSrc) && /more-browse-workspace/.test(
     fs.readFileSync(path.join(__dirname, '../dist/index.html'), 'utf8')));
@@ -681,18 +883,23 @@ group('任务等待提示');
 check('等待文案为「等待模型响应」',
   /等待模型响应/.test(uiSrc) && !/innerHTML = '思考中/.test(uiSrc));
 check('用户发送后立即显示等待提示',
-  /addUser\(p\.display\);[\s\S]{0,260}?showThinking\(\)/.test(uiSrc));
+  // 窗口放宽：addUser 与 showThinking 之间新增了「记下乐观气泡」的注释（2026-09-27）。
+  /addUser\(p\.display\);[\s\S]{0,700}?showThinking\(\)/.test(uiSrc));
 check('busy 事件显示等待提示',
   /case 'busy':[\s\S]{0,600}?showThinking\(\)/.test(uiSrc));
 check('tool_result 后模型再次等待时显示提示',
-  /case 'tool_result':[\s\S]{0,350}?if \(running\) showThinking\(\)/.test(uiSrc));
+  // 窗口放宽：tool_result 分支里现在多了失败判定的注释（2026-09-27），
+  // 350 字符刚好卡在边界上，改动无关的行就会假失败。
+  /case 'tool_result':[\s\S]{0,600}?if \(running\) showThinking\(\)/.test(uiSrc));
 check('reasoning/text/tool_call 到来时移除等待提示',
   uiCase('reasoning').includes('removeThinking()') &&
   uiCase('text').includes('removeThinking()') &&
   uiCase('tool_call').includes('removeThinking()'));
 check('idle/error/hitl 结束或暂停时移除等待提示',
-  uiCase('idle').includes('removeThinking()') &&
-  uiCase('error').includes('removeThinking()') &&
+  // idle/error 现在走 clearRunVisuals()（内含 removeThinking），
+  // hitl_request 仍直接调 —— 两种写法都算「移除了等待提示」。
+  (uiCase('idle').includes('removeThinking()') || uiCase('idle').includes('clearRunVisuals()')) &&
+  (uiCase('error').includes('removeThinking()') || uiCase('error').includes('clearRunVisuals()')) &&
   uiCase('hitl_request').includes('removeThinking()'));
 
 // ---------- 10. ＋ 更多菜单：添加文件 / Skills（右展） ----------
@@ -1177,13 +1384,25 @@ check('移除「自服务启动累计（重启重新计数）」说明',
 // ---------------------------------------------------------------------------
 group('编辑并重发用户消息');
 
-check('用户消息渲染时把原文存进 dataset（编辑按钮靠它对号）',
+check('用户消息渲染时把原文存进 dataset（编辑时回填输入框要用）',
   /b\.dataset\.rawText = text;/.test(uiSrc));
 check('编辑按钮只对服务端下发的白名单显形（前端不自行推断）',
-  uiSrc.includes('editableByText') && uiSrc.includes('setEditables') &&
-  /const back = editableByText\.get\(raw\);/.test(uiSrc));
+  uiSrc.includes('editableBacks') && uiSrc.includes('setEditables') &&
+  /editableBacks\.has\(back\)/.test(uiSrc));
+check('白名单按 back（位置）定位，不按文本（重复提问会改错消息）',
+  // 旧实现是 Map<text, back>：连着问两句一样的，Map 只留一条、后写的覆盖先写的，
+  // 于是第一条的编辑按钮也拿到最后那条的 back，点下去改错消息。
+  !/editableByText/.test(uiCode) &&
+  /const back = total - 1 - i;/.test(uiSrc) &&
+  /it\.back >= 0/.test(uiSrc));
+check('提问行计数排除 steer 插话，且与定位共用同一个取行函数',
+  /function userQuestionRows\(\)/.test(uiSrc) &&
+  /\.msg-user:not\(\.msg-steer\)/.test(uiSrc) &&
+  /const rows = userQuestionRows\(\);/.test(uiSrc) &&
+  // findEditableUserRow 也必须走它，两处各写一份选择器必然漂
+  /function findEditableUserRow\(back\)[\s\S]{0,220}?userQuestionRows\(\)/.test(uiSrc));
 check('运行中不给编辑入口（上下文正在被消费）',
-  /typeof back === 'number' && !running/.test(uiSrc));
+  /editableBacks\.has\(back\) && !running/.test(uiSrc));
 check('编辑按钮默认隐形、悬停整行显形（CSS 契约）',
   /\.msg-user \.edit-btn \{[\s\S]*?opacity: 0;/.test(css) &&
   /\.msg-user:hover \.edit-btn \{ opacity: 1; \}/.test(css));
@@ -1352,7 +1571,7 @@ check('回滚反馈区分还原 / 删除 / 失败三类计数',
 check('无改动时不谎报「已回退」（明确说没有需要回退的内容）',
   /if \(n === 0\) return '没有需要回退的文件改动';/.test(uiSrc));
 check('切会话时清掉上一个会话的白名单（避免挂错按钮）',
-  /editableByText = new Map\(\);\s*\n\s*syncUserEditButtons\(\);/.test(uiSrc));
+  /editableBacks = new Set\(\);\s*\n\s*syncUserEditButtons\(\);/.test(uiSrc));
 check('一轮结束（idle）后重新挂编辑按钮',
   /case 'idle': \{[\s\S]*?syncUserEditButtons\(\);/.test(uiSrc));
 
@@ -1423,7 +1642,28 @@ check('diff 面板 Esc 只关面板、不误打断任务',
 check('历史回放的卡片按路径向 /api/diff 取 diff',
   extractFunction(uiSrc, 'openToolDiff').includes("'/api/diff?session_id='"));
 check('回放的卡片只带路径、不带 diff 文本（diff 不随历史持久化）',
-  /addTool\(toolLabel\(b\.name, b\.input\), \{ path: toolFilePath\(b\.name, b\.input\) \}\)/.test(uiSrc));
+  !/addTool\([\s\S]{0,160}?JSON\.stringify/.test(uiSrc));
+check('改过的卡片可点开看 diff（role / tabindex / Enter）',
+  extractFunction(uiSrc, 'addTool').includes("setAttribute('role', 'button')") &&
+  extractFunction(uiSrc, 'addTool').includes("setAttribute('tabindex', '0')") &&
+  extractFunction(uiSrc, 'addTool').includes("ev.key === 'Enter'"));
+check('历史回放的卡片带 path（点开时向 /api/diff 取 diff）',
+  // ⚠️ 这里刻意**不**断言路径归一化：前端带的是模型传入的原始路径（历史里存的
+  // 也是原始 Input），归一化由服务端 CheckpointFor 的三级容错负责
+  // （精确 → 绝对化 → 边界后缀，见 pkg/agent/checkpoints.go 的 pathMatchers）。
+  // 前端自己拼绝对路径反而会与「同后缀不同文件」的情况打架。
+  /addTool\(toolLabel\(b\.name, b\.input\), \{ path: toolFilePath\(b\.name, b\.input\) \}\)/.test(uiSrc) &&
+  /function toolFilePath\(name, input\)/.test(uiSrc));
+check('未匹配到记录时不谎报「已被回退」',
+  // 大多数未命中是路径写法不同（模型传相对路径 / 大小写差异），
+  // 改动其实好好地记着 —— 说成「已被回退」是对用户说了假话。
+  /按这个路径没匹配到本会话的改动记录/.test(
+    fs.readFileSync(path.join(__dirname, '../..', 'pkg/server/diff_api.go'), 'utf8')));
+check('服务端路径查找三级容错且落在分隔符边界上',
+  /func pathMatchers\(path, root string\) \[\]func\(string\) bool/.test(
+    fs.readFileSync(path.join(__dirname, '../..', 'pkg/agent/checkpoints.go'), 'utf8')) &&
+  /strings\.HasSuffix\(lp, "\/"\+lower\)/.test(
+    fs.readFileSync(path.join(__dirname, '../..', 'pkg/agent/checkpoints.go'), 'utf8')));
 check('样式契约：只有可点击卡片给手型',
   /\.msg-tool\s*\{[^}]*cursor:\s*default/.test(css) &&
   /\.msg-tool\.clickable, \.msg-tool\.retry \{ cursor: pointer; \}/.test(css));

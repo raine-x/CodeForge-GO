@@ -58,8 +58,8 @@ func TestContinueAfterMaxStepsOnlyGrowsHistory(t *testing.T) {
 // 「继续」不追加用户消息。
 //
 // 旧实现是前端发一句字面量「继续」当普通用户消息，那会在历史里留下一条用户
-// 从未说过的假提问：历史回放时它仍在（用户会问「我什么时候说过继续」），
-// 而且模型分不清「被打断后接着跑」与「用户新提了一个要求」，容易把做完的再做一遍。
+// 从未说过的假提问：历史回放时它仍在，而且模型分不清「被打断后接着跑」
+// 与「用户新提了一个要求」，容易把做完的再做一遍。
 func TestContinueTurnAppendsNoUserMessage(t *testing.T) {
 	var seen []llm.Request
 	a := newEmitTestAgent(t, maxStepsProvider(func(_ context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
@@ -290,4 +290,138 @@ func toolResultIndex(msgs []llm.Message, id string) int {
 		}
 	}
 	return -1
+}
+
+// 纯文本阶段打断时，「继续」圆环必须挂得出来。
+//
+// 这是 2026-09-26 反馈对应的真实故障：用户在模型**流式吐字时**按 Esc（最常见的
+// 打断姿势），recordPartialTurn 落下一条**纯文本**助手消息 —— 形状与真终稿完全
+// 一样，于是 UnfinishedTurnAnchor 判成「已完成」，圆环永远不出现。
+// 带工具调用的半截轮次本来就因 hasToolUse 而判为未完成，所以只有纯文本这条路是漏的。
+func TestUnfinishedTurnAnchorSeesTextOnlyPartialTurn(t *testing.T) {
+	a := newEmitTestAgent(t, maxStepsProvider(func(context.Context, llm.Request) (<-chan llm.StreamEvent, error) {
+		return maxStepsToolStream(), nil
+	}))
+	sess, err := a.History().Create("", "partial")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess.appendMessages(llm.TextMessage(llm.RoleUser, "问题"))
+	a.recordPartialTurn(sess, &llm.AssistantTurn{Text: "我先看一下…然后就"}, "本轮被用户打断")
+	a.save(sess, true) // 落盘：判据要能在页面刷新 / 进程重启后算出来
+
+	if got := a.UnfinishedTurnAnchor(sess.ID); got != 0 {
+		t.Fatalf("纯文本被打断应判为未完成（back=0，圆环挂出来），实际 %d", got)
+	}
+	// 标记必须落盘：判据要能在页面刷新 / 进程重启后算出来。
+	reloaded, ok := NewHistory(a.history.st).Get(sess.ID)
+	if !ok {
+		t.Fatal("重载会话失败")
+	}
+	if len(reloaded.Messages) == 0 {
+		t.Fatal("重载后会话没有消息")
+	}
+	last := reloaded.Messages[len(reloaded.Messages)-1]
+	if last.Origin != OriginPartial {
+		t.Errorf("被截断的一轮必须带 OriginPartial 标记（要落盘），实际 %q", last.Origin)
+	}
+	if got := a.UnfinishedTurnAnchor(sess.ID); got != 0 {
+		t.Fatalf("重载后仍应判为未完成，实际 %d", got)
+	}
+}
+
+// 真正给出终稿（纯文本、无工具调用、未被截断）时，不该挂圆环。
+//
+// 这是与上面那条配对的反例，防止「修 bug 修成永远都提示继续」。
+func TestUnfinishedTurnAnchorIgnoresFinalTextAnswer(t *testing.T) {
+	a := newEmitTestAgent(t, maxStepsProvider(func(context.Context, llm.Request) (<-chan llm.StreamEvent, error) {
+		return maxStepsToolStream(), nil
+	}))
+	sess, err := a.History().Create("", "final")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess.appendMessages(llm.TextMessage(llm.RoleUser, "问题"))
+	sess.appendMessages(llm.AssistantBlocksMessage([]llm.ContentBlock{
+		{Type: llm.BlockText, Text: "已经查完了，结论是这样。"},
+	}))
+	if got := a.UnfinishedTurnAnchor(sess.ID); got != -1 {
+		t.Fatalf("完整终稿应判为已完成（-1，不挂圆环），实际 %d", got)
+	}
+}
+
+// 圆环挂出来之后点它，模型要能看到「这是半截的」并接着写。
+func TestContinueTurnAfterTextInterrupt(t *testing.T) {
+	var seen []llm.Request
+	a := newEmitTestAgent(t, maxStepsProvider(func(_ context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+		seen = append(seen, req)
+		return maxStepsToolStream(), nil
+	}))
+	a.SetMaxSteps(1)
+	sess, err := a.History().Create("", "resume-text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess.appendMessages(llm.TextMessage(llm.RoleUser, "把说明补全"))
+	a.recordPartialTurn(sess, &llm.AssistantTurn{Text: "## 说明\n这是开头"}, "本轮被用户打断")
+
+	seen = nil
+	_ = a.ContinueTurn(context.Background(), sess.ID, func(Event) {})
+	if len(seen) == 0 {
+		t.Fatal("「继续」没有发出请求")
+	}
+	last := seen[len(seen)-1]
+	if !strings.Contains(last.System, "本轮是「继续上一轮」") {
+		t.Error("系统提示应说明这是接着上一轮跑")
+	}
+	// 半截的那段正文必须原样还在上下文里（模型要接着它写，不是从头再来）。
+	found := false
+	for _, m := range last.Messages {
+		for _, b := range m.Content {
+			if b.Type == llm.BlockText && strings.Contains(b.Text, "这是开头") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("半截正文应保留在上下文里，供模型接着写")
+	}
+}
+
+// 同一句话连着问两次时，每条消息的编辑 back 必须各自正确、互不串位。
+//
+// 服务端本来就给对了（两条各有正确 back）；这条用例锁住的是「别为了省事
+// 把 back 写死成按文本查」—— 早先前端用 Map<text, back>，重复文本时后写的
+// 覆盖先写的，于是第一条的编辑按钮也拿到最后那条的 back，点下去改错消息。
+func TestEditableUserMessagesKeepDuplicateTextApart(t *testing.T) {
+	a := newEmitTestAgent(t, maxStepsProvider(func(context.Context, llm.Request) (<-chan llm.StreamEvent, error) {
+		return maxStepsToolStream(), nil
+	}))
+	sess, err := a.History().Create("", "dup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		sess.appendMessages(llm.TextMessage(llm.RoleUser, "继续排查这个问题"))
+		sess.appendMessages(llm.AssistantBlocksMessage([]llm.ContentBlock{
+			{Type: llm.BlockText, Text: "第 " + string(rune('A'+i)) + " 次回答"},
+		}))
+	}
+	refs := a.EditableUserMessages(sess.ID, 3)
+	if len(refs) != 2 {
+		t.Fatalf("应下发 2 条可编辑白名单，实际 %d", len(refs))
+	}
+	// 正序：最后一条 back=0，倒数第二条 back=1。
+	if refs[0].Back != 1 || refs[1].Back != 0 {
+		t.Fatalf("重复文本时两条的 back 必须各自正确，实际 %+v", refs)
+	}
+	// 关键：两条 back 不同，前端按 back 定位才不会串位。
+	if refs[0].Back == refs[1].Back {
+		t.Fatal("两条消息的 back 不应相同")
+	}
+	// 且 RerunFrom 用同一个 back 序号能定位到正确的下标。
+	first, _ := a.History().Get(sess.ID)
+	if got := nthLastUserQuestionIndex(first.Messages, 1); got != refs[0].Index {
+		t.Errorf("back=1 应定位到 index=%d，实际 %d", refs[0].Index, got)
+	}
 }

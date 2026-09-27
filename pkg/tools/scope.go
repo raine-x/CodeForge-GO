@@ -26,6 +26,13 @@ type subagentScopeKey struct{}
 type SubagentScope struct {
 	Allowed []string
 	Mode    string
+	// TaskID 是子任务标识（delegate_subagents 里的 id）。
+	//
+	// 存在的唯一理由：**审批卡要能区分是谁在请求**。一次委派最多并行 5 个子任务，
+	// 它们的审批会同时挂在界面上，而卡片只有中文短语（都是「需要审批：写入文件」）
+	// 与同一个 session_id —— 用户批错那张，照样授权了一次真实的、不同的写入。
+	// 由 SubagentRunner 注入，Executor 透传到 ApprovalRequest。
+	TaskID string
 }
 
 // WithSubagentScope 将子智能体的路径围栏注入 context。
@@ -38,6 +45,19 @@ func WithSubagentScope(ctx context.Context, sc SubagentScope) context.Context {
 func SubagentScopeFrom(ctx context.Context) (SubagentScope, bool) {
 	v, ok := ctx.Value(subagentScopeKey{}).(SubagentScope)
 	return v, ok && len(v.Allowed) > 0
+}
+
+// SubagentIdentityFrom 取出子任务身份（TaskID 与 Mode）。
+//
+// ⚠️ 刻意与 SubagentScopeFrom 分开：那个函数的 ok 依赖 `len(Allowed) > 0`
+// （围栏为空 = 不限制），而身份跟围栏无关 —— explore 子任务不必声明 paths，
+// 用 SubagentScopeFrom 取身份会拿到 ok=false，审批卡就退回成「不知道是谁要的」。
+func SubagentIdentityFrom(ctx context.Context) (id, mode string, ok bool) {
+	v, has := ctx.Value(subagentScopeKey{}).(SubagentScope)
+	if !has || v.TaskID == "" {
+		return "", "", false
+	}
+	return v.TaskID, v.Mode, true
 }
 
 // scopeApprovedKey 是 context 中「本次调用已获人工批准越界」的键类型。

@@ -77,6 +77,14 @@ type ApprovalRequest struct {
 	Reason string `json:"reason,omitempty"`
 	Detail string `json:"detail,omitempty"`
 	Diff   string `json:"diff,omitempty"`
+	// SubagentID 是发起这次审批的子任务 id（omitempty = 主智能体发起的）。
+	//
+	// 一次委派最多并行 5 个子智能体（config.SubagentConcurrencyCap），它们的审批
+	// 会同时挂在界面上。没有这个字段时那些卡片长得**完全一样**（中文短语相同、
+	// session_id 也相同），用户无从分辨，批错那张照样授权一次真实的、不同的写入。
+	SubagentID string `json:"subagent_id,omitempty"`
+	// SubagentMode 同样只给子智能体用：explore / implement。
+	SubagentMode string `json:"subagent_mode,omitempty"`
 }
 
 // Approver 由上层（Web 服务）实现，用于 HITL 人工审批。

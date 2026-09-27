@@ -39,7 +39,15 @@ const (
 
 // Event 是 Agent 推送给前端的统一事件。
 type Event struct {
-	Type        string            `json:"type"`
+	Type string `json:"type"`
+	// SessionID 是本事件所属的会话。
+	//
+	// ⚠️ 它由 WS 层在 emit 闭包里统一填写（见 ws_handler.run），Agent 自己不填。
+	// 之前 Event 没有这个字段，于是前端**无法判断一帧事件是不是当前视图的**：
+	// `case 'history'` 只能无条件重建视图，而 `ws_handler` 在 EventEdit 时会
+	// **主动**补一帧 history（非请求触发）—— 运行中切会话的话，那一帧会把
+	// 整屏拽回旧会话（loadSession 是允许运行中调用的）。
+	SessionID   string            `json:"session_id,omitempty"`
 	Step        int               `json:"step,omitempty"`
 	Text        string            `json:"text,omitempty"`
 	ToolCallID  string            `json:"tool_call_id,omitempty"`
@@ -860,9 +868,14 @@ func (a *Agent) ContinueTurn(ctx context.Context, sessionID string, emit Emitter
 // （ContinueTurn），不截断历史、不回退文件（破坏性的重来走「重新生成」/「编辑重发」）。
 //
 // 判据只看历史形状，不依赖任何内存态（页面刷新、进程重启后都能算）：
-//   - 存在最后一条用户纯文本发言，且它之后**没有**任何「纯文本、无工具调用」的
-//     助手终稿 → 该轮未完成（打断 / 上游报错 / 崩溃 / 刚发出尚未回复），返回 0；
+//   - 存在最后一条用户纯文本发言，且它之后**没有**任何「纯文本、无工具调用、
+//     非截断」的助手终稿 → 该轮未完成（打断 / 上游报错 / 崩溃 / 刚发出尚未回复），
+//     返回 0；
 //   - 已有这样的终稿 → 返回 -1，表示这一轮已经收尾，不需要提示继续。
+//
+// ⚠️ 「非截断」这一条是必需的：recordPartialTurn 落的纯文本半截轮次与真终稿
+// 形状完全相同，不看 OriginPartial 就会把「流式吐字时按 Esc」误判成已完成，
+// 「继续」圆环在最常见的打断场景下反而挂不出来。
 //
 // 返回的是 back（距最后一条用户消息的距离），目前只有 0 / -1 两种取值：
 // 只认「最后一轮」，更早的轮次用「编辑」按钮即可。
@@ -879,6 +892,10 @@ func (a *Agent) UnfinishedTurnAnchor(sessionID string) int {
 	}
 	for _, m := range sess.Messages[idx+1:] {
 		if m.Role != llm.RoleAssistant {
+			continue
+		}
+		// 被截断的一轮不是终稿：正文虽已推给前端，但它是半截的，用户需要「继续」。
+		if m.Origin == OriginPartial {
 			continue
 		}
 		hasToolUse, hasText := false, false
@@ -1348,7 +1365,12 @@ func (a *Agent) recordPartialTurn(sess *Session, turn *llm.AssistantTurn, reason
 	if len(blocks) == 0 {
 		return
 	}
-	sess.appendMessages(llm.AssistantBlocksMessage(blocks))
+	// 标记「这是一轮被截断的回复」：纯文本的半截轮次与真终稿形状完全相同，
+	// 没有这个标记 UnfinishedTurnAnchor 会把它当成「已完成」，「继续」圆环就再也
+	// 挂不出来了（这正是「流式吐字时按 Esc」之后圆环不见的根因）。
+	msg := llm.AssistantBlocksMessage(blocks)
+	msg.Origin = OriginPartial
+	sess.appendMessages(msg)
 	for _, tc := range recorded {
 		sess.appendMessages(llm.ToolResultMessage(tc.ID, reason, true))
 	}

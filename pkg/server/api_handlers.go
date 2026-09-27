@@ -292,7 +292,20 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 		"root":  root,
 		"path":  target,
 		"items": listTree(target, depth),
+		// parent 供内置选择器渲染「.. 返回上一级」。放在服务端算而不是让前端
+		// 切字符串：根目录（/ 与 C:\）、UNC 前缀、结尾分隔符这些规则各平台不同，
+		// 前端自己拼会在 Termux/Windows 上错位。已经在根上时返回空串，前端据此隐藏该行。
+		"parent": parentDir(target),
 	})
+}
+
+// parentDir 返回上一级目录；已在根上时返回空串。
+func parentDir(dir string) string {
+	p := filepath.Dir(dir)
+	if p == dir {
+		return "" // 根目录的上一级就是自己
+	}
+	return p
 }
 
 // listTree 递归列出目录内容。
@@ -694,15 +707,18 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			out = append(out, map[string]any{
-				"name":        p.Name,
-				"description": p.Description,
-				"type":        p.Type,
-				"command":     p.Command,
-				"args":        p.Args,
-				"endpoint":    p.Endpoint,
-				"path":        p.Path,
-				"enabled":     p.Enabled && isLoaded,
-				"configured":  p.Enabled,
+				"name": p.Name,
+				// display_name 是界面文案（可为空，前端回退到 name）。
+				// name 仍原样下发：增删改查、工具路由都以它为准，前端不要拿显示名去定位。
+				"display_name": p.Label(),
+				"description":  p.Description,
+				"type":         p.Type,
+				"command":      p.Command,
+				"args":         p.Args,
+				"endpoint":     p.Endpoint,
+				"path":         p.Path,
+				"enabled":      p.Enabled && isLoaded,
+				"configured":   p.Enabled,
 			})
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"items": out})
@@ -712,6 +728,7 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
 		// （type=mcp-http，需 http/https 绝对 URL 端点），默认启用。
 		var body struct {
 			Name        string            `json:"name"`
+			DisplayName string            `json:"display_name"`
 			Type        string            `json:"type"`
 			Command     string            `json:"command"`
 			Args        []string          `json:"args"`
@@ -761,7 +778,9 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
 			desc = "MCP 服务"
 		}
 		p := config.PluginConfig{
-			Name:        body.Name,
+			Name: body.Name,
+			// 显示名留空时后面 Label() 会回退到 Name，不必在这里编一个。
+			DisplayName: strings.TrimSpace(body.DisplayName),
 			Type:        body.Type,
 			Enabled:     true,
 			Description: desc,

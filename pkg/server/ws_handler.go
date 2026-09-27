@@ -392,6 +392,12 @@ func (c *wsClient) run(sessionID, thinking, trigger, label string, agentFn func(
 		if ev.Type == agent.EventError && ctx.Err() != nil {
 			return
 		}
+		// 统一给事件打上会话号：Agent 层不知道会话是谁（一个 Agent 服务多个会话），
+		// 由 WS 层在这里补。前端靠它判断「这帧是不是当前视图的」——
+		// 之前 Event 没有这个字段，case 'history' 只能无条件重建视图，
+		// 而下面 EventEdit 时主动补的那一帧是非请求触发的，
+		// 运行中切会话就会把整屏拽回旧会话（loadSession 允许运行中调用）。
+		ev.SessionID = sessionID
 		// 历史刚被截断（编辑重发 / 断点重试）：除了转发这一帧，还要下发一份
 		// **权威快照**，让前端按库里的样子重建视图。
 		//
@@ -714,6 +720,10 @@ func (a *wsApprover) RequestApproval(ctx context.Context, req tools.ApprovalRequ
 		"reason":      req.Reason,
 		"detail":      req.Detail,
 		"diff":        req.Diff,
+		// 子任务身份：并行委派时界面上会同时挂多张审批卡，靠它区分
+		// （中文短语与 session_id 都相同，光看那两个分不出来）。
+		"subagent_id":   req.SubagentID,
+		"subagent_mode": req.SubagentMode,
 	})
 
 	select {
