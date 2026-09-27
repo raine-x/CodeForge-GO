@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"codeforge/config"
 	"codeforge/pkg/llm"
 )
 
@@ -93,11 +94,16 @@ func TestMaxStepsSnapshotAndHistory(t *testing.T) {
 	}
 }
 
-func TestMaxStepsSubagentCap(t *testing.T) {
+// TestMaxStepsSubagentInheritsParent 锁住「子智能体步数默认跟随主 loop」。
+//
+// 早先这里写死 8：探索类任务经常要十几步，8 步会在半途硬停，模型被迫交一份
+// 「还没看完」的结论，主智能体再接着做等于把活儿又干一遍。现在默认继承，
+// 显式配置（subagents.max_steps）才覆盖。
+func TestMaxStepsSubagentInheritsParent(t *testing.T) {
 	a := newEmitTestAgent(t, maxStepsProvider(func(context.Context, llm.Request) (<-chan llm.StreamEvent, error) {
 		return maxStepsToolStream(), nil
 	}))
-	for _, tc := range []struct{ parent, child int }{{1, 1}, {8, 8}, {100, 8}, {0, 8}} {
+	for _, tc := range []struct{ parent, child int }{{1, 1}, {8, 8}, {12, 12}, {0, 8}} {
 		a.SetMaxSteps(tc.parent)
 		child := a.newSubagent("explore")
 		steps := 0
@@ -112,6 +118,71 @@ func TestMaxStepsSubagentCap(t *testing.T) {
 		if child.MaxSteps() != tc.child || steps != tc.child || err == nil {
 			t.Fatalf("parent=%d child=%d steps=%d err=%v", tc.parent, child.MaxSteps(), steps, err)
 		}
+	}
+}
+
+// TestMaxStepsSubagentPolicyOverride 显式配置优先，且越界值按硬上限收敛。
+func TestMaxStepsSubagentPolicyOverride(t *testing.T) {
+	a := newEmitTestAgent(t, maxStepsProvider(func(context.Context, llm.Request) (<-chan llm.StreamEvent, error) {
+		return maxStepsToolStream(), nil
+	}))
+	for _, tc := range []struct{ parent, want, policy int }{
+		{25, 4, 4},                        // 显式调小
+		{25, 25, 0},                       // 未配置 = 继承
+		{25, 25, -1},                      // 负数同样按「继承」处理
+		{25, config.SubagentStepCap, 999}, // 越界收敛到硬上限，不拒绝
+	} {
+		a.SetMaxSteps(tc.parent)
+		a.SetSubagentPolicy(SubagentPolicy{MaxConcurrent: 1, MaxSteps: tc.policy}.Normalize())
+		if got := a.newSubagent("explore").MaxSteps(); got != tc.want {
+			t.Errorf("parent=%d policy=%d 期望 %d，实际 %d", tc.parent, tc.policy, tc.want, got)
+		}
+	}
+}
+
+// TestSubagentInheritsContextWindow 锁住上下文窗口的继承。
+//
+// contextWindow 是 Agent 上的 atomic，New() 不填；不显式继承的话子智能体
+// 拿到的窗口是 0 → 压缩线回退到写死的 context_token_budget（120000）。
+// 模型真实窗口若小于该值，子智能体就会堆到上游拒绝才压缩 → 子任务直接失败。
+func TestSubagentInheritsContextWindow(t *testing.T) {
+	a := newEmitTestAgent(t, maxStepsProvider(func(context.Context, llm.Request) (<-chan llm.StreamEvent, error) {
+		return maxStepsToolStream(), nil
+	}))
+	a.SetContextWindow(32768)
+	if got := a.newSubagent("explore").ContextWindow(); got != 32768 {
+		t.Fatalf("子智能体上下文窗口期望继承 32768，实际 %d", got)
+	}
+	// 主智能体窗口未知时也不该给子智能体编一个出来。
+	a.SetContextWindow(0)
+	if got := a.newSubagent("explore").ContextWindow(); got != 0 {
+		t.Fatalf("窗口未知时期望 0，实际 %d", got)
+	}
+}
+
+// TestSubagentDropsBuiltinPlugins 锁住「内置插件开关不继承」。
+//
+// 子智能体白名单里没有 create_skill / delegate_subagents，继承了开关就会让
+// System Prompt 注入「你可以创建技能 / 委派子智能体」，模型反复调用不存在的
+// 工具直到步数耗尽。
+func TestSubagentDropsBuiltinPlugins(t *testing.T) {
+	a := newEmitTestAgent(t, maxStepsProvider(func(context.Context, llm.Request) (<-chan llm.StreamEvent, error) {
+		return maxStepsToolStream(), nil
+	}))
+	a.SetSkillCreatorEnabled(true)
+	a.SetMultiAgentEnabled(true)
+	a.SetPlanEnabled(true)
+	child := a.newSubagent("explore")
+	if got := child.builtinOnSnapshot(); len(got) != 0 {
+		t.Fatalf("子智能体不该继承内置插件开关，实际 %v", got)
+	}
+	// 基础提示词里「委派给子智能体」是通用工作流纪律，保留；
+	// 要断言的是**内置插件注入段**整段消失（它承诺的工具子智能体根本没有）。
+	if s := child.builtinPluginSection(); strings.TrimSpace(s) != "" {
+		t.Fatalf("子智能体不该有内置插件注入段，实际 %q", s)
+	}
+	if s := child.systemPromptFor(&Session{ID: "c"}); strings.Contains(s, "## 内置插件：") {
+		t.Fatal("子智能体的系统提示词里不该出现内置插件注入段")
 	}
 }
 

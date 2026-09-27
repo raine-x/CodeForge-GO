@@ -196,6 +196,20 @@ func (c *wsClient) dispatch(msg wsMessage) {
 			return editErr
 		})
 
+	case "continue_turn":
+		// 「继续」：从断点接着跑最后一轮（打断 / 报错 / 刷新后）。
+		//
+		// 不截断历史、不回退文件，也**不追加任何用户消息** —— 早先的实现是
+		// 前端发一句字面量「继续」，那会在历史里留下一条用户从未说过的假提问。
+		// 破坏性的重来是「重新生成」/「编辑重发」两个显式入口的职责。
+		if msg.SessionID == "" {
+			return
+		}
+		c.stop() // 同 regenerate：先同步打断，再启动新 goroutine
+		go c.run(msg.SessionID, msg.Thinking, "继续上一轮", "", func(ctx context.Context, emit func(agent.Event)) error {
+			return c.srv.agent.ContinueTurn(ctx, msg.SessionID, emit)
+		})
+
 	case "retry":
 		// 断点重试：最后一轮没跑完（打断 / 报错 / 刷新页面），保留用户原话，
 		// 只把其后未完成的回复与工具结果截掉重跑。与 edit_user_message 同一套
@@ -609,8 +623,9 @@ func (s *Server) checkpointEvent(sessionID string) map[string]any {
 		// 前端据此在打断 / 报错 / 刷新页面后挂出**「继续」**按钮 —— 判据在服务端算，
 		// 页面刷新后视图是无状态的，前端自己猜不出来。
 		//
-		// ⚠️ 名字必须是 resume 而不是 retry：这个动作是「追加一句『继续』接着跑」，
-		// 不截断历史、不回退文件。破坏性的重来入口只剩「重新生成」与「编辑重发」
+		// ⚠️ 名字必须是 resume 而不是 retry：这个动作是「从断点接着跑」
+		// （Agent.ContinueTurn），不截断历史、不回退文件，也不在历史里追加
+		// 「继续」这句假提问。破坏性的重来入口只剩「重新生成」与「编辑重发」
 		//（2026-09-22 改的语义；字段名到 2026-09-23 才跟上，此前叫 retry_back，
 		// 名字与行为不符，长期共存会误导后续维护）。
 		"resume_back": s.agent.UnfinishedTurnAnchor(sessionID),

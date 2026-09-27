@@ -190,6 +190,94 @@ func TestSubagentPrefsRoundTrip(t *testing.T) {
 	}
 }
 
+// 步数上限：默认 0 = 跟随主循环，视图额外给出「实际会用多少」；
+// 显式设置与负数归零都要落盘生效，且与其它字段互不影响（指针语义）。
+func TestSubagentMaxStepsRoundTrip(t *testing.T) {
+	cfgDir := t.TempDir()
+	deps := newTestDepsAt(t, cfgDir)
+	srv := deps.newServer()
+	ts := httptest.NewServer(srv.Routes())
+	t.Cleanup(ts.Close)
+	client := withAuthClient(t, ts)
+
+	// 默认：未配置 = 跟随主循环。
+	got := getSubagentPrefs(t, client, ts.URL)
+	if n := intField(t, got, "max_steps"); n != 0 {
+		t.Errorf("默认 max_steps 应为 0（跟随主循环），实际 %d", n)
+	}
+	if !boolField(t, got, "steps_inherit") {
+		t.Error("默认 steps_inherit 应为 true")
+	}
+	if n := intField(t, got, "max_steps_allowed"); n != config.SubagentStepCap {
+		t.Errorf("max_steps_allowed 期望 %d，实际 %d", config.SubagentStepCap, n)
+	}
+	if n := intField(t, got, "steps_effective"); n != deps.cfg.Agent.MaxSteps {
+		t.Errorf("steps_effective 应等于主循环的 max_steps（%d），实际 %d", deps.cfg.Agent.MaxSteps, n)
+	}
+
+	// 显式调小：只改步数，并发与能力三项不受影响。
+	resp := postJSON(t, client, ts.URL+"/api/subagents", map[string]any{"max_steps": 6})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST 期望 200，实际 %d", resp.StatusCode)
+	}
+	got = getSubagentPrefs(t, client, ts.URL)
+	if n := intField(t, got, "max_steps"); n != 6 {
+		t.Errorf("max_steps 期望 6，实际 %d", n)
+	}
+	if boolField(t, got, "steps_inherit") {
+		t.Error("显式配置后 steps_inherit 应为 false")
+	}
+	if n := intField(t, got, "steps_effective"); n != 6 {
+		t.Errorf("steps_effective 期望 6，实际 %d", n)
+	}
+	if n := intField(t, got, "max_concurrent"); n != config.SubagentConcurrencyCap {
+		t.Errorf("只改步数时并发不应被改掉，实际 %d", n)
+	}
+	if !boolField(t, got, "allow_write") {
+		t.Error("只改步数时 allow_write 不应被改掉（指针语义）")
+	}
+
+	// 负数归零 = 回到「跟随主循环」。
+	resp = postJSON(t, client, ts.URL+"/api/subagents", map[string]any{"max_steps": -3})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST 负数期望 200，实际 %d", resp.StatusCode)
+	}
+	got = getSubagentPrefs(t, client, ts.URL)
+	if n := intField(t, got, "max_steps"); n != 0 {
+		t.Errorf("负数应归零（跟随主循环），实际 %d", n)
+	}
+	if !boolField(t, got, "steps_inherit") {
+		t.Error("归零后 steps_inherit 应回到 true")
+	}
+
+	// 越界按硬上限收敛（视图给 steps_effective，硬上限在 config 侧收敛）。
+	resp = postJSON(t, client, ts.URL+"/api/subagents", map[string]any{"max_steps": 9999})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("越界期望 200（收敛而非拒绝），实际 %d", resp.StatusCode)
+	}
+	got = getSubagentPrefs(t, client, ts.URL)
+	if n := intField(t, got, "steps_effective"); n != config.SubagentStepCap {
+		t.Errorf("越界应收敛到 %d，实际 %d", config.SubagentStepCap, n)
+	}
+
+	// 落盘：重载后仍然是显式值（不是只在内存里生效）。
+	resp = postJSON(t, client, ts.URL+"/api/subagents", map[string]any{"max_steps": 4})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST 期望 200，实际 %d", resp.StatusCode)
+	}
+	reloaded, err := config.Load(cfgDir)
+	if err != nil {
+		t.Fatalf("重新加载配置失败: %v", err)
+	}
+	if got := reloaded.SubagentMaxSteps(25); got != 4 {
+		t.Errorf("重载后步数上限期望 4，实际 %d", got)
+	}
+	// 显式值 0 时回到继承：把配置清掉后应跟随主循环。
+	if got := (config.Config{}).SubagentMaxSteps(25); got != 25 {
+		t.Errorf("未配置时期望继承 25，实际 %d", got)
+	}
+}
+
 // 方法限制与坏请求体：只接受 GET/POST，坏 JSON 给 400 而不是 500。
 func TestSubagentPrefsMethodAndBadBody(t *testing.T) {
 	deps := newTestDeps(t)

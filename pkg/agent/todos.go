@@ -49,7 +49,8 @@ func (a *Agent) TodoSection(sessionID string) string {
 	return strings.TrimSuffix(b.String(), "\n")
 }
 
-// systemPromptFor 生成会话维度的 System Prompt：在 systemPrompt 基础上追加任务清单。
+// systemPromptFor 生成会话维度的 System Prompt：在 systemPrompt 基础上追加
+// 任务清单，以及「接着上一轮继续跑」的一次性提示（见 Session.continueHint）。
 func (a *Agent) systemPromptFor(sess *Session) string {
 	lastInput := ""
 	if sess != nil {
@@ -59,8 +60,15 @@ func (a *Agent) systemPromptFor(sess *Session) string {
 	if sess == nil {
 		return base
 	}
+	var extras []string
 	if sec := a.TodoSection(sess.ID); sec != "" {
-		return base + "\n\n" + sec
+		extras = append(extras, sec)
 	}
-	return base
+	if hint := sess.ContinueHint(); hint != "" {
+		extras = append(extras, hint)
+	}
+	if len(extras) == 0 {
+		return base
+	}
+	return base + "\n\n" + strings.Join(extras, "\n")
 }

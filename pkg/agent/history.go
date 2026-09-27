@@ -47,6 +47,16 @@ type Session struct {
 	// 必须挂在 Session 上：挂在 Agent 上会被并发会话互相覆盖。
 	lastUserInput string
 
+	// continueHint 是「接着上一轮继续跑」的一次性系统提示尾巴（见 Agent.ContinueTurn）。
+	//
+	// 为什么走系统提示而不是追加一句用户消息「继续」：那会在历史里留下一条
+	// 与用户意图无关的假提问 —— 用户没说过「继续」，是程序替他说的。历史回放
+	// 时这条假消息仍在（用户会问「我什么时候说过继续」），而且模型分不清
+	// 「被中断后接着跑」与「用户新提了一个要求」，容易从头再来一遍。
+	//
+	// 只在本次运行内有效：ContinueTurn 入口置位、出口清空，不落库、不进 Messages。
+	continueHint string
+
 	// saveWarned 记录「持久化失败已告知用户」：DB 故障期间每步都会失败，
 	// 只在第一次推 info 提示，避免刷屏（见 Agent.save）。
 	saveWarned bool
@@ -137,6 +147,21 @@ func (s *Session) LastUserInput() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.lastUserInput
+}
+
+// SetContinueHint 设置「接着上一轮继续跑」的一次性系统提示尾巴（空串 = 清除）。
+// 生命周期由 Agent.ContinueTurn 掌控：入口置位、出口清空。
+func (s *Session) SetContinueHint(hint string) {
+	s.mu.Lock()
+	s.continueHint = hint
+	s.mu.Unlock()
+}
+
+// ContinueHint 返回本轮的一次性「继续」提示（空串 = 没有）。
+func (s *Session) ContinueHint() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.continueHint
 }
 
 // appendMessages 追加消息到历史（写者须为持有运行权的循环 goroutine）。

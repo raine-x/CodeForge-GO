@@ -340,6 +340,16 @@
                 <span id="sub-max-val" class="appear-val"></span>
               </div>
             </div>
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">单任务步数上限</div>
+                <div class="row-desc">单个子智能体一次任务最多迭代多少步。留 0 = 跟随主循环的步数上限（当前 <span id="sub-steps-inherit-val">—</span> 步）。调小可在委派时压低花费，代价是探索类任务可能被半途截断</div>
+              </div>
+              <div class="appear-slider">
+                <input type="number" id="sub-steps" min="0" max="60" step="1" class="num-input">
+                <span id="sub-steps-val" class="appear-val"></span>
+              </div>
+            </div>
           </div>
 
           <div class="settings-card" style="margin-top:16px">

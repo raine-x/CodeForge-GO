@@ -804,10 +804,60 @@ func (a *Agent) RerunFrom(ctx context.Context, sessionID string, back int, newTe
 	return idx, text, nil
 }
 
+// continueHintText 是「接着上一轮继续跑」注入 System Prompt 的一次性尾巴。
+//
+// 措辞要点：说清「是被打断，不是新需求」，并要求先看历史再决定动作 ——
+// 模型看不到界面上的圆环，只知道历史里最后一条助手消息戛然而止。
+const continueHintText = `## 本轮是「继续上一轮」
+- 上一轮被中断（用户打断 / 上游报错 / 页面刷新），你现在要**从断点接着往下做**，不是重新开始。
+- 先读历史里最后一条助手消息与随后的工具结果，判断已经做到哪一步；**不要重复已完成的操作**，也不要重新复述已有内容。
+- 如果上一次的工具调用没有拿到结果（结果位写着「未执行」），重新执行它，然后继续剩下的工作。
+- 只有在确认历史里已经没有可推进的进度时，才给用户一份阶段性小结并说明卡在哪里。`
+
+// ContinueTurn 从断点继续跑最后一轮（打断 / 报错 / 刷新后点「继续」）。
+//
+// 与 Run / RerunFrom 的关键区别：**不往历史里追加任何用户消息**。
+// 早先的实现是让前端发一句字面量「继续」，那会在会话里留下一条用户从未说过的
+// 假提问 —— 历史回放时它仍在（用户会问「我什么时候说过继续」），而且模型分不清
+// 「被打断后接着跑」与「用户新提了一个要求」，容易把已经做完的部分再做一遍。
+//
+// 现在改成：补齐悬空的 tool_result（上游对消息序列有硬约束，带着残缺序列请求会被 400 拒绝），
+// 再把「本轮是继续上一轮」作为一次性系统提示尾巴挂上，跑完即清。
+//
+// 与 Regenerate / RerunFrom 一样**不截断历史、不回退文件**：打断之后该做的是接着跑；
+// 破坏性的重来是「重新生成」与「编辑重发」这两个显式入口的职责。
+func (a *Agent) ContinueTurn(ctx context.Context, sessionID string, emit Emitter) error {
+	limit := a.MaxSteps()
+	if err := a.beginRunWait(ctx, sessionID); err != nil {
+		return err
+	}
+	defer a.endRun(sessionID)
+
+	sess, ok := a.history.Get(sessionID)
+	if !ok {
+		return fmt.Errorf("会话不存在: %s", sessionID)
+	}
+
+	// 上一轮若在「工具执行到一半」被强杀，末尾会挂着一条没有结果的 tool_use。
+	// 补一条说明性结果（而不是删掉调用记录）——见 Session.repairDanglingToolUse。
+	if fixed := sess.repairDanglingToolUse(); len(fixed) > 0 {
+		log.Printf("[agent] 会话=%s 继续前补上 %d 条没有结果的工具调用记录", sessionID, len(fixed))
+		emit(Event{Type: EventInfo,
+			Text: fmt.Sprintf("已补上 %d 条被打断的工具调用记录，接着往下跑", len(fixed))})
+		a.save(sess, true, emit)
+	}
+
+	sess.SetContinueHint(continueHintText)
+	defer sess.SetContinueHint("")
+
+	emit(Event{Type: EventInfo, Text: "正在从上一轮的断点继续"})
+	return a.runLoopWithLimit(ctx, sess, emit, true, limit)
+}
+
 // UnfinishedTurnAnchor 判断「最后一轮是否没有完整结束」，并给出**「继续」**的锚点。
 //
-// 名字刻意不叫 retry：调用方拿到锚点后做的事是「追加一句『继续』接着跑」，
-// 不截断历史、不回退文件（破坏性的重来走「重新生成」/「编辑重发」）。
+// 名字刻意不叫 retry：调用方拿到锚点后做的事是「从断点接着跑」
+// （ContinueTurn），不截断历史、不回退文件（破坏性的重来走「重新生成」/「编辑重发」）。
 //
 // 判据只看历史形状，不依赖任何内存态（页面刷新、进程重启后都能算）：
 //   - 存在最后一条用户纯文本发言，且它之后**没有**任何「纯文本、无工具调用」的

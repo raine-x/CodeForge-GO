@@ -12,8 +12,7 @@ import (
 //
 // 2026-09-22 反馈：跑满 max_steps 后点圆环，界面上的操作记录被一条错误覆盖、
 // 库里的记录也被删。根因是那条路径走的是「截断重跑」（RerunFrom）——它把该轮的
-// assistant / tool_use / tool_result 全部从历史里删掉。打断之后该做的是**接着跑**：
-// 前端改发一句普通用户消息「继续」，服务端只追加、不截断。
+// assistant / tool_use / tool_result 全部从历史里删掉。打断之后该做的是**接着跑**。
 //
 // 这条用例把「只增不减」钉死：若哪天有人把「继续」又接回截断路径，它会立刻红。
 func TestContinueAfterMaxStepsOnlyGrowsHistory(t *testing.T) {
@@ -38,8 +37,8 @@ func TestContinueAfterMaxStepsOnlyGrowsHistory(t *testing.T) {
 		t.Fatalf("第一轮应落 7 条（提问 + 3×(助手+工具结果)），实际 %d", len(before.Messages))
 	}
 
-	// 点「继续」＝ 前端发一条普通用户消息，与用户手打一句「继续」完全同一条链路。
-	if err := a.Run(context.Background(), sess.ID, "继续", func(Event) {}); err == nil {
+	// 点「继续」＝ Agent.ContinueTurn：从断点续跑，不追加任何用户消息。
+	if err := a.ContinueTurn(context.Background(), sess.ID, func(Event) {}); err == nil {
 		t.Fatal("第二轮也应跑满 max_steps")
 	}
 	after, ok := NewHistory(a.history.st).Get(sess.ID)
@@ -53,6 +52,88 @@ func TestContinueAfterMaxStepsOnlyGrowsHistory(t *testing.T) {
 	if !equalPrefix(messageFingerprint(after.Messages), messageFingerprint(before.Messages)) {
 		t.Errorf("「继续」之后第一轮的历史被改动了\nbefore=%v\nafter=%v",
 			messageFingerprint(before.Messages), messageFingerprint(after.Messages))
+	}
+}
+
+// 「继续」不追加用户消息。
+//
+// 旧实现是前端发一句字面量「继续」当普通用户消息，那会在历史里留下一条用户
+// 从未说过的假提问：历史回放时它仍在（用户会问「我什么时候说过继续」），
+// 而且模型分不清「被打断后接着跑」与「用户新提了一个要求」，容易把做完的再做一遍。
+func TestContinueTurnAppendsNoUserMessage(t *testing.T) {
+	var seen []llm.Request
+	a := newEmitTestAgent(t, maxStepsProvider(func(_ context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+		seen = append(seen, req)
+		return maxStepsToolStream(), nil
+	}))
+	a.SetMaxSteps(1)
+
+	sess, err := a.History().Create("", "no-fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// max_steps=1，第一轮跑满即返回「达到上限」错误 —— 这正是「被打断/跑满」
+	// 的形状，「继续」要接的正是这种会话。
+	_ = a.Run(context.Background(), sess.ID, "原始问题", func(Event) {})
+	before := len(seen)
+	if before == 0 {
+		t.Fatal("第一轮没有发出请求")
+	}
+
+	seen = nil
+	if err := a.ContinueTurn(context.Background(), sess.ID, func(Event) {}); err == nil {
+		t.Fatal("应当跑满 max_steps")
+	}
+	if len(seen) == 0 {
+		t.Fatal("「继续」没有发出任何请求")
+	}
+	// 送模的消息里不得凭空多出一条用户提问。
+	first := seen[0]
+	users := 0
+	for _, m := range first.Messages {
+		if m.Role == llm.RoleUser && isPlainUserText(m) {
+			users++
+		}
+	}
+	if users != 1 {
+		t.Fatalf("「继续」后送模的用户提问应仍只有 1 条（原始问题），实际 %d", users)
+	}
+	for _, m := range first.Messages {
+		if m.Role != llm.RoleUser {
+			continue
+		}
+		for _, b := range m.Content {
+			if b.Type == llm.BlockText && strings.TrimSpace(b.Text) == "继续" {
+				t.Fatal("「继续」不该作为用户消息进入上下文")
+			}
+		}
+	}
+	// 「继续」的语义改由一次性系统提示承载。
+	if !strings.Contains(first.System, "本轮是「继续上一轮」") {
+		t.Fatal("「继续」的系统提示里应说明这是接着上一轮跑")
+	}
+}
+
+// 「继续」提示只在本次运行内有效：跑完就清空，不留在会话上。
+func TestContinueTurnHintIsTransient(t *testing.T) {
+	a := newEmitTestAgent(t, maxStepsProvider(func(context.Context, llm.Request) (<-chan llm.StreamEvent, error) {
+		return maxStepsToolStream(), nil
+	}))
+	a.SetMaxSteps(1)
+	sess, err := a.History().Create("", "transient")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Run(context.Background(), sess.ID, "问题", func(Event) {}); err == nil {
+		t.Fatal("应当跑满 max_steps")
+	}
+	_ = a.ContinueTurn(context.Background(), sess.ID, func(Event) {})
+	got, ok := a.History().Get(sess.ID)
+	if !ok {
+		t.Fatal("读不到会话")
+	}
+	if h := got.ContinueHint(); h != "" {
+		t.Fatalf("跑完后「继续」提示应已清空，实际还挂着 %q", h)
 	}
 }
 

@@ -255,6 +255,24 @@ check('样式契约：子智能体卡片三终态（运行 spinner / 完成绿 /
 const uiSrc = fs.readFileSync(UI_PATH, 'utf8');
 const htmlSrc = fs.readFileSync(path.join(DIST, 'index.html'), 'utf8');
 
+// 后端源码（跨语言契约断言：前端事件名、服务端语义必须同源，改一边就要改另一边）
+const goFile = (rel) => fs.readFileSync(path.join(__dirname, '../..', rel), 'utf8');
+// 去掉行注释再断言「代码里没有 X」：注释里常常正好在解释那个被删掉的旧写法
+// （「早先是 sendAsUserText('继续')」），不剥掉就会把注释当成残留代码。
+const goCode = (rel) => goFile(rel).replace(/^\s*\/\/.*$/gm, '');
+const agentSrc = goFile('pkg/agent/agent.go');
+const agentCode = goCode('pkg/agent/agent.go');
+const subagentSrc = goFile('pkg/agent/subagent.go');
+const subagentCode = goCode('pkg/agent/subagent.go');
+const historySrc = goFile('pkg/agent/history.go');
+const todosSrc = goFile('pkg/agent/todos.go');
+const wsSrc = goFile('pkg/server/ws_handler.go');
+const termuxSrc = goFile('pkg/server/termux.go');
+const appearanceSrc = goFile('pkg/server/appearance.go');
+const appearanceCode = goCode('pkg/server/appearance.go');
+// 剥掉 ui.js 的行注释（同一理由：注释里会引用被替换掉的旧写法）
+const uiCode = uiSrc.replace(/^\s*\/\/.*$/gm, '');
+
 // 截出 ui.js 里某个 case 分支（到下一个 case 为止）：
 // 比「case 后 N 字符内必须出现 X」稳，分支里加注释/前置守卫都不会误报。
 function uiCase(name) {
@@ -1184,12 +1202,36 @@ check('发送携带 back（距最后一条的距离）与 rollback_files',
   /type: 'edit_user_message'/.test(uiSrc) &&
   /back: back,/.test(uiSrc) &&
   /rollback_files: true,/.test(uiSrc));
-check('发送前先清掉「该条之后」的界面内容（新回复覆盖下方）',
-  uiSrc.includes('function truncateAfterEditableMessage') &&
-  uiSrc.includes('truncateAfterEditableMessage(back);'));
-check('清空按 back 精确停在被编辑那条用户消息',
-  /let remaining = back \+ 1;/.test(uiSrc) &&
+check('发送前把被编辑那条**就地改写**、只删它之后的节点',
+  // 早先的写法是「连被编辑那条一起删掉、再补一条新气泡」：只要中途 wsSend 失败、
+  // 或服务端在 emit edit 之前就 return error（back 定位不到），那条消息永远回不来
+  // —— 用户看到的正是「被编辑的消息直接就没了」（2026-09-26 反馈）。
+  uiSrc.includes('function applyEditInPlace') &&
+  /applyEditInPlace\(back, text\);/.test(uiSrc) &&
+  /bubble\.dataset\.rawText = text;/.test(uiSrc) &&
+  /renderUserText\(bubble, text\);/.test(uiSrc) &&
+  // 只从目标的 nextSibling 开始删：目标本身绝不在删除范围内
+  /let node = row\.nextSibling;/.test(uiSrc));
+check('就地改写时清掉指向已删节点的流式引用，并摘掉失效的编辑按钮',
+  /currentTextEl = null; textBuffer = '';/.test(uiSrc) &&
+  /const btn = row\.querySelector\('\.edit-btn'\);\s*if \(btn\) btn\.remove\(\);/.test(uiSrc));
+check('倒计数排除 steer 插话（与服务端 isUserQuestion 同一口径）',
+  // .msg-steer 也是 .msg-user，插话不是提问；算进去会数错条数、截错位置。
+  uiSrc.includes('.msg-user:not(.msg-steer)') &&
+  /!node\.classList\.contains\('msg-steer'\)/.test(uiSrc));
+check('找不到目标行时退回全删兜底（宁可位置算错也不让消息消失）',
+  /if \(!row\) \{[\s\S]{0,200}?truncateAfterEditableMessage\(back\);/.test(uiSrc) &&
+  uiSrc.includes('function truncateAfterEditableMessage'));
+check('兜底路径按 back 精确停在被编辑那条用户消息',
+  /let remaining = \(Number\(back\) \|\| 0\) \+ 1;/.test(uiSrc) &&
   /if \(remaining <= 0\) break;/.test(uiSrc));
+check('编辑重发失败时主动拉权威快照把视图拉回真相',
+  // 服务端在截断之前失败（例如 back 定位不到）时既无 edit 帧也无 history 帧，
+  // 界面会停在乐观改动后的状态，与库里的实际历史对不上。
+  uiSrc.includes('pendingEdit') &&
+  uiSrc.includes('function restoreAfterFailedEdit') &&
+  /if \(pendingEdit\) \{[\s\S]{0,120}?pendingEdit = false;[\s\S]{0,120}?restoreAfterFailedEdit\(\);/.test(uiSrc) &&
+  /type: 'load_session'/.test(uiSrc));
 check('服务端 edit 事件只重置流式引用，视图交给随后的 history 快照重建',
   uiSrc.includes("case 'edit':") &&
   uiSrc.includes('function resetStreamRefs') &&
@@ -1205,6 +1247,98 @@ check('编辑条样式存在且与输入区同族',
   /\.edit-bar\.hidden \{ display: none; \}/.test(css));
 check('index.html 有编辑条 DOM（发送 / 取消两个按钮）',
   /id="edit-bar"/.test(htmlSrc) && /id="edit-send"/.test(htmlSrc) && /id="edit-cancel"/.test(htmlSrc));
+
+// ---------------------------------------------------------------------------
+// 「继续」：从断点续跑，而不是往历史里塞一句假提问
+// ---------------------------------------------------------------------------
+group('继续上一轮（从断点续跑）');
+
+check('点「继续」发 continue_turn，不再发送字面量「继续」',
+  uiSrc.includes('function sendContinueRequest') &&
+  /type: 'continue_turn'/.test(uiSrc) &&
+  // 旧实现是 sendAsUserText('继续')：那会在历史里留下一条用户从未说过的假提问。
+  !/sendAsUserText\('继续'\)/.test(uiCode));
+check('「继续」带当前会话与思考强度，且有运行中/未连接的守卫',
+  /session_id: sessionID, thinking: thinkingVal/.test(uiSrc) &&
+  /if \(running \|\| sending \|\| !wsReady\)/.test(uiSrc));
+check('圆环提示讲清语义：不回退文件、不新增提问',
+  /保留已完成的记录，不回退文件，不新增提问/.test(uiSrc));
+check('服务端实现了 ContinueTurn（不追加用户消息，只挂一次性系统提示）',
+  /func \(a \*Agent\) ContinueTurn\(ctx context\.Context, sessionID string, emit Emitter\) error/.test(agentSrc) &&
+  /sess\.SetContinueHint\(continueHintText\)/.test(agentSrc) &&
+  /defer sess\.SetContinueHint\(""\)/.test(agentSrc));
+check('「继续」提示说清「被打断而非新需求」，并要求不重复已完成的工作',
+  /本轮是「继续上一轮」/.test(agentSrc) &&
+  /不要重复已完成的操作/.test(agentSrc) &&
+  /没有拿到结果/.test(agentSrc));
+check('continueHint 只在本次运行内有效，不进历史也不落库',
+  /continueHint string/.test(historySrc) &&
+  !/continueHint/.test(goCode('pkg/store/sessions.go')));
+check('WS 分发 continue_turn（同步打断旧任务后起新轮）',
+  /case "continue_turn":/.test(wsSrc) &&
+  /c\.srv\.agent\.ContinueTurn\(ctx, msg\.SessionID, emit\)/.test(wsSrc));
+check('系统提示拼装把「继续」尾巴接在任务清单之后',
+  /if hint := sess\.ContinueHint\(\); hint != ""/.test(todosSrc));
+
+group('子智能体：步数上限与上下文窗口继承');
+
+check('子智能体步数默认继承主循环（不再写死 8）',
+  /func resolveSubagentSteps\(sp SubagentPolicy, parent int\) int/.test(subagentSrc) &&
+  /if sp\.MaxSteps > 0 \{/.test(subagentSrc) &&
+  /return parent/.test(subagentSrc) &&
+  // 旧实现在 newSubagentIn 里写死 8，删掉即可防止复发。
+  !/cfg\.MaxSteps > 8 \|\| cfg\.MaxSteps <= 0/.test(subagentCode));
+check('子智能体继承上下文窗口（否则压缩线回退到写死的 120000）',
+  /child\.contextWindow\.Store\(int64\(a\.ContextWindow\(\)\)\)/.test(subagentSrc));
+check('子智能体不继承内置插件开关（白名单里没有那些工具）',
+  /child\.builtinOn = map\[string\]bool\{\}/.test(subagentSrc) &&
+  !/child\.builtinOn = a\.builtinOnSnapshot\(\)/.test(subagentCode));
+check('子智能体继承工具可见面（隐藏的工具不该又出现）',
+  /child\.SetExposure\(a\.exposureFn\(\)\)/.test(subagentSrc));
+check('子智能体策略只在父策略里取一次（避免白名单与步数来自不同版本）',
+  /sp := a\.SubagentPolicy\(\)/.test(subagentSrc) &&
+  /subagentToolSetPolicy\(mode, sp\)/.test(subagentSrc) &&
+  /resolveSubagentSteps\(sp, a\.MaxSteps\(\)\)/.test(subagentSrc) &&
+  // 旧写法是对 allowed 与步数各调一次 SubagentPolicy()，两次热更新之间会读到中间态。
+  !/allowed := subagentToolSetPolicy\(mode, a\.SubagentPolicy\(\)\)/.test(subagentSrc));
+check('设置页有「单任务步数上限」输入，0 显示为「跟随主循环（N 步）」',
+  /id="sub-steps"/.test(htmlSrc) &&
+  uiSrc.includes('function stepsLabel') &&
+  /跟随主循环（/.test(uiSrc) &&
+  /postSubagentSetting\(\{ max_steps: n \}/.test(uiSrc));
+check('总开关关闭时步数输入一并置灰',
+  /'sub-max', 'sub-steps', 'sub-allow-write'/.test(uiSrc));
+check('子智能体页有说明文字（0 的语义否则没人懂）',
+  /单任务步数上限/.test(htmlSrc) && /id="sub-steps-inherit-val"/.test(htmlSrc));
+
+group('Termux 换背景图');
+
+check('termux-tools 探测覆盖多个命令并显式并入 $PREFIX/bin',
+  // 只探测 PATH 里的 termux-open-url 会在「从 Termux 外部拉起」时误判未安装。
+  /probes := \[\]string\{"termux-open-url", "termux-storage-get", "termux-setup-storage"\}/.test(termuxSrc) &&
+  /filepath\.Join\(prefix, "bin", name\)/.test(termuxSrc));
+check('选图失败时区分「没装」与「装了但调用失败」，不再一律说需要 termux-tools',
+  /func termuxToolsHint\(err error, out \[\]byte\) string/.test(termuxSrc) &&
+  /termux-tools 未安装或命令不在 PATH/.test(termuxSrc) &&
+  /termux-setup-storage 授权访问手机存储后重试/.test(termuxSrc) &&
+  !/需要 termux-tools/.test(appearanceCode));
+check('termux-storage-get 失败时回落到内置选择器（否则彻底换不了图）',
+  /"ok": true, "builtin": true,/.test(appearanceSrc) &&
+  /"degraded_from": "termux-storage-get"/.test(appearanceSrc) &&
+  /"warning":/.test(appearanceSrc));
+check('落盘路径是工作区下的绝对路径（DataDir 是相对值）',
+  /func \(s \*Server\) bgPickDest\(\) \(string, error\)/.test(appearanceSrc) &&
+  /!filepath\.IsAbs\(base\)/.test(appearanceSrc) &&
+  /未选择工作区，无法确定背景图的保存位置/.test(appearanceSrc));
+check('降级提示如实告知用户为什么换了选图方式',
+  /if \(d\.warning\) addInfo\(d\.warning\);/.test(uiSrc));
+check('内置选择器起点优先已授权的手机存储，否则退回 ~',
+  /func termuxStartDir\(\) string/.test(appearanceSrc) &&
+  /filepath\.Join\(home, "storage", "shared"\)/.test(appearanceSrc) &&
+  /if dirAccessible\(shared\) \{/.test(appearanceSrc));
+check('安装完成的复核只看关键命令（探测点太多会把整次安装误判为失败）',
+  /lookTermuxPath\("termux-open-url"\)/.test(termuxSrc) &&
+  !/err == nil && !termuxToolsReady\(\)/.test(goCode('pkg/server/termux.go')));
 
 group('检查点 / 回滚');
 

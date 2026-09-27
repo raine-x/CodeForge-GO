@@ -24,6 +24,7 @@ const MaxSubagents = config.SubagentConcurrencyCap
 // 白名单本身就不含 shell、插件、技能创建与递归委派，策略再叠加一层收窄。
 type SubagentPolicy struct {
 	MaxConcurrent int  // 一次委派最多并行几个子智能体（1..MaxSubagents）
+	MaxSteps      int  // 单个子智能体的 ReAct 步数上限（<=0 = 继承主 loop）
 	AllowWrite    bool // implement 子智能体是否可写入/编辑文件
 	AllowDelete   bool // 是否可删除文件（AllowWrite=false 时无意义）
 	AllowMemory   bool // 是否可写入用户记忆（save_memory）
@@ -33,6 +34,7 @@ type SubagentPolicy struct {
 func DefaultSubagentPolicy() SubagentPolicy {
 	return SubagentPolicy{
 		MaxConcurrent: MaxSubagents,
+		MaxSteps:      0, // 0 = 继承主 loop 的 max_steps
 		AllowWrite:    true,
 		AllowDelete:   true,
 		AllowMemory:   true,
@@ -44,6 +46,11 @@ func (p SubagentPolicy) Normalize() SubagentPolicy {
 	if p.MaxConcurrent <= 0 || p.MaxConcurrent > MaxSubagents {
 		p.MaxConcurrent = MaxSubagents
 	}
+	// MaxSteps<=0 是「继承主 loop」的合法取值，原样保留；
+	// 越界只可能来自手改 yaml，按硬上限收敛。
+	if p.MaxSteps > config.SubagentStepCap {
+		p.MaxSteps = config.SubagentStepCap
+	}
 	return p
 }
 
@@ -51,6 +58,7 @@ func (p SubagentPolicy) Normalize() SubagentPolicy {
 func NewSubagentPolicy(cfg config.Config) SubagentPolicy {
 	return SubagentPolicy{
 		MaxConcurrent: cfg.SubagentMaxConcurrent(),
+		MaxSteps:      cfg.SubagentMaxSteps(cfg.Agent.MaxSteps),
 		AllowWrite:    cfg.SubagentAllowWrite(),
 		AllowDelete:   cfg.SubagentAllowDelete(),
 		AllowMemory:   cfg.SubagentAllowMemory(),
@@ -196,7 +204,10 @@ func (a *Agent) newSubagent(mode string) *Agent {
 // 与它自己的会话 Workspace 分属两个工作区。
 func (a *Agent) newSubagentIn(mode string, workDir string) *Agent {
 	registry := tools.NewRegistry()
-	allowed := subagentToolSetPolicy(mode, a.SubagentPolicy())
+	// 策略只取一次：白名单与步数上限必须来自同一个版本，否则设置页刚好在
+	// 这一瞬间改并发/步数，子智能体会拿到「按旧策略挑工具、按新步数跑」的组合。
+	sp := a.SubagentPolicy()
+	allowed := subagentToolSetPolicy(mode, sp)
 	for _, tool := range a.registry.List() {
 		// 子智能体只允许使用受控白名单工具集：绝不暴露 delegate_subagents（防递归委派）
 		// 与插件/外部工具（越权风险）；implement 限文件工具集，explore 仅只读子集。
@@ -207,17 +218,47 @@ func (a *Agent) newSubagentIn(mode string, workDir string) *Agent {
 	policy := a.executor.Policy()
 	executor := tools.NewExecutor(registry, policy, nil, nil, 120*time.Second, 32*1024)
 	cfg := a.cfg
-	cfg.MaxSteps = a.MaxSteps()
-	if cfg.MaxSteps > 8 || cfg.MaxSteps <= 0 {
-		cfg.MaxSteps = 8
-	}
+	// 步数上限：策略里显式配了就用它，没配（MaxSteps<=0）就继承主 loop 的值。
+	//
+	// 早先这里写死 8，与主 loop 的 max_steps 毫无关系：探索类任务（读几个文件、
+	// 搜几处、交叉验证）经常要十几步，8 步会在半途硬停，模型被迫交一份
+	// 「还没看完」的结论，主智能体再接着做等于把活儿又干一遍。
+	// 现在口径与主智能体一致，成本需要压时在设置页单独调 subagents.max_steps。
+	cfg.MaxSteps = resolveSubagentSteps(sp, a.MaxSteps())
 	// 四个热更新字段各取一次快照：子智能体在别的 goroutine 上跑，
 	// 而设置页随时可能热替换它们（见 Agent.rtMu）。child 此时尚未共享出去，
 	// 写它自己的字段不需要加锁。
 	child := New(cfg, a.llmCfgSnapshot(), a.providerSnapshot(), executor, a.history, workDir)
 	child.memoryStore = a.memoryStore
-	child.builtinOn = a.builtinOnSnapshot()
+	// ⚠️ 内置插件开关**不继承**：子智能体的工具白名单里没有 create_skill /
+	// delegate_subagents，继承了就会让 System Prompt 注入「你可以创建技能 /
+	// 可以委派子智能体」这类说明，而模型手里根本没有对应工具 —— 措辞与实授
+	// 工具集不一致，模型会反复尝试调用不存在的工具直到步数耗尽。
+	child.builtinOn = map[string]bool{}
+	// ⚠️ 上下文窗口**必须继承**：contextWindow 是 Agent 上的 atomic，
+	// New() 不会填，子智能体拿到的就是 0 → compressBudget() 回退到写死的
+	// context_token_budget（120000）。模型真实窗口若小于该值（32k / 64k 端点），
+	// 子智能体会一路堆到 12 万 token 才压缩 → 上游 400 context overflow →
+	// 收缩两次仍失败 → 子任务直接挂掉，主智能体只拿到一句「子任务失败」。
+	child.contextWindow.Store(int64(a.ContextWindow()))
+	// 工具可见面同样继承：用户隐藏过的工具（config.agent.hidden_tools）
+	// 不该又出现在子智能体的工具定义里。
+	child.SetExposure(a.exposureFn())
 	return child
+}
+
+// resolveSubagentSteps 解析子智能体的步数上限：策略显式配置优先，否则继承主 loop。
+func resolveSubagentSteps(sp SubagentPolicy, parent int) int {
+	if sp.MaxSteps > 0 {
+		if sp.MaxSteps > config.SubagentStepCap {
+			return config.SubagentStepCap
+		}
+		return sp.MaxSteps
+	}
+	if parent <= 0 {
+		return 8 // 主 loop 也没配（配置异常）：给个能跑的兜底值
+	}
+	return parent
 }
 
 // subagentPrompt 生成子智能体的任务提示词。

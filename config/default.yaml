@@ -91,6 +91,7 @@ builtin_plugins:
 # 本节只负责「并发」与「能力」限制，均可在设置 → 子智能体中热调整。
 subagents:
   max_concurrent: 5        # 一次委派最多同时运行几个子智能体（硬上限 5，只能调小）
+  max_steps: 0             # 单个子智能体的 ReAct 步数上限；0 = 继承 agent.max_steps
   allow_write: true        # 允许 implement 子智能体写入/编辑文件；false 则子智能体一律只读
   allow_delete: true       # 允许子智能体删除文件（allow_write=false 时自动无效）
   allow_memory: true       # 允许子智能体写入用户记忆（save_memory）

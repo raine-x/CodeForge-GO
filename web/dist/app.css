@@ -258,6 +258,15 @@ body { background: transparent; }
   min-width: 52px; text-align: right;
   font-family: ui-monospace, Consolas, monospace;
 }
+/* 设置页里的数字输入（子智能体步数上限等）。0 有语义（= 跟随主循环），
+   所以不能禁掉 spin 按钮，得让人能一个数一个数地调回 0。 */
+.appear-slider input.num-input {
+  width: 76px; padding: 5px 8px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg-elev); color: var(--text);
+  font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+}
+.appear-slider input.num-input:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ---------- 内置插件页：条目 + 滑块开关 ---------- */
 .bp-item {

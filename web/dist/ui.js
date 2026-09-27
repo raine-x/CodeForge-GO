@@ -1466,7 +1466,7 @@
     resumeRingEl = document.createElement('button');
     resumeRingEl.type = 'button';
     resumeRingEl.className = 'resume-ring';
-    resumeRingEl.title = '继续这一轮（保留已完成的记录，不回退文件）';
+    resumeRingEl.title = '继续这一轮（保留已完成的记录，不回退文件，不新增提问）';
     // 图标用「向右的箭头」而不是刷新循环：这里的动作是**接着往下跑**，不是重来。
     resumeRingEl.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h15M13 6l6 6-6 6"/></svg>';
     resumeRingEl.addEventListener('click', function () {
@@ -1479,18 +1479,29 @@
     if (resumeRingEl) { resumeRingEl.remove(); resumeRingEl = null; }
   }
 
-  // 打断 / 报错 / 刷新重连后接着跑：追加一句「继续」，让模型从断点往下走。
+  // 打断 / 报错 / 刷新重连后接着跑：让服务端从断点续跑。
   //
-  // ⚠️ 这里刻意**不**再走旧的「断点重试」（截断该轮 + 回退文件）：那套语义会把
-  // 已经跑完的工具调用与结果从历史里删掉、并把改过的文件退回原样 —— 用户看到的
-  // 就是「操作记录全没了」（2026-09-22 反馈）。打断之后该做的是接着跑，不是重来；
+  // ⚠️ 这里刻意**不**再发一句字面量「继续」当用户消息。早先 sendAsUserText('继续')
+  // 会在历史里留下一条用户从未说过的假提问：历史回放时它仍在（用户会问
+  // 「我什么时候说过继续」），而且模型分不清「被打断后接着跑」与「用户新提了
+  // 一个要求」，容易把已经做完的部分再做一遍。服务端 ContinueTurn 不追加任何
+  // 消息，只把「本轮是继续上一轮」作为一次性系统提示挂上。
+  //
+  // 同样**不**走旧的「断点重试」（截断该轮 + 回退文件）：那套语义会把已经跑完的
+  // 工具调用与结果从历史里删掉、并把改过的文件退回原样 —— 用户看到的就是
+  // 「操作记录全没了」（2026-09-22 反馈）。打断之后该做的是接着跑，不是重来；
   // 真要重来，「重新生成」与「编辑重发」才是那条显式的破坏性入口。
-  //
-  // 复用 sendAsUserText：走的是与用户手打一句「继续」完全相同的链路
-  //（别名展开 / 气泡 / 发送 / lastUserText），不另开一条会漂移的旁路。
   function sendContinueRequest() {
     removeResumeRing();
-    sendAsUserText('继续');
+    if (running || sending || !wsReady) { addInfo('正在处理中，请稍候'); return; }
+    if (!sessionID) { removeResumeRing(); return; }
+    sending = true;
+    if (!wsSend({ type: 'continue_turn', session_id: sessionID, thinking: thinkingVal })) {
+      sending = false;
+      addError('未连接到服务，请稍候重试');
+      return;
+    }
+    showThinking();
   }
 
   // ---------- 可复用操作选择面板（ActionPanel）：输入框上方多选 / 用户输入 / 多页 ----------
@@ -3287,6 +3298,8 @@
           renderSessions(ev.items || []);
           break;
         case 'history':
+          // 权威快照到达：编辑重发的乐观改动已被库里的样子取代，pendingEdit 落地。
+          pendingEdit = false;
           replayHistory(ev);
           break;
         case 'session':
@@ -3486,6 +3499,13 @@ case 'busy':
           foldReason();
           closeText();
           addError(describeLLMError(ev.error || '未知错误'));
+          // 编辑重发在「服务端截断之前」就失败（例如 back 定位不到那条消息）时，
+          // 既不会有 edit 帧也不会有 history 帧 —— 界面停在乐观改动后的状态，
+          // 与库里的实际历史对不上。主动拉一次会话，把视图拉回真相。
+          if (pendingEdit) {
+            pendingEdit = false;
+            restoreAfterFailedEdit();
+          }
           break;
         }
 case 'idle': {
@@ -3509,6 +3529,12 @@ case 'idle': {
           // 一轮结束：重新按白名单挂上编辑按钮（最近 N 条用户消息）。
           syncUserEditButtons();
           maybeShowPlanActions();
+          // 一轮结束仍未收到权威快照 = 编辑重发在中途失败了（异常路径）：
+          // 同样把视图拉回库里的样子，别让乐观改动留在屏幕上。
+          if (pendingEdit) {
+            pendingEdit = false;
+            restoreAfterFailedEdit();
+          }
           break;
         }
       }
@@ -3711,14 +3737,13 @@ case 'idle': {
 
   function sendEditRequest(back, text, snap) {
     sending = true;
-    // 先在前端把「被编辑消息之后」的内容删掉：既立刻给出反馈，也避免等服务端
-    // 事件回来之前旧内容仍在屏幕上与新回复混排。服务端随后会重放历史。
-    //
-    // 截断会连被编辑的那条用户气泡一起删掉，而服务端的 history 快照要等一个往返
-    // 才到 —— 中间这段时间屏幕上不该是空的，所以立刻按编辑后的文本把气泡放回去。
-    // 快照到达时 replayHistory 会先清空整列再重建，因此不会重复。
-    truncateAfterEditableMessage(back);
-    if (text) addUser(text);
+    // 破坏视图的动作要**最小**且**可回退**：早先的实现先把「被编辑那条连同其后
+    // 全部」删掉、再补一条新气泡。只要中途 wsSend 失败、或服务端在 emit edit 之前
+    // 就返回错误（back 定位不到消息），那条消息就永远回不来 —— 用户看到的正是
+    // 「被编辑的消息直接就没了」。现在改成：只删目标**之后**的节点，目标那条就地
+    // 改写，任何失败路径下它都还在；服务端随后补发的 history 快照是权威重建。
+    applyEditInPlace(back, text);
+    pendingEdit = true;
     if (!wsSend({
       type: 'edit_user_message',
       session_id: snap.session,
@@ -3728,7 +3753,9 @@ case 'idle': {
       thinking: thinkingVal
     })) {
       sending = false;
+      pendingEdit = false;
       addError('未连接到服务，请稍候重试');
+      restoreAfterFailedEdit();
       return;
     }
     lastUserText = text;
@@ -3737,16 +3764,77 @@ case 'idle': {
     showThinking();
   }
 
+  // pendingEdit：编辑重发已发出、尚未收到服务端权威快照。
+  //
+  // 它的存在是为了兜住「服务端在截断之前就失败」这条路径 —— 那时既没有 edit 帧
+  // 也没有 history 帧，界面停在乐观改动后的状态，与库里的实际历史对不上。
+  // 收到 error 且仍 pending 时主动拉一次会话，把视图拉回真相。
+  let pendingEdit = false;
+
+  function restoreAfterFailedEdit() {
+    if (!sessionID || !wsReady) return;
+    wsSend({ type: 'load_session', session_id: sessionID });
+  }
+
+  // 找出「倒数第 back 条用户提问」对应的 DOM 行。
+  //
+  // ⚠️ 必须排除 .msg-steer：它同样带 .msg-user 类（视觉上也是一条用户消息），
+  // 但插话不是「提问」。服务端算 back 用的是 isUserQuestion（排除 OriginSteer），
+  // 前端把 steer 算进去就会数错条数，截错位置。
+  function findEditableUserRow(back) {
+    const rows = ensureCol().querySelectorAll('.msg-user:not(.msg-steer)');
+    const i = rows.length - 1 - (Number(back) || 0);
+    return (i >= 0 && i < rows.length) ? rows[i] : null;
+  }
+
+  // applyEditInPlace 就地改写被编辑那条用户消息，并清掉它之后的全部节点。
+  //
+  // 找不到目标行时（视图与白名单口径漂移）退回旧的「全删 + 重建一条」，
+  // 宁可位置算错也不能让消息凭空消失。
+  function applyEditInPlace(back, text) {
+    const col = ensureCol();
+    const row = findEditableUserRow(back);
+    if (!row) {
+      truncateAfterEditableMessage(back);
+      if (text) addUser(text);
+      return;
+    }
+    let node = row.nextSibling;
+    while (node) {
+      const next = node.nextSibling;
+      node.remove();
+      node = next;
+    }
+    const bubble = row.querySelector('.bubble');
+    if (bubble) {
+      bubble.dataset.rawText = text;
+      renderUserText(bubble, text);
+    }
+    // 白名单按文本索引，文本变了先摘掉编辑按钮；服务端 checkpoints 到达后会重挂。
+    const btn = row.querySelector('.edit-btn');
+    if (btn) btn.remove();
+    // 清掉流式状态引用（它们指向已被删除的节点）
+    currentTextEl = null; textBuffer = '';
+    reasonEl = null; reasonBuffer = '';
+    lastReply = '';
+    scrollBottom();
+  }
+
   // 删除界面中「被编辑那条用户消息之后」的全部节点（含那条消息自身的旧气泡，
   // 因为重跑后服务端会把改过的消息重新推出来）。
-  // 从后往前扫，遇到第 (back+1) 条用户消息即停 —— 与 back 的语义一致。
+  // 从后往前扫，遇到第 (back+1) 条**提问**即停 —— 与 back 的语义一致。
+  //
+  // ⚠️ 只数非 steer 的行：.msg-steer 也是 .msg-user，插话不是提问，
+  // 算进去会数错条数（与服务端 isUserQuestion 同一口径）。
+  // 注意这是 applyEditInPlace 找不到目标行时的兜底路径，正常不走这里。
   function truncateAfterEditableMessage(back) {
     const col = ensureCol();
-    let remaining = back + 1;
+    let remaining = (Number(back) || 0) + 1;
     let node = col.lastChild;
     while (node) {
       const prev = node.previousSibling;
-      const isUserRow = node.classList && node.classList.contains('msg-user');
+      const isUserRow = node.classList && node.classList.contains('msg-user') &&
+        !node.classList.contains('msg-steer');
       node.remove();
       if (isUserRow) {
         remaining--;
@@ -4898,7 +4986,11 @@ case 'idle': {
         .then(function (d) {
           if (d.error) { addError(d.error); return; }
           if (d.builtin) {
-            // Linux 桌面：内置选择器选图 → 把路径 POST 回服务端
+            // 内置选择器：Linux 桌面直接走；Termux 上是 termux-storage-get
+            // 失败后的**降级路径**（安卓 SAF 选择器要求前台、或存储未授权）。
+            // 降级时服务端会带 warning，如实告诉用户为什么换了选图方式，
+            // 否则「明明装过 termux-tools 却不能用」就变成了无解释的怪现象。
+            if (d.warning) addInfo(d.warning);
             openBuiltinPicker(d.start_path || '', 'file', function (path) {
               if (!path) return;
               saveBg({ background_path: path }).then(function () { applyBgImage(true); });
@@ -5119,12 +5211,19 @@ case 'idle': {
     const on = document.getElementById('sub-enabled');
     if (!on) return;
     const enabled = on.checked;
-    ['sub-max', 'sub-allow-write', 'sub-allow-delete', 'sub-allow-memory'].forEach(function (id) {
+    ['sub-max', 'sub-steps', 'sub-allow-write', 'sub-allow-delete', 'sub-allow-memory'].forEach(function (id) {
       document.getElementById(id).disabled = !enabled;
     });
     if (enabled && !document.getElementById('sub-allow-write').checked) {
       document.getElementById('sub-allow-delete').disabled = true;
     }
+  }
+
+  // stepsLabel 把「0 = 跟随主循环」讲清楚。0 不是一个可以自己解释的数字，
+  // 光显示「0 步」会让人以为子智能体一步都不跑。
+  function stepsLabel(v, inheritVal) {
+    if (!v) return '跟随主循环（' + inheritVal + ' 步）';
+    return v + ' 步';
   }
 
   function applySubagentView(d) {
@@ -5136,6 +5235,15 @@ case 'idle': {
     range.value = max;
     document.getElementById('sub-max-cap').textContent = cap;
     document.getElementById('sub-max-val').textContent = max + ' 个';
+    // 步数上限：0 = 跟随主循环。滑条式的数字框留 min=0，让人能调回「跟随」。
+    const eff = Number(d.steps_effective) || 0;
+    const inheritVal = document.getElementById('sub-steps-inherit-val');
+    if (inheritVal) inheritVal.textContent = eff;
+    const stepsCap = Number(d.max_steps_allowed) || 60;
+    const steps = document.getElementById('sub-steps');
+    steps.max = stepsCap;
+    steps.value = Number(d.max_steps) || 0;
+    document.getElementById('sub-steps-val').textContent = stepsLabel(steps.value, eff);
     document.getElementById('sub-allow-write').checked = d.allow_write !== false;
     document.getElementById('sub-allow-delete').checked = d.allow_delete !== false;
     document.getElementById('sub-allow-memory').checked = d.allow_memory !== false;
@@ -5191,6 +5299,25 @@ case 'idle': {
     range.addEventListener('input', function () { val.textContent = range.value + ' 个'; });
     range.addEventListener('change', function () {
       postSubagentSetting({ max_concurrent: Number(range.value) }, '并发上限已设为 ' + range.value + ' 个')
+        .then(function (ok) { if (!ok) loadSubagentSettings(); });
+    });
+
+    // 单任务步数上限：0 = 跟随主循环。数字框在 input 时先本地回显（打字手感），
+    // change 时才提交；失败一律重拉服务端视图，避免界面留着没存上的值。
+    const steps = document.getElementById('sub-steps');
+    const stepsVal = document.getElementById('sub-steps-val');
+    const effNow = function () {
+      return Number(document.getElementById('sub-steps-inherit-val').textContent) || 0;
+    };
+    steps.addEventListener('input', function () {
+      stepsVal.textContent = stepsLabel(Number(steps.value) || 0, effNow());
+    });
+    steps.addEventListener('change', function () {
+      const raw = Number(steps.value);
+      const n = isFinite(raw) && raw > 0 ? Math.floor(raw) : 0; // 空/非法/负数 → 0（跟随）
+      steps.value = n;
+      const msg = n ? '单任务步数上限已设为 ' + n + ' 步' : '已改为跟随主循环的步数上限';
+      postSubagentSetting({ max_steps: n }, msg)
         .then(function (ok) { if (!ok) loadSubagentSettings(); });
     });
 

@@ -2,6 +2,8 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -139,13 +141,30 @@ func (s *Server) handleAppearancePick(w http.ResponseWriter, r *http.Request) {
 		// 安卓系统选择器：termux-storage-get 会弹 SAF 图片选择器，
 		// 用户选中的图片被复制到我们指定的目标路径（扩展名未知 → 统一无后缀，
 		// 服务时用 http.DetectContentType 嗅探）。超时 2 分钟（用户找图可能较慢）。
-		dest := filepath.Join(s.cfg.DataDir, "background_user")
+		//
+		// ⚠️ dest 必须是**绝对**路径：DataDir 是相对值（".codeforge"），
+		// 拼出来的相对路径要靠进程 CWD 才落得下去，而工作区切换 / 从别处启动
+		// 时 CWD 未必是工作区根，结果是「选了图、文件却不在预期位置」。
+		dest, err := s.bgPickDest()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
 		_ = os.MkdirAll(filepath.Dir(dest), 0o755)
 		_ = os.Remove(dest) // 清掉旧文件，避免用户取消后残留误导
 		cmd := exec.Command("termux-storage-get", dest)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": "安卓图片选择失败（需要 termux-tools）: " + strings.TrimSpace(string(out)),
+		if out, runErr := cmd.CombinedOutput(); runErr != nil {
+			// 如实区分「真没装」与「装了但这次调用失败」——早先一律写成
+			// 「需要 termux-tools」，用户明明装过包也被这句话带偏。
+			msg := termuxToolsHint(runErr, out)
+			log.Printf("[appearance] Termux 系统选图失败：%s", msg)
+			// 无论如何都给一条能走通的路：回落到前端内置选择器。
+			// 起点给已授权的手机存储（没授权就退回 ~，那个一定能列出）。
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": true, "builtin": true,
+				"start_path":    termuxStartDir(),
+				"degraded_from": "termux-storage-get",
+				"warning":       msg + "；已改用内置文件选择器",
 			})
 			return
 		}
@@ -160,6 +179,44 @@ func (s *Server) handleAppearancePick(w http.ResponseWriter, r *http.Request) {
 			"ok": true, "path": "", "builtin": true, "start_path": pickDefaultDir(),
 		})
 	}
+}
+
+// bgPickDest 返回「Termux 选图落盘」的绝对目标路径。
+//
+// 不能直接 filepath.Join(cfg.DataDir, ...)：DataDir 是相对值（".codeforge"），
+// 相对路径要靠进程 CWD 才落得下去，而工作区切换 / 从别处启动时 CWD 未必是
+// 工作区根。ConfigDir 为空时更糟 —— filepath.Join("", "x") 会得到 "x"，
+// 直接把图片写到进程的工作目录去（AGENTS.md 记过同类坑：ConfigDir 为空不得拼路径落盘）。
+func (s *Server) bgPickDest() (string, error) {
+	base := strings.TrimSpace(s.cfg.DataDir)
+	if base == "" {
+		return "", fmt.Errorf("未配置数据目录（data_dir 为空），无法保存选中的图片")
+	}
+	if !filepath.IsAbs(base) {
+		root := s.agent.WorkDir()
+		if root == "" {
+			return "", fmt.Errorf("未选择工作区，无法确定背景图的保存位置；请先在工作区下启动或选择工作区")
+		}
+		base = filepath.Join(root, base)
+	}
+	return filepath.Join(base, "background_user"), nil
+}
+
+// termuxStartDir 返回 Termux 内置选择器的默认起始目录。
+//
+// 优先已授权的手机存储（~/storage/shared）：背景图大概率在相册里，从那里进
+// 少点几层。软链不存在或列不出内容（termux-setup-storage 没跑过 / 被拒）时
+// 退回 ~ —— ~ 一定能列出，不会出现「打开就是空列表」。
+func termuxStartDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "/"
+	}
+	shared := filepath.Join(home, "storage", "shared")
+	if dirAccessible(shared) {
+		return shared
+	}
+	return home
 }
 
 // finishBackgroundPick 收尾「背景图选择」：校验 → **落库** → 响应。

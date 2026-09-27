@@ -66,6 +66,7 @@ type StateNotify struct {
 // local.yaml 里 multi_agent: null 的来历。
 type StateSubagents struct {
 	MaxConcurrent int   `yaml:"max_concurrent,omitempty"`
+	MaxSteps      int   `yaml:"max_steps,omitempty"`
 	AllowWrite    *bool `yaml:"allow_write,omitempty"`
 	AllowDelete   *bool `yaml:"allow_delete,omitempty"`
 	AllowMemory   *bool `yaml:"allow_memory,omitempty"`
@@ -113,10 +114,12 @@ func (c *Config) stateProjection() State {
 	if c.Notify.Enabled != nil {
 		s.Notify = &StateNotify{Enabled: c.Notify.Enabled}
 	}
-	if c.Subagents.MaxConcurrent != 0 || c.Subagents.AllowWrite != nil ||
+	if c.Subagents.MaxConcurrent != 0 || c.Subagents.MaxSteps != 0 ||
+		c.Subagents.AllowWrite != nil ||
 		c.Subagents.AllowDelete != nil || c.Subagents.AllowMemory != nil {
 		s.Subagents = &StateSubagents{
 			MaxConcurrent: c.Subagents.MaxConcurrent,
+			MaxSteps:      c.Subagents.MaxSteps,
 			AllowWrite:    c.Subagents.AllowWrite,
 			AllowDelete:   c.Subagents.AllowDelete,
 			AllowMemory:   c.Subagents.AllowMemory,

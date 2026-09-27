@@ -1,6 +1,11 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 // 硬上限必须与 pkg/agent.MaxSubagents 同源：这里被改小/改大，调度器校验会跟着变。
 func TestSubagentConcurrencyCapIsStable(t *testing.T) {
@@ -31,6 +36,59 @@ func TestSubagentMaxConcurrentClamps(t *testing.T) {
 				t.Errorf("SubagentMaxConcurrent() 期望 %d，实际 %d", c.want, got)
 			}
 		})
+	}
+}
+
+// 步数上限：未配置（<=0）继承主 loop；显式配置夹在 1..硬上限，越界按硬上限收敛。
+//
+// 「继承」是有意设计：早先子智能体被写死 8 步，与主 loop 毫无关系，探索类任务
+// 经常在半途被硬停，模型被迫交一份「还没看完」的结论。
+func TestSubagentMaxStepsInheritsWhenUnset(t *testing.T) {
+	cases := []struct {
+		name   string
+		cfg    Config
+		parent int
+		want   int
+	}{
+		{"缺省继承主循环", Config{}, 25, 25},
+		{"0 继承主循环", Config{Subagents: SubagentConfig{MaxSteps: 0}}, 12, 12},
+		{"负数继承主循环", Config{Subagents: SubagentConfig{MaxSteps: -5}}, 30, 30},
+		{"主循环未配置时给可运行兜底", Config{}, 0, 8},
+		{"显式调小被采纳", Config{Subagents: SubagentConfig{MaxSteps: 4}}, 25, 4},
+		{"显式等于硬上限被采纳", Config{Subagents: SubagentConfig{MaxSteps: SubagentStepCap}}, 25, SubagentStepCap},
+		{"超过硬上限收敛（不拒绝保存）", Config{Subagents: SubagentConfig{MaxSteps: 9999}}, 25, SubagentStepCap},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.cfg.SubagentMaxSteps(c.parent); got != c.want {
+				t.Errorf("SubagentMaxSteps(parent=%d) 期望 %d，实际 %d", c.parent, c.want, got)
+			}
+		})
+	}
+}
+
+// 未配置 max_steps 时 state.yaml 整段不出现该键（省略键 = 不覆盖 default.yaml）。
+func TestStateOmitsUnsetSubagentMaxSteps(t *testing.T) {
+	t.Setenv(stateEnvKey, filepath.Join(t.TempDir(), "state.yaml"))
+	c := Config{Subagents: SubagentConfig{MaxConcurrent: 3}}
+	if err := c.SaveState(); err != nil {
+		t.Fatalf("SaveState 失败: %v", err)
+	}
+	data, err := os.ReadFile(StatePath())
+	if err != nil {
+		t.Fatalf("读取状态文件失败: %v", err)
+	}
+	if strings.Contains(string(data), "max_steps") {
+		t.Fatalf("未配置时不该写出 max_steps 键，实际内容：\n%s", data)
+	}
+	// 配了才写，且写进去的值能被读回来。
+	c.Subagents.MaxSteps = 7
+	if err := c.SaveState(); err != nil {
+		t.Fatalf("SaveState 失败: %v", err)
+	}
+	data, _ = os.ReadFile(StatePath())
+	if !strings.Contains(string(data), "max_steps: 7") {
+		t.Fatalf("配置后应写出 max_steps: 7，实际内容：\n%s", data)
 	}
 }
 

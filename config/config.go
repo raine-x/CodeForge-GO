@@ -199,6 +199,12 @@ func (c BuiltinPluginsConfig) PlanEnabled() bool {
 // 「校验时实际生效的上限」永远同源。
 const SubagentConcurrencyCap = 5
 
+// SubagentStepCap 是子智能体单次任务 ReAct 步数的硬上限。
+//
+// 配置可以调小，也可以不给（0 = 继承主 loop 的 max_steps），但不给上限的话
+// 一次委派 5 个子智能体、每个跑满主循环的步数，token 花费会失控。
+const SubagentStepCap = 60
+
 // SubagentConfig 描述子智能体（多智能体协作）的运行策略，可在设置页热更新。
 //
 // 总开关不在这里：它与内置插件开关 builtin_plugins.multi_agent 是同一个真源
@@ -208,6 +214,15 @@ type SubagentConfig struct {
 	// MaxConcurrent 是一次委派允许同时运行的子智能体数量，范围 1..SubagentConcurrencyCap；
 	// <=0 或越界时按硬上限处理。
 	MaxConcurrent int `yaml:"max_concurrent"`
+	// MaxSteps 是单个子智能体一次任务的 ReAct 步数上限。
+	// 0 / 负数 = 继承主 loop 的 agent.max_steps（与主智能体同口径）；
+	// 正数 = 单独指定，夹在 1..SubagentStepCap。
+	//
+	// 为什么不给子智能体一个写死的更小值：探索类任务（读几个文件、搜几处、
+	// 交叉验证）经常需要十几步，写死的 8 会在半途硬停，模型被迫交一份
+	// 「还没看完」的结论，主智能体再接着做等于把活儿又干了一遍。
+	// 需要压成本时在设置页单独调小，而不是靠一个藏在代码里的魔数。
+	MaxSteps int `yaml:"max_steps"`
 	// AllowWrite：implement 子智能体是否可写入 / 编辑文件。缺省 true。
 	AllowWrite *bool `yaml:"allow_write"`
 	// AllowDelete：子智能体是否可删除文件。缺省 true。
@@ -221,6 +236,26 @@ func (c Config) SubagentMaxConcurrent() int {
 	n := c.Subagents.MaxConcurrent
 	if n <= 0 || n > SubagentConcurrencyCap {
 		return SubagentConcurrencyCap
+	}
+	return n
+}
+
+// SubagentMaxSteps 返回单个子智能体的步数上限。
+//
+// 未配置（<=0）时**继承主 loop**的 max_steps —— 与主智能体同口径，
+// 不再有一个藏在代码里的写死上限。parent<=0 属配置异常，回落到 8 保证可用。
+// 显式配置时夹在 1..SubagentStepCap：越界值按硬上限收敛而不是拒绝保存
+// （与 SubagentMaxConcurrent 同一取向，少一个「界面写了却没生效」的坑）。
+func (c Config) SubagentMaxSteps(parent int) int {
+	n := c.Subagents.MaxSteps
+	if n <= 0 {
+		if parent <= 0 {
+			return 8
+		}
+		return parent
+	}
+	if n > SubagentStepCap {
+		return SubagentStepCap
 	}
 	return n
 }
