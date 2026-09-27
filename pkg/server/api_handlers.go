@@ -320,16 +320,30 @@ func listTree(dir string, depth int) []treeNode {
 		if err != nil {
 			continue
 		}
-		if it.IsDir() && skipEntry(it.Name()) {
+		isDir := it.IsDir()
+		// ⚠️ 符号链接要跟到目标再判一次。
+		//
+		// DirEntry.IsDir() 报的是**链接自身**的类型（DirEntry 走 lstat 语义），
+		// 于是「指向目录的软链」IsDir() 为 false，会被归进**文件**列表：
+		// 文件选择器里能选中它、能点「选择此文件」，拿回来一个目录路径。
+		// 对文件选择器来说这是实打实的错判，所以这里补一次 Stat。
+		//
+		// 只对符号链接多花一次系统调用 —— 真实目录仍走 IsDir() 快路径。
+		if !isDir && it.Type()&os.ModeSymlink != 0 {
+			if st, statErr := os.Stat(filepath.Join(dir, it.Name())); statErr == nil {
+				isDir = st.IsDir()
+			}
+		}
+		if isDir && skipEntry(it.Name()) {
 			continue
 		}
 		node := treeNode{
 			Name:  it.Name(),
 			Path:  filepath.Join(dir, it.Name()),
-			IsDir: it.IsDir(),
+			IsDir: isDir,
 			Size:  info.Size(),
 		}
-		if it.IsDir() && depth > 1 {
+		if isDir && depth > 1 {
 			node.Children = listTree(filepath.Join(dir, it.Name()), depth-1)
 		}
 		out = append(out, node)

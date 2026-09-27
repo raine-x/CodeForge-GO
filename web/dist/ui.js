@@ -3809,6 +3809,12 @@ case 'idle': {
     okBtn.textContent = pickerMode === 'file' ? '选择此文件' : '选择当前目录';
     okBtn.disabled = pickerMode === 'file'; // 文件模式：选中文件后才可确认
     function browse(rel) {
+      // 换目录 = 之前选中的东西作废。pickerSel 里存的是**上一层的绝对路径**，
+      // 不清的话：选中文件 → 点「.. 返回上一级」→ 列表已重绘、高亮消失，
+      // 但「选择此文件」仍可点，点下去拿到的是子目录里的旧路径 ——
+      // 界面上看像在选当前目录的文件，实际是别的层级的东西。
+      pickerSel = '';
+      if (okBtn) okBtn.disabled = pickerMode !== 'file';
       // picker=1：内置选择器要浏览工作区外的目录（如 Termux 的 ~/storage/shared），
       // 服务端只在这个模式下放行绝对路径 —— 不带它会被「路径越出工作区范围」403，
       // 表现正是「选择目录时列表永远为空」。
