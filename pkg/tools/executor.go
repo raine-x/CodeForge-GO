@@ -71,6 +71,18 @@ func (e *Executor) SetApprovalTimeout(d time.Duration) {
 // Registry 返回底层工具注册中心。
 func (e *Executor) Registry() *Registry { return e.registry }
 
+// Timeout 返回工具执行的默认超时（单条工具可用 Schema 覆盖）。
+func (e *Executor) Timeout() time.Duration { return e.timeout }
+
+// Approver 返回当前的人工审批通道，可能为 nil（表示无法弹审批）。
+func (e *Executor) Approver() Approver { return e.approver }
+
+// ApprovalTimeout 返回审批等待上限。
+func (e *Executor) ApprovalTimeout() time.Duration { return e.approvalTimeout }
+
+// MaxOutput 返回输出截断阈值。
+func (e *Executor) MaxOutput() int { return e.maxOutput }
+
 // SetApprover 在服务启动后注入审批实现。
 func (e *Executor) SetApprover(a Approver) { e.approver = a }
 

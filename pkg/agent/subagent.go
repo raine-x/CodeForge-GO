@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"codeforge/config"
 	"codeforge/pkg/llm"
@@ -227,8 +226,10 @@ func (a *Agent) newSubagentIn(mode string, workDir string) *Agent {
 			registry.Register(tool)
 		}
 	}
-	policy := a.executor.Policy()
-	executor := tools.NewExecutor(registry, policy, nil, nil, 120*time.Second, 32*1024)
+	// 执行器走角色工厂：audit / policy 从父执行器派生，调用方无从传 nil。
+	// 早先这里手工写 NewExecutor(registry, policy, nil, nil, ...)，
+	// audit 那个 nil 让子智能体的每一次写入与命令执行都不进审计、且不报错。
+	executor := tools.NewExecutorFor(a.executor, tools.RoleSubagent, registry)
 	cfg := a.cfg
 	// 步数上限：策略里显式配了就用它，没配（MaxSteps<=0）就继承主 loop 的值。
 	//

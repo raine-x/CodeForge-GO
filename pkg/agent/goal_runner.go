@@ -17,7 +17,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"codeforge/config"
 	"codeforge/pkg/llm"
@@ -182,8 +181,8 @@ func (a *Agent) newGoalVerifier(workDir string) *Agent {
 		}
 	}
 	// audit 用真的：审查者会自主执行命令，那些命令必须进审计日志。
-	executor := tools.NewExecutor(registry, a.executor.Policy(), a.executor.Audit(),
-		nil, goalVerifierToolTimeout, 32*1024)
+	// 走角色工厂，audit 从父执行器派生，不再手工传 —— 传错就是静默降级。
+	executor := tools.NewExecutorFor(a.executor, tools.RoleGoalReviewer, registry)
 	cfg := a.cfg
 	cfg.MaxSteps = goalVerifierSteps(a.MaxSteps())
 	child := New(cfg, a.llmCfgSnapshot(), a.providerSnapshot(), executor, a.history, workDir)
@@ -203,7 +202,11 @@ func (a *Agent) newGoalVerifier(workDir string) *Agent {
 // 比默认 120s 宽：一个 run_command 可能要等编译或等服务起来。
 // 注意这不是业务上限 —— 业务上限是审查者的步数预算（goalVerifierSteps）。
 // 用户点停止照样立刻中断（cctx 派生自 ctx）。
-const goalVerifierToolTimeout = 5 * time.Minute
+//
+// 实际取值由角色表给出（单一事实源），这里保留别名是为了让既有测试
+// （TestGoalVerifierToolTimeoutIsWiderThanDefault）继续盯住这条约束 ——
+// 角色表和调用点分家正是本项要消灭的那类漂移。
+var goalVerifierToolTimeout = tools.RoleTimeout(tools.RoleGoalReviewer)
 
 // goalVerifierSteps 解析审查者的步数预算。
 //
