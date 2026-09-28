@@ -2,6 +2,8 @@ package builtin
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,7 +37,7 @@ type FS struct {
 	// readSeen 是「哪个会话读过/改过哪个文件」的登记表，用于先读后写约束。
 	// 整个工作区共用一份 FS，故键必须带上会话 ID：子智能体与各会话之间
 	// 不能拿别人读过的原文下自己的笔。
-	readSeen map[string]bool
+	readSeen map[string]seenEntry
 }
 
 // NewFS 构造文件工具工作区。root 为空表示「未选择工作区」，
@@ -46,7 +48,7 @@ func NewFS(root string) *FS {
 			root = abs
 		}
 	}
-	return &FS{root: root, maxUndo: 100, readSeen: map[string]bool{}}
+	return &FS{root: root, maxUndo: 100, readSeen: map[string]seenEntry{}}
 }
 
 // Root 返回工作区根目录（空字符串表示未选择工作区）。
@@ -76,7 +78,7 @@ func (f *FS) SetRoot(root string) {
 	defer f.mu.Unlock()
 	f.root = root
 	f.undo = nil
-	f.readSeen = map[string]bool{}
+	f.readSeen = map[string]seenEntry{}
 }
 
 // SetAllowOutside 设置是否允许访问工作区之外的路径。
@@ -292,6 +294,10 @@ func (f *FS) snapshot(ctx context.Context, path string) {
 }
 
 // Undo 撤销最近一次文件写入，返回被还原的路径。
+//
+// 撤销会把文件内容**改回**旧值，因此所有相关会话的指纹都必须一起刷新 ——
+// 否则「读 → 写 → 撤销 → 再写」会在最后一步被判成「被外部修改」而失败。
+// 快照里就有还原后的内容（snap.Content），直接拿来算，不必重读磁盘。
 func (f *FS) Undo() (string, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -300,6 +306,30 @@ func (f *FS) Undo() (string, bool) {
 	}
 	snap := f.undo[len(f.undo)-1]
 	f.undo = f.undo[:len(f.undo)-1]
+
+	// 所有见过这个路径的会话，其指纹都指向「改动前」的内容。
+	// 撤销把它们统一对齐到还原后的内容。
+	// seenKey 的结构是 sessionID + "\n" + path，所以匹配后缀时要带前导 \n，
+	// 否则路径 "a.go" 会误匹配到 "xa.go"。
+	suffix := "\n" + snap.Path
+	restored := snap.Existed
+	var sum string
+	var size int64
+	if snap.Existed {
+		sum, size = fingerprint(snap.Content)
+	}
+	for k := range f.readSeen {
+		if !strings.HasSuffix(k, suffix) {
+			continue
+		}
+		if restored {
+			f.readSeen[k] = seenEntry{sum: sum, size: size}
+		} else {
+			// 文件被撤销成「原本不存在」，指纹无从谈起 —— 删掉登记，
+			// 后续写入会走「新建文件」路径（requireReadSeen 对不存在的文件放行）。
+			delete(f.readSeen, k)
+		}
+	}
 
 	if snap.Existed {
 		_ = os.MkdirAll(filepath.Dir(snap.Path), 0o755)
@@ -329,26 +359,67 @@ const maxReadSeen = 20000
 
 func seenKey(sessionID, path string) string { return sessionID + "\n" + path }
 
+// seenEntry 记录「本会话读过这个文件」以及**读到的内容指纹**。
+//
+// 为什么不只存 bool：只存 bool 时，「读 A → 外部改 A → Agent 基于旧内容写 A」
+// 会被静默放行 —— Agent 覆盖掉外部的改动而没有任何报错，数据丢失且无人察觉。
+// 存指纹后，写前比对即可发现。
+type seenEntry struct {
+	sum  string // 内容 SHA-256（取前 16 字节十六进制，足够判别且省内存）
+	size int64  // 快速预筛：大小变了就不必算哈希
+}
+
+func (e seenEntry) matches(sum string, size int64) bool {
+	return e.size == size && e.sum == sum
+}
+
+// sizeDelta 只在大小确实变了时才给出字节数。
+// 常见情况是「改了几个字符、大小没变」，这时报「2 字节 → 2 字节」纯属噪音，
+// 还显得自相矛盾。
+func sizeDelta(before, after int64) string {
+	if before == after {
+		return ""
+	}
+	return fmt.Sprintf("（读取时 %d 字节，现为 %d 字节）", before, after)
+}
+
+// fingerprint 算内容指纹，size 一并返回供 seenEntry 预筛。
+func fingerprint(data []byte) (string, int64) {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:16]), int64(len(data))
+}
+
 // markReadSeen 登记「本会话见过该文件的当前内容」：读成功算，
 // 自己刚改完也算（下一步往往是在刚才的改动上继续）。
-func (f *FS) markReadSeen(ctx context.Context, path string) {
+//
+// content 必须是**调用方手上那份内容的字节**，不重新读盘：
+//   - read_file 传刚 os.ReadFile 出来的 data
+//   - write_file / edit_file 传**刚写进去的新内容**
+//
+// 后者是关键：这样「写后刷新指纹」自然成立，不需要额外一行刷新逻辑。
+// 若不刷新，Agent 改一次文件后指纹就与磁盘实际不符，第二次写会被判成
+// 「被外部修改」而**永久锁死这个 Agent**，且报错极具误导性
+// （用户会以为是别的程序干的）。
+func (f *FS) markReadSeen(ctx context.Context, path string, content []byte) {
 	sc, ok := tools.SessionFrom(ctx)
 	if !ok || sc.SessionID == "" {
 		return
 	}
+	sum, size := fingerprint(content)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.readSeen) >= maxReadSeen {
-		f.readSeen = map[string]bool{}
+		f.readSeen = map[string]seenEntry{}
 	}
-	f.readSeen[seenKey(sc.SessionID, path)] = true
+	f.readSeen[seenKey(sc.SessionID, path)] = seenEntry{sum: sum, size: size}
 }
 
-// requireReadSeen 是写操作的先读后写闸门。
+// requireReadSeen 是写操作的先读后写闸门，两道校验：
 //
-// 为什么必须有：未经阅读就覆盖，模型依据的是记忆里（多半是压缩后摘要里）
-// 的旧版本，整份文件会按记忆重排一遍 —— 界面上就是 +2200/-2170，
-// 丢掉的是这一轮它根本没看到的内容。
+//  1. 本会话读过吗 —— 没读过就改，依据的是记忆里（多半是压缩后摘要里）
+//     的旧版本，整份文件会按记忆重排一遍，界面上就是 +2200/-2170。
+//  2. 读完之后内容变过吗 —— 变过就说明磁盘现状已不是模型看到的那份，
+//     此时的精确替换会覆盖掉这期间别人的改动。
 //
 // 两种情形不拦：
 //   - 目标文件不存在（新建）：没有可丢的旧内容；
@@ -362,12 +433,27 @@ func (f *FS) requireReadSeen(ctx context.Context, path string, existed bool) err
 		return nil
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.readSeen[seenKey(sc.SessionID, path)] {
-		return nil
+	entry, seen := f.readSeen[seenKey(sc.SessionID, path)]
+	f.mu.Unlock()
+
+	if !seen {
+		return fmt.Errorf("本会话还没读过 %s，不能凭记忆改写。先用 read_file 读取（大文件按返回末尾的行号窗口分段读），"+
+			"看到原文后再提交精确替换。", path)
 	}
-	return fmt.Errorf("本会话还没读过 %s，不能凭记忆改写。先用 read_file 读取（大文件按返回末尾的行号窗口分段读），"+
-		"看到原文后再提交精确替换。", path)
+
+	// 第 2 道：指纹比对。读盘失败按「已变」处理（fail-closed）——
+	// 拿不到现状就没法证明现状没变，不能因此放行。
+	cur, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("无法确认 %s 读取之后是否被修改：%w", path, err)
+	}
+	sum, size := fingerprint(cur)
+	if !entry.matches(sum, size) {
+		return fmt.Errorf("%s 在本会话读取之后被外部修改过%s。"+
+			"请先重新 read_file 看到最新内容，再基于它提交修改 —— "+
+			"否则会覆盖掉这段时间别人做的改动。", path, sizeDelta(entry.size, size))
+	}
+	return nil
 }
 
 // ForgetReads 作废该会话的全部阅读登记（实现 tools.ReadGate，由压缩路径调用）。
@@ -527,7 +613,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (*tool
 	// 只有「看到的就是文件本身」才算读过：文档提取出的是残缺正文，
 	// 拿它当依据写回原文件同样是在赌。
 	if !extracted {
-		t.fs.markReadSeen(ctx, path)
+		t.fs.markReadSeen(ctx, path, data)
 	}
 
 	start, end := readWindow(p.StartLine, p.EndLine)
@@ -751,7 +837,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (*too
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return tools.Err("写入文件失败: %v", err), nil
 	}
-	t.fs.markReadSeen(ctx, path)
+	t.fs.markReadSeen(ctx, path, []byte(content))
 	out := map[string]any{"path": path, "bytes": len(content), "created": !existed}
 	if existed {
 		added, removed := LineChurn(string(old), content)
@@ -938,7 +1024,7 @@ func (t *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (*tool
 	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
 		return tools.Err("写入文件失败: %v", err), nil
 	}
-	t.fs.markReadSeen(ctx, path)
+	t.fs.markReadSeen(ctx, path, []byte(updated))
 	added, removed := LineChurn(string(data), updated)
 	return tools.OkMeta(map[string]any{
 		"path":         path,
