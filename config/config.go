@@ -482,12 +482,24 @@ func SavePlugins(path string, plugins []PluginConfig) error {
 	return os.WriteFile(path, data, 0o600)
 }
 
-// Save 将当前配置全量写入 path（历史行为，仅供测试与一次性迁移使用）。
+// SaveWholeConfig 将当前配置全量写入 path（仅供测试构造初始配置）。
 //
-// ⚠️ 设置处理器不要调它：这里序列化的是整个 Config，会把插件目录、安全规则
-// 和明文密钥一并复制进 path，让「用户覆盖文件」退化成程序的全量转储。
-// 运行时状态请改用 SaveState()（只写程序自有字段，见 state.go）。
-func (c *Config) Save(path string) error {
+// Deprecated: 生产代码不要调用它 —— 调用它**本身就是 bug**，不是「不推荐」：
+//
+//  1. 它序列化的是整个 Config（含 Plugins / Rules / DenyPatterns 等切片），
+//     而 yaml 对切片是**替换而非合并**。一旦把它写进 default.yaml，
+//     后续在 default.yaml 新增的规则会被这里的旧副本静默吃掉。
+//     这个坑真实发生过：8 个设置处理器过去各自 cfg.Save(local.yaml)，
+//     互相覆盖，security.rules 一度丢过 todo_write 与 web_*。
+//  2. 它会把明文密钥整份抄进目标文件。
+//
+// 写入程序自有字段的正确入口是 [Config.SaveState] —— 它只写 stateProjection
+// 刻意选出的子集（见 state.go 的文件头注释）。
+//
+// 改名而非只加 Deprecated 标注：删掉旧名后，任何生产调用会**编译失败**；
+// 标注只是提醒，拦不住人。这比在 CI 里 grep 调用点可靠 —— grep 会漏
+// （换别名、换接收者变量名、跨文件包一层）。
+func (c *Config) SaveWholeConfig(path string) error {
 	data, err := yaml.Marshal(c)
 	if err != nil {
 		return err

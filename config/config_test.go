@@ -265,7 +265,7 @@ func TestSaveWorkDirRoundTrip(t *testing.T) {
 	}
 	want := `C:/Users/test/ws` + string(filepath.Separator)
 	cfg.Agent.WorkDir = want
-	if err := cfg.Save(filepath.Join(cfgDir, "local.yaml")); err != nil {
+	if err := cfg.SaveWholeConfig(filepath.Join(cfgDir, "local.yaml")); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 

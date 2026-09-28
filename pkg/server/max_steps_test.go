@@ -95,7 +95,7 @@ func TestConfigMaxStepsInvalidIsAtomic(t *testing.T) {
 	d.cfg.LLM.APIKey = ""
 	s := New(d.cfg, d.agent, d.executor, d.registry, d.fsys)
 	path := filepath.Join(dir, "local.yaml")
-	if err := d.cfg.Save(path); err != nil {
+	if err := d.cfg.SaveWholeConfig(path); err != nil {
 		t.Fatal(err)
 	}
 	before := *d.cfg
