@@ -74,9 +74,15 @@ test: test-go test-web test-llm
 test-go:
 	go test ./...
 
-## 前端 Markdown 渲染器回归测试（纯 Node，零依赖，无需浏览器；不消耗任何额度）
+## 前端回归测试（纯 Node，零依赖，无需浏览器；不消耗任何额度）
+##
+## ⚠️ 这里**必须列全** web/test/ 下的每一个测试文件。早先只跑 render_md.test.js，
+## 把 attachments.test.js 漏在外面，于是「附件脚手架缺依赖、重复提交没被拦住」
+## 这一整类缺陷在 CI 上全程绿灯 —— 绿灯并不代表前端全绿。
+## 新增前端测试时请同步加到这一行。
 test-web:
 	$(NODE) web/test/render_md.test.js
+	$(NODE) web/test/attachments.test.js
 
 ## LLM 端点协议测试（pytest，读取 .env 中的 LLM_API_KEY）
 test-llm:
