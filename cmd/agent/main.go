@@ -33,6 +33,11 @@ import (
 )
 
 func main() {
+	// 尽早设内存软上限：必须早于任何大分配（工具注册表、SQLite 连接都在后面）。
+	// 之前完全没有这个边界，走 Go 默认 GOGC=100 —— 堆翻倍才 GC，
+	// 失控时会被 OOMKill 连带丢掉未落盘的会话状态与正在写的审计日志。
+	applyMemoryLimit()
+
 	// 子命令：start（默认）/ stop / restart；剥离后其余 flag 照常解析。
 	sub := ""
 	if len(os.Args) > 1 {
