@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -27,7 +28,18 @@ type Executor struct {
 	approver  Approver
 	timeout   time.Duration
 	maxOutput int
+	// approvalTimeout 是**人工审批自己的**等待上界，与 timeout（工具执行超时）
+	// 是两件事，不能互相借用。
+	approvalTimeout time.Duration
 }
+
+// DefaultApprovalTimeout 审批默认等待上限。
+//
+// 定这个值的依据：审批要等真人读完 diff 再决定，所以必须容得下正常的思考时间；
+// 但又必须明显短于「连接一直挂着」这种无主场景，否则一个被遗忘的审批卡片会
+// 永久占住执行器与 goroutine（此前正是这个状态：审批只受调用方 ctx 约束，
+// 而生产链路的 ctx 由 WebSocket 连接生命周期决定，没有 deadline）。
+const DefaultApprovalTimeout = 15 * time.Minute
 
 // NewExecutor 构造安全执行器。
 func NewExecutor(registry *Registry, policy *security.Policy, audit *security.AuditLogger, approver Approver, timeout time.Duration, maxOutput int) *Executor {
@@ -38,13 +50,22 @@ func NewExecutor(registry *Registry, policy *security.Policy, audit *security.Au
 		maxOutput = 32 * 1024
 	}
 	return &Executor{
-		registry:  registry,
-		policy:    policy,
-		audit:     audit,
-		approver:  approver,
-		timeout:   timeout,
-		maxOutput: maxOutput,
+		registry:        registry,
+		policy:          policy,
+		audit:           audit,
+		approver:        approver,
+		timeout:         timeout,
+		maxOutput:       maxOutput,
+		approvalTimeout: DefaultApprovalTimeout,
 	}
+}
+
+// SetApprovalTimeout 覆盖审批等待上限。<=0 时回落到 DefaultApprovalTimeout。
+func (e *Executor) SetApprovalTimeout(d time.Duration) {
+	if d <= 0 {
+		d = DefaultApprovalTimeout
+	}
+	e.approvalTimeout = d
 }
 
 // Registry 返回底层工具注册中心。
@@ -182,13 +203,30 @@ func (e *Executor) Execute(ctx context.Context, name string, args json.RawMessag
 				req.Diff = diff
 			}
 		}
-		approved, err := approver.RequestApproval(ctx, req)
+		// 审批有**自己**的上界，不借用 timeout。
+		// 此前这里直接传 Execute 的入参 ctx，而生产链路的 ctx 由 WebSocket
+		// 连接生命周期决定、没有 deadline —— 审批卡片被遗忘就会永久挂住
+		// 执行器与 goroutine。approvalTimeout 补上这个缺口；
+		// 若调用方 ctx 更短（如用户关页面），WithTimeout 仍以先到的为准。
+		approvalTimeout := e.approvalTimeout
+		if approvalTimeout <= 0 {
+			approvalTimeout = DefaultApprovalTimeout
+		}
+		actx, cancelApproval := context.WithTimeout(ctx, approvalTimeout)
+		approved, err := approver.RequestApproval(actx, req)
+		timedOut := errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
+		cancelApproval()
 		if err != nil {
 			entry.Success = false
 			// 审计留原始错误（要可追溯），给用户/模型的说明则翻译成人话
 			entry.Error = "approval-error: " + err.Error()
 			entry.DurationMs = time.Since(start).Milliseconds()
 			_ = e.audit.Log(entry)
+			if timedOut {
+				// 超时**不是拒绝**。两者在界面上必须能区分：
+				// 「用户说不」和「没人管」对下一次决策的含义完全不同。
+				return Err("请求操作审批超时（超过 %s 无人处理，该操作未执行）", approvalTimeout), nil
+			}
 			return Err("%s", errs.FriendlyOr("请求操作审批", err)), nil
 		}
 		entry.Approved = &approved
