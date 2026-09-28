@@ -87,15 +87,31 @@ func (t *TerminalTool) Execute(ctx context.Context, args json.RawMessage) (*tool
 	if err != nil {
 		return tools.Err("%s", errs.FriendlyOr("执行命令", err)), nil
 	}
+	// 保留 CommandContext：不是图它的自动 Kill（那个会被 StartGrouped 覆盖成
+	// 整组终止），而是为了让 os/exec 在 Start 里起 watchCtx goroutine ——
+	// cmd.WaitDelay 的「ctx 到期后关闭管道」逻辑只认 c.ctx。
 	cmd := exec.CommandContext(cctx, shell, argv...)
 	cmd.Dir = dir
+	// 与进程组管理配对：光杀进程组不够 —— 孙进程攥着 stdout/stderr 管道写端时，
+	// cmd.Wait() 会等「管道 EOF」而永久阻塞，工具根本不返回，退出码判定
+	//（-2 = 超时）也一并失效。详见 platform/proc.go。
+	cmd.WaitDelay = platform.ProcessWaitDelay
 
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 
 	start := time.Now()
-	runErr := cmd.Run()
+	// StartGrouped 代替 cmd.Run：把命令放进独立的进程组
+	//（Unix Setpgid / Windows Job Object），并把 cmd.Cancel 改成整组终止。
+	grp, startErr := platform.StartGrouped(cmd)
+	if startErr != nil {
+		return tools.Err("启动命令失败: %v", startErr), nil
+	}
+	// 正常执行完毕也 Close：Windows 侧会连带清理残留的孙进程
+	//（JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE），符合「终端是受控的」这一定位。
+	defer platform.CloseGroup(grp)
+	runErr := cmd.Wait()
 	elapsed := time.Since(start)
 
 	exitCode := 0
