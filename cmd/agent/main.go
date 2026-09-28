@@ -336,6 +336,14 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 	defer manager.Stop()
 
 	// 4) LLM 适配器
+	//
+	// state.yaml 的 llm 段**只存 model id**（明文密钥不再落盘，见 config.StateLLM），
+	// 所以这里必须先按 id 把协议 / base_url / 密钥解析出来，否则 NewProvider
+	// 拿到的是一份「只有模型名」的残缺配置。
+	//
+	// 解析发生在建适配器**之前**：解析不出密钥时还会退回 .env / local.yaml 的值，
+	// 而那份配置已经被 Load() 合进来了。
+	credentialStores(cfg, configDir)
 	provider, err := llm.NewProvider(cfg.LLM)
 	if err != nil {
 		log.Fatalf("初始化 LLM 适配器失败: %v", err)
@@ -643,4 +651,30 @@ func hiddenToolsExposure(hidden []string) func(name string) bool {
 		blocked[h] = true
 	}
 	return func(name string) bool { return !blocked[name] }
+}
+
+// credentialStores 按 cfg.LLM.Model 把凭据解析进 cfg.LLM。
+//
+// 单独抽成函数是为了让它可测：启动流程本身很难在测试里跑，而「只存 model id
+// 之后能不能真的取回密钥」正是这次改动最需要被验证的那件事。
+func credentialStores(cfg *config.Config, configDir string) {
+	// 迁移提示：老 state.yaml 里若还有明文 api_key，加载后它仍会覆盖 cfg.LLM
+	// （LoadStateInto merge 的是整个 Config），所以**不需要**为了兼容去读它；
+	// 这里只是告诉用户「下次保存就不再写了」。
+	if legacy, err := config.LegacyStateHasPlaintextKey(config.StatePath()); err == nil && legacy {
+		log.Printf("[凭据] state.yaml 仍含明文 api_key（兼容期内照常可用）；" +
+			"下次保存设置后它将不再写入 —— 密钥只在 models.yaml / providers.yaml 与进程内存")
+	}
+
+	dir := configDir
+	if d := cfg.ConfigDir(); d != "" {
+		dir = d
+	}
+	if strings.TrimSpace(dir) == "" {
+		log.Printf("[凭据] 未确定配置目录，跳过模型凭据解析（沿用 local.yaml / .env）")
+		return
+	}
+	ms := config.NewModelStore(filepath.Join(dir, "models.yaml"))
+	ps := config.NewProviderStore(filepath.Join(dir, "providers.yaml"))
+	log.Printf("[凭据] %s", config.ResolveModelCredentials(cfg, ms, ps))
 }

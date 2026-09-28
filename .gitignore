@@ -39,6 +39,10 @@ config/providers.yaml
 !.env.*.example
 
 # --- 按命名约定兜底的密钥文件
+# ⚠️ 下面几条匹配的是**文件名**，不是内容。代价：名字里带 secret / credential
+# 的**正常源码**也会被静默忽略 —— 写 config/credentials.go 时它没进版本库，
+# `git status` 连提示都没有，只有 `git check-ignore` 查得到。
+# 所以代码文件避开这些词：凭据解析那套叫 config/resolve_llm.go。
 *apikey*
 *api_key*
 *api-key*

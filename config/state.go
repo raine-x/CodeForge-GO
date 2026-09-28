@@ -85,16 +85,53 @@ type StateBuiltinPlugins struct {
 	GoalModeMaxRounds int   `yaml:"goal_mode_max_rounds,omitempty"`
 }
 
+// StateLLM 是 state.yaml 里 llm 段的内容。
+//
+// ⚠️ 刻意**不含 api_key / base_url / provider**（2026-09-27，7 阶段重构计划第 3 阶段）。
+//
+// 早先这一段直接写整个 LLMConfig，于是 **API Key 以明文落进 state.yaml**
+// （0600 只是文件权限，不是加密）。而密钥本来就有更合适的家：providers.yaml
+// （按供应商去重）或 models.yaml，或环境变量 —— 由 ResolveModelCredentials
+// 在启动时按 model id 解析出来。
+//
+// 下面这些是**用户在设置页调得动、且不是密钥**的项，必须留在这里：
+// max_tokens（用户可覆盖模型自带的 ctx_out）、temperature、重试策略。
+// 曾经整个 llm 段被砍成只剩 model，结果设置页改的 max_tokens / temperature /
+// retry_* 全部在重启后丢失（max_steps_test.go 的 TestConfigMaxStepsOmittedPreservesLimit
+// 就是为此红过一次）。
+//
+// provider / base_url / display_name 属于**派生值**：它们由模型条目决定，
+// 存旧副本只会陈旧 —— 用户换了供应商，落盘那份还指着老地址。
+//
+// 兼容：老的 state.yaml 里若有 `llm.api_key`，仍然会被 LoadStateInto 合进
+// cfg.LLM（它 merge 的是整个 Config，不经过本结构），所以**升级不会登不上**；
+// 下一次 SaveState 就不再写它了 —— 迁移就是这么自然完成的。
+type StateLLM struct {
+	// Model 是当前生效的模型 id（对应 models.yaml 里的一条，或内联模型名）。
+	Model string `yaml:"model,omitempty"`
+	// DisplayName 是界面展示名。空则回退 model id。
+	DisplayName string `yaml:"display_name,omitempty"`
+	// 以下是用户可调、且非密钥的运行参数。
+	MaxTokens      int     `yaml:"max_tokens,omitempty"`
+	Temperature    float64 `yaml:"temperature,omitempty"`
+	MaxAttempts    int     `yaml:"max_attempts,omitempty"`
+	RetryMode      string  `yaml:"retry_mode,omitempty"`
+	RetryBackoffMs int     `yaml:"retry_backoff_ms,omitempty"`
+}
+
 // State 是程序自有的运行状态投影。
 //
 // YAML 键与 Config 一致（字段是其子集），因此 state.yaml 可以直接走
 // mergeYAML 合并进 Config —— 读取侧不需要任何新代码。
 //
-// llm 段目前是整块的（含 api_key）：阶段 3 会把它缩成 `model: <id>`，
-// 由模型目录解析出 base_url 与密钥引用，届时明文密钥不再落在这里。
+// ⚠️ 读取侧走的是**原始 YAML → Config**，不是「反序列化成 State」。
+// 所以 State 里字段变窄（比如 llm 段只剩 model）不会影响读取 —— 读到的
+// state.yaml 里出现什么键，就覆盖 Config 的对应字段。这正是上面能平滑
+// 迁移「老文件里还有 api_key」的原因。
+//
 // appearance 整段保留：模糊 0、亮度清空都是可表达的取值，不能省略键。
 type State struct {
-	LLM        LLMConfig      `yaml:"llm"`
+	LLM        StateLLM       `yaml:"llm"`
 	Agent      StateAgent     `yaml:"agent"`
 	Security   StateSecurity  `yaml:"security"`
 	Appearance AppearanceConf `yaml:"appearance"`
@@ -111,7 +148,19 @@ type State struct {
 // 条目压根不进这个结构，所以也不可能被写回覆盖。
 func (c *Config) stateProjection() State {
 	s := State{
-		LLM:        c.LLM,
+		// ⚠️ llm 段**不投影 api_key / base_url / provider**（明文密钥不再落盘，
+		// 见 StateLLM）。但用户可调、且非密钥的运行参数（max_tokens /
+		// temperature / 重试策略）必须留 —— 它们没有别的持久化位置，
+		// 砍掉的话设置页改完重启就丢。
+		LLM: StateLLM{
+			Model:          c.LLM.Model,
+			DisplayName:    c.LLM.DisplayName,
+			MaxTokens:      c.LLM.MaxTokens,
+			Temperature:    c.LLM.Temperature,
+			MaxAttempts:    c.LLM.MaxAttempts,
+			RetryMode:      c.LLM.RetryMode,
+			RetryBackoffMs: c.LLM.RetryBackoffMs,
+		},
 		Agent:      StateAgent{WorkDir: c.Agent.WorkDir, MaxSteps: c.Agent.MaxSteps},
 		Security:   StateSecurity{PermissionMode: c.Security.PermissionMode},
 		Appearance: c.Appearance,
