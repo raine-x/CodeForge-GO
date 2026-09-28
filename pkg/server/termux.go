@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -11,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"codeforge/pkg/logx"
 	"codeforge/pkg/platform"
 )
 
@@ -150,7 +150,7 @@ func (s *Server) handleTermuxTools(w http.ResponseWriter, r *http.Request) {
 // installTermuxTools 后台执行 pkg install -y termux-tools 并落定状态。
 // 成功以 LookPath 复核为准（exit 0 但命令仍缺失的异常情况按失败处理）。
 func (s *Server) installTermuxTools() {
-	log.Printf("[termux] 开始后台安装 termux-tools…")
+	logx.Infof("开始后台安装 termux-tools…")
 	ctx, cancel := context.WithTimeout(context.Background(), termuxInstallTimeout)
 	defer cancel()
 
@@ -169,12 +169,12 @@ func (s *Server) installTermuxTools() {
 	if err != nil {
 		s.termuxErr.Store(clipText(strings.TrimSpace(string(out)), 200))
 		s.termuxState.Store(termuxFailed)
-		log.Printf("[termux] termux-tools 安装失败: %v", err)
+		logx.Errorf("termux-tools 安装失败: %v", err)
 		return
 	}
 	s.termuxErr.Store("")
 	s.termuxState.Store(termuxInstalled)
-	log.Printf("[termux] termux-tools 安装成功")
+	logx.Infof("termux-tools 安装成功")
 
 	// 存储尚未授权时自动跑一次 termux-setup-storage：它会弹 Android 授权框，
 	// 用户同意后创建 ~/storage 软链（Termux 浏览手机存储选工作区的前提）。
@@ -182,9 +182,9 @@ func (s *Server) installTermuxTools() {
 	if home, err := os.UserHomeDir(); err == nil && home != "" &&
 		!dirAccessible(filepath.Join(home, "storage", "shared")) {
 		if setupTermuxStorage(home) {
-			log.Printf("[termux] 存储授权完成（~/storage/shared 可用）")
+			logx.Infof("存储授权完成（~/storage/shared 可用）")
 		} else {
-			log.Printf("[termux] 存储授权未完成：如需访问手机存储，请在 Termux 执行 termux-setup-storage")
+			logx.Warnf("存储授权未完成：如需访问手机存储，请在 Termux 执行 termux-setup-storage")
 		}
 	}
 }

@@ -11,7 +11,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"net/url"
 	"os"
 	"os/signal"
@@ -23,6 +22,7 @@ import (
 	"codeforge/config"
 	"codeforge/pkg/agent"
 	"codeforge/pkg/llm"
+	"codeforge/pkg/logx"
 	"codeforge/pkg/platform"
 	"codeforge/pkg/security"
 	"codeforge/pkg/server"
@@ -186,15 +186,15 @@ func applyResumeWorkspace(current string, resume *resumeTarget) string {
 	}
 	switch {
 	case resume.Workspace == "":
-		log.Printf("会话续跑：会话 %s 创建时尚未选择工作区，本次同样按「未选择工作区」打开", resume.SessionID)
+		logx.Infof("会话续跑：会话 %s 创建时尚未选择工作区，本次同样按「未选择工作区」打开", resume.SessionID)
 		return ""
 	default:
 		if st, err := os.Stat(resume.Workspace); err != nil || !st.IsDir() {
-			log.Printf("会话续跑：会话 %s 的工作区 %s 已不存在，仍按当前工作区打开（只读对话，别改文件）",
+			logx.Infof("会话续跑：会话 %s 的工作区 %s 已不存在，仍按当前工作区打开（只读对话，别改文件）",
 				resume.SessionID, resume.Workspace)
 			return current
 		}
-		log.Printf("会话续跑：切到该会话所属工作区 %s（原 %s）", resume.Workspace, displayWorkDir(current))
+		logx.Infof("会话续跑：切到该会话所属工作区 %s（原 %s）", resume.Workspace, displayWorkDir(current))
 		return resume.Workspace
 	}
 }
@@ -209,7 +209,7 @@ func withResumeParam(base string, resume *resumeTarget) string {
 
 func openBrowserAt(target string) {
 	if err := platform.OpenBrowser(target); err != nil {
-		log.Printf("自动打开浏览器失败：%v", err)
+		logx.Warnf("自动打开浏览器失败：%v", err)
 	}
 }
 
@@ -246,21 +246,21 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 		filepath.Join(configDir, ".env"),
 		filepath.Join(configDir, "..", ".env"),
 	); err != nil {
-		log.Printf("读取 .env 失败: %v", err)
+		logx.Warnf("读取 .env 失败: %v", err)
 	} else if path != "" {
-		log.Printf("已加载环境变量文件：%s", path)
+		logx.Infof("已加载环境变量文件：%s", path)
 	}
 
 	// 本地覆盖配置：缺失时自动生成带注释的模板（该文件被 .gitignore 忽略）。
 	if path, err := config.EnsureLocalTemplate(configDir); err != nil {
-		log.Printf("生成本地配置模板失败: %v", err)
+		logx.Warnf("生成本地配置模板失败: %v", err)
 	} else if path != "" {
-		log.Printf("本地覆盖配置：%s", path)
+		logx.Infof("本地覆盖配置：%s", path)
 	}
 
 	cfg, err := config.Load(configDir)
 	if err != nil {
-		log.Fatalf("加载配置失败: %v", err)
+		logx.Fatalf("加载配置失败: %v", err)
 	}
 	if workDir != "" {
 		cfg.Agent.WorkDir = workDir
@@ -275,7 +275,7 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 	}
 	if wd != "" {
 		if st, err := os.Stat(wd); err != nil || !st.IsDir() {
-			log.Printf("警告：配置的工作目录 %s 不存在或不是目录，按「未选择工作区」处理（请在界面重新选择）", wd)
+			logx.Warnf("配置的工作目录 %s 不存在或不是目录，按「未选择工作区」处理（请在界面重新选择）", wd)
 			wd = ""
 		}
 	}
@@ -286,7 +286,7 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 	// 不该让整个服务起不来。
 	var resume *resumeTarget
 	if r, err := lookupResume(wd, resumeArg); err != nil {
-		log.Printf("会话续跑：%v（按正常启动处理）", err)
+		logx.Warnf("会话续跑：%v（按正常启动处理）", err)
 	} else if resume = r; resume != nil {
 		wd = applyResumeWorkspace(wd, resume)
 	}
@@ -294,11 +294,11 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 	// 已有实例在运行时拒绝重复启动（以运行信息文件 + 健康检查为准）。
 	if info := readRunInfo(configDir); info != nil {
 		if healthOK(info.Port) {
-			log.Printf("CodeForge 已在运行（PID %d）：%s；如需重启请执行 codeforge restart", info.PID, info.URL)
+			logx.Warnf("CodeForge 已在运行（PID %d）：%s；如需重启请执行 codeforge restart", info.PID, info.URL)
 			if resume != nil {
 				// 续跑不必重启服务：把浏览器指到那条会话即可。
 				// 工作区由界面按会话归属自行切换（旧实例的工作区不改写）。
-				log.Printf("会话续跑：在已运行的实例上打开会话 %s", resume.SessionID)
+				logx.Infof("会话续跑：在已运行的实例上打开会话 %s", resume.SessionID)
 				openBrowserAt(withResumeParam(info.URL, resume))
 			}
 			return 0
@@ -312,7 +312,7 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 	// 工作区约束：默认拒绝访问 agent.work_dir 之外的路径（详见 security.allow_outside_workspace）。
 	fsys.SetAllowOutside(cfg.Security.AllowOutsideWorkspace)
 	if cfg.Security.AllowOutsideWorkspace {
-		log.Printf("安全：已允许访问工作区之外的路径（security.allow_outside_workspace=true）")
+		logx.Warnf("安全：已允许访问工作区之外的路径（security.allow_outside_workspace=true）")
 	}
 	builtin.RegisterFS(registry, fsys)
 	builtin.RegisterTerminal(registry, fsys)
@@ -322,7 +322,7 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 	policy := security.NewPolicy(cfg.Security)
 	audit, err := security.NewAuditLogger(resolvePath(cfg.AuditLog, wd))
 	if err != nil {
-		log.Fatalf("初始化审计日志失败: %v", err)
+		logx.Fatalf("初始化审计日志失败: %v", err)
 	}
 	defer audit.Close()
 
@@ -331,7 +331,7 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 	// 3) 插件引擎
 	manager := plugins.NewManager(registry, policy, cfg.Plugins)
 	if err := manager.LoadAll(context.Background()); err != nil {
-		log.Printf("插件加载告警: %v", err)
+		logx.Warnf("插件加载告警: %v", err)
 	}
 	defer manager.Stop()
 
@@ -346,18 +346,18 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 	credentialStores(cfg, configDir)
 	provider, err := llm.NewProvider(cfg.LLM)
 	if err != nil {
-		log.Fatalf("初始化 LLM 适配器失败: %v", err)
+		logx.Fatalf("初始化 LLM 适配器失败: %v", err)
 	}
 
 	// 5) Agent 引擎与会话历史（SQLite 用户级库，跨工作区共享、按工作区隔离）
 	st, err := store.Open(store.DefaultPath())
 	if err != nil {
-		log.Fatalf("初始化 SQLite 存储失败: %v", err)
+		logx.Fatalf("初始化 SQLite 存储失败: %v", err)
 	}
 	defer st.Close()
 	// 旧版 JSON 会话一次性迁移（幂等；原文件改名 .imported 保留）
 	if n := st.MigrateSessions(resolvePath(cfg.DataDir, wd)); n > 0 {
-		log.Printf("已迁移 %d 条旧版 JSON 会话到 SQLite", n)
+		logx.Infof("已迁移 %d 条旧版 JSON 会话到 SQLite", n)
 	}
 	history := agent.NewHistory(st)
 	ag := agent.New(cfg.Agent, cfg.LLM, provider, executor, history, wd)
@@ -378,7 +378,7 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 	if cfg.BuiltinPlugins.SkillCreatorEnabled() {
 		builtin.RegisterSkillCreator(registry, fsys)
 		ag.SetSkillCreatorEnabled(true)
-		log.Printf("内置插件已启用：Skill Creator（config: builtin_plugins.skill_creator=false 可关闭）")
+		logx.Infof("内置插件已启用：Skill Creator（config: builtin_plugins.skill_creator=false 可关闭）")
 	}
 
 	// 内置插件：Multi-Agent（并发与能力限制见 config.subagents）
@@ -404,14 +404,14 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 		subagentTool = builtin.RegisterSubagents(registry, subagentRunner)
 		applySubagentPolicy() // 把并发上限同步进工具描述与 schema
 		ag.SetMultiAgentEnabled(true)
-		log.Printf("内置插件已启用：Multi-Agent（并发上限 %d，能力：写=%v 删=%v 记忆=%v；config: builtin_plugins.multi_agent=false 可关闭）",
+		logx.Infof("内置插件已启用：Multi-Agent（并发上限 %d，能力：写=%v 删=%v 记忆=%v；config: builtin_plugins.multi_agent=false 可关闭）",
 			cfg.SubagentMaxConcurrent(), cfg.SubagentAllowWrite(), cfg.SubagentAllowDelete(), cfg.SubagentAllowMemory())
 	}
 
 	// 内置插件：Plan 计划模式（纯 System Prompt 注入，无需注册工具）
 	if cfg.BuiltinPlugins.PlanEnabled() {
 		ag.SetPlanEnabled(true)
-		log.Printf("内置插件已启用：Plan 计划模式（输入 @plan 出计划书；config: builtin_plugins.plan=false 可关闭）")
+		logx.Infof("内置插件已启用：Plan 计划模式（输入 @plan 出计划书；config: builtin_plugins.plan=false 可关闭）")
 	}
 
 	// 内置插件：目标模式（@goal_mode 触发，自主验证目标是否达成）。
@@ -429,16 +429,16 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 		goalTool = builtin.RegisterGoalVerify(registry, goalVerifier)
 		applyGoalRounds()
 		ag.SetGoalModeEnabled(true)
-		log.Printf("内置插件：目标模式已启用（@goal_mode 触发，自循环最多 %d 轮；关闭：config: builtin_plugins.goal_mode=false）",
+		logx.Infof("内置插件：目标模式已启用（@goal_mode 触发，自循环最多 %d 轮；关闭：config: builtin_plugins.goal_mode=false）",
 			cfg.BuiltinPlugins.GoalModeRounds())
 	}
 
 	// 归档自动清理：启动即清一次 + 每天定时（归档满 10 天即删）
 	purgeArchived := func() {
 		if n, err := st.DeleteArchivedOlderThan(10); err != nil {
-			log.Printf("清理归档会话失败: %v", err)
+			logx.Warnf("清理归档会话失败: %v", err)
 		} else if n > 0 {
-			log.Printf("已自动清理 %d 条归档满 10 天的会话", n)
+			logx.Infof("已自动清理 %d 条归档满 10 天的会话", n)
 		}
 	}
 	purgeArchived()
@@ -499,12 +499,12 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 		}
 	})
 	if err := srv.Start(); err != nil {
-		log.Fatalf("%v", err)
+		logx.Fatalf("%v", err)
 	}
-	log.Printf("CodeForge 已启动：%s", srv.URL())
-	log.Printf("监听 %s（端口取自全局配置 %s）", srv.Addr(), filepath.Join(configDir, "default.yaml"))
-	log.Printf("平台：%s｜工作目录：%s｜可用工具：%d 个", platform.OSName(), displayWorkDir(wd), len(registry.Names()))
-	log.Printf("模型：%s（provider=%s，API Key %s）", cfg.LLM.Model, cfg.LLM.Provider, keyState(cfg.LLM.APIKey))
+	logx.Startupf("CodeForge 已启动：%s", srv.URL())
+	logx.Startupf("监听 %s（端口取自全局配置 %s）", srv.Addr(), filepath.Join(configDir, "default.yaml"))
+	logx.Startupf("平台：%s｜工作目录：%s｜可用工具：%d 个", platform.OSName(), displayWorkDir(wd), len(registry.Names()))
+	logx.Startupf("模型：%s（provider=%s，API Key %s）", cfg.LLM.Model, cfg.LLM.Provider, keyState(cfg.LLM.APIKey))
 
 	// 记录运行信息，供 codeforge stop / restart 使用（退出时删除）。
 	if err := writeRunInfo(&runInfo{
@@ -514,7 +514,7 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 		URL:       srv.URL(),
 		StartedAt: time.Now().Format(time.RFC3339),
 	}); err != nil {
-		log.Printf("写入运行信息失败: %v", err)
+		logx.Warnf("写入运行信息失败: %v", err)
 	}
 
 	// 7) 自动打开浏览器（Token 通过 HttpOnly Cookie 下发，不出现在地址栏）
@@ -525,7 +525,7 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 			if t := strings.TrimSpace(resume.Title); t != "" {
 				note = "（" + t + "）"
 			}
-			log.Printf("会话续跑：打开会话 %s%s", resume.SessionID, note)
+			logx.Infof("会话续跑：打开会话 %s%s", resume.SessionID, note)
 		}
 		openBrowserAt(target)
 	}
@@ -538,7 +538,7 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 	case <-srv.Done():
 	}
 
-	log.Println("正在关闭 CodeForge…")
+	logx.Infof("正在关闭 CodeForge…")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
@@ -562,8 +562,8 @@ func resolveConfigDir(dir string) string {
 	resolved := resolveConfigDirAt(dir, exeDir())
 	if resolved != dir {
 		abs, _ := filepath.Abs(resolved)
-		log.Printf("提示：当前工作目录下没有 %s，已自动改用可执行文件旁的配置目录：%s", dir, abs)
-		log.Printf("提示：直接运行 bin/ 下的可执行文件会导致工作目录不对，建议用项目根目录的启动脚本（cf）。")
+		logx.Warnf("当前工作目录下没有 %s，已自动改用可执行文件旁的配置目录：%s", dir, abs)
+		logx.Warnf("直接运行 bin/ 下的可执行文件会导致工作目录不对，建议用项目根目录的启动脚本（cf）。")
 	}
 	return resolved
 }
@@ -608,9 +608,9 @@ func warnConfigDir(configDir string) {
 	}
 	abs, _ := filepath.Abs(configDir)
 	exe, _ := os.Executable()
-	log.Printf("警告：配置目录 %s 下没有 default.yaml，将使用内置默认配置。", abs)
-	log.Printf("警告：-config 是相对当前工作目录解析的，这通常说明 CWD 不对。")
-	log.Printf("警告：请在项目根目录下重试，例如：cd <项目根目录> && %s restart -config config", exe)
+	logx.Warnf("配置目录 %s 下没有 default.yaml，将使用内置默认配置。", abs)
+	logx.Warnf("-config 是相对当前工作目录解析的，这通常说明 CWD 不对。")
+	logx.Warnf("请在项目根目录下重试，例如：cd <项目根目录> && %s restart -config config", exe)
 }
 
 // keyState 返回 API Key 的加载状态（只输出状态，绝不输出密钥内容）。
@@ -662,7 +662,7 @@ func credentialStores(cfg *config.Config, configDir string) {
 	// （LoadStateInto merge 的是整个 Config），所以**不需要**为了兼容去读它；
 	// 这里只是告诉用户「下次保存就不再写了」。
 	if legacy, err := config.LegacyStateHasPlaintextKey(config.StatePath()); err == nil && legacy {
-		log.Printf("[凭据] state.yaml 仍含明文 api_key（兼容期内照常可用）；" +
+		logx.Warnf("state.yaml 仍含明文 api_key（兼容期内照常可用）；" +
 			"下次保存设置后它将不再写入 —— 密钥只在 models.yaml / providers.yaml 与进程内存")
 	}
 
@@ -671,10 +671,10 @@ func credentialStores(cfg *config.Config, configDir string) {
 		dir = d
 	}
 	if strings.TrimSpace(dir) == "" {
-		log.Printf("[凭据] 未确定配置目录，跳过模型凭据解析（沿用 local.yaml / .env）")
+		logx.Warnf("未确定配置目录，跳过模型凭据解析（沿用 local.yaml / .env）")
 		return
 	}
 	ms := config.NewModelStore(filepath.Join(dir, "models.yaml"))
 	ps := config.NewProviderStore(filepath.Join(dir, "providers.yaml"))
-	log.Printf("[凭据] %s", config.ResolveModelCredentials(cfg, ms, ps))
+	logx.Infof("%s", config.ResolveModelCredentials(cfg, ms, ps))
 }

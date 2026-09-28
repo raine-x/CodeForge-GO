@@ -12,7 +12,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -22,6 +21,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"codeforge/pkg/logx"
 )
 
 // runEnvKey 允许覆盖运行信息文件位置（测试必须用它，否则会写真实用户目录）。
@@ -172,7 +173,7 @@ func stopInstance(configDir string, fallbackPort int) bool {
 			removeRunInfo(configDir)
 			return true
 		}
-		log.Println("优雅关闭未完成，尝试强制结束…")
+		logx.Warnf("优雅关闭未完成，尝试强制结束…")
 	}
 
 	// 2) 强制结束：优先 run 文件中的 PID，失效则按端口定位

@@ -227,8 +227,67 @@ func TestCompressNoOpWithinBudget(t *testing.T) {
 	msgs := buildTurns(1, 10)
 	out := Compress(msgs, 100000)
 	if len(out) != len(msgs) {
-		t.Errorf("未超预算却改动了消息数：%d → %d", len(msgs), len(out))
+		t.Errorf("未超预算却改动了消息数：%d → %d", len(out), len(msgs))
 	}
+}
+
+// TestCompressKeepsTailOfLastUserMessage 回归：超长用户消息被机械压缩时，
+// **末尾的诉求必须活下来**。
+//
+// 真实故障：用户粘贴 500KB 内容后追加一句「只回复数字1」，clipRunes 只保留
+// 头部 2000 字符，于是模型收到一堆 x 前缀、完全看不到那句要求，只能回
+// 「内容被截断了，没有读到需求」。诉求写在尾部是这个交互的常态（长日志、
+// 报错栈后面跟一句要做什么），所以截断必须保留尾部。
+func TestCompressKeepsTailOfLastUserMessage(t *testing.T) {
+	const ask = "只回复数字1"
+	// 头部是噪音，诉求在末尾 —— 与真实粘贴场景一致
+	huge := strings.Repeat("x", 500000) + ask
+	msgs := []llm.Message{llm.TextMessage(llm.RoleUser, huge)}
+
+	out := Compress(msgs, 3000)
+	if len(out) == 0 {
+		t.Fatal("压缩后为空")
+	}
+
+	var got string
+	for _, m := range out {
+		for _, b := range m.Content {
+			if b.Type == llm.BlockText {
+				got = b.Text
+			}
+		}
+	}
+	if !strings.Contains(got, ask) {
+		t.Fatalf("末尾诉求 %q 被截断丢失了 —— 这正是用户遇到的故障。压缩后尾部为：%q",
+			ask, tailRunes(got, 40))
+	}
+	// 头部也应当保留（前缀里可能有必要的上下文）
+	if !strings.HasPrefix(got, "x") {
+		t.Errorf("头部也丢了，截断应保留首尾两端，实际开头：%q", headRunes(got, 20))
+	}
+	// 并且要真的压下去了，否则等于没修
+	if n := len([]rune(got)); n >= 500000 {
+		t.Errorf("压缩后仍有 %d 字符，未生效", n)
+	}
+	if !strings.Contains(got, "省略") {
+		t.Errorf("缺少省略标记，用户无法判断内容被截断过：%q", headRunes(got, 60))
+	}
+}
+
+func headRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
+}
+
+func tailRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[len(r)-n:])
 }
 
 // ---------- 3. 切点的 API 合法性 ----------

@@ -2,12 +2,12 @@ package store
 
 import (
 	"encoding/json"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"codeforge/pkg/llm"
+	"codeforge/pkg/logx"
 )
 
 // MigrateSessions 导入旧版 JSON 会话文件（.codeforge/<id>.json）。
@@ -30,7 +30,7 @@ func (s *Store) MigrateSessions(legacyDir string) (imported int) {
 		full := filepath.Join(legacyDir, e.Name())
 		n, err := importOne(s, full, workspace)
 		if err != nil {
-			log.Printf("[store] 迁移会话 %s 失败: %v", e.Name(), err)
+			logx.Errorf("迁移会话 %s 失败: %v", e.Name(), err)
 			continue
 		}
 		imported += n
@@ -81,7 +81,7 @@ func importOne(s *Store, full, workspace string) (int, error) {
 		return 0, err
 	}
 	if err := os.Rename(full, full+".imported"); err != nil {
-		log.Printf("[store] 标记已迁移文件失败（不影响数据）: %v", err)
+		logx.Errorf("标记已迁移文件失败（不影响数据）: %v", err)
 	}
 	return 1, nil
 }

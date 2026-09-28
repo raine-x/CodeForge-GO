@@ -8,12 +8,12 @@ package agent
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"codeforge/pkg/logx"
 	"codeforge/pkg/store"
 	"codeforge/pkg/tools"
 )
@@ -52,7 +52,7 @@ func (a *Agent) recordCheckpoint(sessionID string, step int, ev tools.Checkpoint
 		OldContent: ev.OldContent,
 	})
 	if err != nil {
-		log.Printf("[checkpoint] 会话=%s 步骤=%d 记录失败（路径=%s）：%v", sessionID, step, ev.Path, err)
+		logx.Errorf("会话=%s 步骤=%d 记录失败（路径=%s）：%v", sessionID, step, ev.Path, err)
 	}
 }
 
@@ -216,7 +216,7 @@ func (a *Agent) RewindFiles(sessionID string, toStep int) (*RewindResult, error)
 	// 全部成功才清理检查点：有失败项时保留，方便用户修正后重试。
 	if res.Failed == 0 && len(res.Paths) > 0 {
 		if _, err := a.memoryStore.DeleteCheckpointsFrom(sessionID, toStep); err != nil {
-			log.Printf("[checkpoint] 会话=%s 回滚后清理检查点失败：%v", sessionID, err)
+			logx.Errorf("会话=%s 回滚后清理检查点失败：%v", sessionID, err)
 		}
 	}
 	return res, nil

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -14,6 +13,7 @@ import (
 
 	"codeforge/pkg/agent"
 	"codeforge/pkg/errs"
+	"codeforge/pkg/logx"
 	"codeforge/pkg/platform"
 	"codeforge/pkg/tools"
 )
@@ -99,7 +99,7 @@ func (c *wsClient) sendErr(action string, err error) {
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("[ws] 升级失败: %v", err)
+		logx.Errorf("升级失败: %v", err)
 		return
 	}
 	client := &wsClient{srv: s, conn: conn, pageHidden: true}
@@ -185,7 +185,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 				// 只截断对话），可定位时按其保守口径回退。
 				res, err := c.srv.agent.RewindAfterEdit(msg.SessionID, msg.Back)
 				if err != nil {
-					log.Printf("[edit] 会话=%s 文件回退失败（已跳过，仅重跑对话）：%v", msg.SessionID, err)
+					logx.Errorf("会话=%s 文件回退失败（已跳过，仅重跑对话）：%v", msg.SessionID, err)
 				} else if res != nil && len(res.Paths) > 0 {
 					emit(agent.Event{Type: agent.EventRewind, Text: "已回退文件改动", Rewind: res})
 				}
@@ -230,7 +230,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 				// 只截断对话），可定位时按其保守口径回退。
 				res, err := c.srv.agent.RewindAfterEdit(msg.SessionID, back)
 				if err != nil {
-					log.Printf("[retry] 会话=%s 文件回退失败（已跳过，仅重跑对话）：%v", msg.SessionID, err)
+					logx.Errorf("会话=%s 文件回退失败（已跳过，仅重跑对话）：%v", msg.SessionID, err)
 				} else if res != nil && len(res.Paths) > 0 {
 					emit(agent.Event{Type: agent.EventRewind, Text: "已回退文件改动", Rewind: res})
 				}
@@ -338,7 +338,7 @@ func (c *wsClient) startUserMessage(msg wsMessage) {
 func (c *wsClient) run(sessionID, thinking, trigger, label string, agentFn func(ctx context.Context, emit func(agent.Event)) error) {
 	c.stop()
 
-	log.Printf("[run] 会话=%s 触发=%s 输入=%q", sessionID, trigger, clipText(label, 80))
+	logx.Runf("会话=%s 触发=%s 输入=%q", sessionID, trigger, clipText(label, 80))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancelMu.Lock()
@@ -429,7 +429,7 @@ func (c *wsClient) run(sessionID, thinking, trigger, label string, agentFn func(
 	if !owns() {
 		// 已被新一轮取代（用户打断后立刻又发了话）：这一轮的收尾全部作废，
 		// 由接管它的那一轮负责发 idle / 刷新占用 / 通知。
-		log.Printf("[run] 会话=%s 本轮已被更新的轮次取代，跳过收尾事件", sessionID)
+		logx.Debugf("会话=%s 本轮已被更新的轮次取代，跳过收尾事件", sessionID)
 		return
 	}
 	if runErr != nil && ctx.Err() == nil {
@@ -465,7 +465,7 @@ func (c *wsClient) notifyDone(sessionID string, runErr error) {
 	}
 	c.notifyMu.Unlock()
 	if reason != "" {
-		log.Printf("[notify] 跳过系统通知（会话=%s）：%s", sessionID, reason)
+		logx.Infof("跳过系统通知（会话=%s）：%s", sessionID, reason)
 		return
 	}
 
@@ -476,10 +476,10 @@ func (c *wsClient) notifyDone(sessionID string, runErr error) {
 	if runErr != nil {
 		title, message = "CodeForge", "任务执行失败："+clipText(runErr.Error(), 120)
 	}
-	log.Printf("[notify] 发送系统通知（会话=%s）：%s", sessionID, message)
+	logx.Infof("发送系统通知（会话=%s）：%s", sessionID, message)
 	go func() {
 		if err := platform.Notify(title, message); err != nil {
-			log.Printf("系统通知发送失败（已忽略）：%v", err)
+			logx.Errorf("系统通知发送失败（已忽略）：%v", err)
 		}
 	}()
 }

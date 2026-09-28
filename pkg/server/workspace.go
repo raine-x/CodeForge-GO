@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -14,6 +13,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"codeforge/pkg/logx"
 )
 
 // handleWorkspace 查看 / 切换工作区。
@@ -87,7 +88,7 @@ func (s *Server) persistWorkDir(dir string) {
 	dir = filepath.Clean(dir)
 	s.cfg.Agent.WorkDir = dir
 	if err := s.cfg.SaveState(); err != nil {
-		log.Printf("警告：工作区已切换但写回运行状态失败（重启后需重新选择）: %v", err)
+		logx.Warnf("工作区已切换但写回运行状态失败（重启后需重新选择）: %v", err)
 	}
 }
 
@@ -120,7 +121,7 @@ func (s *Server) handleNotifyPrefs(w http.ResponseWriter, r *http.Request) {
 		on := *body.Enabled
 		s.cfg.Notify.Enabled = &on
 		if err := s.cfg.SaveState(); err != nil {
-			log.Printf("警告：通知开关已生效但写回运行状态失败（重启后需重新设置）: %v", err)
+			logx.Warnf("通知开关已生效但写回运行状态失败（重启后需重新设置）: %v", err)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": s.cfg.NotifyEnabled()})
 
@@ -209,7 +210,7 @@ func (s *Server) handleStageFile(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "暂存文件夹失败: " + serr.Error()})
 			return
 		}
-		log.Printf("已暂存工作区外文件夹：%s → %s（%d 个文件）", src, stagedRoot, count)
+		logx.Infof("已暂存工作区外文件夹：%s → %s（%d 个文件）", src, stagedRoot, count)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": true, "inside": false, "is_dir": true, "count": count,
 			"staged_path": stagedRoot, "name": filepath.Base(src),
@@ -256,7 +257,7 @@ func (s *Server) handleStageFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rel, _ := filepath.Rel(root, dst)
-	log.Printf("已暂存工作区外文件：%s → %s", src, rel)
+	logx.Infof("已暂存工作区外文件：%s → %s", src, rel)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "inside": false,
 		"staged_path": filepath.ToSlash(rel), "name": name,

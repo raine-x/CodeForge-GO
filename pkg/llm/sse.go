@@ -7,11 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"codeforge/pkg/logx"
 )
 
 // httpClient 用于流式请求；总超时由 context 控制。
@@ -182,7 +183,7 @@ func postJSON(
 			}
 			lastErr = fmt.Errorf("LLM 请求失败: %w", err)
 			if attempt < policy.MaxAttempts {
-				log.Printf("[llm] 请求异常，准备第 %d 次重试: %v", attempt+1, err)
+				logx.Warnf("请求异常，准备第 %d 次重试: %v", attempt+1, err)
 				if hook := retryHookFrom(ctx); hook != nil {
 					hook(attempt+1, policy.MaxAttempts, lastErr.Error())
 				}
@@ -218,7 +219,7 @@ func postJSON(
 		if hook := retryHookFrom(ctx); hook != nil {
 			hook(attempt+1, policy.MaxAttempts, apiErr.Error())
 		}
-		log.Printf("[llm] 上游返回 %d，第 %d/%d 次尝试，%.1fs 后重试",
+		logx.Infof("上游返回 %d，第 %d/%d 次尝试，%.1fs 后重试",
 			resp.StatusCode, attempt, policy.MaxAttempts, nextDelay.Seconds())
 	}
 

@@ -2,11 +2,11 @@ package server
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 
 	"codeforge/config"
 	"codeforge/pkg/agent"
+	"codeforge/pkg/logx"
 )
 
 // SetSubagentApply 注入子智能体设置的运行时应用钩子（main.go 实现）：
@@ -72,7 +72,7 @@ func (s *Server) handleSubagentPrefs(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if err := s.cfg.SaveState(); err != nil {
-			log.Printf("警告：子智能体设置已生效但写回运行状态失败（重启后需重新设置）: %v", err)
+			logx.Warnf("子智能体设置已生效但写回运行状态失败（重启后需重新设置）: %v", err)
 		}
 		if s.subagentApply != nil {
 			s.subagentApply()

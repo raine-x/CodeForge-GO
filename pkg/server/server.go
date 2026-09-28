@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"log"
 	"net"
 	"net/http"
 	"path"
@@ -27,6 +26,7 @@ import (
 	"codeforge/config"
 	"codeforge/pkg/agent"
 	"codeforge/pkg/llm"
+	"codeforge/pkg/logx"
 	"codeforge/pkg/platform"
 	"codeforge/pkg/tools"
 	"codeforge/pkg/tools/plugins"
@@ -102,7 +102,7 @@ func New(cfg *config.Config, ag *agent.Agent, executor *tools.Executor, registry
 	// 把旧 models.yaml（每条模型各自保存 base_url + 密钥）归并成供应商。
 	// 失败只记日志不阻断启动：迁移不了顶多维持旧格式，模型照常可用。
 	if err := s.ensureProvidersMigrated(); err != nil {
-		log.Printf("[server] 供应商归并失败（模型仍按自带连接信息工作）: %v", err)
+		logx.Errorf("供应商归并失败（模型仍按自带连接信息工作）: %v", err)
 	}
 	// 启动即把当前生效模型的上下文窗口同步给 Agent：压缩阈值（窗口 × 95%）
 	// 从第一轮对话就生效，而不是等用户在设置里点一次「应用」。
@@ -220,7 +220,7 @@ func (s *Server) Start() error {
 	}
 	go func() {
 		if err := s.srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			log.Printf("[server] 服务退出: %v", err)
+			logx.Errorf("服务退出: %v", err)
 		}
 	}()
 	return nil

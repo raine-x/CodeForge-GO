@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
 	"codeforge/pkg/llm"
+	"codeforge/pkg/logx"
 )
 
 // 上下文压缩的常量。
@@ -258,9 +258,31 @@ func Compress(msgs []llm.Message, budget int) []llm.Message {
 	for i := range out {
 		placeholderToolResults(&out[i], 0)
 	}
+	// 截断用户消息前先记下原始长度，最后统一提示。
+	// 静默截断是最糟的失败方式：用户以为模型读到了全文，模型却只看到
+	// 两端，于是双方各执一词还都以为自己没错。
+	var lastUserRunes int
+	if lastUser >= 0 && lastUser < len(out) {
+		for _, b := range out[lastUser].Content {
+			if b.Type == llm.BlockText {
+				lastUserRunes += len([]rune(b.Text))
+			}
+		}
+	}
 	for capRunes := compressTextRunes; capRunes >= 60 && EstimateTokens(out) > budget; capRunes /= 3 {
 		for i := range out {
 			truncateTextBlocks(&out[i], capRunes)
+		}
+	}
+	if lastUserRunes > compressTextRunes && lastUser >= 0 && lastUser < len(out) {
+		after := 0
+		for _, b := range out[lastUser].Content {
+			if b.Type == llm.BlockText {
+				after += len([]rune(b.Text))
+			}
+		}
+		if after < lastUserRunes {
+			logx.Warnf("本轮消息过长（%d 字），已保留首尾约 %d 字后送模型；被省略的是中间部分", lastUserRunes, after)
 		}
 	}
 	return out
@@ -349,7 +371,7 @@ func isPlainUserText(m llm.Message) bool {
 // lastPlainUserIndex 返回最后一条「用户纯文本发言」的下标，无则 -1。
 //
 // 注意：它把「运行中转向」注入的指令也算作发言 —— 这是压缩切点想要的
-//（插话本身是合法的切点）。要定位「真正的提问」请用 isUserQuestion 那组。
+// （插话本身是合法的切点）。要定位「真正的提问」请用 isUserQuestion 那组。
 func lastPlainUserIndex(msgs []llm.Message) int {
 	for i := len(msgs) - 1; i >= 0; i-- {
 		if isPlainUserText(msgs[i]) {
@@ -452,7 +474,18 @@ func renderTranscript(msgs []llm.Message) string {
 	return sb.String()
 }
 
-// clipRunes 按字符（rune）截断，避免把多字节汉字截成半个。
+// clipRunes 按字符（rune）截断，**首尾都保留**，中间用省略标记替代。
+//
+// 为什么不能只留头部：被截断的绝大多数是用户消息，而「要做什么」几乎总是
+// 写在最后面 —— 粘贴的长日志、报错栈、代码片段后面跟一句「把这个改成…
+// 」。只留头部的话模型收到的是一堆无意义前缀，看不到诉求，只能回
+// 「内容看起来被截断了」，而真正该做的是让尾部活下来。
+//
+// 头部同样保留：长粘贴的前缀里常有必要的上下文（文件名、错误摘要），
+// 砍掉它会换来另一类「模型不知道我在说哪个文件」。
+//
+// 比例取 2:1（头多尾少）：头部通常是结构/上下文，尾部是诉求，两者都重要，
+// 但前缀冗余度高于诉求的冗余度。
 func clipRunes(s string, max int) string {
 	if max <= 0 {
 		return s
@@ -461,7 +494,14 @@ func clipRunes(s string, max int) string {
 	if len(r) <= max {
 		return s
 	}
-	return string(r[:max]) + "…（已截断）"
+	head := max * 2 / 3
+	tail := max - head
+	// 标记里必须保留「已截断」三个字：项目记忆区等处靠它告诉模型
+	// 「这里只是片段，全文在那个文件里，自己去读」（见
+	// TestProjectMemorySectionCapsAndDedupes）。措辞不能随便改。
+	// 标记本身也要算进预算，否则极端档位下结果反而比 max 还长。
+	marker := fmt.Sprintf("\n…（已截断，中间省略 %d 字）…\n", len(r)-max)
+	return string(r[:head]) + marker + string(r[len(r)-tail:])
 }
 
 // MarshalMessages 便于调试：将消息序列化为可读 JSON。
@@ -589,11 +629,11 @@ func (a *Agent) CompressNow(ctx context.Context, sessionID string) (CompressInfo
 	// 原文已被挤出送模视图，「这个会话读过它」不再成立（与自动压缩同一口径）。
 	a.forgetReads(sess.ID)
 	if err := a.history.Save(sess.ID); err != nil {
-		log.Printf("[compress] 会话=%s 主动压缩后落库失败：%v", sess.ID, err)
+		logx.Errorf("会话=%s 主动压缩后落库失败：%v", sess.ID, err)
 	}
 
 	after := EstimateTokens(a.requestView(sess))
-	log.Printf("[compress] 会话=%s 主动压缩 阈值=%d 累计 %d 条（本次新增 %d）%d → %d tokens",
+	logx.Debugf("会话=%s 主动压缩 阈值=%d 累计 %d 条（本次新增 %d）%d → %d tokens",
 		sess.ID, a.compressBudget(), split, added, before, after)
 	return CompressInfo{
 		Summarized: split, Added: added,
@@ -732,7 +772,7 @@ func (a *Agent) summarizeRange(ctx context.Context, prev string, msgs []llm.Mess
 			}
 			if chunkBudget > floor {
 				chunkBudget /= 2
-				log.Printf("[compress] 会话摘要单块失败（%v），块预算降至 %d tokens 后重试", err, chunkBudget)
+				logx.Errorf("会话摘要单块失败（%v），块预算降至 %d tokens 后重试", err, chunkBudget)
 				continue // idx / pending 不前进，用更小的块重来
 			}
 			return cur, err

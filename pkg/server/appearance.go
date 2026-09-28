@@ -3,7 +3,6 @@ package server
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -11,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 
+	"codeforge/pkg/logx"
 	"codeforge/pkg/platform"
 )
 
@@ -157,7 +157,7 @@ func (s *Server) handleAppearancePick(w http.ResponseWriter, r *http.Request) {
 			// 如实区分「真没装」与「装了但这次调用失败」——早先一律写成
 			// 「需要 termux-tools」，用户明明装过包也被这句话带偏。
 			msg := termuxToolsHint(runErr, out)
-			log.Printf("[appearance] Termux 系统选图失败：%s", msg)
+			logx.Errorf("Termux 系统选图失败：%s", msg)
 			// 无论如何都给一条能走通的路：回落到前端内置选择器。
 			// 起点给已授权的手机存储（没授权就退回 ~，那个一定能列出）。
 			writeJSON(w, http.StatusOK, map[string]any{

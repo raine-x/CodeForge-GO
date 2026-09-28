@@ -3,11 +3,11 @@ package plugins
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 
 	"codeforge/config"
+	"codeforge/pkg/logx"
 	"codeforge/pkg/security"
 	"codeforge/pkg/tools"
 )
@@ -45,7 +45,7 @@ func (m *Manager) LoadAll(ctx context.Context) error {
 		}
 		if err := m.loadLocked(ctx, cfg); err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", cfg.Name, err))
-			log.Printf("[plugins] 加载插件 %s 失败: %v", cfg.Name, err)
+			logx.Errorf("加载插件 %s 失败: %v", cfg.Name, err)
 		}
 	}
 	if len(errs) > 0 {
@@ -171,6 +171,6 @@ func (m *Manager) loadLocked(ctx context.Context, cfg config.PluginConfig) error
 	}
 
 	m.drivers[cfg.Name] = driver
-	log.Printf("[plugins] 已加载插件 %s（%s），工具数 %d", cfg.Name, cfg.Type, len(remoteTools))
+	logx.Infof("已加载插件 %s（%s），工具数 %d", cfg.Name, cfg.Type, len(remoteTools))
 	return nil
 }

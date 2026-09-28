@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -15,6 +14,7 @@ import (
 
 	"codeforge/config"
 	"codeforge/pkg/errs"
+	"codeforge/pkg/logx"
 )
 
 // modelTestReq 是测试连接请求。
@@ -436,7 +436,7 @@ func (s *Server) handleModelApply(w http.ResponseWriter, r *http.Request) {
 				// CompressNow 内部会按当前生效模型的预算做摘要；压完再复核一次，
 				// 仍然放不下才如实拒绝（此时确实没有别的办法）。
 				if _, err := s.agent.CompressNow(r.Context(), req.SessionID); err != nil {
-					log.Printf("[apply] 会话=%s 切换前自动压缩失败：%v", req.SessionID, err)
+					logx.Warnf("会话=%s 切换前自动压缩失败：%v", req.SessionID, err)
 				}
 				if sess2, ok2 := s.agent.History().Get(req.SessionID); ok2 && sess2 != nil {
 					if over2 := s.agent.SessionOverflowFor(sess2, m.CtxIn); over2 > 0 {
@@ -504,7 +504,7 @@ func (s *Server) applyModelEntry(m config.ModelEntry, supplied string) error {
 	// 运行状态写 state.yaml。这里也是明文密钥的落盘点：阶段 3 把 llm 段缩成
 	// 一个 model id 之后，密钥就只留在 providers.yaml / models.yaml 里了。
 	if err := s.cfg.SaveState(); err != nil {
-		log.Printf("警告：模型已切换但写回运行状态失败（重启后需重新应用）: %v", err)
+		logx.Warnf("模型已切换但写回运行状态失败（重启后需重新应用）: %v", err)
 	}
 	return nil
 }

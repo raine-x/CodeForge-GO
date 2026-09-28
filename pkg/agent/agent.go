@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"math"
 	"strings"
 	"sync"
@@ -14,6 +13,7 @@ import (
 	"codeforge/config"
 	"codeforge/pkg/errs"
 	"codeforge/pkg/llm"
+	"codeforge/pkg/logx"
 	"codeforge/pkg/store"
 	"codeforge/pkg/tools"
 )
@@ -509,7 +509,7 @@ func (a *Agent) prepareMessagesBudget(ctx context.Context, sess *Session, emit E
 	added := split - sess.compressedUpTo
 	summary, err := a.summarizeRange(ctx, prev, sess.Messages, sess.compressedUpTo, split)
 	if err != nil || strings.TrimSpace(summary) == "" {
-		log.Printf("[compress] 会话=%s 摘要压缩失败（已摘要 %d→%d 条）：%v",
+		logx.Errorf("会话=%s 摘要压缩失败（已摘要 %d→%d 条）：%v",
 			sess.ID, sess.compressedUpTo, split, err)
 		return a.degradedCompress(sess, view, used, budget, split, emit)
 	}
@@ -522,7 +522,7 @@ func (a *Agent) prepareMessagesBudget(ctx context.Context, sess *Session, emit E
 
 	next := a.requestView(sess)
 	after := EstimateTokens(next)
-	log.Printf("[compress] 会话=%s 阈值=%d 摘要累计 %d 条（本次新增 %d）%d → %d tokens",
+	logx.Debugf("会话=%s 阈值=%d 摘要累计 %d 条（本次新增 %d）%d → %d tokens",
 		sess.ID, budget, split, added, used, after)
 
 	if emit != nil {
@@ -565,7 +565,7 @@ func (a *Agent) degradedCompress(sess *Session, view []llm.Message, used, budget
 	out := Compress(view, budget)
 	a.forgetReads(sess.ID)
 	after := EstimateTokens(out)
-	log.Printf("[compress] 会话=%s 摘要不可用，回退机械压缩（阈值=%d 候选切点=%d）%d → %d tokens",
+	logx.Debugf("会话=%s 摘要不可用，回退机械压缩（阈值=%d 候选切点=%d）%d → %d tokens",
 		sess.ID, budget, split, used, after)
 	if emit != nil {
 		emit(Event{Type: EventCompress, Compress: &CompressInfo{
@@ -659,7 +659,7 @@ func (a *Agent) RunWithImages(ctx context.Context, sessionID, input string, imag
 	// 没有结果的 tool_use，上游对消息序列有硬约束，带着它请求会被 400 拒绝。
 	// 补一条说明性结果（而不是删掉调用记录）——见 Session.repairDanglingToolUse。
 	if fixed := sess.repairDanglingToolUse(); len(fixed) > 0 {
-		log.Printf("[agent] 会话=%s 补上 %d 条没有结果的工具调用记录（上一轮在工具执行中被中断）",
+		logx.Debugf("会话=%s 补上 %d 条没有结果的工具调用记录（上一轮在工具执行中被中断）",
 			sessionID, len(fixed))
 		emit(Event{Type: EventInfo,
 			Text: fmt.Sprintf("已补上 %d 条被打断的工具调用记录，接着往下跑", len(fixed))})
@@ -869,7 +869,7 @@ func (a *Agent) ContinueTurn(ctx context.Context, sessionID string, emit Emitter
 	// 上一轮若在「工具执行到一半」被强杀，末尾会挂着一条没有结果的 tool_use。
 	// 补一条说明性结果（而不是删掉调用记录）——见 Session.repairDanglingToolUse。
 	if fixed := sess.repairDanglingToolUse(); len(fixed) > 0 {
-		log.Printf("[agent] 会话=%s 继续前补上 %d 条没有结果的工具调用记录", sessionID, len(fixed))
+		logx.Debugf("会话=%s 继续前补上 %d 条没有结果的工具调用记录", sessionID, len(fixed))
 		emit(Event{Type: EventInfo,
 			Text: fmt.Sprintf("已补上 %d 条被打断的工具调用记录，接着往下跑", len(fixed))})
 		a.save(sess, true, emit)
@@ -1054,7 +1054,7 @@ func (a *Agent) appendSteers(sess *Session, texts []string, emit Emitter) {
 		sess.appendMessages(msg)
 		sess.SetLastUserInput(t) // 技能触发词按最新一条用户输入匹配
 	}
-	log.Printf("[steer] 会话=%s 已并入 %d 条中途指令", sess.ID, len(texts))
+	logx.Debugf("会话=%s 已并入 %d 条中途指令", sess.ID, len(texts))
 	emit(Event{Type: EventSteer, Text: strings.Join(texts, "\n")})
 }
 
@@ -1166,7 +1166,7 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 				// 告知用户「不是你的错，我在自救」——否则界面上只会突然多出一段
 				// 摘要，用户不知道发生了什么。
 				shrink *= overflowShrinkRatio
-				log.Printf("[compress] 会话=%s 上游报上下文超窗，收紧压缩线至 %.0f%% 后重试（第 %d 次）",
+				logx.Infof("会话=%s 上游报上下文超窗，收紧压缩线至 %.0f%% 后重试（第 %d 次）",
 					sess.ID, shrink*100, attempt)
 				emit(Event{Type: EventCompress, Compress: &CompressInfo{
 					Budget:   budget,
@@ -1232,7 +1232,7 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 			if strings.TrimSpace(turn.Text) == "" {
 				emptyTurns++
 				if emptyTurns <= maxEmptyTurnRetries {
-					log.Printf("[agent] 会话=%s 第 %d 步是空回合（思考 %d 字、正文 0 字、工具 0 次），重试",
+					logx.Debugf("会话=%s 第 %d 步是空回合（思考 %d 字、正文 0 字、工具 0 次），重试",
 						sess.ID, step, turn.ReasoningLen)
 					emit(Event{Type: EventRetry, Error: "模型本轮没有返回内容，正在重试",
 						Attempt: emptyTurns, MaxAttempts: maxEmptyTurnRetries + 1})
@@ -1312,7 +1312,7 @@ func (a *Agent) save(sess *Session, persist bool, emit ...Emitter) {
 		return
 	}
 	if err := a.history.Save(sess.ID); err != nil {
-		log.Printf("[agent] 会话持久化失败（会话=%s）：%v", sess.ID, err)
+		logx.Errorf("会话持久化失败（会话=%s）：%v", sess.ID, err)
 		if len(emit) > 0 && emit[0] != nil && sess.markSaveWarned() {
 			emit[0](Event{Type: EventInfo,
 				Text: "会话保存失败，本次对话内容可能不会被持久化（详见服务端日志）"})
