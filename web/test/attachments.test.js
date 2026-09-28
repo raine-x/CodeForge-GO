@@ -35,7 +35,12 @@ function harness() {
     fetch(url, options) { requests.push({ url, options }); return c.reply(url, options); },
     reply() { throw new Error('Unexpected fetch'); },
     addError(text) { errors.push(text); }, addInfo(text) { infos.push(text); },
-    addUser(text) { users.push(text); }, showThinking() {}, resetPlanActions() {},
+    // addUser 必须**返回行节点**：submitMessage 记乐观气泡要用 lastAddedUserRow()，
+    // 它取的是 addUser 的返回值。早先这里只 push 不返回，于是 submitMessage 走到
+    // `optimisticBubble = lastAddedUserRow()` 时 ReferenceError，被自己的 catch
+    // 吞掉并 `sending = false` —— 表现是「第一次已发出，紧接着的第二次提交没被
+    // 拦住」（sent.length 2 !== 1），排查时极难指向这里。
+    addUser(text) { users.push(text); return {}; }, showThinking() {}, resetPlanActions() {},
     sendBtn: { classList: { add() {}, remove() {} } },
     sessionsCache: [], loadSessionList() {}, messagesEl: {}, subagentCards: new Map(),
     syncComposerMode() {}, renderSessions() {}, scrollBottom() {},
@@ -46,6 +51,25 @@ function harness() {
     // syncUserEditButtons 由 busy 事件触发，steerNow 在「运行中再按发送」时触发，
     // 两者都不在本框架的覆盖范围内。
     isEditing() { return false; }, syncUserEditButtons() {}, steerNow() {},
+    // 乐观气泡（提交成功后记、error/idle 时撤）。
+    //
+    // 这里打桩而不是抽取源码里的实现：lastAddedUserRow 依赖
+    // userQuestionRows → messagesEl.querySelectorAll，是纯 DOM 视图层；本组测的是
+    // 「发送时机 / 附件暂存 / 重复提交拦截」，与气泡渲染无关。
+    //
+    // ⚠️ 早先没提供它们，submitMessage 走到 `optimisticBubble = lastAddedUserRow()`
+    // 就 ReferenceError，被自己的 catch 吞掉并 `sending = false` —— 于是**紧接着的
+    // 第二次提交没被拦住**（sent.length 2 !== 1）。而 sent[0] 早已写出、users 也已
+    // 追加，看起来「第一次发送是成功的」，排查时极难指向这个缺失依赖。
+    lastAddedUserRow() { return null; }, dropOptimisticBubble() { return false; },
+    // 审批卡作废（busy 分支会调）。纯视图层：改审批按钮的禁用态。
+    // ⚠️ 缺它会让 h.event('busy') 直接抛 ReferenceError —— WS 的 onmessage 没有
+    // try/catch，一抛就整个测试炸在那里，看不出跟「发送时机」有关。
+    expireApprovals() {},
+    // idle/error 分支会调它收尾本轮可视元素（工具卡 / 思考提示 / 重试圆环…）。纯视图层。
+    clearRunVisuals() {},
+    // pendingEdit：编辑重发已发出、尚未收到服务端权威快照的标志。idle/error 分支会读写它。
+    pendingEdit: false,
     setTimeout() {},
     thinkingVal: 'high', composerSnap: false, lastUserText: '', lastReply: '',
     runSessionID: '', runReason: '', runText: '', pendingToolEl: null
