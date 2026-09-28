@@ -936,6 +936,22 @@ check('添加文件按平台分流：Windows 资源管理器 / 其他内置选�
 check('内置选择器支持文件模式（文件可点选 + 确认键禁用态）',
   /pickerMode === 'file' \? '选择此文件' : '选择当前目录'/.test(uiSrc) &&
   /okBtn\.disabled = pickerMode === 'file'/.test(uiSrc));
+// ⚠️ 换目录时重置确认键的那一行必须**单独**钉住，且要限定在 browse() 内。
+//
+// 原因：打开时的复位和换目录时的复位是**两处独立赋值**，只断言「文件里有
+// okBtn.disabled = pickerMode === 'file'」的话，打开那一行就能把断言喂饱，
+// browse() 里写成反的 `!== 'file'` 完全测不出来（2026-09 漏网即此）。
+//
+// 写反的后果只在 dir 模式显形：dir 模式下 `pickerMode !== 'file'` 恒为 true，
+// 于是「选择当前目录」在选择器弹出的第一帧就被置灰且再也点不开 ——
+// 非 Windows 平台（Linux/macOS/Termux）选工作区全废，Windows 走系统对话框
+// 免疫，所以只在 Termux 上被看见。file 模式的反向错误（换目录后误放开）被
+// onPick 里 `if (!pickerSel) return;` 兜住，同样长期无人察觉。
+check('换目录重置确认键：只在 file 模式禁用，dir 模式必须始终可点',
+  /okBtn\.disabled = pickerMode === 'file'/.test(extractFunction(uiSrc, 'browse')));
+check('确认键禁用条件不得写成反向比较（dir 模式会被置灰点不开）',
+  !/okBtn\.disabled = pickerMode !==/.test(uiSrc) &&
+  !/okBtn\.disabled = !pickerMode/.test(uiSrc));
 check('选中后把路径插到输入框光标处',
   /function insertIntoInput/.test(uiSrc) && /insertPickedFile\(res\.data\.path\)/.test(uiSrc));
 check('工作区外文件给出提示（代理默认读不到）',

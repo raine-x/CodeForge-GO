@@ -3814,7 +3814,12 @@ case 'idle': {
       // 但「选择此文件」仍可点，点下去拿到的是子目录里的旧路径 ——
       // 界面上看像在选当前目录的文件，实际是别的层级的东西。
       pickerSel = '';
-      if (okBtn) okBtn.disabled = pickerMode !== 'file';
+      // ⚠️ 只能是 `=== 'file'`：换目录作废的是**文件模式下已选中的那个文件**，
+      // 所以要重新置灰的也只有文件模式。dir 模式的「选择当前目录」无论当前停在哪
+      // 一层都该可点 —— 写成 `!== 'file'` 会让 dir 模式恒为 true，选择器弹出的
+      // 第一帧按钮就被置灰，非 Windows 平台（Linux/macOS/Termux）因此完全选不了
+      // 工作区目录，Windows 走系统对话框不受影响（2026-09 反馈）。
+      if (okBtn) okBtn.disabled = pickerMode === 'file';
       // picker=1：内置选择器要浏览工作区外的目录（如 Termux 的 ~/storage/shared），
       // 服务端只在这个模式下放行绝对路径 —— 不带它会被「路径越出工作区范围」403，
       // 表现正是「选择目录时列表永远为空」。
