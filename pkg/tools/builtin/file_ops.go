@@ -25,6 +25,12 @@ type Snapshot struct {
 	Existed bool      `json:"existed"`
 	Content []byte    `json:"-"`
 	Time    time.Time `json:"time"`
+	// SessionID 是写下这次变更的会话。为空表示调用方没带会话信息
+	// （进程级入口，比如 HTTP 的撤销接口目前就拿不到）。
+	//
+	// 有它才能做会话级撤销：undo 栈是进程级的一条直线，多会话并发时
+	// 「用户点撤销」会撤掉另一个会话的写入。
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // FS 是文件工具共享的工作区状态（含撤销栈）。
@@ -270,6 +276,10 @@ func (f *FS) OutsideScopePath(args json.RawMessage) bool {
 func (f *FS) snapshot(ctx context.Context, path string) {
 	data, err := os.ReadFile(path)
 	snap := Snapshot{Path: path, Time: time.Now()}
+	// 记下是谁写的，会话级撤销（UndoSession）全靠它。
+	if sc, ok := tools.SessionFrom(ctx); ok {
+		snap.SessionID = sc.SessionID
+	}
 	if err == nil {
 		snap.Existed = true
 		snap.Content = data
@@ -295,17 +305,60 @@ func (f *FS) snapshot(ctx context.Context, path string) {
 
 // Undo 撤销最近一次文件写入，返回被还原的路径。
 //
+// 进程级语义：不管是谁写的，撤最后一条。HTTP 的 handleUndo 目前就靠它
+// （前端没有 session header，拿不到会话）。
+func (f *FS) Undo() (string, bool) {
+	return f.undoAt(-1)
+}
+
+// UndoSession 撤销指定会话最近一次写入。
+//
+// 会话级语义：只动该会话自己的写入，别的会话的栈条目原样留着。
+// 从后往前找第一个 SessionID 匹配的条目。
+func (f *FS) UndoSession(sessionID string) (string, bool) {
+	f.mu.Lock()
+	idx := -1
+	for i := len(f.undo) - 1; i >= 0; i-- {
+		if f.undo[i].SessionID == sessionID {
+			idx = i
+			break
+		}
+	}
+	f.mu.Unlock()
+	if idx < 0 {
+		return "", false
+	}
+	return f.undoAt(idx)
+}
+
+// Snapshots 返回当前撤销栈的副本（自旧到新），供诊断与测试使用。
+func (f *FS) Snapshots() []Snapshot {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]Snapshot, len(f.undo))
+	copy(out, f.undo)
+	return out
+}
+
+// undoAt 撤销栈中第 idx 条（-1 = 最后一条）。
+//
 // 撤销会把文件内容**改回**旧值，因此所有相关会话的指纹都必须一起刷新 ——
 // 否则「读 → 写 → 撤销 → 再写」会在最后一步被判成「被外部修改」而失败。
 // 快照里就有还原后的内容（snap.Content），直接拿来算，不必重读磁盘。
-func (f *FS) Undo() (string, bool) {
+//
+// 调用方**不要**持有 f.mu：本方法自己加锁。
+func (f *FS) undoAt(idx int) (string, bool) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if len(f.undo) == 0 {
+	if idx < 0 {
+		idx = len(f.undo) + idx
+	}
+	if idx < 0 || idx >= len(f.undo) {
+		f.mu.Unlock()
 		return "", false
 	}
-	snap := f.undo[len(f.undo)-1]
-	f.undo = f.undo[:len(f.undo)-1]
+	snap := f.undo[idx]
+	f.undo = append(f.undo[:idx:idx], f.undo[idx+1:]...)
+	f.mu.Unlock()
 
 	// 所有见过这个路径的会话，其指纹都指向「改动前」的内容。
 	// 撤销把它们统一对齐到还原后的内容。
@@ -318,6 +371,7 @@ func (f *FS) Undo() (string, bool) {
 	if snap.Existed {
 		sum, size = fingerprint(snap.Content)
 	}
+	f.mu.Lock()
 	for k := range f.readSeen {
 		if !strings.HasSuffix(k, suffix) {
 			continue
@@ -330,6 +384,7 @@ func (f *FS) Undo() (string, bool) {
 			delete(f.readSeen, k)
 		}
 	}
+	f.mu.Unlock()
 
 	if snap.Existed {
 		_ = os.MkdirAll(filepath.Dir(snap.Path), 0o755)
