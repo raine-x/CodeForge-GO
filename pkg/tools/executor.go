@@ -103,7 +103,7 @@ func (e *Executor) Evaluate(name string, args json.RawMessage) Decision {
 	tool, hasTool := e.registry.Get(name)
 	var readOnly bool
 	if hasTool {
-		readOnly = isReadOnlyCall(tool)
+		readOnly = isReadOnlyCall(tool, args)
 	}
 	d, reason := e.policy.Evaluate(name, action, string(args), readOnly)
 	if hasTool {
@@ -112,23 +112,11 @@ func (e *Executor) Evaluate(name string, args json.RawMessage) Decision {
 	return Decision{Tool: name, Action: action, Decision: d, Reason: reason}
 }
 
-// isReadOnlyCall 判断一次调用是否无副作用。
-//
-// 判据是工具的 SideEffect 声明，**不是**名字。
-//
-// 声明为 External/Destructive 的工具，某些具体入参可能仍无副作用
-// （例如命令形如 `ls`）。这类「按入参收窄」是 2.3 的下一项，届时加
-// Narrower 接口；现在一律从严。
-func isReadOnlyCall(tool Tool) bool {
-	meta, ok := MetadataOf(tool)
-	return ok && meta.SideEffect == SideEffectNone
-}
-
 // decide 是 Execute 用的完整判定：策略引擎 + 按模式的越界处理，二者结论一致。
 // 第三个返回值是「本次调用是否指向工作区之外」，Execute 用它决定要不要给这一次
 // 执行注入围栏豁免（见 Execute 里 ScopeApproved 的两处注入）。
 func (e *Executor) decide(tool Tool, name, action string, args json.RawMessage) (security.Decision, string, bool) {
-	d, reason := e.policy.Evaluate(name, action, string(args), isReadOnlyCall(tool))
+	d, reason := e.policy.Evaluate(name, action, string(args), isReadOnlyCall(tool, args))
 	return e.escalate(tool, name, args, d, reason)
 }
 

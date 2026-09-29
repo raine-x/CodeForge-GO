@@ -113,6 +113,52 @@ func MetadataOf(t Tool) (Metadata, bool) {
 	return meta, true
 }
 
+// SideEffectResolver 可由工具实现，按**入参**收窄自身的副作用等级。
+//
+// 为什么需要：静态声明回答不了「这条命令危不危险」。
+// `run_command` 声明为 External，于是只读模式下连 `ls` 都被拒、
+// ask 模式下 `ls` 也要弹审批 —— 而 `ls` 显然不该和 `rm -rf /` 同档。
+//
+// ⚠️ **只能收窄，不能放宽。** 返回值高于声明等级的一律被忽略。
+//
+// 理由：这条接口一旦能「放宽」，一个写工具就能靠「按入参返回 none」
+// 骗过只读模式 —— 那等于给每个工具开了一个后门。
+// 声明是上界，入参只能在它之下细分。这与 ZCode 的
+// `resolvePermissionCapability`（只能把 ask 收窄为 proceed，
+// 不能把 allow 变 ask）和 OpenCode 的同名机制是同一条不变量。
+type SideEffectResolver interface {
+	ResolveSideEffect(args json.RawMessage) SideEffect
+}
+
+// SideEffectFor 求一次调用的有效副作用等级。声明为上界，入参只能在其之下细分。
+//
+// 顺序很重要：先取**声明**（未声明 → 视为最严，不收窄），再让工具按入参
+// 在声明之下细分。
+func SideEffectFor(tool Tool, args json.RawMessage) (eff SideEffect, declared bool) {
+	meta, ok := MetadataOf(tool)
+	if !ok {
+		return SideEffectDestructive, false
+	}
+	eff = meta.SideEffect
+	declared = true
+	r, ok := tool.(SideEffectResolver)
+	if !ok {
+		return eff, true
+	}
+	narrowed := r.ResolveSideEffect(args)
+	if !narrowed.Valid() || narrowed > eff {
+		// 放宽或非法 → 忽略
+		return eff, true
+	}
+	return narrowed, true
+}
+
+// isReadOnlyCall 判断一次调用是否无副作用。
+func isReadOnlyCall(tool Tool, args json.RawMessage) bool {
+	eff, ok := SideEffectFor(tool, args)
+	return ok && eff == SideEffectNone
+}
+
 // SubagentTask 描述一个可并行委派的独立子任务。
 // Mode=explore 时只能使用只读工具；Mode=implement 时允许在声明的路径范围内修改。
 type SubagentTask struct {

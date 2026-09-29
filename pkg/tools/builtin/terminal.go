@@ -31,6 +31,102 @@ func (t *TerminalTool) Metadata() tools.Metadata {
 	return tools.Metadata{SideEffect: tools.SideEffectExternal}
 }
 
+// ResolveSideEffect 按命令内容把等级**收窄**为只读。
+//
+// 为什么这条收窄是安全的 —— 也是为什么它必须这么保守：
+//
+// 命令字符串最终交给 **shell** 解释，而**我们不解释它**。所以只判断首个
+// token 是不够的：`echo hi > important.txt` 的首个词是 `echo`（在白名单里），
+// 但真正产生副作用的是那个 `>`，由 shell 处理。
+//
+// 因此收窄要求**两个条件同时成立**：
+//
+//  1. 首个命令词在只读白名单里；
+//  2. 整条命令不含任何「可能产生副作用」的 shell 元字符。
+//
+// 第 2 条一旦放宽，`>` 重定向、`|` 管道、`;` 串联、“ ` “/`$()` 命令替换、
+// `&` 后台、glob 通配都会从门缝里过去 —— 那等于在只读模式下开了一个
+// 任意写入口。任何拿不准的情形一律不收窄。
+func (t *TerminalTool) ResolveSideEffect(args json.RawMessage) tools.SideEffect {
+	var a struct {
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return tools.SideEffectExternal
+	}
+	if isReadOnlyShellCommand(a.Command) {
+		return tools.SideEffectNone
+	}
+	return tools.SideEffectExternal
+}
+
+// readOnlyCommands 是「命令词本身就只读」的白名单。
+//
+// 刻意短小：只收**不需要看参数就能确定只读**的命令。
+// 像 `find`（有 -delete / -exec）、`git`（子命令决定）、`tee`、
+// `xargs`（能执行任意命令）都不在列表里 —— 收窄它们需要真正的参数分析，
+// 那是 ZCode 写了 15+ 个 bash-readonly-policy-*.ts 的原因，不该照抄。
+//
+// 反过来，`ls` / `cat` / `grep` / `wc` / `head` / `tail` / `pwd` 这一类
+// 覆盖了只读模式下的绝大多数真实需求。
+var readOnlyCommands = map[string]bool{
+	"ls": true, "dir": true,
+	"cat": true, "bat": true,
+	"head": true, "tail": true,
+	"wc": true, "stat": true, "file": true,
+	"grep": true, "egrep": true, "fgrep": true, "rg": true,
+	"pwd": true, "whoami": true, "hostname": true,
+	"date": true, "uname": true, "id": true,
+	"which": true, "whereis": true, "type": true, "where": true,
+	"df": true, "du": true, "tree": true, "printenv": true,
+	"echo": true,
+}
+
+// shellMetaChars 是「一旦出现就拒绝收窄」的字符集合。
+//
+// 逐个说明为什么危险：
+//
+//	>  >>   重定向写文件
+//	|        管道可接写入命令（`ls | tee f`、`ls | sh`）
+//	;        命令分隔，可接任意后续命令
+//	&        后台 / 逻辑与
+//	`  $( )  命令替换：`$(rm -rf x)` 的首个词看着无害
+//	*  ?     glob：文件名可能被展开成任意内容；`rm *` 也是靠它
+//	\  '  "  引号内可藏元字符，无法可靠判断
+//	$        变量展开
+//	{} [] ()  花括号 / 字符类 / 子 shell
+//	\n \r     换行与回车等价于 ;
+//
+// **刻意不含空格与制表符**：它们只是参数分隔，`ls -la /tmp` 才是最常见的
+// 只读命令，把它们列为元字符等于让收窄完全失效。
+//
+// 结论：宁可把 `ls -la` 收窄掉，也不能让 `ls > /etc/passwd` 过去。
+var shellMetaChars = ">|<&;`$*?()[]{}\\'\"\n\r"
+
+// isReadOnlyShellCommand 判断一条 shell 命令是否可安全收窄为只读。
+func isReadOnlyShellCommand(cmd string) bool {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return false
+	}
+	// 任何元字符 → 不收窄。
+	if strings.ContainsAny(cmd, shellMetaChars) {
+		return false
+	}
+	// 首个词就是命令本身（此时没有分隔符，Fields 的结果就是命令）。
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 {
+		return false
+	}
+	// 命令可能带路径：`/bin/ls`、`C:\...\ls.exe`。
+	word := fields[0]
+	if i := strings.LastIndexAny(word, `/\`); i >= 0 {
+		word = word[i+1:]
+	}
+	word = strings.TrimSuffix(strings.ToLower(word), ".exe")
+	return readOnlyCommands[word]
+}
+
 // Name 实现 tools.Tool。
 func (t *TerminalTool) Name() string { return "run_command" }
 
