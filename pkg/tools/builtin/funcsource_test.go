@@ -144,6 +144,40 @@ func renderNode(b *strings.Builder, n ast.Node) {
 	}
 }
 
+// TestNoDeadReadGateFunction 钉住「只检查不写」的读门禁不许复活。
+//
+// requireReadSeen 曾长期零调用却仍在文件里，注释还写着「保留给只需要检查
+// 而不需要写入的场景」。危害不是那 30 行死代码本身，而是**误导**：
+// 读代码的人会以为存在这样一条只检查路径，并据此写出有窗口的代码。
+//
+// 真正的死代码通常在重构中被自然清理；这种带「保留」注释的更容易活下来，
+// 因为它看起来像是有意为之。所以要显式钉住。
+func TestNoDeadReadGateFunction(t *testing.T) {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("取包目录失败：%v", err)
+	}
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, dir, func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("解析包目录失败：%v", err)
+	}
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			for _, decl := range file.Decls {
+				fn, ok := decl.(*ast.FuncDecl)
+				if ok && fn.Name.Name == "requireReadSeen" {
+					t.Errorf("requireReadSeen 复活了。它的职责已由 casCheckReadGate 承担：" +
+						"在临界区内、复用写前那次读的内容、还多一道存在性断言。" +
+						"另起一条「只检查不写」的路径等于重新打开 TOCTOU 窗口。")
+				}
+			}
+		}
+	}
+}
+
 // findFunc 在本包的非测试文件里找函数，返回声明、FileSet 与所在文件名。
 func findFunc(t *testing.T, name string) (*ast.FuncDecl, *token.FileSet, string) {
 	t.Helper()

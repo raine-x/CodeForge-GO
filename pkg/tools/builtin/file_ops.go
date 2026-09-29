@@ -973,40 +973,18 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
-// requireReadSeen 保留给只需要「检查」而不需要「写入」的场景。
+// requireReadSeen 已删除。
 //
-// 写路径**不再**用它 —— 那是 CAS 之前的做法，窗口太大。
-func (f *FS) requireReadSeen(ctx context.Context, path string, existed bool) error {
-	if !existed {
-		return nil
-	}
-	sc, ok := tools.SessionFrom(ctx)
-	if !ok || sc.SessionID == "" {
-		return nil
-	}
-	f.mu.Lock()
-	entry, seen := f.readSeen[seenKey(sc.SessionID, path)]
-	f.mu.Unlock()
-
-	if !seen {
-		return fmt.Errorf("本会话还没读过 %s，不能凭记忆改写。先用 read_file 读取（大文件按返回末尾的行号窗口分段读），"+
-			"看到原文后再提交精确替换。", path)
-	}
-
-	// 第 2 道：指纹比对。读盘失败按「已变」处理（fail-closed）——
-	// 拿不到现状就没法证明现状没变，不能因此放行。
-	cur, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("无法确认 %s 读取之后是否被修改：%w", path, err)
-	}
-	sum, size := fingerprint(cur)
-	if !entry.matches(sum, size) {
-		return fmt.Errorf("%s 在本会话读取之后被外部修改过%s。"+
-			"请先重新 read_file 看到最新内容，再基于它提交修改 —— "+
-			"否则会覆盖掉这段时间别人做的改动。", path, sizeDelta(entry.size, size))
-	}
-	return nil
-}
+// 它是 CAS 之前的读门禁：先读盘比对指纹，再在**之后**写 —— 两步之间有窗口。
+// 它的全部职责现已由 casCheckReadGate 承担，且后者严格更强：
+//
+//	- 在按路径的锁内调用，比对用的就是写前那次读的内容（不重复读盘）；
+//	- 多一道断言「文件仍存在/仍不存在」与调用方判断一致；
+//	- 返回 ErrStaleContent 而非普通 error，审计与界面能分开处理。
+//
+// 它长期零调用却仍在文件里，是个陷阱：注释写着「保留给只需要检查的场景」，
+// 读代码的人会以为存在这样一条「只检查不写」的路径，并据此写出有窗口的代码。
+// 保留死代码的成本正是这种误导。
 
 // ForgetReads 作废该会话的全部阅读登记（实现 tools.ReadGate，由压缩路径调用）。
 //
