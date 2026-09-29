@@ -537,44 +537,98 @@ func (f *FS) removeSpillLocked(s Snapshot) {
 	}
 }
 
+// takenSnapshot 是已从撤销栈摘除、尚未落盘还原的快照。
+//
+// SpillRaw 是副本内容，必须在摘除时（仍持锁）读完 —— 副本可能正被
+// 另一个 goroutine 的逐出删除。读不出来就留 nil，restore 会明确失败，
+// 绝不拿空内容覆盖文件。
+type takenSnapshot struct {
+	snap     Snapshot
+	spillRaw []byte
+}
+
 // Undo 撤销最近一次文件写入，返回被还原的路径。
 //
 // 进程级语义：不管是谁写的，撤最后一条。HTTP 的 handleUndo 目前就靠它
 // （前端没有 session header，拿不到会话）。
 func (f *FS) Undo() (string, bool) {
-	return f.undoAt(-1)
+	taken, ok := f.takeLast()
+	if !ok {
+		return "", false
+	}
+	return f.restore(taken)
 }
 
 // UndoSession 撤销指定会话最近一次写入。
 //
 // 会话级语义：只动该会话自己的写入，别的会话的栈条目原样留着。
-// 从后往前找第一个 SessionID 匹配的条目。
+//
+// ⚠️ 定位与摘除**必须在同一个临界区内**完成。
+// 历史缺陷：这里曾在锁内查出绝对下标，解锁后带着这个下标去摘除。
+// 而下标在解锁后可能失效 —— pushSnapshot 触发预算逐出时头部左移，
+// 所有下标 -1。于是 undoAt 摘走的是**另一个会话**的条目，
+// UndoSession 报告成功并返回别人的路径，而自己的改动原封不动。
+// 后果最严重的一种：别的会话有一笔改动被静默回滚，且它自己完全不知情。
+//
+// 修法就是 takeSnapshot 把两步合并：定位、摘除、读副本、删副本，
+// 全在一把锁里，中间不给任何 goroutine 插入的机会。
 func (f *FS) UndoSession(sessionID string) (string, bool) {
+	taken, ok := f.takeMatching(func(s Snapshot) bool { return s.SessionID == sessionID })
+	if !ok {
+		return "", false
+	}
+	return f.restore(taken)
+}
+
+// takeLast 摘除栈顶（进程级撤销）。
+func (f *FS) takeLast() (takenSnapshot, bool) {
+	return f.takeSnapshot(func(Snapshot) bool { return true })
+}
+
+// takeMatching 摘除最近一条满足 pred 的快照。
+func (f *FS) takeMatching(pred func(Snapshot) bool) (takenSnapshot, bool) {
+	return f.takeSnapshot(pred)
+}
+
+// takeSnapshot 在**同一个临界区**内完成「定位 + 摘除 + 读副本 + 删副本」。
+//
+// pred 收到的遍历顺序是从新到旧 —— 先命中最近的，符合撤销的直觉
+// （「撤销我刚才那一步」而不是「撤销我最早那一步」）。
+//
+// ⚠️ 不要把这个函数拆成「查下标」+「按下标摘除」两步。那样锁一放，
+// 下标就可能失效，且失效是静默的 —— 参见 UndoSession 的注释。
+func (f *FS) takeSnapshot(pred func(Snapshot) bool) (takenSnapshot, bool) {
 	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	idx := -1
 	for i := len(f.undo) - 1; i >= 0; i-- {
-		if f.undo[i].SessionID == sessionID {
+		if pred(f.undo[i]) {
 			idx = i
 			break
 		}
 	}
-	f.mu.Unlock()
 	if idx < 0 {
-		return "", false
+		return takenSnapshot{}, false
 	}
-	return f.undoAt(idx)
+
+	snap := f.undo[idx]
+	f.undo = append(f.undo[:idx:idx], f.undo[idx+1:]...)
+	f.undoBytes -= int64(len(snap.Content))
+	if f.undoBytes < 0 {
+		f.undoBytes = 0
+	}
+	// ⚠️ 副本必须**先读完再删**。反过来的话这里读到的是不存在的文件，
+	// 撤销会静默失败，而「有副本却撤不了」是最难查的一种坏。
+	taken := takenSnapshot{snap: snap}
+	if snap.Spill != "" {
+		taken.spillRaw, _ = os.ReadFile(snap.Spill)
+	}
+	f.removeSpillLocked(snap)
+	return taken, true
 }
 
-// Snapshots 返回当前撤销栈的副本（自旧到新），供诊断与测试使用。
-func (f *FS) Snapshots() []Snapshot {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]Snapshot, len(f.undo))
-	copy(out, f.undo)
-	return out
-}
-
-// undoAt 撤销栈中第 idx 条（-1 = 最后一条）。
+// restore 把已摘除的快照写回磁盘，并刷新所有相关会话的指纹。
 //
 // 撤销会把文件内容**改回**旧值，因此所有相关会话的指纹都必须一起刷新 ——
 // 否则「读 → 写 → 撤销 → 再写」会在最后一步被判成「被外部修改」而失败。
@@ -584,41 +638,18 @@ func (f *FS) Snapshots() []Snapshot {
 // 整个指纹机制就被绕过了。有测试专门盯这条。
 //
 // 调用方**不要**持有 f.mu：本方法自己加锁。
-func (f *FS) undoAt(idx int) (string, bool) {
-	f.mu.Lock()
-	if idx < 0 {
-		idx = len(f.undo) + idx
-	}
-	if idx < 0 || idx >= len(f.undo) {
-		f.mu.Unlock()
-		return "", false
-	}
-	snap := f.undo[idx]
-	f.undo = append(f.undo[:idx:idx], f.undo[idx+1:]...)
-	f.undoBytes -= int64(len(snap.Content))
-	if f.undoBytes < 0 {
-		f.undoBytes = 0
-	}
-	// ⚠️ 副本必须**先读完再删**。反过来的话这里读到的是不存在的文件，
-	// 撤销会静默失败，而「有副本却撤不了」是最难查的一种坏。
-	//
-	// 读在锁内做：副本可能正被另一个 goroutine 的逐出删除。
-	var spillRaw []byte
-	if snap.Spill != "" {
-		spillRaw, _ = os.ReadFile(snap.Spill)
-	}
-	f.removeSpillLocked(snap)
-	f.mu.Unlock()
+func (f *FS) restore(taken takenSnapshot) (string, bool) {
+	snap := taken.snap
 
 	// 完全被丢弃（Dropped）的条目**没有内容可用**：明确失败，
 	// 绝不拿空内容去覆盖文件 —— 那是最灾难性的数据损坏。
 	content := snap.Content
 	if snap.Spill != "" {
-		if spillRaw == nil {
+		if taken.spillRaw == nil {
 			// 副本丢了：同样只能失败。
 			return snap.Path, false
 		}
-		content = spillRaw
+		content = taken.spillRaw
 	}
 	// 内容可能被丢弃 —— 但**指纹必须先作废**，然后才能放弃。
 	//
@@ -671,6 +702,25 @@ func (f *FS) undoAt(idx int) (string, bool) {
 	}
 	return snap.Path, true
 }
+
+// Snapshots 返回当前撤销栈的副本（自旧到新），供诊断与测试使用。
+func (f *FS) Snapshots() []Snapshot {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]Snapshot, len(f.undo))
+	copy(out, f.undo)
+	return out
+}
+
+// undoAt 已移除。
+//
+// 它原本接受一个绝对下标，而「查下标」与「按下标摘除」分处两个临界区，
+// 下标在解锁后可能因 pushSnapshot 的预算逐出（头部左移，所有下标 -1）而失效，
+// 于是摘走别的会话的条目。定位与摘除已合并进 takeSnapshot，
+// Undo / UndoSession 都走它。见 UndoSession 的注释。
+//
+// 保留这条记录是因为「为什么不能再拆成两步」是本文件最容易重犯的错误，
+// 而拆开之后单测抓不到（竞态窗口只有几十纳秒）。
 
 // UndoDepth 返回当前可撤销步数。
 func (f *FS) UndoDepth() int {
