@@ -279,6 +279,9 @@ func (c *wsClient) dispatch(msg wsMessage) {
 			c.send(map[string]any{"type": "error", "error": "会话不存在: " + msg.SessionID})
 			return
 		}
+		// ⚠️ 必须**先**切工作区再回放。不切的话文件工具仍用进程全局的
+		// FS.root —— 点开 A 项目的会话却去读 B 项目的文件（用户报告的 bug）。
+		c.srv.switchSessionWorkspace(sess)
 		// 内存缓存换成用户想继续的那条（后续 user_message 直接续聊）
 		c.send(c.srv.historyEvent(sess.ID))
 		c.send(c.srv.contextUsage(sess.ID))

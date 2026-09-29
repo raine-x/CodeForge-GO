@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"codeforge/pkg/agent"
 	"codeforge/pkg/logx"
 )
 
@@ -90,6 +91,60 @@ func (s *Server) persistWorkDir(dir string) {
 	if err := s.cfg.SaveState(); err != nil {
 		logx.Warnf("工作区已切换但写回运行状态失败（重启后需重新选择）: %v", err)
 	}
+}
+
+// switchSessionWorkspace 把工作区切到该会话**自己**绑定的工作区。
+//
+// 为什么必须有这一步（用户报告的 bug）：
+//
+//	点开 RaineOS 项目里的一条会话，让它分析 → 它去分析了 test 项目的文件。
+//
+// 会话表里本来就存着每条会话的工作区（sessions.workspace），但 `load_session`
+// 帧只回放历史消息，从不读它。于是文件工具用的仍是进程当前全局的
+// `FS.root` —— 也就是「界面上上次选的那个项目」。
+//
+// 后果不止「读到别的项目」：
+//
+//   - 撤销栈、阅读登记（readSeen）都是**工作区级**的，会跨项目混用；
+//   - 一个项目的快照里记着另一个项目的文件路径，撤销时写错地方；
+//   - 审计日志里「谁读了哪个项目」这条线断了。
+//
+// 三条纪律：
+//
+//  1. 会话没绑定工作区（老数据 / 手工建的）时**不动**当前工作区。
+//     清空会让用户莫名其妙地丢失当前项目。
+//  2. 会话绑定的目录若已不存在，同样不动 —— 报「目录不存在」比静默
+//     切到一个错的项目安全得多。
+//  3. 切换**不落盘**。这是「点开一条历史会话」，不是「用户选了工作区」；
+//     把它写进 state.yaml 会让重启后的工作区变成用户最后点开的那条会话
+//     所在的项目，语义完全不对。
+func (s *Server) switchSessionWorkspace(sess *agent.Session) {
+	if sess == nil {
+		return
+	}
+	target := strings.TrimSpace(sess.Workspace)
+	if target == "" {
+		// 会话没绑定工作区：保持现状（纪律 1）
+		return
+	}
+	if info, err := os.Stat(target); err != nil || !info.IsDir() {
+		logx.Warnf("会话 %s 绑定的工作区已不存在，保持当前工作区: %s", sess.ID, target)
+		return // 纪律 2
+	}
+	target = filepath.Clean(target)
+	if cur := s.fs.Root(); cur == target {
+		return // 已经在那儿，别白清一次撤销栈
+	}
+
+	setter, ok := s.fs.(interface{ SetRoot(string) })
+	if !ok {
+		return
+	}
+	setter.SetRoot(target)
+	// FS 与 Agent 是两份独立状态，只切一个就是历史上那种「一半修法」。
+	s.agent.SetWorkDir(target)
+	// 刻意不调 persistWorkDir —— 纪律 3
+	logx.Infof("切到会话 %s 的工作区：%s", sess.ID, target)
 }
 
 // handleNotifyPrefs 查看 / 设置「任务完成系统通知」偏好。
