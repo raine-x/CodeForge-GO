@@ -33,6 +33,9 @@ type Executor struct {
 	approvalTimeout time.Duration
 }
 
+// defaultMaxOutput 是 maxOutput 的兜底默认值（构造与限幅两条路径共用同一个数）。
+const defaultMaxOutput = 32 * 1024
+
 // DefaultApprovalTimeout 审批默认等待上限。
 //
 // 定这个值的依据：审批要等真人读完 diff 再决定，所以必须容得下正常的思考时间；
@@ -47,7 +50,7 @@ func NewExecutor(registry *Registry, policy *security.Policy, audit *security.Au
 		timeout = 120 * time.Second
 	}
 	if maxOutput <= 0 {
-		maxOutput = 32 * 1024
+		maxOutput = defaultMaxOutput
 	}
 	return &Executor{
 		registry:        registry,
@@ -281,7 +284,10 @@ func (e *Executor) Execute(ctx context.Context, name string, args json.RawMessag
 		entry.DurationMs = time.Since(start).Milliseconds()
 		_ = e.audit.Log(entry)
 		if res != nil {
-			return res, nil
+			// 也要限幅：这条短路返回的是工具自己产出的结果，
+			// 可能一样超大（插件驱动的 invokeFn 理论上能同时给 res 和 err）。
+			// 不限幅的话一个走错分支的大结果就能绕过全部防护。
+			return e.truncate(res), nil
 		}
 		// 给模型/用户的说明带上工具名与成因 —— 光说「工具执行失败」等于没说
 		return Err("%s", errs.FriendlyOr("执行工具 "+name, err)), nil
@@ -353,19 +359,87 @@ func (e *Executor) run(ctx context.Context, tool Tool, args json.RawMessage) (*T
 	}
 }
 
+// truncatedEnvelope 是大结果被限幅时的**合法 JSON 替身**。
+//
+// 为什么不能沿用「按字节硬切 + 拼一句提示」：结构化结果硬切出来的是半个对象
+// （`{"a":1,"b":[1,2,`），引号与括号都不闭合。模型拿到的内容在语法上就是坏的，
+// 它一旦把这段抄进下一次 tool_call 的 arguments，上游 json.Unmarshal 直接失败。
+// AGENTS.md 硬规则 6 要求：超限时**输出必须仍是合法 JSON**。
+type truncatedEnvelope struct {
+	Truncated     bool   `json:"truncated"`
+	OriginalBytes int    `json:"original_bytes"`
+	Preview       string `json:"preview"`
+	Hint          string `json:"hint,omitempty"`
+}
+
+const truncateHint = "结果过大已被限幅。请缩小范围（更窄的 pattern / 更小的目录 / 更少的结果条数）后重试。"
+
 // truncate 对超大输出做限幅，避免撑爆上下文。
+//
+// 三条纪律：
+//  1. **绝不按字节硬切结构化结果** —— 切出来的非法 JSON 比超限更糟。
+//     超限就换成一个合法的信封，preview 只是给人看的线索。
+//  2. 纯文本结果保留原形态。截断后的字符串作为 JSON 字符串值仍然合法，
+//     而且 read_file 这类工具的输出形态不能因为兜底逻辑而改变
+//     （有测试钉住，见 executor_truncate_test.go）。
+//  3. 这是**兜底**。大结果该由工具自己分页/限流 —— 见 read_file 的
+//     maxReadBytes 注释：工具不收尾，执行器硬切会让模型拿着残本重写文件。
 func (e *Executor) truncate(res *ToolResult) *ToolResult {
 	if res == nil {
 		return res
 	}
-	if s, ok := res.Data.(string); ok && len(s) > e.maxOutput {
-		res.Data = truncateString(s, e.maxOutput) + fmt.Sprintf("\n... [输出已截断，原始长度 %d 字节]", len(s))
+	max := e.maxOutput
+	if max <= 0 {
+		max = defaultMaxOutput
+	}
+
+	// ① 纯文本：形态不变，只在尾部挂标记。
+	if s, ok := res.Data.(string); ok {
+		if len(s) <= max {
+			return res
+		}
+		res.Data = truncateString(s, max) + fmt.Sprintf("\n... [输出已截断，原始长度 %d 字节]", len(s))
 		return res
 	}
-	data, err := json.Marshal(res.Data)
-	if err == nil && len(data) > e.maxOutput {
-		res.Data = truncateString(string(data), e.maxOutput) + fmt.Sprintf("\n... [结果已截断，原始长度 %d 字节]", len(data))
+
+	// ② 结构化：未超限原样返回（Data==nil 的失败结果也走这里）。
+	raw, err := json.Marshal(res.Data)
+	if err != nil || len(raw) <= max {
+		return res
 	}
+
+	// ③ 超限：换成合法 JSON 替身。
+	//
+	// preview 取原文**前缀** —— 结构化结果的信息密度在开头（首条命中、首个错误）。
+	//
+	// 预算只给一半：preview 是 JSON 文本的切片，里面的 " 和 \ 在内嵌进外层 JSON
+	// 时还要再转义一次，膨胀可达约 2 倍。给满预算会二次超限。
+	env := truncatedEnvelope{
+		Truncated:     true,
+		OriginalBytes: len(raw),
+		Hint:          truncateHint,
+	}
+	env.Preview = truncateString(string(raw), max/2)
+	out, mErr := json.Marshal(env)
+	if mErr == nil && len(out) > max {
+		// 一次回砍必然够：转义只会把字节变长、不会变短，
+		// 所以砍掉 N 个成品字节至少让成品少 N 字节。
+		if over := len(out) - max; over < len(env.Preview) {
+			env.Preview = truncateString(env.Preview, len(env.Preview)-over)
+		} else {
+			env.Preview = ""
+		}
+		out, mErr = json.Marshal(env)
+	}
+	if mErr != nil {
+		// 理论上不可达（struct 全是基础类型）。真发生也不能放行超限内容，
+		// 退到一个手写的定长合法 JSON。
+		res.Data = json.RawMessage(
+			fmt.Sprintf(`{"truncated":true,"original_bytes":%d,"preview":"","hint":%q}`,
+				len(raw), truncateHint))
+		return res
+	}
+	res.Data = json.RawMessage(out)
 	return res
 }
 

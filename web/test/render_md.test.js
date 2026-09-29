@@ -280,6 +280,7 @@ const mainSrc = goFile('cmd/agent/main.go');
 const bpHandlerSrc = goFile('pkg/server/builtin_plugins_handler.go');
 const bpSrc = goFile('pkg/agent/builtin_plugins.go');
 const goalRunnerSrc = goFile('pkg/agent/goal_runner.go');
+const roleSrc = goFile('pkg/tools/role.go');
 
 // 剥掉 ui.js 的行注释（同一理由：注释里会引用被替换掉的旧写法）
 const uiCode = uiSrc.replace(/^\s*\/\/.*$/gm, '');
@@ -2363,8 +2364,16 @@ check('审查者白名单不含任何写工具（有测试锁住，这里锁住�
   /var goalVerifierTools = \[\]string\{[\s\S]*?"run_command",\s*\n\}/.test(goalRunnerSrc) &&
   !/goalVerifierTools = \[\]string\{[^}]*write_file/.test(goalRunnerSrc));
 
+// 断言方式在 2.1（执行器角色工厂）之后改了：审查者不再手工写
+// `a.executor.Audit()`，而是走 `NewExecutorFor(parent, RoleGoalReviewer, ...)`
+// 由工厂从 parent 派生 audit —— 手工传参在签名里就没有这个位置，想传错都传不了。
+//
+// 行为没变（审查者仍然用真审计），变的是断言要盯住的那条路径。
+// 更强的护栏在 Go 侧：pkg/agent/executor_role_test.go 的
+// TestNewSubagentHasAudit 直接断言 newGoalVerifier(...).executor.Audit() != nil。
 check('审查者用的是真审计（自主执行命令必须留痕）',
-  /a\.executor\.Audit\(\)/.test(goalRunnerSrc) &&
+  /tools\.NewExecutorFor\(\s*a\.executor,\s*tools\.RoleGoalReviewer/.test(goalRunnerSrc) &&
+  /audit:\s*parent\.Audit\(\)/.test(roleSrc) &&
   /func \(e \*Executor\) Audit\(\) \*security\.AuditLogger/.test(executorSrc));
 
 check('预算用尽：不跑审查、不判 PASS、明确要求人工介入',
