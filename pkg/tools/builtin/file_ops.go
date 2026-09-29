@@ -613,6 +613,12 @@ func (f *FS) takeSnapshot(pred func(Snapshot) bool) (takenSnapshot, bool) {
 	}
 
 	snap := f.undo[idx]
+	// 摘除前先取该路径的锁：读副本时另一个 goroutine 可能正在为同一路径
+	// 压新快照并触发逐出删除副本。锁序 pathLock → f.mu，与 casWrite 同序。
+	pathMu := f.lockPath(snap.Path)
+	pathMu.Lock()
+	defer pathMu.Unlock()
+
 	f.undo = append(f.undo[:idx:idx], f.undo[idx+1:]...)
 	f.undoBytes -= int64(len(snap.Content))
 	if f.undoBytes < 0 {
@@ -640,6 +646,26 @@ func (f *FS) takeSnapshot(pred func(Snapshot) bool) (takenSnapshot, bool) {
 // 调用方**不要**持有 f.mu：本方法自己加锁。
 func (f *FS) restore(taken takenSnapshot) (string, bool) {
 	snap := taken.snap
+
+	// ⚠️ 落盘前必须取该路径的锁。
+	//
+	// 撤销改的是同一个文件系统上的同一个文件，而 casWrite / casEdit /
+	// casRemove 都在按路径的锁内做「读当前 → 比对 → 写」。不取锁就会交错：
+	//
+	//	casWrite  持锁 → 读当前（内容 X）
+	//	restore          （不持锁）写回 X-1
+	//	casWrite  持锁 → 写 Y      ← 用户刚才那次编辑被撤销静默覆盖
+	//
+	// 现象是「撤销之后我明明又改了一次，内容却又变回去了」，两侧都不报错。
+	//
+	// 锁序说明：这里持路径锁之后还会取 f.mu（刷指纹），
+	// 与 casWrite 的「pathLock → f.mu」同序，不构成死锁。
+	//
+	// ⚠️ 落盘本身也必须在锁内，不能像原来那样把锁只用于取内容 ——
+	// 那样只是把「无锁写」换成「锁内读 + 无锁写」，窗口没变窄。
+	pathMu := f.lockPath(snap.Path)
+	pathMu.Lock()
+	defer pathMu.Unlock()
 
 	// 完全被丢弃（Dropped）的条目**没有内容可用**：明确失败，
 	// 绝不拿空内容去覆盖文件 —— 那是最灾难性的数据损坏。
@@ -694,7 +720,11 @@ func (f *FS) restore(taken takenSnapshot) (string, bool) {
 
 	if snap.Existed {
 		_ = os.MkdirAll(filepath.Dir(snap.Path), 0o755)
-		if err := os.WriteFile(snap.Path, content, 0o644); err != nil {
+		// 必须用 atomicWriteFile，不能用裸 os.WriteFile。
+		// 裸写是「打开 → 截断 → 写」，撤销过程被打断（OOM、Ctrl+C、崩溃）
+		// 会留下**半截文件** —— 而这份文件是用户写之前的版本，
+		// 丢了就再也回不去了。与 casWrite 的原子性原则必须一致。
+		if err := atomicWriteFile(snap.Path, content, 0o644); err != nil {
 			return snap.Path, false
 		}
 	} else {
