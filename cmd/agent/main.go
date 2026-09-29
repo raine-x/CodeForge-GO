@@ -314,6 +314,13 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 	// 1) 工具注册中心与内置工具
 	registry := tools.NewRegistry()
 	fsys := builtin.NewFS(wd)
+	// 清掉上一次进程（含崩溃）留下的撤销副本孤儿。
+	// 启动时撤销栈必然是空的 ⇒ 副本目录里任何文件都是孤儿，可整目录删。
+	// 放在这里而不是 NewFS 内部：go test 会并发跑多个进程，
+	// 一个测试的启动清理会把另一个测试正在用的副本删掉。
+	if err := fsys.GCUndoSpill(); err != nil {
+		logx.Warnf("清理上次的撤销副本失败（可忽略）: %v", err)
+	}
 	// 工作区约束：默认拒绝访问 agent.work_dir 之外的路径（详见 security.allow_outside_workspace）。
 	fsys.SetAllowOutside(cfg.Security.AllowOutsideWorkspace)
 	if cfg.Security.AllowOutsideWorkspace {

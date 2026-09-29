@@ -116,10 +116,11 @@
 
 ## 6. 已知问题（修完请从此列表删除）
 
-- `checkpoints.go` 路径匹配第三级大小写不敏感，Linux 上可能把 `partA` / `partA2` 判为同一文件
-- 撤销栈只限条数，不限字节
+- `checkpoints.go` 路径匹配的大小写折叠**只在 Windows 生效**（Linux 上 `Pkg/` 与 `pkg/` 是两个目录）
+- 撤销栈的**单次 CAS 读峰值**仍无界：改一个 2 GB 文件，`casWrite` 仍会瞬时把 2 GB 读进内存。预算只约束「稳态保留」
 - `ScopeChecker` / `DiffProvider` / `ReadGate` / `TimeoutPolicy` 仍是运行时断言，漏实现即静默降级（见硬规则 3a）
 - CAS 只保证**同一进程内**并发调用互斥，未用 OS 级文件锁防「另一个进程在临界区内改文件」
+- 检查点表 `old_content` 无大小上限（`store/checkpoints.go`），是另一条无界的持久化路径
 - 未决审批在**刷新页面**后丢失（服务端 `pending` 挂在旧连接的 `wsApprover` 上，页面刷新即失去渠道；注意这与「审批无上界」已修是两件事）
 - 审计日志的 `run.json` 里 token 明文落盘
 - `History.cache` 只增不减

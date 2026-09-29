@@ -549,7 +549,14 @@ func (s *Server) handleUndo(w http.ResponseWriter, r *http.Request) {
 	}
 	path, ok := s.fs.Undo()
 	if !ok {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "没有可撤销的操作"})
+		// 「有路径但撤不了」与「没得撤」是两回事，**文案必须分开**。
+		// 前者通常是「改动前的内容过大、没保留下来」；说成「没有可撤销的操作」
+		// 是在对用户说假话 —— 明明有一步操作摆在那里。
+		msg := "没有可撤销的操作"
+		if path != "" {
+			msg = "这次改动前的内容过大或已被清理，无法自动还原（改动本身已成功，但没有留副本）"
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": msg})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{

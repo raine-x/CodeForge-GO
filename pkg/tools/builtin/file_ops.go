@@ -31,7 +31,31 @@ type Snapshot struct {
 	// 有它才能做会话级撤销：undo 栈是进程级的一条直线，多会话并发时
 	// 「用户点撤销」会撤掉另一个会话的写入。
 	SessionID string `json:"session_id,omitempty"`
+
+	// Spill 是「内容太大时」的落盘副本路径。为空表示内容在 Content 里。
+	//
+	// 为什么需要：Content 存的是**写前全量内容**，只限条数不限字节的话
+	// 最坏情况是 100 × 单文件体积 —— 理论无界。
+	Spill string `json:"-"`
+	// Dropped 表示内容大到连副本都不值得落（超 maxUndoSpillBytes），
+	// 本次改动**不可撤销**。撤销会明确失败而不是拿空内容覆盖文件。
+	Dropped bool `json:"-"`
 }
+
+// 撤销栈的三个预算。缺一不可：
+//
+//	maxUndo          条数。界面靠 UndoDepth 展示 remaining，用户对「撤销历史
+//	                 是有限的」已有预期。
+//	maxUndoBytes     内存总量。这是真正兜住 OOM 的那个上限。
+//	maxUndoEntryBytes 单条留在内存里的上限 —— 没有它，一条 2 GB 的快照就能
+//	                 独自吃掉整个总预算，逐出会退化成「每次 push 都清空栈」。
+//	maxUndoSpillBytes 单个落盘副本的上限 —— 再大就连副本也不落。
+const (
+	defaultMaxUndo           = 100
+	defaultMaxUndoBytes      = 32 << 20 // 32 MiB
+	defaultMaxUndoEntryBytes = 1 << 20  // 1 MiB
+	defaultMaxUndoSpillBytes = 64 << 20 // 64 MiB
+)
 
 // FS 是文件工具共享的工作区状态（含撤销栈）。
 type FS struct {
@@ -39,7 +63,6 @@ type FS struct {
 	allowOutside bool
 	mu           sync.Mutex
 	undo         []Snapshot
-	maxUndo      int
 	// readSeen 是「哪个会话读过/改过哪个文件」的登记表，用于先读后写约束。
 	// 整个工作区共用一份 FS，故键必须带上会话 ID：子智能体与各会话之间
 	// 不能拿别人读过的原文下自己的笔。
@@ -50,6 +73,80 @@ type FS struct {
 	// 若 pathLocks 由 f.mu 保护，就形成 f.mu → 路径锁 的顺序；
 	// 任何反向顺序都会死锁。sync.Map 的读路径不占全局锁，天然避免。
 	pathLocks sync.Map // path → *sync.Mutex
+
+	// undoBytes 是当前撤销栈占用的内存字节（只计 Content，副本在磁盘上）。
+	// 与 undo / readSeen 同受 f.mu 守护。
+	undoBytes int64
+
+	// 撤销预算与副本目录。四项都可注入，便于测试与将来按需调参。
+	maxUndo           int
+	maxUndoBytes      int64
+	maxUndoEntryBytes int
+	maxUndoSpillBytes int
+	spillDir          string
+}
+
+// SetUndoLimits 覆盖撤销预算（<=0 的项保持现值）。
+//
+// 存在的理由不只是「可测」：这五个数字是**产品参数**（一个会话该留多少撤销
+// 历史），迟早要能按工作区大小或用户偏好调整，而写死在 NewFS 里就没有调整面。
+func (f *FS) SetUndoLimits(maxCount int, maxBytes int64, maxEntry, maxSpill int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if maxCount > 0 {
+		f.maxUndo = maxCount
+	}
+	if maxBytes > 0 {
+		f.maxUndoBytes = maxBytes
+	}
+	if maxEntry > 0 {
+		f.maxUndoEntryBytes = maxEntry
+	}
+	if maxSpill > 0 {
+		f.maxUndoSpillBytes = maxSpill
+	}
+}
+
+// SetUndoSpillDir 指定副本目录。测试必须指向临时目录，
+// 否则会往真实的 ~/.codeforge/undo/ 里写垃圾。
+func (f *FS) SetUndoSpillDir(dir string) {
+	f.mu.Lock()
+	f.spillDir = dir
+	f.mu.Unlock()
+}
+
+// undoSpillHome 是默认的副本目录（%USERPROFILE%/.codeforge/undo）。
+//
+// 刻意不放 <workspace>/.codeforge/：那是用户可见的项目目录，而 FS 是
+// **进程级、跨工作区**的（见 AGENTS.md §5 的已知迁移项），快照与工作区
+// 没有 1:1 关系。
+func undoSpillHome() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".codeforge", "undo")
+}
+
+// GCUndoSpill 清空副本目录。
+//
+// 为什么可以整目录删：进程启动时撤销栈必然是空的 ⇒ 目录里任何文件都是上一次
+// 进程（含崩溃）留下的孤儿。前提是单实例 —— cmd/agent/main.go 已在检测到
+// 已有实例时拒绝启动。
+//
+// 刻意**不**做成「NewFS 里自动清」：go test 会并发跑多个测试，
+// 一个测试的启动清理会把另一个测试正在用的副本删掉。
+func (f *FS) GCUndoSpill() error {
+	f.mu.Lock()
+	dir := f.spillDir
+	f.mu.Unlock()
+	if dir == "" {
+		return nil
+	}
+	if err := os.RemoveAll(dir); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // NewFS 构造文件工具工作区。root 为空表示「未选择工作区」，
@@ -60,7 +157,15 @@ func NewFS(root string) *FS {
 			root = abs
 		}
 	}
-	return &FS{root: root, maxUndo: 100, readSeen: map[string]seenEntry{}}
+	return &FS{
+		root:              root,
+		maxUndo:           defaultMaxUndo,
+		maxUndoBytes:      defaultMaxUndoBytes,
+		maxUndoEntryBytes: defaultMaxUndoEntryBytes,
+		maxUndoSpillBytes: defaultMaxUndoSpillBytes,
+		spillDir:          undoSpillHome(),
+		readSeen:          map[string]seenEntry{},
+	}
 }
 
 // Root 返回工作区根目录（空字符串表示未选择工作区）。
@@ -89,7 +194,12 @@ func (f *FS) SetRoot(root string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.root = root
+	// 副本也要清 —— 否则切工作区就在用户目录里留一堆孤儿。
+	for _, s := range f.undo {
+		f.removeSpillLocked(s)
+	}
 	f.undo = nil
+	f.undoBytes = 0
 	f.readSeen = map[string]seenEntry{}
 }
 
@@ -292,25 +402,54 @@ func (f *FS) OutsideScopePath(args json.RawMessage) bool {
 //     是「回退回某条用户消息之前」的基础（Plan.md #4）。
 //
 // 上报必须发生在写入之前：sink 拿到的是读出的旧内容，晚一步就只能读到新内容。
-func (f *FS) snapshot(ctx context.Context, path string, before []byte, existed bool) {
+//
+// 返回值是给调用方塞进工具返回值的**人话提示**（见 undoNote）。空串 = 无需提示。
+func (f *FS) snapshot(ctx context.Context, path string, before []byte, existed bool) string {
 	snap := Snapshot{Path: path, Time: time.Now()}
 	// 记下是谁写的，会话级撤销（UndoSession）全靠它。
 	if sc, ok := tools.SessionFrom(ctx); ok {
 		snap.SessionID = sc.SessionID
 	}
-	if existed {
-		snap.Existed = true
-		snap.Content = before
-	}
+
 	f.mu.Lock()
-	f.undo = append(f.undo, snap)
-	if len(f.undo) > f.maxUndo {
-		f.undo = f.undo[len(f.undo)-f.maxUndo:]
-	}
+	maxEntry := f.maxUndoEntryBytes
+	maxSpill := f.maxUndoSpillBytes
+	spillDir := f.spillDir
 	f.mu.Unlock()
 
+	note := ""
+	if existed {
+		snap.Existed = true
+		switch {
+		case len(before) <= maxEntry:
+			// 内存层：绝大多数编辑走这条路，不产生任何磁盘副���
+			snap.Content = before
+		case spillDir != "" && len(before) <= maxSpill:
+			// 落盘副本层。
+			//
+			// 这一层不能省：WithCheckpointSink 只在主循环注入，子智能体的写入
+			// **内存 undo 栈是唯一的撤销途径**。若对大文件一律降级为哈希，
+			// 子智能体改 5 MB 文件就变成不可撤销 —— 那是真的功能回退。
+			if p, err := writeSpill(spillDir, before); err == nil {
+				snap.Spill = p
+			} else {
+				snap.Dropped = true
+				note = "该文件改动前的内容过大且落盘副本失败，本次改动无法自动撤销。"
+			}
+			if !snap.Dropped {
+				note = "该文件改动前的内容已存到磁盘副本，本次撤销仍然可用。"
+			}
+		default:
+			// 只留指纹层：连副本都不落。
+			snap.Dropped = true
+			note = "该文件改动前的内容过大，本次改动未保留、无法自动撤销（改动本身已成功）。"
+		}
+	}
+
+	evicted := f.pushSnapshot(snap)
+
 	if ctx == nil {
-		return
+		return note
 	}
 	if sink, ok := tools.CheckpointSinkFrom(ctx); ok {
 		sink(tools.CheckpointEvent{
@@ -318,6 +457,72 @@ func (f *FS) snapshot(ctx context.Context, path string, before []byte, existed b
 			Existed:    snap.Existed,
 			OldContent: string(before), // 文件不存在时 before 为 nil，转成空串
 		})
+	}
+	// 逐出也是**有损**事件。常规的「第 101 步挤掉最旧一步」是用户已有预期的
+	// 有限历史（界面还展示 remaining），每次都啰嗦是噪音 —— 只在
+	// 「因为字节预算被挤掉」时补一句。
+	if evicted > 0 && note == "" {
+		note = fmt.Sprintf("撤销历史已达上限，本次有 %d 步更早的改动被挤出、无法再撤销。", evicted)
+	}
+	return note
+}
+
+// pushSnapshot 压栈并按两个预算逐出，返回被挤掉的条数。
+func (f *FS) pushSnapshot(snap Snapshot) int {
+	f.mu.Lock()
+	f.undo = append(f.undo, snap)
+	f.undoBytes += int64(len(snap.Content))
+	evicted := 0
+	// 逐出：先按字节预算丢最旧的，再按条数裁剪。
+	// 顺序不影响正确性，但字节优先 —— 它才是真正兜住 OOM 的那个上限。
+	for len(f.undo) > 0 && (f.undoBytes > f.maxUndoBytes || len(f.undo) > f.maxUndo) {
+		// 绝不逐出栈顶：Undo() 撤的是最后一条，逐出它等于让「撤销上一步」失效。
+		if len(f.undo) == 1 && f.undoBytes > f.maxUndoBytes {
+			break
+		}
+		old := f.undo[0]
+		f.undoBytes -= int64(len(old.Content))
+		if f.undoBytes < 0 {
+			f.undoBytes = 0
+		}
+		f.undo = f.undo[1:]
+		f.removeSpillLocked(old)
+		evicted++
+	}
+	f.mu.Unlock()
+	return evicted
+}
+
+// writeSpill 把内容写成临时副本，返回路径。
+//
+// 用 os.CreateTemp 的唯一名而不是内容寻址：同一份内容被两条快照引用时，
+// 内容寻址要删一条就会连带删掉另一条还在用的文件，要正确处理就得引入 refcount。
+// 唯一名 + 无脑 Remove 才是可证明正确的最小实现。
+func writeSpill(dir string, data []byte) (string, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	fh, err := os.CreateTemp(dir, "undo-*.bak")
+	if err != nil {
+		return "", err
+	}
+	name := fh.Name()
+	if _, err := fh.Write(data); err != nil {
+		fh.Close()
+		os.Remove(name)
+		return "", err
+	}
+	if err := fh.Close(); err != nil {
+		os.Remove(name)
+		return "", err
+	}
+	return name, nil
+}
+
+// removeSpillLocked 删掉快照的副本。调用方必须已持 f.mu。
+func (f *FS) removeSpillLocked(s Snapshot) {
+	if s.Spill != "" {
+		_ = os.Remove(s.Spill)
 	}
 }
 
@@ -362,7 +567,10 @@ func (f *FS) Snapshots() []Snapshot {
 //
 // 撤销会把文件内容**改回**旧值，因此所有相关会话的指纹都必须一起刷新 ——
 // 否则「读 → 写 → 撤销 → 再写」会在最后一步被判成「被外部修改」而失败。
-// 快照里就有还原后的内容（snap.Content），直接拿来算，不必重读磁盘。
+//
+// ⚠️ **降级条目（Dropped）必须走「删登记」而不是「按空内容算指纹」。**
+// 留着旧指纹的话，下一次写入会基于一个错误的基线通过 CAS，
+// 整个指纹机制就被绕过了。有测试专门盯这条。
 //
 // 调用方**不要**持有 f.mu：本方法自己加锁。
 func (f *FS) undoAt(idx int) (string, bool) {
@@ -376,18 +584,48 @@ func (f *FS) undoAt(idx int) (string, bool) {
 	}
 	snap := f.undo[idx]
 	f.undo = append(f.undo[:idx:idx], f.undo[idx+1:]...)
+	f.undoBytes -= int64(len(snap.Content))
+	if f.undoBytes < 0 {
+		f.undoBytes = 0
+	}
+	// ⚠️ 副本必须**先读完再删**。反过来的话这里读到的是不存在的文件，
+	// 撤销会静默失败，而「有副本却撤不了」是最难查的一种坏。
+	//
+	// 读在锁内做：副本可能正被另一个 goroutine 的逐出删除。
+	var spillRaw []byte
+	if snap.Spill != "" {
+		spillRaw, _ = os.ReadFile(snap.Spill)
+	}
+	f.removeSpillLocked(snap)
 	f.mu.Unlock()
+
+	// 完全被丢弃（Dropped）的条目**没有内容可用**：明确失败，
+	// 绝不拿空内容去覆盖文件 —— 那是最灾难性的数据损坏。
+	content := snap.Content
+	if snap.Spill != "" {
+		if spillRaw == nil {
+			// 副本丢了：同样只能失败。
+			return snap.Path, false
+		}
+		content = spillRaw
+	}
+	// 内容可能被丢弃 —— 但**指纹必须先作废**，然后才能放弃。
+	//
+	// 顺序很重要：若在这里就 return，那些指向旧基线的指纹会留在 readSeen 里，
+	// 下一次写入会基于一个错误的基线通过 CAS，整个指纹机制被绕过。
+	// 有测试专门盯这条（TestDroppedSnapshotInvalidatesFingerprint）。
+	restorable := !snap.Dropped || content != nil
 
 	// 所有见过这个路径的会话，其指纹都指向「改动前」的内容。
 	// 撤销把它们统一对齐到还原后的内容。
 	// seenKey 的结构是 sessionID + "\n" + path，所以匹配后缀时要带前导 \n，
 	// 否则路径 "a.go" 会误匹配到 "xa.go"。
 	suffix := "\n" + snap.Path
-	restored := snap.Existed
+	restored := snap.Existed && restorable
 	var sum string
 	var size int64
-	if snap.Existed {
-		sum, size = fingerprint(snap.Content)
+	if restored {
+		sum, size = fingerprint(content)
 	}
 	f.mu.Lock()
 	for k := range f.readSeen {
@@ -397,16 +635,24 @@ func (f *FS) undoAt(idx int) (string, bool) {
 		if restored {
 			f.readSeen[k] = seenEntry{sum: sum, size: size}
 		} else {
-			// 文件被撤销成「原本不存在」，指纹无从谈起 —— 删掉登记，
-			// 后续写入会走「新建文件」路径（requireReadSeen 对不存在的文件放行）。
+			// 文件被撤销成「原本不存在」，**或**内容已不可得（Dropped）——
+			// 两种情况指纹都无从谈起。删掉登记，后续写入会走「新建文件」路径
+			// （casCheckReadGate 对不存在的文件放行）或要求重读。
+			// 绝不能留着一个指向旧基线的指纹。
 			delete(f.readSeen, k)
 		}
 	}
 	f.mu.Unlock()
 
+	if !restorable {
+		// 指纹已作废，这里才安全地放弃：文件内容不可得，明确失败，
+		// 绝不拿空内容去覆盖 —— 那是最灾难性的数据损坏。
+		return snap.Path, false
+	}
+
 	if snap.Existed {
 		_ = os.MkdirAll(filepath.Dir(snap.Path), 0o755)
-		if err := os.WriteFile(snap.Path, snap.Content, 0o644); err != nil {
+		if err := os.WriteFile(snap.Path, content, 0o644); err != nil {
 			return snap.Path, false
 		}
 	} else {
@@ -1066,9 +1312,12 @@ func (t *WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (*too
 	if casErr != nil {
 		return tools.Err("%s", casErr), nil
 	}
-	t.fs.snapshot(ctx, path, before, existed)
+	undoNote := t.fs.snapshot(ctx, path, before, existed)
 	t.fs.markReadSeen(ctx, path, []byte(content))
 	out := map[string]any{"path": path, "bytes": len(content), "created": !existed}
+	if undoNote != "" {
+		out["undo_note"] = undoNote
+	}
 	if existed {
 		added, removed := LineChurn(string(before), content)
 		out["added"], out["removed"] = added, removed
@@ -1316,8 +1565,16 @@ func (t *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (*tool
 	if casErr != nil {
 		return tools.Err("%s", casErr), nil
 	}
-	t.fs.snapshot(ctx, path, data, true)
+	undoNote := t.fs.snapshot(ctx, path, data, true)
 	t.fs.markReadSeen(ctx, path, []byte(updated))
+	if undoNote != "" {
+		return tools.OkMeta(map[string]any{
+			"path":         path,
+			"hunks":        len(pairs),
+			"replacements": count,
+			"undo_note":    undoNote,
+		}, map[string]any{"path": path}), nil
+	}
 	added, removed := LineChurn(string(data), updated)
 	return tools.OkMeta(map[string]any{
 		"path":         path,
