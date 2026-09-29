@@ -103,14 +103,20 @@
 目标方向：本地与远程共用同一套工具，工作区归会话而不是进程。
 
 - [ ] 执行环境分层：底层 Backend 只做纯 IO（Read/Write/Stat/List/Remove/Realpath/Grep/Glob/Exec）；上层会话级 Guard 负责越界检查、指纹、快照撤销。"是否在工作区内"的判断只在 Guard 写一份，后端只提供 `Realpath`。
-- [ ] 执行器角色工厂（`Role` + `NewExecutorFor`），审计等参数不再靠手工传
+- [x] 执行器角色工厂（`Role` + `NewExecutorFor`），审计等参数不再靠手工传
 - [ ] 每次工具调用一条权威 `ExecutionRecord`，审计、界面事件、检查点都从它派生
-- [ ] 工作区归会话：`Workspace` 结构化；`undo` / `readSeen` 移到会话；`Snapshot` 加 `SessionID`
-- [ ] 工具声明 `SideEffect`（读 / 写 / 外部 / 破坏性），驱动审批与并发
+- [ ] 工作区归会话：`Workspace` 结构化；`undo` / `readSeen` 移到会话；`Snapshot` 加 `SessionID`（结构已加，接口接线待做）
+- [x] 工具声明 `SideEffect`（none / write / external / destructive），驱动审批与并发
 - [ ] ReAct 循环状态化 + 多 tool_call 批处理
 - [ ] 事件日志与序号（低优先级）
 
-**等待中，请勿启动**：Backend/Guard 分层、工作区会话化、循环状态化。在架构对照分析出结论前，不要动这三项，否则很可能返工。
+**"等待中，请勿启动"已解除**（原为：Backend/Guard 分层、工作区会话化、循环状态化）。ZCode / OpenCode 架构对照分析已交付，原先「等结论、动它们大概率返工」的理由不再成立。实施顺序与逐项取舍见 `C:\Users\26536\Desktop\test\CodeForge-Go-架构问题与改进方案.md` §0.5 与 §5.1。
+
+**分层落地时的三条既定决策**（改之前先看，别重新讨论）：
+
+1. **`pathLocks` 留在 Guard，不下沉 Backend。** 锁序是 `pathLock → Guard.mu`（`casWrite` 持路径锁期间要取 `mu` 读 `readSeen`）。跨对象无法表达这个顺序 —— 接口层没有机制保证它不被违反，一次「顺手」重构就会翻成反向顺序，死锁而不是失败。
+2. **撤销副本 scratch 目录（默认 `~/.codeforge/undo`）刻意不进 Backend。** 它是进程级、跨工作区的。进 Backend 等于给远程后端定义「往我本地 home 目录写文件」的契约。
+3. **`Backend` 不加 `IsInScope` / `CheckScope` 之类的方法。** 加了就等于邀请每个后端自己实现一遍围栏，安全逻辑必然分叉。Backend 只提供 `Realpath`，判断在 Guard。
 
 ---
 
