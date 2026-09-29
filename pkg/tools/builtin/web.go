@@ -186,6 +186,11 @@ func (t *FetchTool) InputSchema() json.RawMessage {
 // IsReadOnly 声明只读（网络读取）。
 func (t *FetchTool) IsReadOnly() bool { return true }
 
+// Metadata 声明副作用等级。
+func (t *FetchTool) Metadata() tools.Metadata {
+	return tools.Metadata{SideEffect: tools.SideEffectExternal}
+}
+
 // Execute 实现 tools.Tool。
 func (t *FetchTool) Execute(ctx context.Context, args json.RawMessage) (*tools.ToolResult, error) {
 	var p struct {
@@ -310,6 +315,11 @@ func (t *SearchToolWeb) InputSchema() json.RawMessage {
 
 // IsReadOnly 声明只读。
 func (t *SearchToolWeb) IsReadOnly() bool { return true }
+
+// Metadata 声明副作用等级。
+func (t *SearchToolWeb) Metadata() tools.Metadata {
+	return tools.Metadata{SideEffect: tools.SideEffectExternal}
+}
 
 // Execute 实现 tools.Tool。
 func (t *SearchToolWeb) Execute(ctx context.Context, args json.RawMessage) (*tools.ToolResult, error) {

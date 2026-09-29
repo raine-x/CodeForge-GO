@@ -21,8 +21,96 @@ type Tool interface {
 }
 
 // ReadOnlyTool 可由工具实现，用于显式声明其是否只读。
+//
+// ⚠️ 已废弃：请改用 Metadata().SideEffect。保留它只是为了不破坏外部实现，
+// 判定侧不再读它（IsReadOnly 与 SideEffect 可能互相矛盾，工具会同时实现两者）。
 type ReadOnlyTool interface {
 	IsReadOnly() bool
+}
+
+// SideEffect 声明工具对世界的副作用等级。
+//
+// 之所以要这个：早先「是否只读」有两处真相来源 —— 工具实现的 IsReadOnly()
+// 与 security 包里一张按名字硬编码的表。两边不一致，而且**两个方向都出错**：
+// 声明了只读但不在表里的工具被误拒；只在表里却没声明的工具被凭名字放行，
+// 而工具名是插件/MCP 可控的，等于给插件开了提权口子。
+//
+// 声明放在工具上、只有一处、且漏声明会 fail-closed，这三个性质一起把
+// 「静默降级」这个反模式关掉了（见 AGENTS.md 硬规则 3）。
+type SideEffect int
+
+const (
+	// SideEffectNone 纯读：读文件、列目录、搜索、抓网页。不改变任何状态，
+	// 可与任何其他调用并发，也可被只读模式自动放行。
+	SideEffectNone SideEffect = iota
+	// SideEffectWrite 写工作区内的内容。可逆（快照可撤销）。
+	SideEffectWrite
+	// SideEffectExternal 影响工作区之外：执行命令、写工作区外文件、发网络请求。
+	// 不可由工具自己保证可逆，故与 Write 分开。
+	SideEffectExternal
+	// SideEffectDestructive 破坏性：删除、覆盖既有内容且无法自动撤销。
+	// 与 Write 分开是因为「可撤销」这件事本身需要用户单独确认。
+	SideEffectDestructive
+)
+
+// Valid 报告取值是否在枚举范围内。
+//
+// 判定侧遇到非法取值一律按最严处理，因此这个方法主要用于**测试**：
+// 声明里写错等级会立刻被 CI 抓到，而不是悄悄退化。
+func (s SideEffect) Valid() bool { return s >= SideEffectNone && s <= SideEffectDestructive }
+
+// String 用于审计与调试输出。
+func (s SideEffect) String() string {
+	switch s {
+	case SideEffectNone:
+		return "none"
+	case SideEffectWrite:
+		return "write"
+	case SideEffectExternal:
+		return "external"
+	case SideEffectDestructive:
+		return "destructive"
+	default:
+		return "invalid"
+	}
+}
+
+// Metadata 是工具的静态声明面。
+//
+// 参照 ZCode 的 ToolMetadata（core/src/tool/types.ts:68-97），
+// 但只保留本项目当下真正有消费者的字段。刻意**不**加：
+//   - ConcurrentSafe：批量并发调度属 2.6（ReAct 循环状态化），已推迟；
+//     现在加就是个没人读的字段。
+//   - riskLevel / timeoutMs：已有 TimeoutPolicy 接口在承担同样的职责，
+//     重复声明只会造成第二个真相来源。
+type Metadata struct {
+	// SideEffect 副作用等级，必填。
+	SideEffect SideEffect
+}
+
+// Metadated 由需要声明副作用等级的工具实现。
+//
+// 未实现它的工具在**只读模式下会被拒绝**（fail-closed）：
+// 不知道副作用等级时，唯一安全的假设是「它有副作用」。
+type Metadated interface {
+	Metadata() Metadata
+}
+
+// MetadataOf 取工具的声明。第二个返回值为 false 表示该工具没有声明。
+//
+// 判定侧必须用这个函数而不是直接类型断言，这样「未声明」与「声明为 none」
+// 才不会被混为一谈 —— 前者要拒绝，后者要放行。
+func MetadataOf(t Tool) (Metadata, bool) {
+	m, ok := t.(Metadated)
+	if !ok {
+		return Metadata{}, false
+	}
+	meta := m.Metadata()
+	// 非法取值当作「没声明」，走 fail-closed。
+	if !meta.SideEffect.Valid() {
+		return Metadata{}, false
+	}
+	return meta, true
 }
 
 // SubagentTask 描述一个可并行委派的独立子任务。

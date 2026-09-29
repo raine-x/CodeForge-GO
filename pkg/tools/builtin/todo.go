@@ -25,6 +25,14 @@ type TodoTool struct{ store TodoStore }
 // NewTodoTool 构造 todo_write 工具。
 func NewTodoTool(store TodoStore) *TodoTool { return &TodoTool{store: store} }
 
+// Metadata 声明副作用等级。
+//
+// run_command 的等级是 External 而非 Write：它能起进程、能碰网络、
+// 写工作区之外的任何路径。用 Write 描述会低估它。
+func (t *TodoTool) Metadata() tools.Metadata {
+	return tools.Metadata{SideEffect: tools.SideEffectWrite}
+}
+
 // Name 实现 tools.Tool。
 func (t *TodoTool) Name() string { return "todo_write" }
 

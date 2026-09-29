@@ -20,6 +20,14 @@ type MemoryTool struct{ store MemoryStore }
 // NewMemoryTool 构造 save_memory 工具。
 func NewMemoryTool(store MemoryStore) *MemoryTool { return &MemoryTool{store: store} }
 
+// Metadata 声明副作用等级。
+//
+// run_command 的等级是 External 而非 Write：它能起进程、能碰网络、
+// 写工作区之外的任何路径。用 Write 描述会低估它。
+func (t *MemoryTool) Metadata() tools.Metadata {
+	return tools.Metadata{SideEffect: tools.SideEffectWrite}
+}
+
 // Name 实现 tools.Tool。
 func (t *MemoryTool) Name() string { return "save_memory" }
 

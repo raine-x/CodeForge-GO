@@ -45,6 +45,11 @@ func (t *SearchTool) InputSchema() json.RawMessage {
 // IsReadOnly 声明只读。
 func (t *SearchTool) IsReadOnly() bool { return true }
 
+// Metadata 声明副作用等级。
+func (t *SearchTool) Metadata() tools.Metadata {
+	return tools.Metadata{SideEffect: tools.SideEffectNone}
+}
+
 // OutsideScope 实现 tools.ScopeChecker。
 func (t *SearchTool) OutsideScope(args json.RawMessage) bool { return t.fs.OutsideScopePath(args) }
 
@@ -169,6 +174,11 @@ func (t *FindFilesTool) InputSchema() json.RawMessage {
 }
 
 func (t *FindFilesTool) IsReadOnly() bool { return true }
+
+// Metadata 声明副作用等级。
+func (t *FindFilesTool) Metadata() tools.Metadata {
+	return tools.Metadata{SideEffect: tools.SideEffectNone}
+}
 
 func (t *FindFilesTool) OutsideScope(args json.RawMessage) bool { return t.fs.OutsideScopePath(args) }
 

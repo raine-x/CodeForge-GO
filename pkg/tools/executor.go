@@ -100,18 +100,35 @@ func (e *Executor) Audit() *security.AuditLogger { return e.audit }
 // Evaluate 仅做安全判定，不执行工具。
 func (e *Executor) Evaluate(name string, args json.RawMessage) Decision {
 	action := extractAction(name, args)
-	d, reason := e.policy.Evaluate(name, action, string(args))
-	if tool, ok := e.registry.Get(name); ok {
+	tool, hasTool := e.registry.Get(name)
+	var readOnly bool
+	if hasTool {
+		readOnly = isReadOnlyCall(tool)
+	}
+	d, reason := e.policy.Evaluate(name, action, string(args), readOnly)
+	if hasTool {
 		d, reason, _ = e.escalate(tool, name, args, d, reason)
 	}
 	return Decision{Tool: name, Action: action, Decision: d, Reason: reason}
+}
+
+// isReadOnlyCall 判断一次调用是否无副作用。
+//
+// 判据是工具的 SideEffect 声明，**不是**名字。
+//
+// 声明为 External/Destructive 的工具，某些具体入参可能仍无副作用
+// （例如命令形如 `ls`）。这类「按入参收窄」是 2.3 的下一项，届时加
+// Narrower 接口；现在一律从严。
+func isReadOnlyCall(tool Tool) bool {
+	meta, ok := MetadataOf(tool)
+	return ok && meta.SideEffect == SideEffectNone
 }
 
 // decide 是 Execute 用的完整判定：策略引擎 + 按模式的越界处理，二者结论一致。
 // 第三个返回值是「本次调用是否指向工作区之外」，Execute 用它决定要不要给这一次
 // 执行注入围栏豁免（见 Execute 里 ScopeApproved 的两处注入）。
 func (e *Executor) decide(tool Tool, name, action string, args json.RawMessage) (security.Decision, string, bool) {
-	d, reason := e.policy.Evaluate(name, action, string(args))
+	d, reason := e.policy.Evaluate(name, action, string(args), isReadOnlyCall(tool))
 	return e.escalate(tool, name, args, d, reason)
 }
 
@@ -152,11 +169,17 @@ func (e *Executor) escalate(tool Tool, name string, args json.RawMessage, d secu
 		// 自主模式不弹审批：放行本次调用，Execute 会一并注入围栏豁免。
 		return security.Allow, "自主模式自动放行（越界访问不再请求审批）", true
 	case security.ModeReadOnly:
-		if security.IsReadOnlyTool(name) {
+		// 只认工具**自己**的声明，不看名字。
+		//
+		// 早先这里查 security.IsReadOnlyTool(name) —— 一张按名字硬编码的表。
+		// 两个方向都出过事：声明了只读但不在表里的 find_files / web_fetch
+		// 被误拒；只在表里却没有任何声明的 git_status / git_log 被凭名字放行，
+		// 而工具名是插件/MCP 可控的。
+		//
+		// 未声明 = 不知道 = 拒绝。这是 fail-closed，也是「漏实现」不再是
+		// 静默降级的关键。
+		if meta, ok := MetadataOf(tool); ok && meta.SideEffect == SideEffectNone {
 			return security.Allow, "只读模式放行只读工具：" + name, true
-		}
-		if rt, ok := tool.(ReadOnlyTool); ok && rt.IsReadOnly() {
-			return security.Allow, "只读模式放行声明的只读工具：" + name, true
 		}
 		return security.Deny, "只读模式禁止非只读工具：" + name, true
 	default:

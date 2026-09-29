@@ -23,6 +23,11 @@ type SkillCreatorTool struct{ fs *FS }
 // NewSkillCreatorTool 构造 create_skill 工具。
 func NewSkillCreatorTool(fs *FS) *SkillCreatorTool { return &SkillCreatorTool{fs: fs} }
 
+// Metadata 声明副作用等级。
+func (t *SkillCreatorTool) Metadata() tools.Metadata {
+	return tools.Metadata{SideEffect: tools.SideEffectWrite}
+}
+
 // Name 实现 tools.Tool。
 func (t *SkillCreatorTool) Name() string { return "create_skill" }
 

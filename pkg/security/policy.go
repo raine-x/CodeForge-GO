@@ -46,15 +46,6 @@ var builtinDenyPatterns = []string{
 	`(?i)\bchown\s+-R\s+.*\s+/\s*$`,
 }
 
-// readOnlyTools 为默认只读工具集合。
-var readOnlyTools = map[string]bool{
-	"read_file":    true,
-	"list_dir":     true,
-	"search_files": true,
-	"git_status":   true,
-	"git_log":      true,
-}
-
 // 权限模式（前端「权限控制」三态）。
 const (
 	ModeReadOnly = "readonly" // 只读：只读工具放行，其余一律拒绝
@@ -142,7 +133,17 @@ func (p *Policy) SetMode(mode string) {
 // Evaluate 对一次工具调用给出判定与理由。
 //
 // toolName: 工具名；action: 语义动作（如 shell 命令、文件路径）；payload: 原始参数文本。
-func (p *Policy) Evaluate(toolName, action, payload string) (Decision, string) {
+// readOnly: **调用方**判定的「本次调用无副作用」，来源是工具自己的 SideEffect 声明
+// （tools.MetadataOf）。刻意做成入参而不是在这里按名字查表：
+//
+//  1. security 不能 import tools（tools 依赖 security），无法读声明；
+//  2. 早先这里是查 readOnlyTools 这张硬编码表，于是「谁只读」有了第二个真相来源，
+//     而且错在两个方向 —— 声明了只读但不在表里的被误拒，只在表里却没声明的
+//     被凭名字放行（工具名是插件可控的）。
+//
+// 传 false 是安全的默认（从严）；传错 true 的责任在调用方，且只影响
+// autoReadOnly 这一条「只读工具自动放行」的提升路径。
+func (p *Policy) Evaluate(toolName, action, payload string, readOnly bool) (Decision, string) {
 	subject := strings.TrimSpace(action)
 	if subject == "" {
 		subject = strings.TrimSpace(payload)
@@ -194,7 +195,9 @@ func (p *Policy) Evaluate(toolName, action, payload string) (Decision, string) {
 	}
 
 	// 4) 只读工具在开启自动放行时可提升为 Allow
-	if autoReadOnly && readOnlyTools[strings.ToLower(toolName)] {
+	//
+	// readOnly 由调用方从工具的 SideEffect 声明传入，不再按名字查表。
+	if autoReadOnly && readOnly {
 		return Allow, "只读操作自动放行"
 	}
 
@@ -209,9 +212,6 @@ func (p *Policy) RequireApproval(toolNames ...string) {
 		}
 	}
 }
-
-// IsReadOnlyTool 判断工具是否属于只读集合。
-func IsReadOnlyTool(name string) bool { return readOnlyTools[strings.ToLower(name)] }
 
 func matchAny(patterns []string, subject string) bool {
 	if len(patterns) == 0 {

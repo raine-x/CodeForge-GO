@@ -23,6 +23,14 @@ type TerminalTool struct{ fs *FS }
 // NewTerminalTool 构造 run_command 工具。
 func NewTerminalTool(fs *FS) *TerminalTool { return &TerminalTool{fs: fs} }
 
+// Metadata 声明副作用等级。
+//
+// run_command 的等级是 External 而非 Write：它能起进程、能碰网络、
+// 写工作区之外的任何路径。用 Write 描述会低估它。
+func (t *TerminalTool) Metadata() tools.Metadata {
+	return tools.Metadata{SideEffect: tools.SideEffectExternal}
+}
+
 // Name 实现 tools.Tool。
 func (t *TerminalTool) Name() string { return "run_command" }
 

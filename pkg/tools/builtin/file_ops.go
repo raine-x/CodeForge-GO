@@ -630,6 +630,11 @@ func (t *ReadFileTool) InputSchema() json.RawMessage {
 // IsReadOnly 声明只读。
 func (t *ReadFileTool) IsReadOnly() bool { return true }
 
+// Metadata 声明副作用等级。
+func (t *ReadFileTool) Metadata() tools.Metadata {
+	return tools.Metadata{SideEffect: tools.SideEffectNone}
+}
+
 // OutsideScope 实现 tools.ScopeChecker。
 func (t *ReadFileTool) OutsideScope(args json.RawMessage) bool { return t.fs.OutsideScopePath(args) }
 
@@ -727,6 +732,11 @@ func (t *ListDirTool) InputSchema() json.RawMessage {
 // IsReadOnly 声明只读。
 func (t *ListDirTool) IsReadOnly() bool { return true }
 
+// Metadata 声明副作用等级。
+func (t *ListDirTool) Metadata() tools.Metadata {
+	return tools.Metadata{SideEffect: tools.SideEffectNone}
+}
+
 // OutsideScope 实现 tools.ScopeChecker。
 func (t *ListDirTool) OutsideScope(args json.RawMessage) bool { return t.fs.OutsideScopePath(args) }
 
@@ -810,6 +820,11 @@ type WriteFileTool struct{ fs *FS }
 
 // NewWriteFileTool 构造 write_file 工具。
 func NewWriteFileTool(fs *FS) *WriteFileTool { return &WriteFileTool{fs: fs} }
+
+// Metadata 声明副作用等级。
+func (t *WriteFileTool) Metadata() tools.Metadata {
+	return tools.Metadata{SideEffect: tools.SideEffectWrite}
+}
 
 // Name 实现 tools.Tool。
 func (t *WriteFileTool) Name() string { return "write_file" }
@@ -962,6 +977,11 @@ type EditFileTool struct{ fs *FS }
 
 // NewEditFileTool 构造 edit_file 工具。
 func NewEditFileTool(fs *FS) *EditFileTool { return &EditFileTool{fs: fs} }
+
+// Metadata 声明副作用等级。
+func (t *EditFileTool) Metadata() tools.Metadata {
+	return tools.Metadata{SideEffect: tools.SideEffectWrite}
+}
 
 // Name 实现 tools.Tool。
 func (t *EditFileTool) Name() string { return "edit_file" }
@@ -1187,6 +1207,11 @@ type DeleteFileTool struct{ fs *FS }
 
 // NewDeleteFileTool 构造 delete_file 工具。
 func NewDeleteFileTool(fs *FS) *DeleteFileTool { return &DeleteFileTool{fs: fs} }
+
+// Metadata 声明副作用等级。
+func (t *DeleteFileTool) Metadata() tools.Metadata {
+	return tools.Metadata{SideEffect: tools.SideEffectDestructive}
+}
 
 // Name 实现 tools.Tool。
 func (t *DeleteFileTool) Name() string { return "delete_file" }
