@@ -1,21 +1,23 @@
 package builtin
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
+	"codeforge/pkg/backend"
 	"codeforge/pkg/errs"
-	"codeforge/pkg/platform"
 	"codeforge/pkg/tools"
 )
+
+// itoaExit 把退出码转成字符串（文案用）。
+func itoaExit(n int) string { return strconv.Itoa(n) }
 
 // TerminalTool 跨平台异步执行 Shell 命令并收集输出。
 type TerminalTool struct{ fs *FS }
@@ -181,76 +183,49 @@ func (t *TerminalTool) Execute(ctx context.Context, args json.RawMessage) (*tool
 	if p.TimeoutSec > 0 {
 		timeout = time.Duration(p.TimeoutSec) * time.Second
 	}
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	shell, shellArgs := platform.Shell()
-	argv := append(append([]string{}, shellArgs...), p.Command)
 
 	dir, err := t.fs.ResolveCheckedCtx(ctx, p.Cwd)
 	if err != nil {
 		return tools.Err("%s", errs.FriendlyOr("执行命令", err)), nil
 	}
-	// 保留 CommandContext：不是图它的自动 Kill（那个会被 StartGrouped 覆盖成
-	// 整组终止），而是为了让 os/exec 在 Start 里起 watchCtx goroutine ——
-	// cmd.WaitDelay 的「ctx 到期后关闭管道」逻辑只认 c.ctx。
-	cmd := exec.CommandContext(cctx, shell, argv...)
-	cmd.Dir = dir
-	// 与进程组管理配对：光杀进程组不够 —— 孙进程攥着 stdout/stderr 管道写端时，
-	// cmd.Wait() 会等「管道 EOF」而永久阻塞，工具根本不返回，退出码判定
-	//（-2 = 超时）也一并失效。详见 platform/proc.go。
-	cmd.WaitDelay = platform.ProcessWaitDelay
 
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
-
-	start := time.Now()
-	// StartGrouped 代替 cmd.Run：把命令放进独立的进程组
-	//（Unix Setpgid / Windows Job Object），并把 cmd.Cancel 改成整组终止。
-	grp, startErr := platform.StartGrouped(cmd)
-	if startErr != nil {
-		return tools.Err("启动命令失败: %v", startErr), nil
+	// 执行委托给 Backend：进程组管理、WaitDelay、退出码判定全是**后端的义务**。
+	// 留在工具层就等于假设「命令一定在本机跑」—— 远程后端接入时，
+	// run_command 要么没法实现，要么把本地 shell 硬塞进远程场景。
+	//
+	// 工具层只保留：围栏校验、结果整形、以及「超时 / 启动失败」的文案区分。
+	res, execErr := t.fs.backend().Exec(ctx, backend.ExecRequest{
+		Command: p.Command,
+		Dir:     dir,
+		Timeout: timeout,
+	})
+	if execErr != nil {
+		return tools.Err("执行命令失败: %v", execErr), nil
 	}
-	// 正常执行完毕也 Close：Windows 侧会连带清理残留的孙进程
-	//（JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE），符合「终端是受控的」这一定位。
-	defer platform.CloseGroup(grp)
-	runErr := cmd.Wait()
-	elapsed := time.Since(start)
-
-	exitCode := 0
-	switch {
-	case runErr == nil:
-		exitCode = 0
-	case cctx.Err() == context.DeadlineExceeded:
-		exitCode = -2
-	default:
-		if ee, ok := runErr.(*exec.ExitError); ok {
-			exitCode = ee.ExitCode()
-		} else {
-			exitCode = -1
-		}
+	if res.StartErr != nil {
+		return tools.Err("启动命令失败: %v", res.StartErr), nil
 	}
 
-	out := buf.String()
+	exitCode := res.ExitCode
+	out := res.Output
 	meta := map[string]any{
 		"exit_code":   exitCode,
-		"duration_ms": elapsed.Milliseconds(),
-		"shell":       shell,
+		"duration_ms": res.Duration.Milliseconds(),
+		"shell":       res.Shell,
 	}
 
-	if cctx.Err() == context.DeadlineExceeded {
+	if res.TimedOut {
 		return tools.OkMeta(map[string]any{
 			"output":    out,
 			"exit_code": exitCode,
 			"note":      "命令执行超时，已被终止",
 		}, meta), nil
 	}
-	if runErr != nil && exitCode < 0 {
+	if exitCode < 0 {
 		return tools.OkMeta(map[string]any{
 			"output":    out,
 			"exit_code": exitCode,
-			"note":      runErr.Error(),
+			"note":      "命令未正常结束（退出码 " + itoaExit(exitCode) + "）",
 		}, meta), nil
 	}
 
@@ -344,18 +319,18 @@ func (f *FS) tokenOutside(root, home, tok string) bool {
 	} else {
 		abs = filepath.Join(root, tok)
 	}
-	return f.absOutside(root, abs)
+	return f.absOutside(abs)
 }
 
-// absOutside 判断绝对路径（词法层 + 真实路径层）是否落在 root 之外。
-func (f *FS) absOutside(root, abs string) bool {
-	realRoot := root
-	if r, err := filepath.EvalSymlinks(root); err == nil {
-		realRoot = r
-	}
-	if !within(root, abs) && !within(realRoot, abs) {
-		return true
-	}
-	real := resolveReal(abs)
-	return !within(root, real) && !within(realRoot, real)
+// absOutside 判断绝对路径是否落在 root 之外。
+//
+// 2.7 起**不再自带一份围栏逻辑**：原实现是 checkScope 的复制品
+// （同样两层、同样对 root 与 realRoot 各判一次），只少了「未选工作区 /
+// 显式放行」的提前返回 —— 于是两份逻辑迟早会分叉。
+//
+// 现在直接委托 checkScope。差别只有一处：checkScope 在 root == "" 或
+// allowOutside 时**放行**，而调用方 commandTouchesOutside 在那之前就已经
+// 返回 false 了（它自己判了 allow 与空 root），所以行为等价。
+func (f *FS) absOutside(abs string) bool {
+	return f.checkScope(abs) != nil
 }

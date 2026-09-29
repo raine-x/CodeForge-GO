@@ -106,7 +106,7 @@ func (t *SkillCreatorTool) Execute(ctx context.Context, args json.RawMessage) (*
 	if err != nil {
 		return tools.Err("技能目录超出工作区: %v", err), nil
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := t.fs.backend().MkdirAll(dir, 0o755); err != nil {
 		return tools.Err("创建技能目录失败: %v", err), nil
 	}
 	file := filepath.Join(dir, "SKILL.md")
@@ -153,10 +153,13 @@ func (t *SkillCreatorTool) Execute(ctx context.Context, args json.RawMessage) (*
 // 单独拆成函数是为了让「不许有裸 os.WriteFile / os.Stat / os.MkdirAll」
 // 这条纪律能被 AST 断言稳定检查（见 skill_creator_guard_test.go）。
 func (t *SkillCreatorTool) skillWrite(ctx context.Context, path string, data []byte) error {
+	// 存在性探测：CAS 的 existed 参数需要它。
+	// 用 Backend.Stat 而非 os.Stat —— 后端不知道就用本机路径，
+	// 那正是分层要避免的事。
 	existed := false
-	if _, err := os.Stat(path); err == nil {
+	if _, err := t.fs.backend().Stat(path); err == nil {
 		existed = true
-	} else if !os.IsNotExist(err) {
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 

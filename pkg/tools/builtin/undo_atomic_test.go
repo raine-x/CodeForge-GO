@@ -27,10 +27,18 @@ func TestUndoRestoreIsAtomic(t *testing.T) {
 
 	if strings.Contains(code, "os.WriteFile") {
 		t.Errorf("restore 的代码里出现了 os.WriteFile，撤销过程被打断会留半截文件；\n"+
-			"应改用 atomicWriteFile。实际代码行：\n%s", code)
+			"应改走 atomicWriteFileAt。实际代码行：\n%s", code)
 	}
-	if !strings.Contains(code, "atomicWriteFile(") {
-		t.Errorf("restore 没有走 atomicWriteFile，撤销不是原子的；\n实际代码行：\n%s", code)
+	// 2.7 后原子落盘由 Backend.WriteFile 承担，守卫侧的入口是
+	// atomicWriteFileAt —— 断言指向它，而不是指向某个具体实现细节
+	//（本地后端是「临时文件 + rename」，远程后端各有自己的等价物）。
+	if !strings.Contains(code, "atomicWriteFileAt(") {
+		t.Errorf("restore 没有走 atomicWriteFileAt，撤销不是原子的；\n实际代码行：\n%s", code)
+	}
+	// 且它必须真的落到 Backend 上，不能自己造轮子。
+	if !strings.Contains(funcCode(t, "atomicWriteFileAt"), "backend().WriteFile(") {
+		t.Errorf("atomicWriteFileAt 必须委托给 Backend.WriteFile，" +
+			"否则每个后端要各写一遍原子落盘，远程后端就退化成裸写")
 	}
 }
 

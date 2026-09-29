@@ -817,7 +817,10 @@ check('addUser 返回新建的行（供回滚）',
 check('提交时记下乐观气泡',
   /optimisticBubble = lastAddedUserRow\(\);/.test(uiSrc));
 check('busy 到达即视为已落库、清掉引用（此刻的 error 不该删用户的话）',
-  /case 'busy':[\s\S]{0,700}?optimisticBubble = null;/.test(uiSrc));
+  // 窗口放宽：busy 分支里 2026-09-29 加了 runSessionId 取服务端 session_id 的说明
+  // （并行多会话必需），把 optimisticBubble 推出了 700 字符窗口 —— 那是断言脆，
+  // 不是行为变了。用 uiCase 取整个分支，不再数窗口。
+  uiCase('busy').includes('optimisticBubble = null;'));
 check('error 与 idle 收尾都回滚未落库的气泡',
   uiCase('error').includes('dropOptimisticBubble()') &&
   uiCase('idle').includes('dropOptimisticBubble()'));
@@ -1005,11 +1008,17 @@ check('运行中的打断按钮为危险色（区别于发送按钮的 accent）
   /#send-btn\.running\s*\{[^}]*background:\s*var\(--danger\)/.test(css) &&
   !/#send-btn\.running\s*\{[^}]*background:\s*var\(--text-dim\)/.test(css));
 check('三态判定与 submitMessage 的实际分支一一对应',
-  // 提交分支：running && 有字 → steerNow（转向）；running && 无字 → cancel（打断）；
+  // 提交分支：running && !runAway && 有字 → steerNow（只转向**当前会话**）；
+  // running && !runAway && 无字 → cancel（打断，同样只针对当前会话）；
   // 否则 raw 为空直接 return。按钮显示的必须是「点下去会发生什么」。
+  //
+  // ⚠️ runAway() 那半个条件是 2026-09-29 加的：别的会话在后台跑时，
+  // 当前会话并没有任务在跑，输入框里的字是**新消息**，不能被改道成转向。
+  // 少了它就会出现「B 会话的消息跑进 A 会话」。
   /const stop = running && !hasText;/.test(uiSrc) &&
   /const dim = !running && !hasText;/.test(uiSrc) &&
-  /if \(running\) \{\s*\n\s*\/\/ 运行中按发送 = 转向[\s\S]{0,200}?if \(String\(input\.value\)\.trim\(\)\) \{ steerNow\(\); return; \}/.test(uiSrc) &&
+  /if \(running && !runAway\(\)\) \{[\s\S]{0,400}?steerNow\(\)/.test(uiSrc) &&
+  /type: 'cancel', session_id: sessionID/.test(uiSrc) &&
   /const raw = String\([^)]*\)\.trim\(\);\s*\n\s*if \(!raw\) return;/.test(uiSrc));
 check('单一定态出口：改 running / 写 input.value 都走 syncSendBtn',
   /function syncSendBtn\(\)/.test(uiSrc) &&
@@ -1033,7 +1042,7 @@ check('用户发送后立即显示等待提示',
   // 窗口放宽：addUser 与 showThinking 之间新增了「记下乐观气泡」的注释（2026-09-27）。
   /addUser\(p\.display\);[\s\S]{0,700}?showThinking\(\)/.test(uiSrc));
 check('busy 事件显示等待提示',
-  /case 'busy':[\s\S]{0,600}?showThinking\(\)/.test(uiSrc));
+  uiCase('busy').includes('showThinking()'));
 check('tool_result 后模型再次等待时显示提示',
   // 窗口放宽：tool_result 分支里现在多了失败判定的注释（2026-09-27），
   // 350 字符刚好卡在边界上，改动无关的行就会假失败。

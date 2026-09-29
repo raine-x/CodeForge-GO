@@ -3703,8 +3703,19 @@
           break;
         case 'busy':
           sending = false;
+          // ⚠️ runSessionID 取**服务端给的** session_id，不是当前视图的 sessionID。
+          //
+          // 曾经写 `runSessionID = sessionID`：并行两个会话时，B 的 busy 到达时
+          // 视图可能已经切回 A，于是 A 被标成「正在跑的会话」——
+          // 之后在 A 里发消息会被判成「转向」，落进 B。
+          //
+          // 服务端每个 busy/idle 都带 session_id，正是为了这个。
+          if (ev.session_id) {
+            runSessionID = ev.session_id;
+          } else {
+            runSessionID = sessionID;
+          }
           running = true;
-          runSessionID = sessionID;
           runReason = ''; runText = '';
           lastReply = '';
           hasModelReplied = false; // 新一轮开始：重置回复标记
@@ -3868,8 +3879,25 @@
           }
           break;
         }
-case 'idle': {
+        // workspace_blocked：会话切换被拒（工作区被另一个正在跑的任务占着）。
+        //
+        // ⚠️ 它**只是提示**，绝不能碰 sessionChanging / sessionID / 乐观气泡。
+        // 之前这里用的是 error 帧，而 case 'error' 会无条件执行
+        // `sessionChanging = false` 与 `dropOptimisticBubble()`；
+        // 这一帧抢在随后的 history 帧之前到达，切换状态机被打断，
+        // sessionID 永远不更新 —— 用户以为在会话 B、实际视图停在 A，
+        // 于是他发的消息被 steerNow 判成「转向后台任务」落进 A。
+        // 那条「已把这条指令转向到后台正在运行的任务」就是这么来的。
+        case 'workspace_blocked': {
+          addInfo(ev.text || '当前工作区与该会话不一致，继续发消息会读到当前项目的文件');
+          break;
+        }
+        case 'idle': {
           sending = false;
+          // ⚠️ 只处理**当前视图这个会话**的收尾。
+          // 别的会话跑完了，它的 idle 不该把当前会话的运行态清掉
+          // （那会让「正在跑」显示消失，用户以为任务停了）。
+          if (ev.session_id && ev.session_id !== sessionID) break;
           const backHome = !runAway();
           expireApprovals();
           clearRunVisuals();
@@ -4503,22 +4531,29 @@ case 'idle': {
   }
 
   // ---------- 运行中转向（steering）与打断（cancel）----------
-  // 转向：任务不换、方向换。指令交给正在跑的循环，在下一个步骤边界并入上下文，
-  // 已经产生的工具结果全部保留 —— 不打断正在飞行中的那次请求，也不清空历史。
-  // 打断：输入框为空时的 Esc / 发送，让循环在边界处收摊（工具结果仍然留存）。
+  // 转向：任务不换、方向换。指令交给**当前会话**正在跑的循环，在下一个步骤边界
+  // 并入上下文，已经产生的工具结果全部保留。
+  // 打断：输入框为空时的 Esc / 发送，让循环在边界处收摊。
+  //
+  // ⚠️ 转向**只对当前会话生效，绝不跨会话**。
+  // 曾经的目标是 `runSessionID || sessionID` —— 视图在 B、A 在后台跑时，
+  // 用户在 B 里打的字被静默送进 A。症状是「B 的消息出现在 A 里」+
+  // 「已把这条指令转向到后台正在运行的任务」。
+  // 那个版本还配合「一个连接只有一个 cancel 槽」，等于同连接上无法并行跑两个会话。
+  // 现在：会话之间彻底隔离，各自的提问只进各自的会话，各自能并行跑。
   function steerNow() {
     const raw = String(input.value || '').trim();
     if (!raw) return false;
-    // 转向的对象是「正在跑的那一轮」：用户可能已经把视图切到别的会话。
-    const target = runSessionID || sessionID;
-    if (!target) { addError('还没有会话可转向，先发送一条消息'); return true; }
+    // 当前视图这个会话没有任务在跑 → 不该走转向，交给调用方按新消息处理。
+    if (runAway() || !running) return false;
+    const target = sessionID;
+    if (!target) { addError('还没有会话，请先发送一条消息'); return true; }
     if (!wsSend({ type: 'steer', session_id: target, text: raw })) {
       addError('未连接到服务，这条转向没发出去');
       return true;
     }
     setInputValue('');   // 转向已发出、输入框清空 → 按钮回到打断态
-    if (target === sessionID) addSteer(raw);
-    else addInfo('已把这条指令转向到后台正在运行的任务');
+    addSteer(raw);
     return true;
   }
 
@@ -4560,15 +4595,21 @@ case 'idle': {
     if (pendingUploads) { addInfo('文件正在上传，请等待上传完成后发送'); return; }
     if (sending) { addInfo('消息正在发送，请勿重复提交'); return; }
     if (workspaceChanging || sessionChanging) { addInfo('正在切换会话或工作区，请稍候'); return; }
-    if (running) {
-      // 运行中按发送 = 转向：任务继续跑，只是中途换个方向（已产生的工具结果保留）。
-      // 输入框是空的才算「打断」。
-      if (String(input.value).trim()) { steerNow(); return; }
-      if (runAway()) addInfo('已请求打断正在后台运行的任务');
-      wsSend({ type: 'cancel' });
-      // 未回复的打断：显示重试圆环，点击可从用户输入重新开始（保留上下文）
-      if (!hasModelReplied) showResumeRing();
-      return;
+    // 转向与打断都**只对当前会话**生效。
+    //
+    // `running` 是「本连接上有任务在跑」，`runAway()` 是「跑的不是当前视图这个会话」。
+    // 两个都要判：
+    //   - 不 runAway：当前会话自己在跑 → 有字转向、无字打断。
+    //   - runAway：别的会话在跑 → 当前会话没有任务，输入框里的字是**新消息**，
+    //     按正常发送处理，绝不改道。
+    if (running && !runAway()) {
+      if (String(input.value).trim()) { if (steerNow()) return; }
+      else {
+        wsSend({ type: 'cancel', session_id: sessionID });
+        // 未回复的打断：显示重试圆环，点击可从用户输入重新开始（保留上下文）
+        if (!hasModelReplied) showResumeRing();
+        return;
+      }
     }
     const raw = String(override === undefined ? input.value : override).trim();
     if (!raw) return;
@@ -5264,9 +5305,11 @@ case 'idle': {
         return el && !el.classList.contains('hidden');
       })) return;
     e.preventDefault();
-    if (String(input.value || '').trim()) { steerNow(); return; }
-    if (runAway()) addInfo('已请求打断正在后台运行的任务');
-    wsSend({ type: 'cancel' });
+    // 与发送按钮同一套判据：打断**只对当前会话**生效。
+    // 别的会话在跑时，当前会话没有任务可打断 —— 用户在 B 按 Esc 不该停掉 A。
+    if (runAway() || !running) { addInfo('当前会话没有正在运行的任务'); return; }
+    if (String(input.value || '').trim()) { if (steerNow()) return; return; }
+    wsSend({ type: 'cancel', session_id: sessionID });
     if (!hasModelReplied) showResumeRing();
   });
   // 左侧分类导航（nav-back / nav-models 无 data-page，各自单独绑定）

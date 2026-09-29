@@ -59,6 +59,27 @@ func (a *Agent) IsRunning(sessionID string) bool {
 	return a.running[sessionID]
 }
 
+// RunningSessionIDs 返回当前有循环在跑的会话 id 列表（无则返回 nil）。
+//
+// 为什么需要「列出全部」而不只是 IsRunning 一个：
+// 工作区是**进程全局**的，切工作区会连带改掉所有正在跑的会话所看到的目录。
+// 于是判断「能不能切」需要知道**除了目标会话之外**还有谁在跑 ——
+// 只问目标会话自己是不够的。
+func (a *Agent) RunningSessionIDs() []string {
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
+	if len(a.running) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(a.running))
+	for id, on := range a.running {
+		if on {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // steerQueue 是一个会话的待注入指令队列。
 // 字段由 Agent.runMu 保护，本身不再加锁。
 type steerQueue struct {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -62,8 +63,17 @@ type wsClient struct {
 	writeMu  sync.Mutex
 	approver *wsApprover
 
-	cancelMu sync.Mutex
-	cancel   context.CancelFunc
+	// runs 是**按会话 id** 的运行表，不是单个 cancel 槽。
+	//
+	// 曾经只有一个 cancel 槽，于是同一连接上**无法并行跑两个会话**：
+	// 在 B 会话发消息会先把 A 那一轮停掉（startUserMessage 里的 c.stop()），
+	// 打断按钮也会停掉「最近起的那一轮」而不是「你看的那个」。
+	// 两个症状都被用户报成「消息跑进另一个会话」。
+	//
+	// 现在每个会话各占一个槽：起一轮只影响那个会话，打断也只影响那个会话。
+	runsMu sync.Mutex
+	runs   map[string]*sessionRun
+
 	// runSeq 是「第几轮」的代号：每起一轮 +1，收尾时比对代号，
 	// 只有仍是当前轮的 goroutine 才允许改前端的运行态。
 	// 上一轮被打断后是异步收尾的，它那句迟到的 idle 若照发，
@@ -76,6 +86,111 @@ type wsClient struct {
 	pageHidden      bool      // 页面是否不可见（缺省 true：未知时按「不可见」处理，保持通知可用）
 	visibilityKnown bool      // 前端是否已上报过可见性
 	lastNotify      time.Time // 上次发送通知的时间（节流用）
+}
+
+// sessionRun 是单个会话当前那一轮的运行态。
+type sessionRun struct {
+	cancel context.CancelFunc
+	seq    int
+	// superseded 表示这一轮已被同会话的新一轮取代。
+	//
+	// 为什么要单独一个标记，而不是靠「槽还在不在」判断：
+	// 打断（stopSession）会**立即删掉槽**，若 owns() 判据是「槽里还有我」，
+	// 那么被打断的那轮 owns() 就是 false → 跳过收尾 → 永远不发 idle，
+	// 前端的运行态卡在「忙」，按钮一直是打断态。
+	//
+	// 所以改成显式记录「我是否已被取代」：槽删了不等于我被取代。
+	superseded bool
+}
+
+// runFor 返回该会话当前那一轮；没有则 nil。
+func (c *wsClient) runFor(sessionID string) *sessionRun {
+	c.runsMu.Lock()
+	defer c.runsMu.Unlock()
+	if c.runs == nil {
+		return nil
+	}
+	return c.runs[sessionID]
+}
+
+// beginRun 登记一轮运行：把该会话的旧轮**标记为已被取代并取消它**，再登记新的。
+//
+// 旧轮不 join：它异步收尾，用 owns() 挡掉迟到的 idle / error，
+// 不会覆盖新一轮的运行态。但 ctx **必须**在这里被取消 —— 否则旧轮会一直卡在
+// Agent.beginRunWait 的让位逻辑里（上限 15 秒），新轮迟迟起不来。
+func (c *wsClient) beginRun(sessionID string, cancel context.CancelFunc) {
+	c.runsMu.Lock()
+	old := c.runs[sessionID]
+	if old != nil {
+		old.superseded = true
+	}
+	if c.runs == nil {
+		c.runs = map[string]*sessionRun{}
+	}
+	c.runSeq++
+	c.runs[sessionID] = &sessionRun{cancel: cancel, seq: c.runSeq}
+	c.runsMu.Unlock()
+
+	// 锁外发 cancel：cancel 本身不该在锁内调（它会同步唤醒等在那里的 goroutine）。
+	if old != nil {
+		old.cancel()
+	}
+}
+
+// isCurrent 判断 (sessionID, seq) 这一轮是否**未被同会话的新一轮取代**。
+//
+// ⚠️ 刻意**不**要求「槽里还有我」：打断会立即删掉运行槽，若把删槽当成
+// 「被取代」，被打断的那轮就会跳过收尾、永远不发 idle —— 前端运行态
+// 卡在「忙」，按钮一直是打断态。
+//
+// 所以判据只有一个：有没有更新的轮次顶替了我。槽删了不等于被顶替。
+func (c *wsClient) isCurrent(sessionID string, seq int) bool {
+	c.runsMu.Lock()
+	defer c.runsMu.Unlock()
+	r := c.runs[sessionID]
+	// 槽还在且是我 → 当前轮。
+	// 槽不在了 → 可能是被打断（该收尾），也可能是被新轮顶替（不该收尾）。
+	// 区分靠 superseded 标记：被打断时没人把它置 true。
+	return r == nil || (r.seq == seq && !r.superseded)
+}
+
+// endRunIfCurrent 收尾：只有仍是该会话当前那一轮才清槽。
+func (c *wsClient) endRunIfCurrent(sessionID string, seq int) {
+	c.runsMu.Lock()
+	defer c.runsMu.Unlock()
+	if c.runs == nil {
+		return
+	}
+	if r := c.runs[sessionID]; r != nil && r.seq == seq {
+		delete(c.runs, sessionID)
+	}
+}
+
+// stopSession 停掉指定会话当前那一轮，返回是否真的停掉了。
+//
+// 注意：它删的是「运行槽」，而被打断的那轮**仍然要发收尾帧**
+// （owns() 判据是 superseded，不是槽还在不在 —— 见 sessionRun 的注释）。
+func (c *wsClient) stopSession(sessionID string) bool {
+	c.runsMu.Lock()
+	r := c.runs[sessionID]
+	delete(c.runs, sessionID)
+	c.runsMu.Unlock()
+	if r == nil || r.superseded {
+		return false
+	}
+	r.cancel()
+	return true
+}
+
+// runningSessionIDs 列出本连接上正在跑的会话。
+func (c *wsClient) runningSessionIDs() []string {
+	c.runsMu.Lock()
+	defer c.runsMu.Unlock()
+	out := make([]string, 0, len(c.runs))
+	for id := range c.runs {
+		out = append(out, id)
+	}
+	return out
 }
 
 func (c *wsClient) send(v any) {
@@ -106,7 +221,11 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	client.approver = &wsApprover{client: client, pending: map[string]chan bool{}}
 
 	defer func() {
-		client.stop()
+		// 断连时停掉**本连接上所有**正在跑的会话。
+		// 这里不能只停一个 —— runs 是按会话分的，断连意味着整批都没人接收事件了。
+		for _, sid := range client.runningSessionIDs() {
+			client.stopSession(sid)
+		}
 		_ = conn.Close()
 	}()
 
@@ -160,11 +279,15 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		if msg.SessionID == "" {
 			return
 		}
-		// 打断旧任务必须**同步**发生在启动新 goroutine 之前（dispatch 串行）：
-		// 放进 run() 里再 stop，两条快速连续的消息会让两个 goroutine 都先跑过
-		// stop()（cancel 还是 nil），随后第二个覆盖第一个的 cancel ——
+		// 打断本会话的旧任务必须**同步**发生在启动新 goroutine 之前（dispatch 串行）：
+		// 放进 run() 里再停，两条快速连续的消息会让两个 goroutine 都先跑过
+		// 登记（cancel 还是 nil），随后第二个覆盖第一个 ——
 		// 第一个循环从此无法打断，且两个循环并发写同一会话。
-		c.stop()
+		//
+		// ⚠️ 只停**本会话**：曾经这里是 c.stop()，停掉「本连接上最近起的那一轮」，
+		// 不分会话 —— 于是「重新生成 B」会把「正在跑的 A」杀掉，
+		// 同一连接上也无法并行跑两个会话。
+		c.stopSession(msg.SessionID)
 		go c.run(msg.SessionID, msg.Thinking, "重新生成", "", func(ctx context.Context, emit func(agent.Event)) error {
 			return c.srv.agent.Regenerate(ctx, msg.SessionID, emit)
 		})
@@ -176,7 +299,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		if msg.SessionID == "" || strings.TrimSpace(msg.Text) == "" {
 			return
 		}
-		c.stop() // 同 regenerate：先同步打断，再启动新 goroutine
+		c.stopSession(msg.SessionID) // 只打断**本会话**；别的会话并行跑着的不受影响
 		go c.run(msg.SessionID, msg.Thinking, "编辑重发", msg.Text, func(ctx context.Context, emit func(agent.Event)) error {
 			rollback := msg.RollbackFiles == nil || *msg.RollbackFiles
 			if rollback {
@@ -205,7 +328,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		if msg.SessionID == "" {
 			return
 		}
-		c.stop() // 同 regenerate：先同步打断，再启动新 goroutine
+		c.stopSession(msg.SessionID) // 只打断**本会话**；别的会话并行跑着的不受影响
 		go c.run(msg.SessionID, msg.Thinking, "继续上一轮", "", func(ctx context.Context, emit func(agent.Event)) error {
 			return c.srv.agent.ContinueTurn(ctx, msg.SessionID, emit)
 		})
@@ -221,7 +344,7 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		if back < 0 {
 			back = 0
 		}
-		c.stop() // 同 regenerate：先同步打断，再启动新 goroutine
+		c.stopSession(msg.SessionID) // 只打断**本会话**；别的会话并行跑着的不受影响
 		go c.run(msg.SessionID, msg.Thinking, "断点重试", "", func(ctx context.Context, emit func(agent.Event)) error {
 			rollback := msg.RollbackFiles == nil || *msg.RollbackFiles
 			if rollback {
@@ -281,12 +404,33 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		}
 		// ⚠️ 必须**先**切工作区再回放。不切的话文件工具仍用进程全局的
 		// FS.root —— 点开 A 项目的会话却去读 B 项目的文件（用户报告的 bug）。
-		c.srv.switchSessionWorkspace(sess)
+		//
+		// 切不过去时**绝不能发 error 帧**。前端的 case 'error' 会无条件执行
+		// `sessionChanging = false` 与 `dropOptimisticBubble()`，而这一帧抢在
+		// 随后的 history 帧之前到达 —— 切换状态机被打断，前端的 sessionID
+		// 永远不更新。用户以为自己在会话 B，实际视图还停在 A，
+		// 于是他发的消息被判成「转向后台任务」，落进 A 里。
+		// （这条曾经真的发生过：症状是「B 会话的消息跑进 A 会话」+ 顶部一条
+		//   「已把这条指令转向到后台正在运行的任务」。）
+		//
+		// 正确做法：用独立的 workspace_blocked 帧，只提示、不碰切换状态。
+		// history / context / todo / checkpoints 四帧照发 —— 读历史不碰工作区，
+		// 让用户能看内容；只是继续发消息会落在当前工作区，界面会明确告知。
+		blocked := ""
+		if !c.srv.switchSessionWorkspace(sess) && sess.Workspace != "" &&
+			c.srv.fs.Root() != sess.Workspace {
+			blocked = "该会话属于另一个项目，但当前工作区仍是「" +
+				filepath.Base(c.srv.fs.Root()) + "」。可以查看历史，" +
+				"但继续发消息会读到当前项目的文件；请先停止正在运行的任务。"
+		}
 		// 内存缓存换成用户想继续的那条（后续 user_message 直接续聊）
 		c.send(c.srv.historyEvent(sess.ID))
 		c.send(c.srv.contextUsage(sess.ID))
 		c.send(c.srv.todoEvent(sess.ID))       // 切会话：回放该会话的任务清单
 		c.send(c.srv.checkpointEvent(sess.ID)) // 回放可编辑白名单（编辑按钮的数据源）
+		if blocked != "" {
+			c.send(map[string]any{"type": "workspace_blocked", "text": blocked})
+		}
 
 	case "hitl_decision":
 		c.approver.resolve(msg.ApprovalID, msg.Approved)
@@ -300,9 +444,36 @@ func (c *wsClient) dispatch(msg wsMessage) {
 		c.setVisibility(msg.Hidden)
 
 	case "cancel":
-		// 打断当前任务：由 run() 统一收尾发送 idle；无任务时兜底复位前端状态。
-		if !c.stop() {
-			c.send(map[string]any{"type": "idle", "reason": "cancelled"})
+		// 打断**指定会话**当前那一轮。
+		//
+		// ⚠️ 曾经这里是 c.stop() —— 停掉「本连接上最近起的那一轮」，不管它是
+		// 哪个会话。结果：在 B 会话按打断，停掉的是后台的 A；同一个连接也
+		// 因此无法并行跑两个会话。现在按会话分槽停。
+		//
+		// session_id 为空时的处置：**只在恰好有一个会话在跑时才停它**。
+		//   - 恰好一个 → 没有歧义，停掉就是用户的意思（老前端不带 id 时的行为）；
+		//   - 多个在跑 → 不猜。宁可这次打断不生效，也不能停掉用户没指的那个。
+		//     静默什么都不做会让人以为打断坏了，所以回一个 idle 让前端复位。
+		if msg.SessionID == "" {
+			ids := c.runningSessionIDs()
+			switch len(ids) {
+			case 0:
+				c.send(map[string]any{"type": "idle", "reason": "cancelled"})
+			case 1:
+				c.stopSession(ids[0])
+			default:
+				c.send(map[string]any{
+					"type":   "idle",
+					"reason": "cancelled",
+					"note":   "有多个会话正在运行，请切到要打断的那个会话再按打断",
+				})
+			}
+			return
+		}
+		if !c.stopSession(msg.SessionID) {
+			c.send(map[string]any{
+				"type": "idle", "reason": "cancelled", "session_id": msg.SessionID,
+			})
 		}
 	}
 }
@@ -325,7 +496,20 @@ func (c *wsClient) startUserMessage(msg wsMessage) {
 		}
 		sessionID = sess.ID
 	}
-	c.stop() // 同步打断旧任务后再起新轮（否则两条连发消息会让两轮并存）
+	// ⚠️ 这里**不再** c.stop()。
+	//
+	// 曾经是「同步打断旧任务后再起新轮」，理由是「否则两条连发消息会让两轮并存」。
+	// 但 c.stop() 停的是「本连接上最近起的那一轮」，**不分会话** ——
+	// 于是「在 B 会话发消息」会先把「A 会话正在跑的那轮」杀掉。
+	// 这就是「同一项目里两个会话没法并发」的根因。
+	//
+	// 这里不做打断 —— run() 里的 beginRun 会「标记旧轮被取代 + 取消它的 ctx」，
+	// 同一会话的重发天然是「打断旧的、起新的」。
+	// 不同会话各占一个运行槽，互不干涉 —— 这才是并发要的。
+	//
+	// ⚠️ 曾经这里是 c.stop()：停掉「本连接上最近起的那一轮」，不分会话 ——
+	// 于是「在 B 会话发消息」会先把「A 会话正在跑的那轮」杀掉，
+	// 同一连接上也无法并行跑两个会话。
 	go c.run(sessionID, msg.Thinking, "用户消息", msg.Text, func(ctx context.Context, emit func(agent.Event)) error {
 		images, err := readAttachmentImages(ws, msg.Attachments)
 		if err != nil {
@@ -339,25 +523,28 @@ func (c *wsClient) startUserMessage(msg wsMessage) {
 // trigger/label 仅用于日志：明确「这一轮是谁、以什么方式触发的」，
 // 便于事后排查「我没操作，怎么跑了一轮」这类问题。
 func (c *wsClient) run(sessionID, thinking, trigger, label string, agentFn func(ctx context.Context, emit func(agent.Event)) error) {
-	c.stop()
+	// ⚠️ 这里**不**再 c.stop()。
+	//
+	// 曾经第一行就是 c.stop()，用来「同步打断旧任务后再起新轮」。但 c.stop() 停的
+	// 是「本连接上最近起的那一轮」，不分会话 —— 于是 B 会话起新轮会把 A 会话
+	// 正在跑的那轮杀掉。同一连接上因此永远只能跑一个会话。
+	//
+	// 防重入改成按会话：只清**本会话**的旧槽（不同会话各占一个槽，并行跑）。
+	// 清槽不 join —— 旧轮异步收尾，它用 owns() 挡掉迟到的 idle，不会覆盖新一轮。
+	ctx, cancel := context.WithCancel(context.Background())
+	c.beginRun(sessionID, cancel)
+	mySeq := c.runFor(sessionID).seq
+	defer cancel()
 
 	logx.Runf("会话=%s 触发=%s 输入=%q", sessionID, trigger, clipText(label, 80))
 
-	ctx, cancel := context.WithCancel(context.Background())
-	c.cancelMu.Lock()
-	c.cancel = cancel
-	c.runSeq++
-	mySeq := c.runSeq
-	c.cancelMu.Unlock()
-	defer cancel()
-
-	// owns 判断这一轮是否仍是「当前轮」：被打断的旧轮在收尾时要用它挡一遍，
-	// 否则迟到的 idle / error 会覆盖新一轮的运行态。
-	owns := func() bool {
-		c.cancelMu.Lock()
-		defer c.cancelMu.Unlock()
-		return c.runSeq == mySeq
-	}
+	// owns 判断这一轮是否仍是「该会话当前那一轮」。
+	//
+	// ⚠️ 判据是「我没被同会话的新一轮取代」，**不是**「槽里还有我」——
+	// 打断会立即删槽，用后者会让被打断的那轮跳过收尾、永远不发 idle，
+	// 前端运行态卡在「忙」。
+	owns := func() bool { return c.isCurrent(sessionID, mySeq) }
+	defer c.endRunIfCurrent(sessionID, mySeq)
 
 	// 将本连接的审批器注入 context，使 HITL 请求路由到当前浏览器。
 	ctx = tools.WithApprover(ctx, c.approver)
@@ -426,7 +613,7 @@ func (c *wsClient) run(sessionID, thinking, trigger, label string, agentFn func(
 	}
 
 	c.send(map[string]any{"type": "session", "session_id": sessionID})
-	c.send(map[string]any{"type": "busy"})
+	c.send(map[string]any{"type": "busy", "session_id": sessionID})
 
 	runErr := agentFn(ctx, emit)
 	if !owns() {
@@ -445,7 +632,7 @@ func (c *wsClient) run(sessionID, thinking, trigger, label string, agentFn func(
 		// FriendlyOr 对未识别的错误原样返回，所以既有的前端断言不受影响。
 		c.send(map[string]any{"type": "error", "error": errs.FriendlyOr("生成回复", runErr)})
 	}
-	c.send(map[string]any{"type": "idle"})
+	c.send(map[string]any{"type": "idle", "session_id": sessionID})
 	c.send(map[string]any{"type": "sessions", "items": c.srv.agent.History().List("", false)})
 	// 本轮结束后刷新上下文占用：进度条要跟着对话一起长。
 	c.send(c.srv.contextUsage(sessionID))
@@ -672,17 +859,12 @@ func clipText(s string, max int) string {
 	return string(r[:max]) + "…"
 }
 
-// stop 取消当前正在执行的任务，返回是否有任务被取消。
-func (c *wsClient) stop() bool {
-	c.cancelMu.Lock()
-	defer c.cancelMu.Unlock()
-	if c.cancel == nil {
-		return false
-	}
-	c.cancel()
-	c.cancel = nil
-	return true
-}
+// stop 已删除。
+//
+// 它停掉「本连接上最近起的那一轮」，**不分会话** —— 这正是「在 B 会话发消息
+// 却把 A 会话正在跑的任务杀掉」「同一连接无法并行跑两个会话」的根因。
+// 现在按会话分开：stopSession(sessionID) 只停那一个会话，
+// 运行表是 wsClient.runs（见结构体注释）。
 
 // ---------------------------------------------------------------------------
 // HITL 审批器（实现 tools.Approver）

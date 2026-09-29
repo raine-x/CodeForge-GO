@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"codeforge/pkg/backend"
 	"codeforge/pkg/errs"
 	"codeforge/pkg/tools"
 )
@@ -57,21 +58,37 @@ const (
 	defaultMaxUndoSpillBytes = 64 << 20 // 64 MiB
 )
 
-// FS 是文件工具共享的工作区状态（含撤销栈）。
+// FS 是文件工具共享的工作区状态。
+//
+// 2.7 分层：它现在**不实现任何 IO 能力**，全部委托给 be Backend；
+// 它只做四件事会话级的事：工作区围栏、先读后写指纹、阅读登记、
+// 按会话分桶的撤销栈（见结构体注释）。
+//
+// 「是否在工作区内」的判断**只在这里写一份**，Backend 只提供 Realpath。
+// 加一个远程后端时它没有机会自己实现围栏 —— 接口里根本没有这个方法。
 type FS struct {
+	// be 是纯 IO 后端。nil 时按需回落到 backend.NewLocal()，
+	// 这样测试里直接 NewFS(dir) 的老写法不必改。
+	be backend.Backend
+
 	root         string
 	allowOutside bool
 	mu           sync.Mutex
-	undo         []Snapshot
+	// undo 按会话 id 分桶。会话 id 为空串的条目归到 "" 桶
+	// （进程级入口，例如 HTTP 撤销接口拿不到会话时走的 Undo()）。
+	undo map[string][]Snapshot
 	// readSeen 是「哪个会话读过/改过哪个文件」的登记表，用于先读后写约束。
-	// 整个工作区共用一份 FS，故键必须带上会话 ID：子智能体与各会话之间
-	// 不能拿别人读过的原文下自己的笔。
+	// 键是 sessionID + "\n" + path：不同会话读同一个文件是各自独立的事实。
 	readSeen map[string]seenEntry
 	// pathLocks 给每个规范路径一把互斥锁，用于 CAS 写入的临界区。
 	//
 	// 用 sync.Map 而非普通 map：casWrite 持路径锁期间还要取 f.mu（读 readSeen），
 	// 若 pathLocks 由 f.mu 保护，就形成 f.mu → 路径锁 的顺序；
 	// 任何反向顺序都会死锁。sync.Map 的读路径不占全局锁，天然避免。
+	//
+	// ⚠️ 刻意**不下沉**到 Backend：锁序是 pathLock → f.mu，
+	// 跨对象无法表达这个顺序，接口层没有机制保证它不被违反 ——
+	// 一次「顺手把 lockPath 改成 be.Lock」的改动就会翻成反向顺序，死锁。
 	pathLocks sync.Map // path → *sync.Mutex
 
 	// undoBytes 是当前撤销栈占用的内存字节（只计 Content，副本在磁盘上）。
@@ -79,11 +96,26 @@ type FS struct {
 	undoBytes int64
 
 	// 撤销预算与副本目录。四项都可注入，便于测试与将来按需调参。
+	//
+	// 预算现在是**全局**的（所有会话之和），因为它管的是内存/磁盘占用；
+	// 但逐出时优先逐出「自己桶里最旧的」，保证一个会话的洪水
+	// 不会把另一个会话的快照全挤掉。见 pushSnapshot。
 	maxUndo           int
 	maxUndoBytes      int64
 	maxUndoEntryBytes int
 	maxUndoSpillBytes int
-	spillDir          string
+	// spillDir 是**进程级、跨工作区**的 scratch 目录（默认 ~/.codeforge/undo），
+	// 刻意**不**走 Backend —— 它不是工作区资源。进 Backend 等于给远程后端
+	// 定义一个「往我本地 home 目录写文件」的契约。
+	spillDir string
+}
+
+// backend 返回绑定的后端（未显式设置时回落到本机实现）。
+func (f *FS) backend() backend.Backend {
+	if f.be == nil {
+		f.be = backend.NewLocal()
+	}
+	return f.be
 }
 
 // SetUndoLimits 覆盖撤销预算（<=0 的项保持现值）。
@@ -149,21 +181,34 @@ func (f *FS) GCUndoSpill() error {
 	return nil
 }
 
-// NewFS 构造文件工具工作区。root 为空表示「未选择工作区」，
-// 所有文件工具在 选择工作区 之前拒绝执行。
+// NewFS 构造文件工具工作区，绑本机后端。
+// root 为空表示「未选择工作区」，所有文件工具在选择工作区之前拒绝执行。
 func NewFS(root string) *FS {
+	return NewGuard(backend.NewLocal(), root)
+}
+
+// NewGuard 构造绑定了指定后端的会话级守卫。
+//
+// be 只做纯 IO；越界检查、指纹、阅读登记、撤销栈全在 FS 这一侧，
+// 对所有后端通用 —— 这正是拆两层的意义。
+func NewGuard(be backend.Backend, root string) *FS {
+	if be == nil {
+		be = backend.NewLocal()
+	}
 	if root = strings.TrimSpace(root); root != "" {
 		if abs, err := filepath.Abs(root); err == nil {
 			root = abs
 		}
 	}
 	return &FS{
+		be:                be,
 		root:              root,
 		maxUndo:           defaultMaxUndo,
 		maxUndoBytes:      defaultMaxUndoBytes,
 		maxUndoEntryBytes: defaultMaxUndoEntryBytes,
 		maxUndoSpillBytes: defaultMaxUndoSpillBytes,
 		spillDir:          undoSpillHome(),
+		undo:              map[string][]Snapshot{},
 		readSeen:          map[string]seenEntry{},
 	}
 }
@@ -206,8 +251,11 @@ func (f *FS) SetRoot(root string) {
 	defer f.mu.Unlock()
 	f.root = root
 	// 副本也要清 —— 否则切工作区就在用户目录里留一堆孤儿。
-	for _, s := range f.undo {
-		f.removeSpillLocked(s)
+	// 2.7 分桶后要遍历**所有**桶（改造前只有一条栈）。
+	for _, bucket := range f.undo {
+		for _, s := range bucket {
+			f.removeSpillLocked(s)
+		}
 	}
 	f.undo = nil
 	f.undoBytes = 0
@@ -250,6 +298,11 @@ var ErrOutsideWorkspace = errors.New(
 	"路径超出工作区范围（如需访问工作区外的文件，请在 config/local.yaml 中设置 security.allow_outside_workspace: true）")
 
 // within 判断 path 是否位于 root 之内（含 root 自身）。
+//
+// ⚠️ 它是**纯词法**比较，且假定两者分隔符一致（都用 filepath 的）。
+// 远程后端的路径由远端 OS 决定，与本机无关 —— 那时必须由后端自己
+// 保证传进来的路径形态一致，或改用后端提供的比较。
+// 本地实现（Windows 传 \ 、POSIX 传 /）满足这个前提。
 func within(root, path string) bool {
 	rel, err := filepath.Rel(root, path)
 	if err != nil {
@@ -261,30 +314,27 @@ func within(root, path string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// resolveReal 返回 path 的真实路径：自 path 起逐级向上找到第一个能被
-// EvalSymlinks 成功解析的祖先，把真实祖先与尚未存在的尾部组件拼回。
-// 只对最终组件做 EvalSymlinks 会漏掉「区内软链指向区外、目标文件尚不存在」
-// 的写入绕过（新建文件的 EvalSymlinks 必然失败）。
-func resolveReal(path string) string {
-	suffix := ""
-	cur := path
-	for {
-		if real, err := filepath.EvalSymlinks(cur); err == nil {
-			if suffix == "" {
-				return real
-			}
-			return filepath.Join(real, suffix)
-		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return path // 已到根仍解析失败，退回原路径
-		}
-		suffix = filepath.Join(filepath.Base(cur), suffix)
-		cur = parent
+// resolveReal 返回 path 的真实路径，逐级向上委托给 Backend。
+//
+// ⚠️ 解析失败时**退回原路径**（fail-open）—— 这是既有行为，不是疏漏：
+// 此时词法层（within）已经在 checkScope 的第 1 步证明 abs ∈ root，
+// 所以「软链层放弃、词法层仍在」不构成越界。
+//
+// 真正的逐级向上逻辑在 backend.Local.Realpath 里，那是**唯一一份**。
+// 这里若自己再写一遍，安全逻辑就分叉了 —— 改一处漏一处的经典温床。
+func (f *FS) resolveReal(path string) string {
+	real, err := f.backend().Realpath(path)
+	if err != nil {
+		return path // 解析不出来 → 退回原路径（见上方说明）
 	}
+	return real
 }
 
 // checkScope 对已解析的绝对路径做工作区约束校验（词法层 + 软链接层）。
+//
+// ⚠️ 这是**唯一**的围栏实现。任何后端都不得自己判断「是否在工作区内」——
+// 那等于要求每个远程后端重写一遍围栏，安全代码必然分叉。
+// Backend 只提供 Realpath（解析真实位置），判断在这里。
 func (f *FS) checkScope(abs string) error {
 	f.mu.Lock()
 	root, allow := f.root, f.allowOutside
@@ -294,17 +344,22 @@ func (f *FS) checkScope(abs string) error {
 	if root == "" || allow {
 		return nil
 	}
+	be := f.backend()
 
+	// root 自身带软链时（如 macOS 的 /var → /private/var），把它的真实位置
+	// 也视为合法基准，避免把区内路径误判为越界。
 	realRoot := root
-	if r, err := filepath.EvalSymlinks(root); err == nil {
+	if r, err := be.Realpath(root); err == nil {
 		realRoot = r
 	}
 
+	// 第 1 层：词法。
 	if !within(root, abs) && !within(realRoot, abs) {
 		return fmt.Errorf("%w: %s", ErrOutsideWorkspace, abs)
 	}
-	// 词法上在区内，再解析真实路径，挡住「区内软链指向区外」。
-	real := resolveReal(abs)
+	// 第 2 层：软链。挡住「区内软链指向区外」，且**包括目标尚不存在**的情形
+	//（逐级向上解析把那部分也解析出来了）。
+	real := f.resolveReal(abs)
 	if !within(root, real) && !within(realRoot, real) {
 		return fmt.Errorf("%w: %s", ErrOutsideWorkspace, abs)
 	}
@@ -478,30 +533,103 @@ func (f *FS) snapshot(ctx context.Context, path string, before []byte, existed b
 	return note
 }
 
-// pushSnapshot 压栈并按两个预算逐出，返回被挤掉的条数。
+// pushSnapshot 把快照压进**它自己会话的桶**并按预算逐出，返回被挤掉的条数。
+//
+// 逐出策略（分桶后的关键改动）：预算仍是**全局**的（它管的是内存/磁盘占用，
+// 每个会话各给一份会让总占用变成 N 倍），但逐出时**优先从肇事者自己的桶里丢最旧的**。
+//
+// 为什么不能「从全局最旧的丢」：那等于让一个会话的洪水把另一个会话的快照全挤掉。
+// 一个会话写了 200 个大文件，不该导致另一个会话一条都撤不了。
+//
+// 逐出顺序：先丢**肇事者自己**桶里最旧的；自己桶里丢光了还超，才去动别人的桶，
+// 且从别人的最旧开始丢。
 func (f *FS) pushSnapshot(snap Snapshot) int {
+	sid := snap.SessionID
+
 	f.mu.Lock()
-	f.undo = append(f.undo, snap)
+	defer f.mu.Unlock()
+
+	if f.undo == nil {
+		f.undo = map[string][]Snapshot{}
+	}
+	f.undo[sid] = append(f.undo[sid], snap)
 	f.undoBytes += int64(len(snap.Content))
+
 	evicted := 0
-	// 逐出：先按字节预算丢最旧的，再按条数裁剪。
-	// 顺序不影响正确性，但字节优先 —— 它才是真正兜住 OOM 的那个上限。
-	for len(f.undo) > 0 && (f.undoBytes > f.maxUndoBytes || len(f.undo) > f.maxUndo) {
-		// 绝不逐出栈顶：Undo() 撤的是最后一条，逐出它等于让「撤销上一步」失效。
-		if len(f.undo) == 1 && f.undoBytes > f.maxUndoBytes {
+	// 字节优先 —— 它才是真正兜住 OOM 的那个上限。
+	for f.overBudgetLocked() {
+		victim, ok := f.pickEvictionLocked(sid)
+		if !ok {
 			break
 		}
-		old := f.undo[0]
-		f.undoBytes -= int64(len(old.Content))
-		if f.undoBytes < 0 {
-			f.undoBytes = 0
+		// 绝不逐出栈顶：撤销撤的是最后一条，逐出它等于让「撤销上一步」失效。
+		// （若肇事者只剩栈顶、且别的桶还有可丢的，就去动别的桶。）
+		if victim.sid == sid && len(f.undo[victim.sid]) == 1 && len(f.undo) == 1 {
+			break
 		}
-		f.undo = f.undo[1:]
-		f.removeSpillLocked(old)
+		f.dropOldestLocked(victim.sid)
 		evicted++
 	}
-	f.mu.Unlock()
 	return evicted
+}
+
+// overBudgetLocked 报告当前是否超出任一预算。调用方须持 f.mu。
+func (f *FS) overBudgetLocked() bool {
+	total := 0
+	for _, b := range f.undo {
+		total += len(b)
+	}
+	return total > 0 && (f.undoBytes > f.maxUndoBytes || total > f.maxUndo)
+}
+
+// evictionTarget 是一次逐出的定位结果。
+type evictionTarget struct{ sid string }
+
+// pickEvictionLocked 选出该逐出哪个会话的哪一条。
+//
+// 顺序：肇事者自己最旧 → 其余会话里全局最旧的那个桶的最旧。
+// 调用方须持 f.mu。
+func (f *FS) pickEvictionLocked(selfSID string) (evictionTarget, bool) {
+	// 第一轮：只从自己身上丢
+	if b := f.undo[selfSID]; len(b) > 0 {
+		return evictionTarget{sid: selfSID}, true
+	}
+	// 第二轮：自己空了，动别人 —— 选非空桶里最旧的一条。
+	// 「最旧」用快照时间戳比；同毫秒的用桶内最早位置兜底。
+	oldestSID := ""
+	var oldestAt time.Time
+	found := false
+	for sid, b := range f.undo {
+		if len(b) == 0 {
+			continue
+		}
+		if !found || b[0].Time.Before(oldestAt) {
+			oldestSID, oldestAt, found = sid, b[0].Time, true
+		}
+	}
+	if !found {
+		return evictionTarget{}, false
+	}
+	return evictionTarget{sid: oldestSID}, true
+}
+
+// dropOldestLocked 丢掉某桶里最旧的一条。调用方须持 f.mu。
+func (f *FS) dropOldestLocked(sid string) {
+	b := f.undo[sid]
+	if len(b) == 0 {
+		return
+	}
+	old := b[0]
+	f.undoBytes -= int64(len(old.Content))
+	if f.undoBytes < 0 {
+		f.undoBytes = 0
+	}
+	if len(b) == 1 {
+		delete(f.undo, sid)
+		return
+	}
+	f.undo[sid] = b[1:]
+	f.removeSpillLocked(old)
 }
 
 // writeSpill 把内容写成临时副本，返回路径。
@@ -547,79 +675,116 @@ type takenSnapshot struct {
 	spillRaw []byte
 }
 
-// Undo 撤销最近一次文件写入，返回被还原的路径。
+// Undo 撤销**最近活跃会话**的一次写入（兼容旧接口）。
 //
-// 进程级语义：不管是谁写的，撤最后一条。HTTP 的 handleUndo 目前就靠它
-// （前端没有 session header，拿不到会话）。
+// ⚠️ 这是**兜底**语义，不精确：它挑「最后写入的那个会话」来撤，
+// 多个会话并行时未必是用户想撤的那个。
+//
+// 新的调用方**一律**用 UndoSession(sessionID)。HTTP 的 handleUndo
+// 因为拿不到会话 id（前端不带 session header）才退到这里，
+// 接口接线属 2.2 的后续工作。
 func (f *FS) Undo() (string, bool) {
-	taken, ok := f.takeLast()
+	sid, ok := f.mostRecentSession()
+	if !ok {
+		return "", false
+	}
+	taken, ok := f.takeLastIn(sid)
 	if !ok {
 		return "", false
 	}
 	return f.restore(taken)
+}
+
+// mostRecentSession 返回最后写入过的会话 id。
+func (f *FS) mostRecentSession() (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	best := ""
+	var bestAt time.Time
+	found := false
+	for sid, b := range f.undo {
+		if len(b) == 0 {
+			continue
+		}
+		if !found || b[len(b)-1].Time.After(bestAt) {
+			best, bestAt, found = sid, b[len(b)-1].Time, true
+		}
+	}
+	return best, found
 }
 
 // UndoSession 撤销指定会话最近一次写入。
 //
-// 会话级语义：只动该会话自己的写入，别的会话的栈条目原样留着。
+// 会话级语义：只动该会话自己的桶，别的会话的快照原样留着。
 //
-// ⚠️ 定位与摘除**必须在同一个临界区内**完成。
-// 历史缺陷：这里曾在锁内查出绝对下标，解锁后带着这个下标去摘除。
-// 而下标在解锁后可能失效 —— pushSnapshot 触发预算逐出时头部左移，
-// 所有下标 -1。于是 undoAt 摘走的是**另一个会话**的条目，
-// UndoSession 报告成功并返回别人的路径，而自己的改动原封不动。
-// 后果最严重的一种：别的会话有一笔改动被静默回滚，且它自己完全不知情。
-//
-// 修法就是 takeSnapshot 把两步合并：定位、摘除、读副本、删副本，
-// 全在一把锁里，中间不给任何 goroutine 插入的机会。
+// 2.7 之后这条保证是**结构性**的：撤销栈按会话分桶，
+// takeSnapshot 只在 sessionID 自己的桶里定位。因此即使调用方
+// 逻辑有错，也不可能摘到别人的条目 —— 改造前「从一条线性栈里
+// 从后往前找第一条匹配」是**可能**摘错的（下标在解锁后失效）。
 func (f *FS) UndoSession(sessionID string) (string, bool) {
-	taken, ok := f.takeMatching(func(s Snapshot) bool { return s.SessionID == sessionID })
+	taken, ok := f.takeMatching(sessionID, nil)
 	if !ok {
 		return "", false
 	}
 	return f.restore(taken)
 }
 
-// takeLast 摘除栈顶（进程级撤销）。
-func (f *FS) takeLast() (takenSnapshot, bool) {
-	return f.takeSnapshot(func(Snapshot) bool { return true })
+// takeLastIn 摘除指定会话桶里的栈顶（会话级撤销）。
+//
+// ⚠️ 这里**必须**带会话 id：改造前 takeLast 是「弹全局栈顶」，
+// 于是 A 点撤销会撤掉 B 最后一步写入。分桶后每个会话只碰自己的桶。
+func (f *FS) takeLastIn(sessionID string) (takenSnapshot, bool) {
+	return f.takeSnapshot(sessionID, nil)
 }
 
-// takeMatching 摘除最近一条满足 pred 的快照。
-func (f *FS) takeMatching(pred func(Snapshot) bool) (takenSnapshot, bool) {
-	return f.takeSnapshot(pred)
+// takeMatching 摘除某会话最近一条满足 pred 的快照（pred 为 nil 表示取栈顶）。
+func (f *FS) takeMatching(sessionID string, pred func(Snapshot) bool) (takenSnapshot, bool) {
+	return f.takeSnapshot(sessionID, pred)
 }
 
 // takeSnapshot 在**同一个临界区**内完成「定位 + 摘除 + 读副本 + 删副本」。
 //
-// pred 收到的遍历顺序是从新到旧 —— 先命中最近的，符合撤销的直觉
-// （「撤销我刚才那一步」而不是「撤销我最早那一步」）。
+// 定位被限制在 sessionID 自己的桶内 —— 这是「A 撤不到 B」的结构性保证，
+// 不依赖调用方传对参数。
+//
+// pred 为 nil 时取栈顶；非 nil 时从新到旧取第一条匹配的。
 //
 // ⚠️ 不要把这个函数拆成「查下标」+「按下标摘除」两步。那样锁一放，
 // 下标就可能失效，且失效是静默的 —— 参见 UndoSession 的注释。
-func (f *FS) takeSnapshot(pred func(Snapshot) bool) (takenSnapshot, bool) {
+func (f *FS) takeSnapshot(sessionID string, pred func(Snapshot) bool) (takenSnapshot, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	bucket := f.undo[sessionID]
 	idx := -1
-	for i := len(f.undo) - 1; i >= 0; i-- {
-		if pred(f.undo[i]) {
-			idx = i
-			break
+	if pred == nil {
+		if len(bucket) > 0 {
+			idx = len(bucket) - 1
+		}
+	} else {
+		for i := len(bucket) - 1; i >= 0; i-- {
+			if pred(bucket[i]) {
+				idx = i
+				break
+			}
 		}
 	}
 	if idx < 0 {
 		return takenSnapshot{}, false
 	}
 
-	snap := f.undo[idx]
+	snap := bucket[idx]
 	// 摘除前先取该路径的锁：读副本时另一个 goroutine 可能正在为同一路径
 	// 压新快照并触发逐出删除副本。锁序 pathLock → f.mu，与 casWrite 同序。
 	pathMu := f.lockPath(snap.Path)
 	pathMu.Lock()
 	defer pathMu.Unlock()
 
-	f.undo = append(f.undo[:idx:idx], f.undo[idx+1:]...)
+	if len(bucket) == 1 {
+		delete(f.undo, sessionID)
+	} else {
+		f.undo[sessionID] = append(bucket[:idx:idx], bucket[idx+1:]...)
+	}
 	f.undoBytes -= int64(len(snap.Content))
 	if f.undoBytes < 0 {
 		f.undoBytes = 0
@@ -719,26 +884,44 @@ func (f *FS) restore(taken takenSnapshot) (string, bool) {
 	}
 
 	if snap.Existed {
-		_ = os.MkdirAll(filepath.Dir(snap.Path), 0o755)
+		_ = f.backend().MkdirAll(filepath.Dir(snap.Path), 0o755)
 		// 必须用 atomicWriteFile，不能用裸 os.WriteFile。
 		// 裸写是「打开 → 截断 → 写」，撤销过程被打断（OOM、Ctrl+C、崩溃）
 		// 会留下**半截文件** —— 而这份文件是用户写之前的版本，
 		// 丢了就再也回不去了。与 casWrite 的原子性原则必须一致。
-		if err := atomicWriteFile(snap.Path, content, 0o644); err != nil {
+		if err := f.atomicWriteFileAt(snap.Path, content, 0o644); err != nil {
 			return snap.Path, false
 		}
 	} else {
-		_ = os.Remove(snap.Path)
+		_ = f.backend().Remove(snap.Path)
 	}
 	return snap.Path, true
 }
 
-// Snapshots 返回当前撤销栈的副本（自旧到新），供诊断与测试使用。
+// Snapshots 返回**全部会话**的撤销栈副本（自旧到新，按时间排序），
+// 供诊断与测试使用。
+//
+// ⚠️ 分桶后它不再是「一条栈」而是「所有桶的并集按时间排序」。
+// 想要某个会话的请用 SnapshotsFor —— 用 Snapshots 拿到的深度
+// 去回答「这个会话还能撤几步」是错的。
 func (f *FS) Snapshots() []Snapshot {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := make([]Snapshot, len(f.undo))
-	copy(out, f.undo)
+	var out []Snapshot
+	for _, b := range f.undo {
+		out = append(out, b...)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
+	return out
+}
+
+// SnapshotsFor 返回指定会话的撤销栈副本（自旧到新）。
+func (f *FS) SnapshotsFor(sessionID string) []Snapshot {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b := f.undo[sessionID]
+	out := make([]Snapshot, len(b))
+	copy(out, b)
 	return out
 }
 
@@ -752,11 +935,26 @@ func (f *FS) Snapshots() []Snapshot {
 // 保留这条记录是因为「为什么不能再拆成两步」是本文件最容易重犯的错误，
 // 而拆开之后单测抓不到（竞态窗口只有几十纳秒）。
 
-// UndoDepth 返回当前可撤销步数。
+// UndoDepth 返回**全部会话**的可撤销步数合计。
+//
+// ⚠️ 分桶后它不再是「当前会话还能撤几步」。想回答那个问题必须用
+// UndoDepthFor(sessionID) —— 否则界面上会出现「A 点撤销之后还剩
+// 12 步」，而那 12 步全是 B 的。
 func (f *FS) UndoDepth() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.undo)
+	n := 0
+	for _, b := range f.undo {
+		n += len(b)
+	}
+	return n
+}
+
+// UndoDepthFor 返回指定会话的可撤销步数。
+func (f *FS) UndoDepthFor(sessionID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.undo[sessionID])
 }
 
 // ---------------------------------------------------------------------------
@@ -862,7 +1060,7 @@ func (f *FS) casWrite(ctx context.Context, path string, existed bool, next []byt
 	defer mu.Unlock()
 
 	// —— 临界区：读当前 ——
-	cur, readErr := os.ReadFile(path)
+	cur, readErr := f.backend().ReadFile(path)
 	nowExists := readErr == nil
 
 	if nowExists != existed {
@@ -881,10 +1079,10 @@ func (f *FS) casWrite(ctx context.Context, path string, existed bool, next []byt
 		return nil, err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := f.backend().MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	if err := atomicWriteFile(path, next, 0o644); err != nil {
+	if err := f.atomicWriteFileAt(path, next, 0o644); err != nil {
 		return nil, err
 	}
 	return cur, nil
@@ -929,48 +1127,17 @@ func (f *FS) casCheckReadGate(ctx context.Context, path string, cur []byte, exis
 			"否则会覆盖掉这段时间别人做的改动。")
 }
 
-// atomicWriteFile 用「同目录临时文件 + rename」落盘。
+// atomicWriteFileAt 原子落盘。
 //
-// 为什么不直接 os.WriteFile：WriteFile 是「打开 → 截断 → 写」，
+// 为什么不直接 os.WriteFile：那是「打开 → 截断 → 写」，
 // 进程在写一半被杀（OOM、用户 Ctrl+C、崩溃）会留下**半截文件**。
-// rename 在同一文件系统内是原子的，读者只会看到完整的旧内容或完整的新内容。
+// 同目录临时文件 + rename 是原子的，读者只会看到完整的旧内容或完整的新内容。
 //
-// 同目录是必须的：跨文件系统 rename 会失败。
-func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".cf-tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	// 任何失败路径都要清掉临时文件，否则目录里会积累垃圾
-	// （这也是「落盘后目录里多了残留文件」那条测试要守的东西）。
-	defer func() {
-		if tmpName != "" {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	// CreateTemp 用 0600 建文件；显式改成目标权限，否则产物权限会莫名变严。
-	if err := os.Chmod(tmpName, perm); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	tmpName = "" // 已消费，defer 不再删
-	return nil
+// 2.7 起委托给 Backend.WriteFile —— 原子性是**后端的义务**，
+// 远程后端同样要保证「读者不会看到写了一半的文件」。放在 builtin 这一层
+// 就等于假设只有本机才有原子写。
+func (f *FS) atomicWriteFileAt(path string, data []byte, perm os.FileMode) error {
+	return f.backend().WriteFile(path, data, perm)
 }
 
 // requireReadSeen 已删除。
@@ -1130,7 +1297,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (*tool
 	if err != nil {
 		return tools.Err("%s", errs.FriendlyOr("读取文件", err)), nil
 	}
-	data, err := os.ReadFile(path)
+	data, err := t.fs.backend().ReadFile(path)
 	if err != nil {
 		return tools.Err("读取文件失败: %v", err), nil
 	}
@@ -1240,41 +1407,27 @@ func (t *ListDirTool) Execute(ctx context.Context, args json.RawMessage) (*tools
 	}
 
 	entries := make([]dirEntry, 0, 64)
-	add := func(path string, info os.FileInfo) {
-		entries = append(entries, dirEntry{
-			Name:  info.Name(),
-			Path:  path,
-			IsDir: info.IsDir(),
-			Size:  info.Size(),
-		})
-	}
+	be := t.fs.backend()
 
-	if p.Recursive {
-		_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-			if path == dir {
-				return nil
-			}
-			if info.IsDir() && skipDir(info.Name()) {
-				return filepath.SkipDir
-			}
-			add(path, info)
-			return nil
+	// 遍历交给 Backend：远程后端一次远端命令就能完成，
+	// 放在工具层就等于默认「本地遍历」实现，远程必然退化成几千次往返。
+	//
+	// 两条分支的失败语义**不同**（递归吞错 / 非递归 fail-fast），
+	// 由 backendContract 逐条钉住 —— 这是既有行为，不是疏漏。
+	raw, err := be.List(dir, backend.ListOptions{
+		Recursive: p.Recursive,
+		SkipDirs:  skipDirSet(),
+	})
+	if err != nil {
+		return tools.Err("%s", errs.FriendlyOr("列出目录", err)), nil
+	}
+	for _, e := range raw {
+		entries = append(entries, dirEntry{
+			Name:  e.Info.Name,
+			Path:  e.Path,
+			IsDir: e.Info.IsDir,
+			Size:  e.Info.Size,
 		})
-	} else {
-		items, err := os.ReadDir(dir)
-		if err != nil {
-			return tools.Err("读取目录失败: %v", err), nil
-		}
-		for _, it := range items {
-			info, err := it.Info()
-			if err != nil {
-				continue
-			}
-			add(filepath.Join(dir, it.Name()), info)
-		}
 	}
 
 	sort.Slice(entries, func(i, j int) bool {
@@ -1284,6 +1437,18 @@ func (t *ListDirTool) Execute(ctx context.Context, args json.RawMessage) (*tools
 		return entries[i].Name < entries[j].Name
 	})
 	return tools.OkMeta(entries, map[string]any{"dir": dir, "count": len(entries)}), nil
+}
+
+// skipDirSet 构造当前跳目录集合的快照。
+//
+// 返回新 map 而不是共享 backend.DefaultSkipDirs：后端可能往里写
+// （远程后端会追加自己的跳过项），共享会污染全局默认值。
+func skipDirSet() map[string]bool {
+	out := make(map[string]bool, len(backend.DefaultSkipDirs))
+	for k, v := range backend.DefaultSkipDirs {
+		out[k] = v
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -1338,7 +1503,7 @@ func (t *WriteFileTool) PreviewDiff(args json.RawMessage) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	old, _ := os.ReadFile(path)
+	old, _ := t.fs.backend().ReadFile(path)
 	return UnifiedDiff(path, path, string(old), p.Content), nil
 }
 
@@ -1378,7 +1543,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (*too
 	//
 	// 用 ReadFile 而非 Stat 探测存在性：目标是目录时 Stat 会成功，
 	// 而 ReadFile 失败 —— 后者才是「不是可写文件」的正确判据。
-	_, readErr := os.ReadFile(path)
+	_, readErr := t.fs.backend().ReadFile(path)
 	existed := readErr == nil
 	// 全部收进同一把按路径的锁里：读当前 → 比对 → 原子写。
 	// 返回的 before 是临界区内读到的真实旧内容，直接用于改动行数统计 ——
@@ -1446,7 +1611,7 @@ func (f *FS) casEdit(ctx context.Context, path string, pairs []editPair) (update
 	mu.Lock()
 	defer mu.Unlock()
 
-	data, readErr := os.ReadFile(path)
+	data, readErr := f.backend().ReadFile(path)
 	if readErr != nil {
 		return "", 0, nil, readErr
 	}
@@ -1459,7 +1624,7 @@ func (f *FS) casEdit(ctx context.Context, path string, pairs []editPair) (update
 	if err != nil {
 		return "", 0, nil, err
 	}
-	if err := atomicWriteFile(path, []byte(updated), 0o644); err != nil {
+	if err := f.atomicWriteFileAt(path, []byte(updated), 0o644); err != nil {
 		return "", 0, nil, err
 	}
 	return updated, count, data, nil
@@ -1474,15 +1639,15 @@ func (f *FS) casRemove(ctx context.Context, path string) error {
 	mu.Lock()
 	defer mu.Unlock()
 
-	info, err := os.Stat(path)
+	info, err := f.backend().Stat(path)
 	if err != nil {
 		return tools.NewErrStaleContent(path,
 			"删除时发现该文件已不存在（可能刚被别人删了或重命名）。请先 read_file 确认现状。")
 	}
-	if info.IsDir() {
+	if info.IsDir {
 		return fmt.Errorf("delete_file 不支持删除目录: %s", path)
 	}
-	cur, err := os.ReadFile(path)
+	cur, err := f.backend().ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("无法确认 %s 的内容：%w", path, err)
 	}
@@ -1491,7 +1656,7 @@ func (f *FS) casRemove(ctx context.Context, path string) error {
 	}
 	// 快照必须在删除前记，且记的是刚在锁内读到的内容。
 	f.snapshot(ctx, path, cur, true)
-	if err := os.Remove(path); err != nil {
+	if err := f.backend().Remove(path); err != nil {
 		return err
 	}
 	return nil
@@ -1603,7 +1768,7 @@ func (t *EditFileTool) PreviewDiff(args json.RawMessage) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	old, err := os.ReadFile(path)
+	old, err := t.fs.backend().ReadFile(path)
 	if err != nil {
 		return "", err
 	}

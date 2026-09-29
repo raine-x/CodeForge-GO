@@ -161,8 +161,15 @@ func TestCreateSkillIsUndoable(t *testing.T) {
 //
 // 间接断言：casWrite 内部的落盘必须走 atomicWriteFile。
 func TestCreateSkillUsesAtomicWrite(t *testing.T) {
-	if !strings.Contains(funcCode(t, "casWrite"), "atomicWriteFile(") {
-		t.Errorf("casWrite 内部没有走 atomicWriteFile，写入不是原子的")
+	// 2.7 后原子落盘是**后端的义务**：守卫侧统一走 atomicWriteFileAt，
+	// 它委托给 Backend.WriteFile。断言指向这条链，而不是具体实现
+	//（本地后端是「临时文件 + rename」，远程后端各有等价物）。
+	if !strings.Contains(funcCode(t, "atomicWriteFileAt"), "backend().WriteFile(") {
+		t.Errorf("atomicWriteFileAt 必须委托给 Backend.WriteFile")
+	}
+	// 而 casWrite 必须用上它。
+	if !strings.Contains(funcCode(t, "casWrite"), "atomicWriteFileAt(") {
+		t.Errorf("casWrite 应经 atomicWriteFileAt 落盘")
 	}
 }
 

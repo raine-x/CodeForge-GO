@@ -118,33 +118,67 @@ func (s *Server) persistWorkDir(dir string) {
 //  3. 切换**不落盘**。这是「点开一条历史会话」，不是「用户选了工作区」；
 //     把它写进 state.yaml 会让重启后的工作区变成用户最后点开的那条会话
 //     所在的项目，语义完全不对。
-func (s *Server) switchSessionWorkspace(sess *agent.Session) {
+//
+// 另外一条从上面那条 bug 里学到的：**运行中必须拒绝切换**。
+// 工作区是进程全局的，切它会连带改掉正在跑的那个会话所看到的工作区。
+// 「A 正在跑、用户顺手点了别的会话」是很自然的操作，不是边缘用法 ——
+// 硬切的后果是 A 的下一轮工具调用落到别的项目里，混进分析结果且毫无察觉。
+//
+// 返回 false = 没有切换（被拒 / 无需切 / 目标不可用）。调用方据此提示用户。
+func (s *Server) switchSessionWorkspace(sess *agent.Session) bool {
 	if sess == nil {
-		return
+		return false
 	}
 	target := strings.TrimSpace(sess.Workspace)
 	if target == "" {
 		// 会话没绑定工作区：保持现状（纪律 1）
-		return
+		return false
 	}
 	if info, err := os.Stat(target); err != nil || !info.IsDir() {
 		logx.Warnf("会话 %s 绑定的工作区已不存在，保持当前工作区: %s", sess.ID, target)
-		return // 纪律 2
+		return false // 纪律 2
 	}
 	target = filepath.Clean(target)
 	if cur := s.fs.Root(); cur == target {
-		return // 已经在那儿，别白清一次撤销栈
+		// 同一个工作区 —— 什么都不用做。
+		//
+		// 这条同时也是「同一项目里两个会话并发」的关键：它们工作区相同，
+		// 切会话时压根不碰 FS.root，因此「有别的会话在跑」与这里无关。
+		// 曾在下面加一条「任何会话在跑就拒绝切换」，结果同一项目里
+		// 第二个会话根本点不开 —— 并发被自己堵死了。
+		return true
+	}
+
+	// 跨项目：工作区是**进程全局**的，切它会连带改掉正在跑的那些会话
+	// 所看到的工作区（A 的下一轮工具调用会落到 B 的项目里，混进分析结果
+	// 且毫无察觉）。所以这里必须挡住。
+	//
+	// ⚠️ 这条限制是「工作区还没归会话」的历史包袱，不是设计意图。
+	// 2.2（Workspace 结构化 + 工作区下沉到会话）落地后就可以删掉，
+	// 届时每个会话有自己的工作区，跨项目并发与同项目并发一样自然。
+	if s.anySessionRunning() {
+		logx.Warnf("有会话正在运行，暂不切工作区到 %s（等 2.2 工作区归会话后可解除）", target)
+		return false
 	}
 
 	setter, ok := s.fs.(interface{ SetRoot(string) })
 	if !ok {
-		return
+		return false
 	}
 	setter.SetRoot(target)
 	// FS 与 Agent 是两份独立状态，只切一个就是历史上那种「一半修法」。
 	s.agent.SetWorkDir(target)
 	// 刻意不调 persistWorkDir —— 纪律 3
 	logx.Infof("切到会话 %s 的工作区：%s", sess.ID, target)
+	return true
+}
+
+// anySessionRunning 报告当前是否有任何会话在跑。
+//
+// 只用于「跨项目切工作区」这一个决策点。同项目切换在
+// switchSessionWorkspace 的开头就 return 了，不受这里影响。
+func (s *Server) anySessionRunning() bool {
+	return len(s.agent.RunningSessionIDs()) > 0
 }
 
 // handleNotifyPrefs 查看 / 设置「任务完成系统通知」偏好。

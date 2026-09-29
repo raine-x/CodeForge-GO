@@ -1,13 +1,11 @@
 package builtin
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"strings"
 
+	"codeforge/pkg/backend"
 	"codeforge/pkg/errs"
 	"codeforge/pkg/tools"
 )
@@ -94,57 +92,24 @@ func (t *SearchTool) Execute(ctx context.Context, args json.RawMessage) (*tools.
 	matches := make([]matchItem, 0, maxResults)
 	scanned := 0
 
-	walkErr := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if info.IsDir() {
-			if path != root && skipDir(info.Name()) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if len(matches) >= maxResults {
-			return filepath.SkipAll
-		}
-		if p.Glob != "" {
-			if ok, _ := filepath.Match(p.Glob, info.Name()); !ok {
-				return nil
-			}
-		}
-		if info.Size() > searchMaxFileSize {
-			return nil
-		}
-
-		f, err := os.Open(path)
-		if err != nil {
-			return nil
-		}
-		defer f.Close()
-
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 0, 64*1024), searchMaxFileSize)
-		lineNo := 0
-		for scanner.Scan() {
-			lineNo++
-			line := scanner.Text()
-			haystack := line
-			if !p.CaseSensitive {
-				haystack = strings.ToLower(line)
-			}
-			if strings.Contains(haystack, needle) {
-				matches = append(matches, matchItem{File: path, Line: lineNo, Text: strings.TrimRight(line, "\r")})
-				if len(matches) >= maxResults {
-					break
-				}
-			}
-		}
-		scanned++
-		return nil
+	// 检索委托给 Backend：远程后端一次远端命令即可完成，
+	// 留在工具层就等于默认「本地遍历」实现 —— 远程会退化成几千次往返。
+	//
+	// 参数解析、结果整形、meta 仍在工具层；遍历与匹配在后端。
+	res, err := t.fs.backend().Grep(ctx, root, backend.GrepOptions{
+		Pattern:       p.Query,
+		Glob:          p.Glob,
+		CaseSensitive: p.CaseSensitive,
+		MaxResults:    maxResults,
+		MaxFileSize:   searchMaxFileSize,
 	})
-	if walkErr != nil && walkErr != filepath.SkipAll {
-		return tools.Err("检索失败: %v", walkErr), nil
+	if err != nil {
+		return tools.Err("检索失败: %v", err), nil
 	}
+	for _, m := range res.Matches {
+		matches = append(matches, matchItem{File: m.Path, Line: m.Line, Text: m.Text})
+	}
+	scanned = res.Scanned
 
 	return tools.OkMeta(matches, map[string]any{
 		"root":    root,
@@ -214,29 +179,17 @@ func (t *FindFilesTool) Execute(ctx context.Context, args json.RawMessage) (*too
 	matches := make([]findItem, 0, maxResults)
 	scanned := 0
 
-	walkErr := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if info.IsDir() {
-			if path != root && skipDir(info.Name()) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if len(matches) >= maxResults {
-			return filepath.SkipAll
-		}
-		if ok, _ := filepath.Match(p.Pattern, info.Name()); ok {
-			rel, _ := filepath.Rel(root, path)
-			matches = append(matches, findItem{Path: rel})
-		}
-		scanned++
-		return nil
+	// 同上：按名查找也交给 Backend，路径在后端侧就算成相对路径。
+	res, err := t.fs.backend().Glob(ctx, root, p.Pattern, backend.GlobOptions{
+		MaxResults: maxResults,
 	})
-	if walkErr != nil && walkErr != filepath.SkipAll {
-		return tools.Err("查找失败: %v", walkErr), nil
+	if err != nil {
+		return tools.Err("查找失败: %v", err), nil
 	}
+	for _, p2 := range res.Paths {
+		matches = append(matches, findItem{Path: p2})
+	}
+	scanned = res.Scanned
 
 	return tools.OkMeta(matches, map[string]any{
 		"root":    root,
