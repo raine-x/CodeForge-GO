@@ -41,7 +41,11 @@ function harness() {
     // 吞掉并 `sending = false` —— 表现是「第一次已发出，紧接着的第二次提交没被
     // 拦住」（sent.length 2 !== 1），排查时极难指向这里。
     addUser(text) { users.push(text); return {}; }, showThinking() {}, resetPlanActions() {},
-    sendBtn: { classList: { add() {}, remove() {} } },
+    // syncSendBtn 走 classList.toggle(cls, force) + setAttribute(aria-label)：
+    // 桩要跟着补齐，否则打桩比真实 DOM 少方法，报错会指向附件逻辑、实际是桩不全。
+    sendBtn: { classList: { add() {}, remove() {}, toggle() {} }, setAttribute() {} },
+    // 按钮三态不是本组关注点（由 render_md.test.js 锁），打桩即可。
+    syncSendBtn() {},
     sessionsCache: [], loadSessionList() {}, messagesEl: {}, subagentCards: new Map(),
     syncComposerMode() {}, renderSessions() {}, scrollBottom() {},
     removeThinking() {}, removeRetry() {}, removeResumeRing() {}, showResumeRing() {}, settleActiveTool() {}, foldReason() {}, closeText() {},
@@ -77,7 +81,7 @@ function harness() {
   const state = src.slice(src.indexOf('  let ws = null;'), src.indexOf('  let currentTextEl = null;'));
   const names = ['mentionBody', 'mentionToken', 'pruneFileAliases', 'expandFileAliases',
     'insideWorkspace', 'attachmentKey', 'composerSnapshot', 'sameComposer', 'fileMentions',
-    'prepareMentions', 'syncInputMirror', 'insertIntoInput', 'insertUploadedFile', 'pasteFiles',
+    'prepareMentions', 'syncInputMirror', 'setInputValue', 'insertIntoInput', 'insertUploadedFile', 'pasteFiles',
     'submitMessage', 'wsSend', 'runAway', 'setWorkspace', 'loadSession', 'doNewSession',
     'deleteWorkspace', 'connectWS'];
   vm.runInContext(state + '\n' + src.match(/  const MENTION_SPLIT = .*;/)[0] + '\n' +

@@ -14,25 +14,37 @@
   <div id="app">
     <!-- 左栏（可拖拽调宽，最窄 200px） -->
     <aside id="sidebar">
-      <!-- MCP 入口（历史会话之上；仅查看，新增/管理在设置 → MCP 服务） -->
-      <div class="sidebar-section-label" id="mcp-entry">
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="2.4"/><circle cx="19" cy="12" r="2.4"/><circle cx="12" cy="5" r="2.4"/><circle cx="12" cy="19" r="2.4"/><path d="M7.2 10.8 10.4 6.7M16.8 10.8 13.6 6.7M7.2 13.2l3.2 4.1M16.8 13.2l-3.2 4.1"/></svg>
-        <span>MCP 服务</span>
+      <!-- 上卡：MCP 只读概览。卡片化处理与左右大分栏一致（底色 + 1px 边 + 弧边）。 -->
+      <div class="sidebar-card">
+        <div class="sidebar-section-label" id="mcp-entry">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="2.4"/><circle cx="19" cy="12" r="2.4"/><circle cx="12" cy="5" r="2.4"/><circle cx="12" cy="19" r="2.4"/><path d="M7.2 10.8 10.4 6.7M16.8 10.8 13.6 6.7M7.2 13.2l3.2 4.1M16.8 13.2l-3.2 4.1"/></svg>
+          <span>MCP 服务</span>
+        </div>
+        <!-- 只报「已启用 N 个」一行，明细在行的 title 里；见 ui.js renderMcpList -->
+        <ul id="mcp-list" class="mcp-list"></ul>
       </div>
-      <ul id="mcp-list" class="mcp-list"></ul>
 
-      <!-- 新建项目（项目列表之上）：清空当前对话区，在空工作区下开一个默认名为「新项目」的新项目 -->
-      <button type="button" id="new-chat-btn" class="new-chat-btn" title="新建项目">
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
-        <span>新建项目</span>
-      </button>
+      <!-- 两卡之间的隔离带：与 #app 里 #sidebar/#main 的分栏接缝同一套做法 -->
+      <div class="sidebar-sep" role="separator" aria-hidden="true"><span class="grip"></span></div>
 
-      <!-- 项目（键 = 工作区，按工作区分组）；项目行 = 折叠箭头 + 项目名 + ＋（新建会话）+ ⋯（重命名/归档/删除） -->
-      <div class="sidebar-section-label" id="sessions-entry">
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-        <span>项目</span>
+      <!-- 下卡：项目（新建 / 分组标题 / 可滚动列表） -->
+      <div class="sidebar-card sidebar-card-main">
+        <!-- 新建项目（项目列表之上）：清空当前对话区，在空工作区下开一个默认名为「新项目」的新项目 -->
+        <button type="button" id="new-chat-btn" class="new-chat-btn" title="新建项目">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+          <span>新建项目</span>
+        </button>
+
+        <!-- 项目（键 = 工作区，按工作区分组）；项目行 = 折叠箭头 + 项目名 + ＋（新建会话）+ ⋯（重命名/归档/删除） -->
+        <div class="sidebar-section-label" id="sessions-entry">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          <span>项目</span>
+        </div>
+        <!-- 项目列表 = 侧栏唯一的滚动容器（标签固定在上方，只有列表内部滚） -->
+        <div class="sidebar-scroll">
+          <ul id="session-list" class="session-list"></ul>
+        </div>
       </div>
-      <ul id="session-list" class="session-list"></ul>
       <div class="sidebar-footer">
         <button id="open-settings" class="settings-btn" title="设置">
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.09a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.09a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z"/></svg>
@@ -104,7 +116,8 @@
           </div>
           <div class="composer-bottom">
             <div class="bottom-left">
-              <!-- ＋ → 上拉菜单：添加文件（Windows 用资源管理器，Linux/Termux 用内置选择器）/ Skills（右展已加载技能） -->
+              <!-- ＋ → 上拉菜单：添加文件（Windows 用资源管理器，Linux/Termux 用内置选择器）/
+                   Skills和技能（右展已加载技能 + 内置插件，两类都插 @ 提及） -->
               <div class="pop-anchor">
                 <button type="button" id="more-btn" class="icon-btn" title="更多">
                   <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
@@ -118,7 +131,7 @@
                   </button>
                   <div class="pop-anchor">
                     <button type="button" class="pop-opt more-item" id="more-skills">
-                      <span>Skills</span><span class="more-arrow">›</span>
+                      <span>Skills和技能</span><span class="more-arrow">›</span>
                     </button>
                     <div id="more-skills-pop" class="popup popup-right hidden"></div>
                   </div>
@@ -554,10 +567,14 @@
         <!-- 模型管理：模型列表 / 供应商管理 / 添加模型
              供应商持有 Base URL 与密钥，其下模型只填 id —— 同供应商下切换模型不必重复配置 -->
         <section id="page-models" class="settings-page">
-          <div class="models-tabs">
-            <button type="button" class="models-tab active" data-mtab="list">模型列表</button>
-            <button type="button" class="models-tab" data-mtab="prov">供应商管理</button>
-            <button type="button" class="models-tab" data-mtab="config">添加模型</button>
+          <!-- tab 条独占一整行，只有中间那颗 pill；下面内容从这一行下沿开始排，
+               不会被它盖住（刻意不用 sticky —— 悬浮会压住从下面滚过去的文字）。 -->
+          <div class="models-tabs-bar">
+            <div class="models-tabs">
+              <button type="button" class="models-tab active" data-mtab="list">模型列表</button>
+              <button type="button" class="models-tab" data-mtab="prov">供应商管理</button>
+              <button type="button" class="models-tab" data-mtab="config">添加模型</button>
+            </div>
           </div>
 
           <!-- 模型列表：按供应商分组，逐行「设为当前」 -->
@@ -577,66 +594,70 @@
           <div id="mtab-config" class="mtab-pane">
             <div class="settings-card">
               <div id="mf-title" class="mf-title">添加模型</div>
-              <div class="form-grid">
-                <label class="f-field"><span>归属供应商</span>
-                  <select id="mf-prov"></select>
-                </label>
-                <!-- 选定供应商后：地址与密钥自动继承，表单里不再重复出现这两项 -->
-                <div class="f-field" id="mf-inherit-field" hidden>
-                  <span>请求地址 / 密钥</span>
-                  <div class="mf-inherit" id="mf-inherit"></div>
-                </div>
-                <label class="f-field"><span>显示名称</span><input id="mf-name" type="text" placeholder="界面显示的名称"></label>
-                <label class="f-field"><span>模型 id</span>
-                  <div class="id-row">
-                    <input id="mf-id" type="text" placeholder="如 gpt-4o / claude-sonnet-4">
-                    <button type="button" id="mf-discover" title="向上游请求模型列表，可勾选多个一次性批量添加">获取模型列表</button>
+              <!-- 表单区自己滚：「测试连接 / 重置 / 保存」留在卡片底部常驻可见，
+                   不用为了点保存先把整页滚到底。 -->
+              <div class="mf-scroll">
+                <div class="form-grid">
+                  <label class="f-field"><span>归属供应商</span>
+                    <select id="mf-prov"></select>
+                  </label>
+                  <!-- 选定供应商后：地址与密钥自动继承，表单里不再重复出现这两项 -->
+                  <div class="f-field f-field-wide" id="mf-inherit-field" hidden>
+                    <span>请求地址 / 密钥</span>
+                    <div class="mf-inherit" id="mf-inherit"></div>
                   </div>
-                </label>
-                <label class="f-field" id="mf-url-field"><span>请求地址</span><input id="mf-url" type="text" placeholder="https://api.openai.com/v1"></label>
-                <div class="f-field" id="mf-key-field">
-                  <span>密钥</span>
-                  <div class="key-row">
-                    <div class="key-seg" id="mf-key-seg">
-                      <button type="button" data-ks="env" class="active">环境变量</button>
-                      <button type="button" data-ks="plain">明文密钥</button>
+                  <label class="f-field"><span>显示名称</span><input id="mf-name" type="text" placeholder="界面显示的名称"></label>
+                  <label class="f-field" id="mf-url-field"><span>请求地址</span><input id="mf-url" type="text" placeholder="https://api.openai.com/v1"></label>
+                  <label class="f-field" id="mf-proto-field"><span>兼容协议</span>
+                    <select id="mf-proto">
+                      <option value="openai">OpenAI</option>
+                      <option value="anthropic">Anthropic</option>
+                    </select>
+                  </label>
+                  <label class="f-field f-field-wide"><span>模型 id</span>
+                    <div class="id-row">
+                      <input id="mf-id" type="text" placeholder="如 gpt-4o / claude-sonnet-4">
+                      <button type="button" id="mf-discover" title="向上游请求模型列表，可勾选多个一次性批量添加">获取模型列表</button>
                     </div>
-                    <input id="mf-key-env" type="text" placeholder="变量名，如 OPENAI_API_KEY">
-                    <span class="key-eye-wrap">
-                      <input id="mf-key-plain" type="password" placeholder="sk-..." style="display:none">
-                      <button type="button" id="mf-key-eye" class="key-eye" title="显示/隐藏密钥" style="display:none">👁</button>
-                    </span>
+                  </label>
+                  <div class="f-field f-field-wide" id="mf-key-field">
+                    <span>密钥</span>
+                    <div class="key-row">
+                      <div class="key-seg" id="mf-key-seg">
+                        <button type="button" data-ks="env" class="active">环境变量</button>
+                        <button type="button" data-ks="plain">明文密钥</button>
+                      </div>
+                      <input id="mf-key-env" type="text" placeholder="变量名，如 OPENAI_API_KEY">
+                      <span class="key-eye-wrap">
+                        <input id="mf-key-plain" type="password" placeholder="sk-..." style="display:none">
+                        <button type="button" id="mf-key-eye" class="key-eye" title="显示/隐藏密钥" style="display:none">👁</button>
+                      </span>
+                    </div>
+                  </div>
+                  <div class="f-field ctx-row f-field-wide">
+                    <span>上下文</span>
+                    <div class="ctx-inputs">
+                      <!-- 输入/输出改成「预置档位 + 自定义」的下拉：档位由 ui.js 的
+                           buildCtxPicker 填充（预置档见 CTX_PRESETS_IN / _OUT）。 -->
+                      <label>输入 <span id="mf-ctx-in-host"></span></label>
+                      <label>输出 <span id="mf-ctx-out-host"></span></label>
+                    </div>
                   </div>
                 </div>
-                <label class="f-field" id="mf-proto-field"><span>兼容协议</span>
-                  <select id="mf-proto">
-                    <option value="openai">OpenAI</option>
-                    <option value="anthropic">Anthropic</option>
-                  </select>
-                </label>
-                <div class="f-field ctx-row">
-                  <span>上下文</span>
-                  <div class="ctx-inputs">
-                    <!-- 输入/输出改成「预置档位 + 自定义」的下拉：档位由 ui.js 的
-                         buildCtxPicker 填充（预置档见 CTX_PRESETS_IN / _OUT）。 -->
-                    <label>输入 <span id="mf-ctx-in-host"></span></label>
-                    <label>输出 <span id="mf-ctx-out-host"></span></label>
+                <!-- 从上游 /models 拉取的模型列表（点「获取模型列表」后展开，选中后填入模型 id） -->
+                <div id="mf-discover-panel" class="discover-panel hidden">
+                  <div class="disc-head">
+                    <div class="disc-title">上游可用模型<span id="disc-count" class="disc-count"></span></div>
+                    <div class="disc-tools">
+                      <input id="disc-filter" type="text" placeholder="筛选模型 id…">
+                      <button type="button" id="disc-close">收起</button>
+                    </div>
                   </div>
-                </div>
-              </div>
-              <!-- 从上游 /models 拉取的模型列表（点「获取模型列表」后展开，选中后填入模型 id） -->
-              <div id="mf-discover-panel" class="discover-panel hidden">
-                <div class="disc-head">
-                  <div class="disc-title">上游可用模型<span id="disc-count" class="disc-count"></span></div>
-                  <div class="disc-tools">
-                    <input id="disc-filter" type="text" placeholder="筛选模型 id…">
-                    <button type="button" id="disc-close">收起</button>
+                  <div id="disc-list" class="disc-list"></div>
+                  <div class="disc-foot">
+                    <span id="disc-result" class="mf-test-result"></span>
+                    <button type="button" id="disc-add" class="primary">添加选中</button>
                   </div>
-                </div>
-                <div id="disc-list" class="disc-list"></div>
-                <div class="disc-foot">
-                  <span id="disc-result" class="mf-test-result"></span>
-                  <button type="button" id="disc-add" class="primary">添加选中</button>
                 </div>
               </div>
               <div class="mf-actions">

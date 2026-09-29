@@ -4,8 +4,8 @@ import "strings"
 
 // ThinkingStep 是离散思考档位。
 type ThinkingStep struct {
-	Value string `json:"value"` // 请求参数原值（如 minimal / low）
-	Label string `json:"label"` // 界面显示名
+	Value string `json:"value"` // 请求参数原值（none/minimal/low/…/max，或 default=不下发）
+	Label string `json:"label"` // 界面显示名（首字母大写：None/Minimal/…/Max）
 }
 
 // ThinkingSpec 描述当前 provider 支持的思考强度分级，
@@ -21,13 +21,25 @@ type ThinkingSpec struct {
 	Param   string         `json:"param"` // 上游参数名：reasoning_effort / budget_tokens
 }
 
-// OffThinkingValue 是「关闭」档的前端取值：选中它 = 不向上游发送任何思考参数。
-const OffThinkingValue = "none"
+// 思考档位的两个特殊取值。它们在**请求上不同**，这是 2026-09-29 拆开的原因：
+//
+//	OffThinkingValue     "none"    → 显式下发 reasoning_effort="none"，明确要求不推理。
+//	                                 它是 OpenAI 官方枚举里的真实一档，不是「不设置」。
+//	DefaultThinkingValue "default" → 完全不下发该参数，由上游按模型自己的默认走。
+//	                                 各模型的默认档不同（gpt-5.1=none、gpt-5=medium），
+//	                                 本程序不该替它们选。
+//
+// 拆开之前只有「关闭 = 不发参数」一档，于是「不想思考」和「想让模型自己定」不可表达。
+const (
+	OffThinkingValue     = "none"
+	DefaultThinkingValue = "default"
+)
 
 // ThinkingSpecFor 按上游协议返回思考分级定义。
 // 分级取自各厂商官方参数，而非本地固定三档：
-//   - OpenAI 系（含旧 custom 兼容端点别名）：reasoning_effort ∈ minimal/low/medium/high，
-//     外加「关闭」档（none，不上送参数，兼容不支持该参数的非推理模型）
+//   - OpenAI 系（含旧 custom 兼容端点别名）：reasoning_effort ∈ none/minimal/low/
+//     medium/high/xhigh/max（2026-09-29 补齐 xhigh / max 两档上限），外加一档
+//     Default（default，不下发参数 = 走上游默认）
 //   - Anthropic：thinking.budget_tokens 连续区间（0=关闭 / 1024–16384，步进 512）
 func ThinkingSpecFor(provider string) ThinkingSpec {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
@@ -45,13 +57,18 @@ func ThinkingSpecFor(provider string) ThinkingSpec {
 		return ThinkingSpec{
 			Mode: "steps",
 			Steps: []ThinkingStep{
-				{Value: OffThinkingValue, Label: "关闭"},
-				{Value: "minimal", Label: "极简"},
-				{Value: "low", Label: "低"},
-				{Value: "medium", Label: "中"},
-				{Value: "high", Label: "高"},
+				{Value: OffThinkingValue, Label: "None"},
+				{Value: DefaultThinkingValue, Label: "Default"},
+				{Value: "minimal", Label: "Minimal"},
+				{Value: "low", Label: "Low"},
+				{Value: "medium", Label: "Medium"},
+				{Value: "high", Label: "High"},
+				{Value: "xhigh", Label: "Xhigh"},
+				{Value: "max", Label: "Max"},
 			},
-			Default: "medium",
+			// 非法值回落到 Default 而不是替用户猜一档：猜错就是把用户没要的
+			// 思考强度加上去（还可能超出模型支持集）。不下发永远不会是错的。
+			Default: DefaultThinkingValue,
 			Param:   "reasoning_effort",
 		}
 	default:
@@ -69,15 +86,20 @@ func isOffThinking(v string) bool {
 }
 
 // NormalizeThinking 将前端上送的思考值规整为上游可用的参数值。
-//   - 「关闭」→ 空串（调用方据此不发参数）
-//   - 数字字符串（Anthropic budget）：0=关闭，其余夹紧到 [OnMin,Max] 并对齐步进
-//   - 枚举字符串：仅当属于该 provider 的合法档位时保留
+// 返回空串 = 调用方不向下游发该参数。两种协议对「关闭」的处理**不同**：
+//   - steps（OpenAI）：none → 原样返回并显式下发（官方合法取值）；
+//     Default 档 → 空串（不下发 = 走上游默认）。只有「完全没指定」和 Default 是空串。
+//   - range（Anthropic）：关闭值（none/0/off/关闭…）→ 空串，不发 thinking 字段。
+//     Anthropic 没有「none」这个取值，关闭就是不发这个字段。
 func (s ThinkingSpec) NormalizeThinking(v string) string {
 	v = strings.TrimSpace(v)
-	if s.Mode == "none" || v == "" || isOffThinking(v) {
+	if s.Mode == "none" || v == "" {
 		return ""
 	}
 	if s.Mode == "range" {
+		if isOffThinking(v) {
+			return "" // 关闭：Anthropic 靠「不发 thinking 字段」表示
+		}
 		if !isDigits(v) {
 			// 兼容旧枚举值（low/medium/high）
 			return itoa(legacyBudget(v))
@@ -102,11 +124,29 @@ func (s ThinkingSpec) NormalizeThinking(v string) string {
 		}
 		return itoa(n)
 	}
-	// steps：校验枚举（关闭值已在上面返回空串 = 不发参数）
+	// steps：命中档位即按档位语义返回。
+	// Default 档是唯一返回空串的合法档（不下发 = 走上游默认）；
+	// none 档照常返回 "none"，由 openai.buildPayload 显式下发。
 	for _, st := range s.Steps {
 		if strings.EqualFold(st.Value, v) {
+			if strings.EqualFold(st.Value, DefaultThinkingValue) {
+				return ""
+			}
 			return st.Value
 		}
+	}
+	// 旧值（0/off/关闭…）与关闭档同义，归到关闭档。
+	if isOffThinking(v) {
+		for _, st := range s.Steps {
+			if strings.EqualFold(st.Value, OffThinkingValue) {
+				return st.Value
+			}
+		}
+	}
+	// 非法值回落到 spec.Default。Default 档的语义是「不下发」，所以这里要解析成
+	// 空串 —— 直接把 "default" 返回出去会被 openai.buildPayload 当成参数发出去。
+	if strings.EqualFold(s.Default, DefaultThinkingValue) {
+		return ""
 	}
 	return s.Default
 }

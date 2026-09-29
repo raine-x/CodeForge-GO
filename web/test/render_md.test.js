@@ -42,6 +42,22 @@ function extractFunction(src, name) {
   return src.slice(start, i + 1);
 }
 
+// messagesEl 上挂了多个 scroll 监听（minimap 等），要挑**含 composerHide 的那个**。
+// 直接取第一个会锁到不相干的监听上，断言变成永远为真。
+function composerScrollHandler() {
+  const src = fs.readFileSync(UI_PATH, 'utf8');
+  const key = "messagesEl.addEventListener('scroll', ";
+  let from = 0, hit = -1;
+  while (hit < 0) {
+    const at = src.indexOf(key, from);
+    if (at < 0) throw new Error('ui.js 里找不到输入卡折叠的 scroll 监听');
+    const end = src.indexOf('\n  });', at);
+    if (src.slice(at, end).includes('composerHide')) hit = at;
+    from = at + 1;
+  }
+  return src.slice(hit, src.indexOf('\n  });', hit) + 5);
+}
+
 function loadRenderer() {
   const src = fs.readFileSync(UI_PATH, 'utf8');
   // 注意：新增纯函数必须同时改两处 —— 这里的截取列表，以及文件下方的顶层 let 声明。
@@ -226,6 +242,9 @@ check('超长文件名被截断',
 
 // ---------- 4.5 思考过程行数统计（>10 行触发页内页滚动） ----------
 const css = fs.readFileSync(CSS_PATH, 'utf8');
+// 断言「代码里没有 X」时必须先剥掉注释 —— 注释里常常正好在解释那个被删掉的旧写法
+// （「别写 calc(100dvh - Nxx)」「原先这里是 min-height:420px」），不剥就会把注释当成残留。
+const cssCode = css.replace(/\/\*[\s\S]*?\*\//g, '');
 group('思考过程行数（countLines）');
 check('空串为 0 行', countLines('') === 0);
 check('无换行的单行文本为 1 行', countLines('hello') === 1);
@@ -306,6 +325,95 @@ check('项目行按钮顺序为 ＋ 在前、⋯ 在后',
   uiSrc.indexOf('head.appendChild(add)') < uiSrc.indexOf('head.appendChild(dots)'));
 check('侧栏入口文案为「新建项目」', htmlSrc.includes('<span>新建项目</span>') && !htmlSrc.includes('新建对话'));
 check('空态文案为「暂无项目」', uiSrc.includes('暂无项目'));
+
+// ---------- 6.0 侧栏高度链：项目列表必须是滚动容器（2026-09-29） ----------
+// 历史 bug：#session-list 只是个普通的 flex 子项 —— 没有 flex、没有 min-height:0、
+// 也没有 overflow-y:auto，于是它**不是滚动容器**。项目一多，内容顶破 #sidebar，
+// 而 #app 是 overflow:hidden，溢出部分被视口边缘硬裁掉：内容还在，但滚不到
+// （表现 = 左栏拉不动、底部设置按钮被一起顶出屏幕）。
+// 三件套缺一不可：flex 给它高度、min-height:0 允许收缩（flex 子项默认 auto，
+// 不置 0 永远不缩）、overflow-y:auto 让溢出变成滚动而不是裁剪。
+group('侧栏滚动：项目列表');
+check('项目列表被滚动容器包住（标签留在外面固定，只有列表内部滚）',
+  /<div class="sidebar-scroll">\s*<ul id="session-list" class="session-list"><\/ul>\s*<\/div>/.test(htmlSrc));
+check('滚动容器三件套齐全：flex 分配高度 + min-height:0 允许收缩 + overflow-y:auto',
+  /\.sidebar-scroll\s*\{[^}]*flex:\s*1 1 0[^}]*min-height:\s*0[^}]*overflow-y:\s*auto/.test(css));
+check('#sidebar 自身也允许被压扁（min-height:0，否则内部仍会溢出）',
+  /#sidebar\s*\{[^}]*flex-direction:\s*column[^}]*min-height:\s*0/.test(css));
+check('不再留没有挂载点的旧滚动规则（.sidebar-body 从未被任何元素使用）',
+  /\.sidebar-scroll\s*\{/.test(css) && !/\.sidebar-body\s*\{/.test(css) &&
+  !/sidebar-body/.test(htmlSrc) && !/sidebar-body/.test(uiSrc));
+check('拉条藏掉但滚动能力保留（Firefox / Chromium / 旧 Edge 三条都要覆盖）',
+  /\.sidebar-scroll\s*\{[^}]*scrollbar-width:\s*none/.test(css) &&
+  /\.sidebar-scroll\s*\{[^}]*-ms-overflow-style:\s*none/.test(css) &&
+  /\.sidebar-scroll::\-webkit-scrollbar\s*\{\s*width:\s*0;\s*height:\s*0;\s*\}/.test(css));
+check('没有对 #sidebar 加 overflow:hidden（会裁掉底部栏里向上弹的 .ctx-pop）',
+  !/#sidebar\s*\{[^}]*overflow:\s*hidden/.test(css));
+check('列表本身不再自带高度/滚动约束（那属于外层滚动容器的职责）',
+  !/^\.session-list\s*\{[^}]*overflow/.test(css) && !/^\.session-list\s*\{[^}]*min-height/.test(css));
+
+// 侧栏内部按「左右大分栏」的手法再分两卡：MCP 一张、项目一张，
+// 缝隙里露出 #sidebar 的底色，隔离带是缝中间那根圆角手柄。
+// 不是画一条横线 —— 上下两块必须读成两张卡片（用户明确要求「类似左右大分栏的处理方式」）。
+group('侧栏分区：MCP 与项目各成一张卡');
+check('MCP 区被 .sidebar-card 包住',
+  /<div class="sidebar-card">\s*<div class="sidebar-section-label" id="mcp-entry">[\s\S]{0,700}?id="mcp-list"[\s\S]{0,60}?<\/div>/.test(htmlSrc));
+check('项目区被 .sidebar-card-main 包住，且滚动区在它里面',
+  /<div class="sidebar-card sidebar-card-main">[\s\S]{0,900}?id="new-chat-btn"[\s\S]{0,900}?id="sessions-entry"[\s\S]{0,400}?class="sidebar-scroll"/.test(htmlSrc));
+check('卡片四件套齐全：自带底色 + 1px 边 + 圆角 + 内边距（与 #sidebar/#main 同构）',
+  /\.sidebar-card\s*\{[^}]*background:\s*var\(--bg\)[^}]*border:\s*1px solid var\(--border\)[^}]*border-radius:\s*12px[^}]*padding:\s*8px/.test(css) &&
+  /\.sidebar-card\s*\{[^}]*min-height:\s*0/.test(css));
+check('卡片底色比缝隙深一档（照搬 #app 衬底 / 面板的明暗关系）',
+  /#app\s*\{[^}]*background:\s*var\(--bg-elev-2\)/.test(css) &&
+  /#sidebar\s*\{[^}]*background:\s*var\(--bg-elev\)/.test(css) &&
+  /\.sidebar-card\s*\{[^}]*background:\s*var\(--bg\);/.test(css));
+check('开启背景图时两张小卡一起透明化（否则白卡盖在图上，与左右两栏不一致）',
+  /body\.has-bg \.sidebar-card\s*\{\s*background:\s*transparent;/.test(css));
+check('项目卡吃掉侧栏剩余高度，滚动区才能在它内部收缩',
+  /\.sidebar-card-main\s*\{[^}]*flex:\s*1 1 auto[^}]*min-height:\s*0/.test(css));
+check('隔离带落在两张卡之间（不是画一条横线）',
+  /id="mcp-list"[\s\S]{0,700}?class="sidebar-sep"[\s\S]{0,700}?class="sidebar-card sidebar-card-main"[\s\S]{0,700}?id="new-chat-btn"/.test(htmlSrc));
+check('隔离带不可聚焦也不进无障碍树（纯装饰）',
+  /class="sidebar-sep" role="separator" aria-hidden="true"><span class="grip"><\/span><\/div>/.test(htmlSrc));
+check('隔离带复用 #drag-handle 的构造：自身透明 + 正中一根手柄',
+  /\.sidebar-sep\s*\{[^}]*background:\s*transparent[^}]*align-items:\s*center[^}]*justify-content:\s*center/.test(css) &&
+  /\.sidebar-sep \.grip\s*\{/.test(css));
+check('手柄两端收圆角，且横放（横向分隔；#drag-handle 的 .grip 是竖的）',
+  /\.sidebar-sep \.grip\s*\{[^}]*width:\s*28px[^}]*height:\s*3px[^}]*border-radius:\s*3px/.test(css));
+check('负外边距抵消 #sidebar 的 gap，卡间距落到 6px（与 #app 的 padding 对齐）',
+  /\.sidebar-sep\s*\{[^}]*height:\s*6px[^}]*margin:\s*-10px 0/.test(css) &&
+  /#sidebar\s*\{[^}]*gap:\s*10px/.test(css) &&
+  /#app\s*\{[^}]*padding:\s*6px/.test(css));
+check('隔离带不参与高度分配、也不假装可拖（不复制 #drag-handle 的 hover/光标）',
+  /\.sidebar-sep\s*\{[^}]*flex:\s*0 0 auto/.test(css) &&
+  !/\.sidebar-sep:hover/.test(css) && !/\.sidebar-sep\s*\{[^}]*cursor:\s*col-resize/.test(css));
+
+// ---------- 6.05 左栏 MCP 只报启用数量（2026-09-29） ----------
+// 早先这里逐个列 MCP 服务名。侧栏只有 240px，几个名字就把下面的项目列表顶没了，
+// 而项目列表才是左栏主体。改成一行「已启用 N 个」，明细（谁在跑 / 谁加载失败 /
+// 端点）挪进这一行的 title：悬停看得到，不占垂直空间。
+group('左栏 MCP：只报启用数量');
+const mcpListFn = extractFunction(uiSrc, 'renderMcpList');
+check('只渲染一行汇总（不再 items.forEach 逐个建 li）',
+  /nm\.textContent = '已启用 ' \+ on\.length \+ ' 个'/.test(mcpListFn) &&
+  !/items\.forEach\(function \(p\)/.test(mcpListFn));
+check('计数口径 = configured 的 MCP 插件里 enabled 的个数（与运行态同源）',
+  /const on = items\.filter\(function \(p\) \{ return p\.enabled; \}\)/.test(mcpListFn) &&
+  /p\.type === 'mcp' \|\| p\.type === 'mcp-http'\) && p\.configured/.test(mcpListFn));
+check('圆点跟着计数走 on/off（复用既有配色：全绿=都在跑，全灰=一个都没起来）',
+  /li\.className = 'mcp-count ' \+ \(on\.length \? 'on' : 'off'\)/.test(mcpListFn) &&
+  /\.mcp-list li\.on \.dot\s*\{/.test(css) && /\.mcp-list li\.off \.dot\s*\{/.test(css));
+check('明细保留在 title 里（启用数 + 加载失败数 + 逐条端点），不静默丢掉',
+  /li\.title = '共 ' \+ items\.length/.test(mcpListFn) &&
+  /items\.map\(function \(p\) \{ return \(p\.enabled \? '● ' : '○ '\) \+ mcpTitle\(p\); \}\)/.test(mcpListFn) &&
+  /设置 → MCP 服务/.test(mcpListFn));
+check('未配置时仍是「尚未添加」提示（0 个不能显示成「已启用 0 个」）',
+  /if \(!items\.length\) \{\s*\n\s*list\.innerHTML = '<li class="mcp-empty"[^>]*>尚未添加/.test(mcpListFn));
+check('MCP 汇总行不参与高度分配（固定一行，不许被压缩）',
+  /\.mcp-list\s*\{[^}]*flex:\s*none/.test(css));
+check('汇总行样式：有服务在跑时用正文色，数字等宽防刷新抖动',
+  /\.mcp-list li\.mcp-count\s*\{[^}]*color:\s*var\(--text\)/.test(css) &&
+  /\.mcp-list li\.mcp-count \.mcp-n\s*\{[^}]*font-variant-numeric:\s*tabular-nums/.test(css));
 
 // ---------- 6.1 项目显示名与工作区键解耦（2026-09-14） ----------
 // 「重命名项目」只改显示名（workspace_names 表），绝不动 sessions.workspace ——
@@ -595,8 +703,11 @@ check('内建插件都配了中文别名（用户反馈「显示代号不好看�
 check('接口下发 display_name，但仍原样下发 name 供定位',
   /"display_name": p\.Label\(\)/.test(
     fs.readFileSync(path.join(__dirname, '../..', 'pkg/server/api_handlers.go'), 'utf8')));
-check('侧栏与设置列表用显示名，标识退到 title / 小字',
-  /nm\.textContent = \(p\.display_name \|\| p\.name\)/.test(uiSrc) &&
+check('设置列表用显示名，标识退到小字；侧栏明细同源（共用 mcpTitle）',
+  // 侧栏早先逐个列服务名，现已收成一行汇总（明细在 title 里），所以「侧栏那一半」
+  // 的契约改为：mcpTitle 里显示名在前、标识进括号，两者不再各写一份文案。
+  /function mcpTitle\(p\)/.test(uiSrc) &&
+  /p\.display_name \+ '（' \+ p\.name \+ '）'/.test(extractFunction(uiSrc, 'mcpTitle')) &&
   /const label = p\.display_name \|\| p\.name;/.test(uiSrc) &&
   /alias\.className = 'mi-alias'/.test(uiSrc) &&
   /\.mi-name \.mi-alias \{/.test(css));
@@ -822,7 +933,7 @@ check('别名展开、附件准备与 WS 发送成功后才清空输入框', (fu
   const expand = submit.indexOf('expandFileAliases(raw)');
   const prepare = submit.indexOf('await prepareMentions(outgoing, raw)');
   const send = submit.indexOf('if (!wsSend({');
-  const clear = submit.indexOf("input.value = '';");
+  const clear = submit.indexOf("setInputValue('');");
   return expand >= 0 && expand < prepare && prepare < send && send < clear;
 })());
 check('prepareMentions 显式分开「发送文本」与「气泡显示文本」',
@@ -874,20 +985,45 @@ check('内容变化即重画：input 事件',
   /input\.addEventListener\('input', function \(\) \{\s*\n?\s*syncInputMirror\(\)/.test(uiSrc));
 check('滚动位置同步：scroll 事件',
   /input\.addEventListener\('scroll', syncInputMirror\)/.test(uiSrc));
-check('程序化改动也同步：发出后清空',
-  /input\.value = '';\s*\n\s*syncInputMirror\(\)/.test(uiSrc));
-check('程序化改动也同步：@面板选中 / ＋菜单插入',
-  /input\.value = before \+ '@' \+ token \+ ' ' \+ after;\s*\n\s*syncInputMirror\(\)/.test(uiSrc) &&
-  /input\.value = before \+ sep \+ ins \+ after;\s*\n\s*syncInputMirror\(\)/.test(uiSrc));
+check('程序化改动走 setInputValue 单一出口（发出后清空 / @面板 / ＋菜单 / 转向）',
+  // 2026-09-29：拆出 setInputValue 之前，这些点各自写 `input.value = X; syncInputMirror()`，
+  // 少调一次 syncSendBtn 就是「打完字按钮还停在打断态」。断言锁住出口 + 无残留裸写。
+  /function setInputValue\(v\) \{\s*\n\s*input\.value = v;\s*\n\s*syncInputMirror\(\);\s*\n\s*syncSendBtn\(\);/.test(uiSrc) &&
+  /if \(override === undefined\) setInputValue\(''\);/.test(uiSrc) &&
+  /setInputValue\(before \+ '@' \+ token \+ ' ' \+ after\)/.test(uiSrc) &&
+  /setInputValue\(before \+ sep \+ ins \+ after\)/.test(uiSrc) &&
+  // 除了 setInputValue 自身，源码里不该再有裸的 input.value = … 紧跟 syncInputMirror
+  !(uiSrc.replace(/function setInputValue\(v\) \{[\s\S]*?\n  \}/, '')
+    .match(/input\.value = [^;]+;\s*\n\s*syncInputMirror\(\)/)));
 
-// ---------- 9. 发送 / 打断按钮共色 ----------
-group('发送 / 打断按钮颜色');
+// ---------- 9. 发送 / 打断按钮：状态与实际点击后果一致 ----------
+group('发送按钮三态（打断 / 发送 / 无内容变暗）');
 check('运行中的打断按钮为危险色（区别于发送按钮的 accent）',
   // 发送按钮是「实心 accent + 白字」→ 用 accent-solid（白字对比度才够）；
   // 断言意图不变：它仍与 danger 区分开、也不该退化成 text-dim。
   /#send-btn\s*\{[^}]*background:\s*var\(--accent-solid\)/.test(css) &&
   /#send-btn\.running\s*\{[^}]*background:\s*var\(--danger\)/.test(css) &&
   !/#send-btn\.running\s*\{[^}]*background:\s*var\(--text-dim\)/.test(css));
+check('三态判定与 submitMessage 的实际分支一一对应',
+  // 提交分支：running && 有字 → steerNow（转向）；running && 无字 → cancel（打断）；
+  // 否则 raw 为空直接 return。按钮显示的必须是「点下去会发生什么」。
+  /const stop = running && !hasText;/.test(uiSrc) &&
+  /const dim = !running && !hasText;/.test(uiSrc) &&
+  /if \(running\) \{\s*\n\s*\/\/ 运行中按发送 = 转向[\s\S]{0,200}?if \(String\(input\.value\)\.trim\(\)\) \{ steerNow\(\); return; \}/.test(uiSrc) &&
+  /const raw = String\([^)]*\)\.trim\(\);\s*\n\s*if \(!raw\) return;/.test(uiSrc));
+check('单一定态出口：改 running / 写 input.value 都走 syncSendBtn',
+  /function syncSendBtn\(\)/.test(uiSrc) &&
+  // 不允许再各自 add/remove class —— 早先 3 处各改各的，漏一处就与实际行为不符
+  !/sendBtn\.classList\.(add|remove)\('(running|dim)'\)/.test(uiSrc) &&
+  (uiSrc.match(/syncSendBtn\(\)/g) || []).length >= 6);
+check('无内容时按钮变暗，且 hover 不再提亮成「能点」',
+  /#send-btn\.dim\s*\{[^}]*background:\s*var\(--bg-elev\)[^}]*cursor:\s*default/.test(css) &&
+  /#send-btn\.dim:hover \{ filter: none; \}/.test(css));
+check('打断提示随「运行中的会话是否在当前视图」变化',
+  // runAway() 比的是 sessionID，所以必须在 sessionID 换掉之后才刷新
+  /sessionID = ev\.session_id \|\| '';[\s\S]{0,200}?syncSendBtn\(\);/.test(uiSrc) &&
+  /runAway\(\) \? '（正在运行的会话）' : ''/.test(uiSrc) &&
+  !/if \(running\) sendBtn\.title/.test(uiSrc));
 
 // ---------- 10. 任务等待提示：模型响应前 / 工具返回后 ----------
 group('任务等待提示');
@@ -913,10 +1049,10 @@ check('idle/error/hitl 结束或暂停时移除等待提示',
   (uiCase('error').includes('removeThinking()') || uiCase('error').includes('clearRunVisuals()')) &&
   uiCase('hitl_request').includes('removeThinking()'));
 
-// ---------- 10. ＋ 更多菜单：添加文件 / Skills（右展） ----------
+// ---------- 10. ＋ 更多菜单：添加文件 / Skills和技能（右展） ----------
 // 点 ＋ → 图标变 ✕ + 上拉菜单；「添加文件」按平台分流（Windows 资源管理器 / 其他内置选择器），
-// 「Skills」向右展开已加载技能并点选插入 @技能名。
-group('＋ 更多菜单：添加文件 / Skills');
+// 「Skills和技能」向右展开**两类**：工作区已加载的技能（插 @技能名）+ 内置插件（插 @id）。
+group('＋ 更多菜单：添加文件 / Skills和技能');
 // ＋↔✕ 用「加号旋转 45°」做形变（旋转 45° 的加号就是叉号），所以有过渡动画；
 // 换字符（textContent='✕'）是硬跳，不能再退回去。
 check('＋→✕ 用旋转形变而非换字符',
@@ -928,7 +1064,16 @@ check('旋转带过渡，且尊重「减少动态效果」',
 check('按钮内含加号 SVG（旋转的是图标本身）',
   /id="more-btn"[\s\S]{0,300}?<svg[\s\S]{0,200}?M12 5v14M5 12h14/.test(htmlSrc));
 check('菜单两项存在', /id="more-add-file"/.test(htmlSrc) && /id="more-skills"/.test(htmlSrc));
-check('Skills 子菜单向右展开',
+// 菜单名必须写全：这个二级菜单同时列技能（SKILL.md）和内置插件（@id 触发词），
+// 只写「Skills」会让人以为里面只有 SKILL.md，进去发现还有 Plan 之类就以为点错了。
+check('菜单名为「Skills和技能」（子菜单确实两类都列）',
+  /id="more-skills"[\s\S]{0,200}?<span>Skills和技能<\/span>/.test(htmlSrc) &&
+  !/<span>Skills<\/span>/.test(htmlSrc));
+check('子菜单两类都列：技能（@slug）+ 内置插件（@id）',
+  /fetch\('\/api\/skills'\)/.test(extractFunction(uiSrc, 'renderMoreSkills')) &&
+  /fetch\('\/api\/builtin-plugins'\)/.test(extractFunction(uiSrc, 'renderMoreSkills')) &&
+  /insertIntoInput\('@' \+ sk\.name\)/.test(uiSrc));
+check('Skills和技能 子菜单向右展开',
   /popup popup-right/.test(htmlSrc) && /\.popup\.popup-right\s*\{[^}]*left:\s*calc\(100% \+/.test(css));
 check('添加文件按平台分流：Windows 资源管理器 / 其他内置选择器',
   /fetch\('\/api\/pick_file'/.test(uiSrc) &&
@@ -968,7 +1113,7 @@ check('图标状态跟随弹层实际显隐（防停在 ✕）',
   /new MutationObserver/.test(uiSrc) &&
   /if \(visible !== moreOpen\) syncMoreIcon\(visible\)/.test(uiSrc));
 check('Esc 关闭', /e\.key === 'Escape' && moreOpen/.test(uiSrc));
-check('Skills 点选插入 @技能名（复用 @ 提及语义）',
+check('技能点选插入 @技能名（复用 @ 提及语义）',
   /insertIntoInput\('@' \+ sk\.name\)/.test(uiSrc));
 check('样式契约：禁用态 / 选中态 / 右展子菜单',
   /\.picker-actions button:disabled\s*\{/.test(css) &&
@@ -1098,7 +1243,10 @@ check('「添加模型」tab 仍是独立的空白新建态（未被编辑复用
 check('点「添加模型」tab 回到空白新建态',
   /name === 'config'\) \{[\s\S]{0,140}?loadLibrary\(\)\.then\(function \(\) \{ resetForm\(\); \}\)/.test(uiSrc));
 check('供应商 tab 切换时重新渲染供应商列表',
-  /name === 'prov'\) \{[\s\S]{0,80}?renderProviders\(\)/.test(uiSrc));
+  // 2026-09-29：模型列表与供应商详情数据同源，切到任一子 Tab 都走 loadModelViews()
+  // （一次取数 + 重绘两个视图），不再分别调各自的 render。
+  /name === 'config'\)[\s\S]{0,400}?\} else \{\s*loadModelViews\(\)/.test(uiSrc) &&
+  /function loadModelViews\(\)[\s\S]{0,120}?loadLibrary\(\)\.then\(renderModelViews\)/.test(uiSrc));
 check('对话框模型弹层列出模型库全部条目（不再只显示当前一个）',
   // 现在遍历的是「按当前供应商过滤后」的列表（modelChoices 的子集），
   // 全部条目仍来自 modelChoices；切供应商时自动换列表。
@@ -1111,7 +1259,10 @@ check('弹层点选即切换生效模型（/api/models/apply）',
   /switchActiveModel\(m\.id\)/.test(uiSrc) &&
   /fetch\('\/api\/models\/apply'/.test(uiSrc));
 check('保存成功：刷新模型列表并用新快照刷新对话框选择',
-  /showMTab\('list'\);[\s\S]{0,240}?modelsLoaded = false;[\s\S]{0,140}?loadLibrary\(\)\.then\(function \(\) \{ renderModelItems\(\); loadModels\(\); \}\)/.test(uiSrc));
+  // 2026-09-29：收敛到 refreshModelViews()——它内部置 modelsLoaded=false 并调
+  // loadModels()，所以「新条目出现在对话框模型选择里」这个语义由出口保证。
+  /showMTab\('list'\);[\s\S]{0,200}?refreshModelViews\(\);/.test(uiSrc) &&
+  /function refreshModelViews\(\)[\s\S]{0,200}?return loadModels\(\)/.test(uiSrc));
 check('样式契约：弹层列表限高滚动 + 表单标题',
   /#model-list\s*\{[^}]*max-height[^}]*overflow-y:\s*auto/.test(css) &&
   /\.mf-title\s*\{/.test(css));
@@ -1122,6 +1273,142 @@ check('编辑未动密钥时不提交 key_value（不删除已存 key）',
   /editingIndex >= 0 && !keyTouched/.test(uiSrc) &&
   /keyTouched = false; \/\/ 刚回填的表单没有改过密钥/.test(uiSrc) &&
   /keyTouched = true/.test(uiSrc));
+
+// ---------- 模型管理页：tab 条独占一行且居中；供应商管理收敛成一屏 ----------
+group('模型管理页：tab 条独占一行且居中');
+check('HTML 里有独立的 tab 条行，里面只有那颗 pill',
+  /<div class="models-tabs-bar">\s*<div class="models-tabs">[\s\S]{0,400}?<\/div>\s*<\/div>/.test(htmlSrc));
+// ⚠️ 契约：**不许**做 sticky。悬浮在内容之上会盖住从下方滚过去的文字
+//（用户反馈：「不能覆盖到下面的滚动文字」）。它只是普通的一行，
+// 下面内容从这一行的下沿开始排。
+check('tab 条不悬浮（无 sticky / 无 z-index 抬层）',
+  /\.models-tabs-bar\s*\{[^}]*position:\s*sticky/.test(cssCode) === false &&
+  !/\.models-tabs\s*\{[^}]*position:\s*sticky/.test(cssCode) &&
+  !/\.models-tabs-bar\s*\{[^}]*z-index/.test(cssCode));
+check('tab 条行不吃高度也不需要不透明背板（既然不悬浮，遮盖的问题就不存在）',
+  /\.models-tabs-bar\s*\{[^}]*margin:\s*-10px 0 14px/.test(cssCode) &&
+  /\.models-tabs-bar\s*\{[^}]*background/.test(cssCode) === false);
+check('负上外边距把 pill 贴向顶部（吃掉 .settings-content 的 26px 上内边距）',
+  /\.models-tabs-bar\s*\{[^}]*margin:\s*-10px 0 14px/.test(cssCode) &&
+  /\.settings-content\s*\{[^}]*padding:\s*26px 30px/.test(css));
+check('pill 在这一行里居中：块级 flex + fit-content + auto 外边距（inline-flex 无法 auto 居中）',
+  /\.models-tabs\s*\{[^}]*display:\s*flex[^}]*width:\s*fit-content[^}]*margin:\s*0 auto/.test(cssCode) &&
+  // 居中后不能再靠 margin-bottom 撑开与内容的距离
+  !/\.models-tabs\s*\{[^}]*margin-bottom/.test(cssCode));
+check('三个 tab 按钮与 data-mtab 接线未被动过',
+  /class="models-tab active" data-mtab="list">模型列表</.test(htmlSrc) &&
+  /data-mtab="prov">供应商管理</.test(htmlSrc) &&
+  /data-mtab="config">添加模型</.test(htmlSrc));
+
+group('模型管理页：供应商管理收敛成一屏');
+check('高度预算走 flex 链，不写 100dvh - Nxx 魔数（内边距一改就错位成「差几像素也要滚」）',
+  /\.settings-page#page-models\.active\s*\{[^}]*display:\s*flex[^}]*flex-direction:\s*column[^}]*height:\s*100%/.test(css) &&
+  /#mtab-prov\.active\s*\{[^}]*display:\s*flex[^}]*flex:\s*1 1 auto[^}]*min-height:\s*0/.test(css) &&
+  !/calc\(100dvh/.test(cssCode));
+check('去掉 min-height:420px 硬地板（有它在，内容短时白撑空白把页面顶到要滚）',
+  /\.prov-md\s*\{[^}]*flex:\s*1 1 auto[^}]*min-height:\s*260px/.test(css) &&
+  !/min-height:\s*420px/.test(cssCode));
+check('两列各自在内部滚（min-height:0 + overflow-y:auto），页面本身永远不滚',
+  /\.prov-list\s*\{[^}]*min-height:\s*0[^}]*overflow-y:\s*auto/.test(cssCode) &&
+  /\.prov-detail\s*\{[^}]*min-height:\s*0[^}]*overflow-y:\s*auto/.test(cssCode));
+// ⚠️ 两处会让「内部滚动」静默失效的坑：
+//  ① 行高必须是 minmax(0,1fr)。隐式行是 auto（按内容高），内容比容器高时行会溢出、
+//     被 .prov-md 的 overflow:hidden 裁掉，两列的 overflow-y:auto 压根不触发 ——
+//     症状是「下半截看不见，也滚不动」。
+//  ② .prov-detail 绝不能是 flex 列容器。它是块流排版，flex 没用；换上 flex 反而
+//     让 .pv-disc（获取模型列表，overflow:hidden）的自动最小尺寸变成 0，
+//     空间不够时被压到 0 高，里面的 .disc-list 一起消失（2026-09 反馈）。
+check('行高锁成 minmax(0,1fr)，两列才有确定的行高可分（auto 行会溢出被裁，滚不动）',
+  /\.prov-md\s*\{[^}]*grid-template-rows:\s*minmax\(0, 1fr\)/.test(cssCode));
+check('.prov-detail 保持块流（不得改成 flex 列，否则获取模型列表面板被压扁消失）',
+  /\.prov-detail\s*\{[^}]*\}/.test(cssCode) && // 能匹配到规则
+  !/\.prov-detail\s*\{[^}]*display:\s*flex/.test(cssCode) &&
+  // 判据的另一半：那个面板确实是 overflow:hidden（所以在 flex 里会被压到 0 高）
+  /\.pv-disc\s*\{[^}]*overflow:\s*hidden/.test(cssCode) &&
+  /\.disc-list\s*\{[^}]*max-height:\s*300px[^}]*overflow-y:\s*auto/.test(cssCode));
+check('表单改两列网格（原先 5 个整宽竖排字段就 ~320px，单它一个就撑爆一屏）',
+  /\.prov-form\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/.test(css) &&
+  /\.prov-form \.f-field-wide\s*\{\s*grid-column:\s*1 \/ -1/.test(css));
+check('长值字段（Base URL / 密钥 / 停用开关）占满整行，其余两两并排',
+  /form\.appendChild\(domField\('名称', nameIn\)\);\s*\n\s*form\.appendChild\(domField\('兼容协议', protoSel\)\);\s*\n\s*form\.appendChild\(domField\('Base URL', urlIn, 'f-field-wide'\)\);\s*\n\s*form\.appendChild\(domField\('密钥', key\.node, 'f-field-wide'\)\)/.test(uiSrc) &&
+  /domEl\('label', 'f-field f-field-wide'\)/.test(uiSrc));
+check('domField 的第三参是可选类名（共享函数，加必填会连带改掉模型表单的 4 处调用）',
+  /function domField\(label, control, cls\) \{[\s\S]{0,200}?domEl\('label', 'f-field' \+ \(cls \? ' ' \+ cls : ''\)\)/.test(uiSrc) &&
+  // 模型表单那两处仍是两参调用
+  /domField\('显示名称', nameIn\)/.test(uiSrc) && /domField\('模型 id', idIn\)/.test(uiSrc));
+check('内边距同步收窄（省下的高度正是给表单两列用的）',
+  /\.prov-detail\s*\{[^}]*padding:\s*14px 18px 16px/.test(css) &&
+  /\.prov-item\s*\{[^}]*padding:\s*7px 10px/.test(css) &&
+  /\.prov-sub\s*\{[^}]*margin:\s*14px 0 6px/.test(css) &&
+  /\.prov-actions\s*\{[^}]*margin-top:\s*10px/.test(css));
+
+group('模型管理页：添加模型的按钮不用滚到底才够得着');
+// 故障：「保存 / 测试连接」在表单最下方，7 个整宽竖排字段把它顶到一屏开外，
+// 想点保存得先滚到底（2026-09 反馈）。修法两条：表单改两列（高度直接砍半），
+// 并且滚动只发生在表单区内部，动作条留在卡片底部常驻。
+const cfgHtml = (function () {
+  const a = htmlSrc.indexOf('id="mtab-config"');
+  // 切到本 section 结束（要含整个动作条，不能切在 #mf-save 之前）
+  const b = htmlSrc.indexOf('</section>', a);
+  return a < 0 ? '' : htmlSrc.slice(a, b);
+})();
+// 「滚动区内容」= 从 <div class="mf-scroll"> 到**真正**把它关掉的那个 </div> 之间。
+// ⚠️ 只能用深度计数找边界：光比较 indexOf 大小 / 用 lastIndexOf('</div>') 都判不出来 ——
+// 把面板挪到滚动区外面之后，index 顺序照样不变、动作条前照样有个 </div>，断言会假过。
+function innerOfDiv(html, openMarker) {
+  const start = html.indexOf(openMarker);
+  if (start < 0) return '';
+  const re = /<div\b|<\/div>/g;
+  re.lastIndex = start + openMarker.length;
+  let depth = 1, m;
+  while ((m = re.exec(html))) {
+    depth += m[0] === '</div>' ? -1 : 1;
+    if (depth === 0) return html.slice(start + openMarker.length, m.index);
+  }
+  return '';
+}
+const cfgScrollInner = innerOfDiv(cfgHtml, '<div class="mf-scroll">');
+check('表单区与动作条分开：.mf-scroll 里是表单 + 上游模型面板，动作条在它外面',
+  /class="mf-scroll">\s*<div class="form-grid">/.test(cfgHtml) &&
+  // 上游模型勾选面板也必须放进滚动区（否则展开后把动作条顶下去）
+  cfgScrollInner.includes('id="mf-discover-panel"') &&
+  !cfgScrollInner.includes('class="mf-actions"'));
+check('动作条（测试连接 / 重置 / 保存）完整且在滚动区之外',
+  /id="mf-test">测试连接</.test(cfgHtml) && /id="mf-reset">重置</.test(cfgHtml) &&
+  /id="mf-save" class="primary">保存</.test(cfgHtml) &&
+  cfgHtml.lastIndexOf('class="mf-actions"') > cfgHtml.indexOf('id="mf-discover-panel"'));
+check('高度链与滚动边界：pane / 卡片 / .mf-scroll 各负其职，标题与动作条不收缩',
+  /#mtab-config\.active\s*\{[^}]*display:\s*flex[^}]*flex:\s*1 1 auto[^}]*min-height:\s*0/.test(cssCode) &&
+  /#mtab-config > \.settings-card\s*\{[^}]*flex:\s*1 1 auto[^}]*min-height:\s*0[^}]*display:\s*flex[^}]*flex-direction:\s*column/.test(cssCode) &&
+  /\.mf-scroll\s*\{[^}]*flex:\s*1 1 auto[^}]*min-height:\s*0[^}]*overflow-y:\s*auto/.test(cssCode) &&
+  /#mtab-config \.mf-title,\s*\n?\s*#mtab-config \.mf-actions\s*\{\s*flex:\s*none/.test(cssCode));
+check('表单改两列，且作用域限死在本页（.form-grid 是共享类，全局改会连带变形另三个表单）',
+  /#mtab-config \.form-grid\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/.test(cssCode) &&
+  // 共享的 .form-grid 本身必须还是单列竖排
+  /^\.form-grid\s*\{[^}]*display:\s*flex[^}]*flex-direction:\s*column/m.test(cssCode) &&
+  // 另外三个表单 + ui.js 的就地编辑都还在用它
+  (htmlSrc.match(/class="form-grid"/g) || []).length >= 4 &&
+  /domEl\('div', 'form-grid'\)/.test(uiSrc));
+check('长值字段占满整行：模型 id（带「获取模型列表」按钮）/ 密钥 / 上下文 / 继承块',
+  /class="f-field f-field-wide" id="mf-inherit-field"/.test(cfgHtml) &&
+  /class="f-field f-field-wide"><span>模型 id</.test(cfgHtml) &&
+  /class="f-field f-field-wide" id="mf-key-field"/.test(cfgHtml) &&
+  /class="f-field ctx-row f-field-wide"/.test(cfgHtml) &&
+  /#mtab-config \.f-field-wide\s*\{\s*grid-column:\s*1 \/ -1/.test(cssCode));
+// 窄字段必须成对相邻，否则网格里会留下半行空洞。
+// 选供应商时 请求地址 / 协议 / 密钥 由 JS 整组隐藏（ui.js syncProvForm），
+// 隐藏的格子在 grid 里不留空位，所以两种组合都是整行。
+check('窄字段两两成对：供应商|显示名称 一行、请求地址|协议 一行（DOM 顺序已按网格排）',
+  cfgHtml.indexOf('id="mf-prov"') < cfgHtml.indexOf('id="mf-name"') &&
+  cfgHtml.indexOf('id="mf-name"') < cfgHtml.indexOf('id="mf-url-field"') &&
+  cfgHtml.indexOf('id="mf-url-field"') < cfgHtml.indexOf('id="mf-proto-field"') &&
+  cfgHtml.indexOf('id="mf-proto-field"') < cfgHtml.indexOf('id="mf-id"') &&
+  cfgHtml.indexOf('id="mf-id"') < cfgHtml.indexOf('id="mf-key-field"'));
+check('隐藏靠 hidden 属性，且全局有 [hidden]{display:none!important} 兜住 .f-field 的 display:flex',
+  /document\.getElementById\('mf-url-field'\)\.hidden = !!p/.test(uiSrc) &&
+  /document\.getElementById\('mf-key-field'\)\.hidden = !!p/.test(uiSrc) &&
+  /document\.getElementById\('mf-proto-field'\)\.hidden = !!p/.test(uiSrc) &&
+  /\[hidden\] \{ display: none !important; \}/.test(cssCode));
 
 // ---------------------------------------------------------------------------
 // 运行中体验：思考过程自动贴底 / 允许切换会话 + 运行中会话转圈 / 事件按会话路由
@@ -1159,14 +1446,38 @@ check('HITL 审批带会话来源（服务端下发 + 前端标注）',
   /\.msg-approval\.from-other\s*\{/.test(css));
 
 // ---------------------------------------------------------------------------
-// 思考强度拉条：关闭档 + 按协议记忆（localStorage）
-// 关闭档 = 直接不发上游参数，兼容不支持 reasoning_effort / thinking 的模型。
-group('思考强度：关闭档 / 按协议记忆');
-check('后端规格含关闭档（openai 首档 none / anthropic Min=0）',
+// 思考强度拉条：档位集合 + 按协议记忆（localStorage）
+// 2026-09-29：OpenAI 侧从 5 档扩到 8 档（none/default/minimal/low/medium/high/xhigh/max），
+// 界面一律显示首字母大写的英文原名；Anthropic 仍是 token 连续滑条。
+group('思考强度：档位集合 / 按协议记忆');
+check('后端规格：无参关闭语义已拆成 none 与 default 两档',
+  // 2026-09-29 之前只有「关闭 = 不发参数」一档，于是「不思考」和「让模型自己定」
+  // 不可表达。两者在请求上必须不同，否则默认档就是假分档。
   /OffThinkingValue\s*=\s*"none"/.test(fs.readFileSync(
+    path.join(__dirname, '..', '..', 'pkg', 'llm', 'thinking.go'), 'utf8')) &&
+  /DefaultThinkingValue\s*=\s*"default"/.test(fs.readFileSync(
     path.join(__dirname, '..', '..', 'pkg', 'llm', 'thinking.go'), 'utf8')) &&
   /isOffThinking\(v\)/.test(fs.readFileSync(
     path.join(__dirname, '..', '..', 'pkg', 'llm', 'thinking.go'), 'utf8')));
+check('openai 档位是官方八档，顺序与取值都锁住',
+  (function () {
+    const go = fs.readFileSync(path.join(__dirname, '..', '..', 'pkg', 'llm', 'thinking.go'), 'utf8');
+    const m = /Steps: \[\]ThinkingStep\{([\s\S]*?)\n\t\t\t\}/.exec(go);
+    if (!m) return false;
+    const vals = (m[1].match(/Value:\s*(?:"[a-z]+"|[A-Za-z][A-Za-z0-9_]*)/g) || [])
+      .map(function (s) { return s.replace(/^Value:\s*/, '').replace(/"/g, ''); });
+    return vals.join(',') === 'OffThinkingValue,DefaultThinkingValue,minimal,low,medium,high,xhigh,max';
+  })());
+check('none 显式下发、default 不下发（两者在请求上可区分）', (function () {
+  const go = fs.readFileSync(path.join(__dirname, '..', '..', 'pkg', 'llm', 'thinking.go'), 'utf8');
+  const openai = fs.readFileSync(path.join(__dirname, '..', '..', 'pkg', 'llm', 'openai.go'), 'utf8');
+  return /Default 档是唯一返回空串的合法档/.test(go) &&
+    /EqualFold\(st\.Value, DefaultThinkingValue\)\s*\{\s*return ""/.test(go) &&
+    // none 不在特判里 → 落到 return st.Value，即被显式下发
+    !/EqualFold\(st\.Value, OffThinkingValue\)\s*\{\s*return "";/.test(go) &&
+    // 空串才不发参数，所以「返回 default 字符串」这种错会被挡住
+    /if effort := reasoningEffort\(req\.Thinking\); effort != "" \{/.test(openai);
+})());
 check('档位按协议记忆（cf_thinking_<mode>）',
   /function thinkingStorageKey\(spec\) \{ return 'cf_thinking_' \+/.test(uiSrc) &&
   /function pickThinking\(spec\)/.test(uiSrc) &&
@@ -1177,13 +1488,16 @@ check('加载 / 切模型时恢复记忆档位（不再一律吃默认值）',
 check('拖拽 / 点档后落盘记忆',
   (uiSrc.match(/saveThinking\(\);/g) || []).length >= 2 &&
   /saveThinking\(\);\s*\n\s*syncLevelUI\(\);/.test(uiSrc));
-check('关闭档显示为「关闭」',
-  /if \(thinkingVal === 'none'\) return '关闭';/.test(uiSrc) &&
-  /if \(!v \|\| v === '0' \|\| v === 'none'\) return '关闭';/.test(uiSrc));
-check('思考档位枚举首字母大写（Minimal/Low/Medium/High）',
+check('steps 模式用服务端 label 显示（None/Minimal/…/Xhigh/Max），none 不再中文化成「关闭」',
+  // none 是真实下发的档位，中文化成「关闭」会和「不设置」混淆
+  /hit\.label \|\| capitalizeFirst\(hit\.value\)/.test(uiSrc) &&
+  !/if \(thinkingVal === 'none'\) return '关闭'/.test(uiSrc) &&
+  // range（Anthropic）的 0 档仍是「关闭」
+  /if \(!thinkingVal \|\| thinkingVal === 'none' \|\| thinkingVal === '0'\) return '关闭';/.test(uiSrc));
+check('思考档位名首字母大写（缺 label 时退回大写原值）',
   /function capitalizeFirst\(s\)/.test(uiSrc) &&
-  /return val \? capitalizeFirst\(val\) : 'Medium';/.test(uiSrc) &&
-  /return v === 'none' \? '关闭' : capitalizeFirst\(v\);/.test(uiSrc));
+  /return thinkingVal \? capitalizeFirst\(thinkingVal\) : 'Medium';/.test(uiSrc) &&
+  /return hit \? \(hit\.label \|\| capitalizeFirst\(hit\.value\)\) : capitalizeFirst\(v\);/.test(uiSrc));
 
 // ---------- 归档页：项目级恢复（与侧栏「归档」对称） ----------
 // 侧栏 ⋯ 的「归档」一次点掉整组会话；归档页必须能一次恢复整组，
@@ -1438,9 +1752,9 @@ check('编辑按钮不遮挡气泡（order 归位到左侧）',
 
 check('编辑态把该条消息填入输入框并露出发送/取消',
   uiSrc.includes('function startEditMessage') && uiSrc.includes('function exitEditMode') &&
-  /input\.value = text;/.test(uiSrc) && /editBar\.classList\.remove\('hidden'\)/.test(uiSrc));
+  /setInputValue\(text\);/.test(uiSrc) && /editBar\.classList\.remove\('hidden'\)/.test(uiSrc));
 check('取消会清空输入框并收起编辑条（不留下残影）',
-  /function exitEditMode\(restore\)[\s\S]*?if \(restore\) \{[\s\S]*?input\.value = '';[\s\S]*?editBar\.classList\.add\('hidden'\)/.test(uiSrc));
+  /function exitEditMode\(restore\)[\s\S]*?if \(restore\) setInputValue\(''\);[\s\S]*?editBar\.classList\.add\('hidden'\)/.test(uiSrc));
 check('编辑态下按发送走编辑重发，而非普通新消息',
   /if \(isEditing\(\) && override === undefined\) \{ submitEdit\(\); return; \}/.test(uiSrc));
 
@@ -1612,6 +1926,25 @@ check('scrollBottom 在非跟随态不再强行滚底',
 check('scroll 回调据「是否贴近底部」判定跟随态（不靠滚动方向）',
   /followTail\s*=\s*isNearBottom\(\);/.test(uiSrc) &&
   /function isNearBottom\(\)[\s\S]{0,160}?scrollHeight - messagesEl\.scrollTop - messagesEl\.clientHeight <= FOLLOW_NEAR_BOTTOM/.test(uiSrc));
+// 输入卡折叠：上翻按滚动量藏、往回滑按滚动量露，**只有到底才完全弹出**。
+// 早先只要 delta > 0 就整块弹回（composerHide = 0），往回滑 1px 输入框整个跳出来 ——
+// 卡片位移量远大于那点滚动量，视觉上是「弹」而不是「滑」，翻历史看到一半就被糊住。
+check('折叠与收回对称：都按滚动量渐进，不是整块跳',
+  (function () {
+    const h = composerScrollHandler();
+    return /composerHide = Math\.max\(0, Math\.min\(max, composerHide - delta\)\);/.test(h) &&
+      !/if \(delta > 0 \|\|/.test(h);      // 旧写法：任意向下滚动即归零
+  })());
+check('只有滑到最底部才完全弹出（中途只收回一部分）',
+  /if \(followTail\) composerHide = 0;/.test(composerScrollHandler()));
+check('位移写入只有一处，且无位移时不必带 translateY',
+  (function () {
+    const h = composerScrollHandler();
+    const n = (h.match(/composerWrap\.style\.transform =/g) || []).length;
+    return n === 1 && /composerHide \? ' translateY\(' \+ Math\.round\(composerHide\) \+ 'px\)' : ''/.test(h);
+  })());
+check('不再另写 < 80 的魔数（与 FOLLOW_NEAR_BOTTOM 同值，改一处就漂）',
+  !/messagesEl\.scrollHeight - st - messagesEl\.clientHeight < 80/.test(uiSrc));
 check('用户重新发送消息即恢复跟随（否则发问后看不到回复）',
   /followTail = true;[\s\S]{0,260}?addUser\(p\.display\)/.test(uiSrc));
 check('回放历史后恢复跟随；截断信号只重置流式引用、不清空聊天列',
@@ -1679,8 +2012,8 @@ check('历史回放的卡片带 path（点开时向 /api/diff 取 diff）',
   // 也是原始 Input），归一化由服务端 CheckpointFor 的三级容错负责
   // （精确 → 绝对化 → 边界后缀，见 pkg/agent/checkpoints.go 的 pathMatchers）。
   // 前端自己拼绝对路径反而会与「同后缀不同文件」的情况打架。
-  /addTool\(toolLabel\(b\.name, b\.input\), \{ path: toolFilePath\(b\.name, b\.input\) \}\)/.test(uiSrc) &&
-  /function toolFilePath\(name, input\)/.test(uiSrc));
+     /addTool\(toolLabel\(b\.name, b\.input\), \{\s*\n?\s*name: b\.name,\s*\n?\s*path: toolFilePath\(b\.name, b\.input\)\s*\n?\s*\}\)/.test(uiSrc) &&
+     /function toolFilePath\(name, input\)/.test(uiSrc));
 check('未匹配到记录时不谎报「已被回退」',
   // 大多数未命中是路径写法不同（模型传相对路径 / 大小写差异），
   // 改动其实好好地记着 —— 说成「已被回退」是对用户说了假话。
@@ -1778,6 +2111,78 @@ check('编辑模型改为就地展开，不再复用「添加模型」表单',
 check('就地编辑不再提交密钥明文（列表是脱敏视图，提交会覆盖掉已存密钥）',
   /body\.key_source = m\.key_source/.test(uiSrc) &&
   !/key_value:/.test(uiSrc.slice(uiSrc.indexOf('function buildModelEditor'), uiSrc.indexOf('function buildModelEditor') + 3000)));
+
+// ---------- 模型库刷新：单一出口（2026-09-29）----------
+// 故障：在「供应商管理」里删模型，模型确实没了，列表却不动，重新进入该页面才对。
+// 原因：模型行同时渲染在两个视图（模型列表 #model-items / 供应商详情 #prov-detail），
+// 而删除回调只刷了 renderModelItems —— 供应商详情那块 DOM 从没重绘。
+// 修法：抽出 refreshModelViews() 作唯一出口，两个 render 退化为纯渲染。
+group('模型库视图刷新走单一出口');
+check('存在统一出口，一次取数后重绘两个视图 + 同步主界面',
+  /function refreshModelViews\(\)/.test(uiSrc) &&
+  /modelsLoaded = false;[\s\S]{0,120}?loadLibrary\(\)\.then\(function \(\) \{\s*renderModelItems\(\);\s*renderProviders\(\);/.test(uiSrc) &&
+  /function loadModelViews\(\)/.test(uiSrc));
+check('两个 render 都不再自带 loadLibrary（纯渲染，避免重复取数）',
+  // 取数收敛到出口后，render 里再拉一次就是同一 endpoint 打两次
+  !/function renderModelItems\(\)[\s\S]{0,400}?loadLibrary\(\)/.test(uiSrc) &&
+  !/function renderProviders\(\)[\s\S]{0,400}?loadLibrary\(\)/.test(uiSrc));
+check('没有任何取数点自带「取完就刷视图」的组合', (function () {
+  // 不变量（比数个数更耐改）：loadLibrary 的每个调用点，后面都不允许直接跟
+  // renderModelItems / renderProviders —— 那正是本次漏刷的形态。
+  // 先把两个出口函数体摘掉，它们内部的取数是设计如此（由下一条断言锁住职责）。
+  const body = uiSrc
+    .replace(/function refreshModelViews\(\)[\s\S]*?\n  \}/, '')
+    .replace(/function loadModelViews\(\)[\s\S]*?\n  \}/, '');
+  const re = /loadLibrary\(\)/g;
+  let m, bad = 0, n = 0;
+  while ((m = re.exec(body)) !== null) {
+    n++;
+    if (/renderModelItems\(\)|renderProviders\(\)|renderModelViews\(\)/.test(body.slice(m.index, m.index + 90))) bad++;
+  }
+  return n >= 3 && bad === 0;   // 摘掉出口后应剩：gotoAddModel、切 config tab
+})());
+check('两个出口各自承担职责：refreshModelViews 刷全部并同步主界面，loadModelViews 只重绘',
+  /function refreshModelViews\(\) \{\s*\n\s*modelsLoaded = false;[\s\S]{0,200}?renderModelItems\(\);\s*\n\s*renderProviders\(\);\s*\n\s*return loadModels\(\);/.test(uiSrc) &&
+  /function loadModelViews\(\) \{\s*\n\s*return loadLibrary\(\)\.then\(renderModelViews\);/.test(uiSrc));
+check('无条件重绘两个视图，不按当前 tab 条件刷',
+  // 早先 applyModel 里的 `if (mtab-prov.active) renderProviders()` 就是条件判断
+  // 漏刷的第二处；且它后面紧跟 showPage('general')，条件恒真、本就是死代码。
+  !/mtab-prov'\)\.classList\.contains\('active'\)/.test(uiSrc));
+check('modelRowEl 不再收 afterChange 钩子（钩子只有一个调用点传且没传）',
+  /function modelRowEl\(m\)/.test(uiSrc) &&
+  !/opts\.afterChange/.test(uiSrc));
+check('模型删除成功后走统一出口（供应商页删模型即时消失）', (function () {
+  const i = uiSrc.indexOf('function modelRowEl');
+  const body = uiSrc.slice(i, uiSrc.indexOf('\n  }', i));
+  return /\/api\/models\/delete/.test(body) && /refreshModelViews\(\)/.test(body);
+})());
+
+// ---------- 删除类操作：原位二次确认的一致性（2026-09-29 审计）----------
+group('删除操作的二次确认');
+check('模型删除：查 d.ok，失败时先提示再退出、不刷新界面', (function () {
+  const i = uiSrc.indexOf('function modelRowEl');
+  const body = uiSrc.slice(i, uiSrc.indexOf('\n  }', i));
+  // ok 分支在 !d.ok 分支**之后**才调 refreshModelViews —— 顺序反了就是失败也刷
+  const bad = body.indexOf('if (!d.ok)');
+  const good = body.indexOf('refreshModelViews()');
+  return /删除失败/.test(body) && bad >= 0 && good > bad;
+})());
+check('模型 / 供应商删除都有防连点（确认按钮点下即禁用）',
+  (uiSrc.match(/confirmBtn\.disabled = true;/g) || []).length >= 2);
+check('供应商删除取消后按钮回到原位（appendChild，不用 insertBefore 挪位）',
+  /acts\.appendChild\(delBtn\)/.test(uiSrc) && !/insertBefore\(delBtn, testBtn\)/.test(uiSrc));
+check('归档会话的「永久删除」也有二次确认',
+  // 不可逆操作，两处保护等级必须一致：侧栏 renderSessions 早有，归档页曾漏
+  /label: '永久删除', danger: true, confirmDelete: true, fn: function \(\) \{ deleteSession/.test(uiSrc) &&
+  /label: '永久删除', danger: true, confirmDelete: true, fn: function \(\) \{[\s\S]{0,120}?api\/sessions\?id=/.test(uiSrc));
+check('MCP 插件删除改为原位二次确认（曾一点即删）',
+  /mkBtn\('确认删除', 'confirming'/.test(uiSrc) &&
+  /deletePlugin\(p\.name\)/.test(uiSrc));
+check('记忆删除不再用浏览器 confirm，改原位确认',
+  !/confirm\('删除这条记忆/.test(uiSrc) &&
+  /className = 'label-btn confirming'/.test(uiSrc));
+check('「确认删除」危险色样式覆盖 .label-btn（记忆/插件行不在 .mi-actions 内）',
+  /\.label-btn\.confirming \{[^}]*color: var\(--danger\)/.test(css));
 
 // ---------- 上下文档位（2026-09-20）----------
 group('上下文长度预置档位');
@@ -2406,6 +2811,71 @@ check('进度事件复用子智能体卡（不发 todo，避免污染真实任�
 check('modeLabel 认识 verify（否则卡片显示「探索 · goal-verify」）',
   /if mode == "verify" \{/.test(subagentSrc) &&
   /return "验证"/.test(subagentSrc));
+
+// ---------- 探索分组：连续搜索/读取收成可折叠块（2026-09-29）----------
+// 动机：探代码时 read_file / search_files 连着来十几二十次，一次一张卡片会把
+// 真正的回答挤出视野。行为照着参考实现：标题「已探索 N 次搜索」，点开看明细。
+group('探索分组（已探索 N 次搜索/读取）');
+check('入组范围只含只读探索工具，不含写/改/删与运行命令', (function () {
+  // 折叠的代价是「看不见」，只对可回看的只读信息才划算；
+  // 写/改/删要显示 diff，运行命令是显式动作，都不该被藏起来。
+  const m = /const EXPLORE_KINDS = \{([\s\S]*?)\};/.exec(uiSrc);
+  if (!m) return false;
+  const names = (m[1].match(/(\w+):/g) || []).map(function (s) { return s.slice(0, -1); });
+  return names.sort().join(',') === 'find_files,list_dir,read_file,search_files' &&
+    !/write_file|edit_file|delete_file|run_command/.test(m[1]);
+})());
+check('判定「连续」靠分组是否仍贴着消息列末尾，不靠标志位', (function () {
+  // 少一个状态变量，也不会漏掉某条边界：期间插进任何内容它就不再是末尾，
+  // 下一个探索卡片自然另起一组。
+  return /function lastElementIn\(node\)/.test(uiSrc) &&
+    /if \(!exploreGroup \|\| exploreGroup\.parentNode !== col \|\| lastElementIn\(col\) !== exploreGroup\) \{/.test(uiSrc) &&
+    /exploreGroup\.parentNode === col && lastElementIn\(col\) === exploreGroup/.test(uiSrc) &&
+    // lastElementIn 必须跳过文本节点：列里夹着文本节点，直接看 lastChild 拿不到元素
+    /if \(n\.nodeType === 1\) return n;/.test(uiSrc);
+})());
+check('收尾挂在列的 appendChild（追加之后判，不是追加之前）', (function () {
+  // ⚠️ 这里踩过一个坑：检查早先挂在 ensureCol() 里，而 ensureCol() 是
+  // `ensureCol().appendChild(x)` 的**接收者表达式** —— 它求值时新内容还没插进去，
+  // 分组仍贴着末尾，检查恒为真，分组永远不会被收起。差一步的顺序，
+  // 症状是「该折的没折」。所以必须包在 appendChild 上、在追加**之后**同步。
+  const col = extractFunction(uiSrc, 'ensureCol');
+  return /const rawAppend = msgCol\.appendChild\.bind\(msgCol\);/.test(col) &&
+    /msgCol\.appendChild = function \(node\) \{\s*\n\s*const r = rawAppend\(node\);\s*\n\s*if \(node !== exploreGroup\) syncExploreGroup\(msgCol\);/.test(col) &&
+    (uiSrc.match(/ensureCol\(\)\.appendChild\(/g) || []).length >= 10;
+})());
+check('一轮结束时收起末尾那组，用户手动开过的不动', /function collapseExploreGroup\(\)[\s\S]*?if \(exploreUserToggled\) return;/.test(uiSrc) &&
+  /function clearRunVisuals\(\)[\s\S]*?collapseExploreGroup\(\);/.test(uiSrc) &&
+  /exploreUserToggled = false;/.test(uiSrc));
+check('折叠禁令只有一处判定（⛔ 绝不能被藏进折叠块）', (function () {
+  // 早先 update 因「有失败」强制展开、collapse 又无条件折上，两处各判各的，
+  // 结果组内失败时仍然被折起来 —— 正是这个功能最该避免的事。
+  return /function exploreMustStayOpen\(g\)[\s\S]*?\.msg-tool\.denied[\s\S]*?\.msg-tool\.running/.test(uiSrc) &&
+    /function updateExploreSummary\(g\)[\s\S]*?if \(exploreMustStayOpen\(g\)\) setExploreOpen\(g, true\);/.test(uiSrc) &&
+    /function collapseExploreGroup\(\)[\s\S]*?updateExploreSummary\(g\);\s*\n\s*if \(exploreMustStayOpen\(g\)\) return;/.test(uiSrc) &&
+    /function syncExploreGroup\(col\)[\s\S]*?if \(exploreMustStayOpen\(g\)\) return;/.test(uiSrc) &&
+    // 判定只写一次：open 的写入都经 setExploreOpen（靠 _auto 区分自动/用户）
+    (uiSrc.match(/function exploreMustStayOpen\(/g) || []).length === 1 &&
+    !/g\._auto = true;\s*\n\s*g\.open = true/.test(uiSrc);
+})());
+check('写 open 走 setExploreOpen，靠 _auto 区分自动与用户点击', /function setExploreOpen\(g, on\) \{[\s\S]*?g\._auto = true;/.test(uiSrc) &&
+  /g\.addEventListener\('toggle', function \(\) \{\s*\n\s*if \(!g\._auto\) exploreUserToggled = true;/.test(uiSrc));
+check('标题按类别计数（搜索/读取/查看），混合时并列', /const EXPLORE_ORDER = \['搜索', '读取', '查看'\]/.test(uiSrc) &&
+  /parts\.push\(n \+ ' 次' \+ k\);/.test(uiSrc) &&
+  /return parts\.join\(' · '\);/.test(uiSrc));
+check('两处 addTool 都传 name（实时与回放分组结果才一致）',
+  /addTool\(toolLabel\(name, ev\.tool_input\), \{\s*\n\s*name: name,/.test(uiSrc) &&
+  /addTool\(toolLabel\(b\.name, b\.input\), \{\s*\n\s*name: b\.name,/.test(uiSrc));
+check('清空视图时分组引用一并作废（节点已被 innerHTML 销毁）',
+  /function clearViewState\(opts\)[\s\S]{0,900}?exploreGroup = null;/.test(uiSrc));
+check('用 <details> 实现，与思考过程折叠块同一套做法', (function () {
+  const g = extractFunction(uiSrc, 'createExploreGroup');
+  return /document\.createElement\('details'\)/.test(g) &&
+    /document\.createElement\('summary'\)/.test(g) &&
+    /\.msg-explore\s*\{/.test(css) &&
+    /\.msg-explore summary::after/.test(css) &&
+    /\.msg-explore \.explore-body\s*\{[^}]*flex-direction:\s*column/.test(css);
+})());
 
 console.log('\n' + '-'.repeat(52));
 if (failures.length) {

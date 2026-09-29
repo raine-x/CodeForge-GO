@@ -221,14 +221,17 @@
     return s.charAt(0).toUpperCase() + s.slice(1);
   }
 
-  // 思考档位显示名：枚举档首字母大写（Minimal/Low/…），range 为 token 数，关闭档显示「关闭」
+  // 思考档位显示名：枚举档取服务端下发的 label（None/Minimal/Low/Medium/High/Xhigh/Max），
+  // 缺 label 时退回「首字母大写原值」；range 模式显示 token 数，0 档显示「关闭」。
+  //
+  // ⚠️ steps 模式下 **none 显示为「None」而不是「关闭」**：none 是官方枚举里的真实一档
+  // （不下发才是关闭），中文化会让它和「真的不发参数」混为一谈。
   function thinkingLabel() {
     if (!thinkingSpec) return 'Medium';
     if (thinkingSpec.mode === 'steps') {
-      if (thinkingVal === 'none') return '关闭';
       const hit = (thinkingSpec.steps || []).find(function (s) { return s.value === thinkingVal; });
-      const val = hit ? hit.value : thinkingVal;
-      return val ? capitalizeFirst(val) : 'Medium';
+      if (hit) return hit.label || capitalizeFirst(hit.value);
+      return thinkingVal ? capitalizeFirst(thinkingVal) : 'Medium';
     }
     if (thinkingSpec.mode === 'range') {
       if (!thinkingVal || thinkingVal === 'none' || thinkingVal === '0') return '关闭';
@@ -417,8 +420,11 @@
       loadModels();
       const mEl = document.getElementById('settings-model');
       if (mEl) { mEl.textContent = modelName || model || '--'; mEl.title = model || ''; }
-      // 设置页开着时同步列表里的「当前」徽标
-      if (!settingsOverlay.classList.contains('hidden')) renderModelItems();
+      // 设置页开着时同步两个视图里的「当前」徽标（对话框弹层切换也会走到这里）。
+      // 必须用 loadModelViews 而不是 renderModelViews：activeModelId 是**设置页
+      // 的变量**，只由 loadLibrary 写。对话框弹层切模型不经设置页，
+      // 不重新取数的话徽标会停在上一个模型上。
+      if (!settingsOverlay.classList.contains('hidden')) loadModelViews();
       showBanner('已切换到 ' + (modelName || model), 'info');
     }).catch(function (e) {
       showBanner('切换模型失败：' + e, 'error');
@@ -507,9 +513,13 @@
       // 最高强度：粒子加速 + 滑块呼吸光晕
       slider.classList.toggle('max', ratio >= 0.995);
     };
-    // 拖动中预览档位名（关闭档统一显示「关闭」，range 的 0 就是关闭）
+    // 拖动中预览档位名。steps 用服务端下发的 label（None/Minimal/…/Max），
+    // 缺 label 时退回首字母大写原值；range 的 0 档仍显示「关闭」。
     function previewLabel(v) {
-      if (spec.mode === 'steps') return v === 'none' ? '关闭' : capitalizeFirst(v);
+      if (spec.mode === 'steps') {
+        const hit = (spec.steps || []).find(function (s) { return s.value === v; });
+        return hit ? (hit.label || capitalizeFirst(hit.value)) : capitalizeFirst(v);
+      }
       if (!v || v === '0' || v === 'none') return '关闭';
       return v + ' tokens';
     }
@@ -725,8 +735,144 @@
       msgCol = document.createElement('div');
       msgCol.className = 'msg-col';
       messagesEl.appendChild(msgCol);
+      // 「有新内容进入聊天列」的唯一口子是 msgCol.appendChild —— 在这里包一层，
+      // 追加**之后**再判断探索分组有没有被插队。
+      //
+      // ⚠️ 早先把检查挂在 ensureCol() 里是错的：ensureCol() 是 appendChild 的
+      // **接收者表达式**，在它求值那一刻新内容还没插进去，分组仍然贴着末尾，
+      // 检查恒为真 —— 分组永远不会被收起。差一步的顺序，症状是「该折的没折」。
+      const rawAppend = msgCol.appendChild.bind(msgCol);
+      msgCol.appendChild = function (node) {
+        const r = rawAppend(node);
+        if (node !== exploreGroup) syncExploreGroup(msgCol);
+        return r;
+      };
     }
     return msgCol;
+  }
+
+  // ---------- 探索分组：把连续的「搜索 / 读取 / 查看项目」收成一个可折叠块 ----------
+  //
+  // 为什么合：模型探代码时 read_file / search_files 会连着来十几二十次，
+  // 一次一张卡片会把真正的回答挤出视野。收成一块后默认只占一行，
+  // 要看细节再展开 —— 与思考过程折叠块（.msg-reasoning）同一套 <details> 做法。
+  //
+  // 判定「连续」不靠记标志位，靠**分组是否还贴着消息列末尾**：
+  // 期间插进任何别的内容（正文、命令、审批、子智能体卡），它就不再是末尾，
+  // 下一个探索卡片自然另起一组。少一个状态变量，也不会漏掉某条边界。
+  const EXPLORE_KINDS = {
+    search_files: '搜索',
+    find_files: '搜索',
+    read_file: '读取',
+    list_dir: '查看'
+  };
+  // 只有**只读**的探索工具入组。写/改/删要显示 diff，运行命令是显式动作，
+  // 都不该被折叠藏起来 —— 折叠的代价是「看不见」，只对可回看的信息才划算。
+  const EXPLORE_ORDER = ['搜索', '读取', '查看'];
+  let exploreGroup = null;        // 当前还贴着消息列末尾的分组
+  let exploreUserToggled = false; // 用户手动展开/收起过：之后不再自动折叠
+
+  function toolLocalName(name) {
+    name = typeof name === 'string' ? name : '';
+    const i = name.indexOf('.');
+    return i > 0 ? name.slice(i + 1) : name;
+  }
+  // 列里最后一个**元素**子节点：列里还夹着文本节点，直接看 lastChild 会拿到 null。
+  function lastElementIn(node) {
+    for (let n = node && node.lastChild; n; n = n.previousSibling) {
+      if (n.nodeType === 1) return n;
+    }
+    return null;
+  }
+  function exploreCountText(counts) {
+    const parts = [];
+    EXPLORE_ORDER.forEach(function (k) {
+      const n = counts[k] || 0;
+      if (n > 0) parts.push(n + ' 次' + k);
+    });
+    return parts.join(' · ');
+  }
+  function createExploreGroup() {
+    const g = document.createElement('details');
+    g.className = 'msg-explore';
+    const summary = document.createElement('summary');
+    const title = document.createElement('span');
+    title.className = 'ex-title';
+    title.textContent = '已探索';
+    const count = document.createElement('span');
+    count.className = 'ex-count';
+    summary.appendChild(title);
+    summary.appendChild(count);
+    const body = document.createElement('div');
+    body.className = 'explore-body';
+    g.appendChild(summary);
+    g.appendChild(body);
+    // 用户手动点过就记住：这个组此后不再被自动折叠/展开抢走控制权。
+    g.addEventListener('toggle', function () {
+      if (!g._auto) exploreUserToggled = true;
+    });
+    g._title = title;
+    g._count = count;
+    g._body = body;
+    g._counts = {};
+    return g;
+  }
+  // 折叠禁令 —— 只此一处判定，别让 update / sync / collapse 各判各的：
+  // 早先 update 因为有失败强制展开、collapse 又无条件折上，两处各写一套条件，
+  // 结果「组内有失败时仍然被折起来」，⛔ 被藏进折叠块 —— 正是这个功能最该避免的事。
+  function exploreMustStayOpen(g) {
+    const body = g._body;
+    // · 有失败：⛔ 必须看得见，藏起来等于把「这一步没跑成」藏起来；
+    // · 正在跑：折起来用户就不知道模型此刻在读什么。
+    return !!body.querySelector('.msg-tool.denied') || !!body.querySelector('.msg-tool.running');
+  }
+  function updateExploreSummary(g) {
+    g._count.textContent = exploreCountText(g._counts);
+    const failed = !!g._body.querySelector('.msg-tool.denied');
+    g._title.textContent = failed ? '已探索 ⚠' : '已探索';
+    if (exploreMustStayOpen(g)) setExploreOpen(g, true);
+  }
+  // 写 open 走这里：_auto 用来区分「自动」与「用户点了」，toggle 事件据此记账。
+  function setExploreOpen(g, on) {
+    if (g.open === on) return;
+    g._auto = true;
+    g.open = on;
+    g._auto = false;
+  }
+  // 分组不再贴着列末尾 → 自动收起（用户手动开过的除外）。
+  function syncExploreGroup(col) {
+    if (!exploreGroup) return;
+    if (exploreGroup.parentNode === col && lastElementIn(col) === exploreGroup) return;
+    const g = exploreGroup;
+    exploreGroup = null;
+    if (exploreUserToggled) return;   // 用户自己开着的，不抢
+    updateExploreSummary(g);
+    if (exploreMustStayOpen(g)) return;
+    setExploreOpen(g, false);
+  }
+  // 主动收起当前探索分组（一轮结束）。用户手动开过的不动 —— 自动折叠抢走
+  // 用户的控制权比多占一行更烦人。
+  function collapseExploreGroup() {
+    if (!exploreGroup) return;
+    const g = exploreGroup;
+    exploreGroup = null;
+    if (exploreUserToggled) return;
+    updateExploreSummary(g);
+    if (exploreMustStayOpen(g)) return;
+    setExploreOpen(g, false);
+  }
+  function appendExploreCard(card, kind) {
+    const col = ensureCol();
+    if (!exploreGroup || exploreGroup.parentNode !== col || lastElementIn(col) !== exploreGroup) {
+      collapseExploreGroup();   // 上一组已被插队 / 已收尾：先收掉再开新的
+      exploreGroup = createExploreGroup();
+      exploreUserToggled = false;
+      col.appendChild(exploreGroup);   // 追加的是分组本身，包装层会跳过同步
+    }
+    const g = exploreGroup;
+    g._counts[kind] = (g._counts[kind] || 0) + 1;
+    g._body.appendChild(card);
+    updateExploreSummary(g);
   }
   // ---------- 任务清单面板（输入卡片上方，可折叠） ----------
   // todo 事件驱动：○待办 / ◐进行中 / ✓完成 / ✕取消；点标题折叠/展开。
@@ -1209,6 +1355,7 @@
 
   // 工具卡片。
   //
+  // opts.name   工具名 —— 探索分组据此判断要不要收进「已探索」块
   // opts.stats  {added, removed} → 卡片上的 +N/-M 徽标
   // opts.diff   现成的 unified diff（实时卡片有；历史回放没有）
   // opts.path   改动文件路径（历史回放的卡片点开时用它去服务端取 diff）
@@ -1254,7 +1401,14 @@
         }
       });
     }
-    ensureCol().appendChild(d);
+    // 探索工具：收进「已探索」折叠块，不直接落进消息列。
+    // 其余工具直接追加 —— 顺带把上一组探索收起来（ensureCol 里的 sync 负责）。
+    const kind = EXPLORE_KINDS[toolLocalName(opts.name)];
+    if (kind) {
+      appendExploreCard(d, kind);
+    } else {
+      ensureCol().appendChild(d);
+    }
     activeToolEl = d;
     scrollBottom();
   }
@@ -1718,10 +1872,9 @@
     if (!input) return;
     const keep = input.value;
     sending = false;
-    input.value = text;
+    setInputValue(text);
     form.requestSubmit();
-    input.value = keep;
-    syncInputMirror();
+    setInputValue(keep);
   }
   // @plan 计划书回复完成后：输入框上方弹出「直接发送 / 取消」（可复用 ActionPanel）。
   function maybeShowPlanActions() {
@@ -2963,7 +3116,8 @@
     sessionChanging = true;
     // 记账：这一帧 history 是**我请求的**，必须放行（case 'history' 的守卫靠它）。
     awaitingHistoryFor = id;
-    if (running) sendBtn.title = '点击打断' + (id === runSessionID ? '' : '（正在运行的会话）');
+    // 按钮不在这里刷：syncSendBtn 的「（正在运行的会话）」提示要看 runAway()，
+    // 而 runAway() 比的是 sessionID —— 那要等 replayHistory 把它换掉才知道。
     wsSend({ type: 'load_session', session_id: id });
   }
 
@@ -2985,6 +3139,11 @@
     // 切会话保留 lastUserText（重新生成要用），其余引用一律作废
     clearViewState({ keepLastUser: true });
     sessionID = ev.session_id || '';
+    // sessionID 换了才刷按钮：runAway()（运行中的会话是否在当前视图）刚变成真值，
+    // 打断按钮的提示要据此标不标「（正在运行的会话）」。早先在 loadSession 里刷，
+    // 那时 sessionID 还没换，提示恒为「不在当前视图」——切回正在跑的那个会话时
+    // 仍然标着后台运行。
+    syncSendBtn();
 
     (ev.messages || []).forEach(function (m) {
       const blocks = m.content || [];
@@ -3012,7 +3171,10 @@
             closeText();
             // 回放出来的卡片：不传参数详情（不再有「鼠标一放一堆参数」），
             // 只记下文件路径 —— 点开时向 /api/diff 取那次改动（见 openToolDiff）。
-            addTool(toolLabel(b.name, b.input), { path: toolFilePath(b.name, b.input) });
+            addTool(toolLabel(b.name, b.input), {
+              name: b.name,
+              path: toolFilePath(b.name, b.input)
+            });
           } else if (b.type === 'tool_result') {
             settleActiveTool(); // 工具已完成：无 spinner
           }
@@ -3044,7 +3206,19 @@
   }
 
   // ---------- MCP 入口（仅查看；新增/启停/删除在 设置 → MCP 服务） ----------
-  // 展示 type=mcp（stdio）与 type=mcp-http（远程 Streamable HTTP）且已启用的插件。
+  // 单个服务的一行明细文案（显示名在前、标识与端点退到后面）。
+  // 侧栏汇总与设置页列表共用它，避免两处口径漂移。
+  function mcpTitle(p) {
+    return (p.display_name && p.display_name !== p.name
+      ? p.display_name + '（' + p.name + '）' : p.name) +
+      '：' + (p.description || '') +
+      (p.endpoint ? '：' + p.endpoint : (p.command ? '：' + p.command + ' ' + (p.args || []).join(' ') : '')) +
+      (p.enabled ? '（运行中）' : '（已启用但加载失败）');
+  }
+  // 左栏只报一个数：「已启用 N 个」。
+  // 早先这里逐个列服务名，在窄侧栏（240px）里几个名字就把下面的项目列表顶出屏幕，
+  // 而项目列表才是左栏的主体。明细（谁在跑 / 谁加载失败 / 端点是什么）挪到这一行
+  // 的 title —— 悬停即可，不占垂直空间。
   function renderMcpList() {
     const list = document.getElementById('mcp-list');
     list.innerHTML = '';
@@ -3056,25 +3230,21 @@
         list.innerHTML = '<li class="mcp-empty" style="cursor:default">尚未添加，见 设置 → MCP 服务</li>';
         return;
       }
-      items.forEach(function (p) {
-        const li = document.createElement('li');
-        li.className = p.enabled ? 'on' : 'off';
-        const dot = document.createElement('span');
-        dot.className = 'dot';
-        dot.title = p.enabled ? '运行中'
-          : '已启用，但连接未建立（加载失败：请到 设置 → MCP 服务 检查端点/启动命令）';
-        const nm = document.createElement('span');
-        // 显示名优先（服务端已把「无别名」回退成 name 填好），标识只放进 title。
-        nm.textContent = (p.display_name || p.name) + (p.enabled ? '' : '（加载失败）');
-        nm.title = (p.display_name && p.display_name !== p.name
-          ? p.display_name + '（' + p.name + '）' : p.name) +
-          '：' + (p.description || '') +
-          (p.endpoint ? '：' + p.endpoint : (p.command ? '：' + p.command + ' ' + (p.args || []).join(' ') : '')) +
-          (p.enabled ? '（运行中）' : '（已启用但加载失败）');
-        li.appendChild(dot);
-        li.appendChild(nm);
-        list.appendChild(li);
-      });
+      const on = items.filter(function (p) { return p.enabled; });
+      const li = document.createElement('li');
+      // on/off 复用 .mcp-list 既有圆点配色：全绿=都在跑，全灰=一个都没起来。
+      li.className = 'mcp-count ' + (on.length ? 'on' : 'off');
+      const dot = document.createElement('span');
+      dot.className = 'dot';
+      const nm = document.createElement('span');
+      nm.className = 'mcp-n';
+      nm.textContent = '已启用 ' + on.length + ' 个';
+      li.title = '共 ' + items.length + ' 个 · 运行中 ' + on.length + ' 个 · 加载失败 ' + (items.length - on.length) + ' 个\n' +
+        items.map(function (p) { return (p.enabled ? '● ' : '○ ') + mcpTitle(p); }).join('\n') +
+        '\n新增 / 启停 / 删除：设置 → MCP 服务';
+      li.appendChild(dot);
+      li.appendChild(nm);
+      list.appendChild(li);
     }).catch(function () {
       list.innerHTML = '<li class="mcp-empty" style="cursor:default">MCP 服务加载失败</li>';
     });
@@ -3092,7 +3262,13 @@
   function deletePlugin(name) {
     fetch('/api/plugins?name=' + encodeURIComponent(name), { method: 'DELETE' })
       .then(function (r) { return r.json(); })
-      .then(function () { renderMcpList(); renderMcpSettings(); });
+      .then(function (d) {
+        // 查 d.ok：删除失败时静默重绘会让界面显示「已删」而条目其实还在，
+        // 用户无从察觉，只能反复点。
+        if (d && d.ok === false) { addError('删除失败：' + (d.error || '未知错误')); return; }
+        renderMcpList();
+        renderMcpSettings();
+      }).catch(function (e) { addError('删除失败：' + e); });
   }
   renderMcpList();
 
@@ -3154,9 +3330,23 @@
         acts.appendChild(mkBtn(p.configured ? '停用' : '启用', 'apply', function () {
           togglePlugin(p.name, !p.configured);
         }));
-        acts.appendChild(mkBtn('删除', '', function () {
-          deletePlugin(p.name);
-        }));
+        // 删除插件会从配置里移除该条目并停掉进程，原来配的能力就没了 ——
+        // 与模型/供应商删除同级，必须原位二次确认（2026-09 审计：此处曾一点即删）。
+        // 语义与 modelRowEl / 供应商详情一致：原位换成「确认删除 + 取消」。
+        const delBtn = mkBtn('删除', '', function () {
+          const confirmBtn = mkBtn('确认删除', 'confirming', function () {
+            confirmBtn.disabled = true;   // 防连点：重复 DELETE
+            deletePlugin(p.name);
+          });
+          const cancelBtn = mkBtn('取消', '', function () {
+            acts.removeChild(confirmBtn);
+            acts.removeChild(cancelBtn);
+            acts.appendChild(delBtn);
+          });
+          acts.replaceChild(confirmBtn, delBtn);
+          acts.appendChild(cancelBtn);
+        });
+        acts.appendChild(delBtn);
         row.appendChild(main); row.appendChild(badge); row.appendChild(acts);
         box.appendChild(row);
       });
@@ -3426,8 +3616,7 @@
         case 'ready':
           // 断线重连：旧任务已随连接关闭被服务端取消，复位运行态避免按钮卡在 ▶
           running = false; runSessionID = ''; runReason = ''; runText = '';
-          sendBtn.classList.remove('running');
-          sendBtn.title = '发送';
+          syncSendBtn();
           renderSessions(ev.sessions || []);
           // 旧连接上的待决审批全部作废（服务端 handleWS 的 defer 已 stop 掉那一轮）。
           // 不作废的话，卡片会带着可点的按钮留在屏幕上，点了只会静默 no-op。
@@ -3532,8 +3721,7 @@
           // 只收尾「被取代的那一轮不会再来事件」的部分：工具卡与参数生成占位。
           settleActiveTool();
           if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
-          sendBtn.classList.add('running');
-          sendBtn.title = '点击打断';
+          syncSendBtn();
           showThinking();
           syncRunBadges();
           // 运行中不给编辑入口（上下文正在被消费）：按钮在 syncUserEditButtons 里统一摘掉。
@@ -3617,6 +3805,7 @@
           // stats 与 diff 同源（服务端 previewFor 一次算出）：徽标 +N/-M 与点开的
           // diff 面板不会互相矛盾。改过文件的卡片可点开看改动位置。
           addTool(toolLabel(name, ev.tool_input), {
+            name: name,
             stats: ev.diff_stats,
             diff: ev.diff,
             path: toolFilePath(name, ev.tool_input)
@@ -3691,8 +3880,7 @@ case 'idle': {
           runSessionID = '';
           runReason = ''; runText = '';
           hasModelReplied = false;
-          sendBtn.classList.remove('running');
-          sendBtn.title = '发送';
+          syncSendBtn();
           syncRunBadges();
           // 一轮结束：重新按白名单挂上编辑按钮（最近 N 条用户消息）。
           syncUserEditButtons();
@@ -3888,11 +4076,47 @@ case 'idle': {
     browse(startPath || '');
   }
 
-  // ---------- 发送按钮两态：↑ 空闲 / ▶ 运行中 ----------
+  // ---------- 发送按钮三态：■ 打断 / ↑ 发送 / 淡 ----------
+  //
+  // 状态只由两个事实决定：**在不在跑** + **输入框有没有字**，
+  // 且必须与 submitMessage 的分支一一对应，否则按钮在骗人：
+  //   running && 无字 → 打断   点它发 cancel，本轮中止
+  //   有字            → 发送   running 时点它是「转向」：任务继续跑，把这句话插进去
+  //   无字 && 空闲    → 变暗   submitMessage 里 raw 为空直接 return，点了什么也不会发生；
+  //                             亮着 accent 等于暗示「现在可以发」
+  //
+  // 早先只看 running，于是「运行中打了字」显示的是停止方块、点下去却是转向。
+  // 单一出口 syncSendBtn()：改 running 或改 input.value 都调它，不各自改 class。
   const form = $('#composer');
   const sendBtn = $('#send-btn');
   const input = $('#input');
   let running = false;
+
+  function syncSendBtn() {
+    const hasText = !!String(input.value || '').trim();
+    const stop = running && !hasText;   // 打断
+    const dim = !running && !hasText;   // 无事可做
+    sendBtn.classList.toggle('running', stop);
+    sendBtn.classList.toggle('dim', dim);
+    let tip;
+    if (stop) {
+      tip = '点击打断' + (runAway() ? '（正在运行的会话）' : '');
+    } else if (running) {
+      tip = '发送（转向：任务继续跑，把这句话插进去）';
+    } else {
+      tip = '发送' + (hasText ? '' : '（还没有内容）');
+    }
+    sendBtn.title = tip;
+    sendBtn.setAttribute('aria-label', tip);
+  }
+
+  // 输入框写值的唯一出口：内容、@提及高亮、发送按钮三态一起更新。
+  // 三件事分散到各调用点各写一遍时，漏一处就是「打完字按钮还停在打断态」。
+  function setInputValue(v) {
+    input.value = v;
+    syncInputMirror();
+    syncSendBtn();
+  }
 
   // ---------- 编辑重发 ----------
   // 进入编辑态：把该条用户消息的文字放回输入框，上方露出「发送 / 取消」。
@@ -3908,8 +4132,7 @@ case 'idle': {
     if (!wsReady) { addError('未连接到服务，请稍候重试'); return; }
     if (editing) exitEditMode(false); // 已在编辑另一条：先复位再切过去
     editing = { back: back, original: text };
-    input.value = text;
-    syncInputMirror();
+    setInputValue(text);
     if (editBar) editBar.classList.remove('hidden');
     input.focus();
     // 光标放到末尾，方便直接在原话上修改
@@ -3919,10 +4142,7 @@ case 'idle': {
   // 退出编辑态。restore=true 时把输入框恢复成进入编辑前的样子（取消按钮用）。
   function exitEditMode(restore) {
     if (!editing) return;
-    if (restore) {
-      input.value = '';
-      syncInputMirror();
-    }
+    if (restore) setInputValue('');
     editing = null;
     if (editBar) editBar.classList.add('hidden');
   }
@@ -4104,6 +4324,9 @@ case 'idle': {
     settleActiveTool();
     if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
     resetSubagentCards();
+    // 一轮结束（或被新一轮取代）：末尾那组探索没有下文了，收起来。
+    // 期间插队的情况由 ensureCol 里的 syncExploreGroup 负责，两条路径都要收。
+    collapseExploreGroup();
   }
 
   // clearViewState 清空整个聊天列（新建 / 归档 / 删除 / 切会话回放）。
@@ -4117,6 +4340,8 @@ case 'idle': {
     reasonEl = null; reasonBuffer = ''; reasonPinned = false;
     thinkingEl = null; activeToolEl = null; retryEl = null; pendingToolEl = null;
     resumeRingEl = null;
+    exploreGroup = null;        // 探索分组节点也被 innerHTML='' 销毁了，引用一并作废
+    exploreUserToggled = false;
     subagentCards.clear();
     lastReply = '';
     optimisticBubble = null; // 视图整个没了，引用一并作废
@@ -4152,6 +4377,7 @@ case 'idle': {
   }
   input.addEventListener('scroll', syncInputMirror);
   syncInputMirror();
+  syncSendBtn();   // 开局就定态：还没跑、输入框是空的 → 变暗
 
   function pasteFiles(e) {
     const clipboard = e.clipboardData;
@@ -4290,8 +4516,7 @@ case 'idle': {
       addError('未连接到服务，这条转向没发出去');
       return true;
     }
-    input.value = '';
-    syncInputMirror();
+    setInputValue('');   // 转向已发出、输入框清空 → 按钮回到打断态
     if (target === sessionID) addSteer(raw);
     else addInfo('已把这条指令转向到后台正在运行的任务');
     return true;
@@ -4365,10 +4590,7 @@ case 'idle': {
         attachments: p.attachments,
         thinking: thinkingVal
       })) throw new Error('未连接到服务，请稍候重试');
-      if (override === undefined) {
-        input.value = '';
-        syncInputMirror();
-      }
+      if (override === undefined) setInputValue('');
       lastUserText = p.text; // 记录供「重新生成」（用发送文本，可直接重放）
       resetPlanActions(); // 新用户消息发出：下一条 @plan 回复完成后可再次弹出选择面板
       composerSnap = false; // 用户主动发出第一句：位置切换要有下放动画
@@ -4550,8 +4772,7 @@ case 'idle': {
     const token = it.builtin ? it.id : (it.token || it.name);
     const before = input.value.slice(0, atStart);
     const after = input.value.slice(input.selectionStart);
-    input.value = before + '@' + token + ' ' + after;
-    syncInputMirror();
+    setInputValue(before + '@' + token + ' ' + after);
     closeAtPop();
     input.focus();
     const pos = (before + '@' + token + ' ').length;
@@ -4559,6 +4780,7 @@ case 'idle': {
   }
   input.addEventListener('input', function () {
     syncInputMirror(); // 内容一变就重画 @提及 高亮
+    syncSendBtn();    // 有没有字决定按钮是「发送」还是变暗
     const cur = atContext();
     if (!cur) { closeAtPop(); atLoadedFor = -1; return; }
     atStart = cur.start;
@@ -4580,12 +4802,13 @@ case 'idle': {
     setTimeout(closeAtPop, 150);
   });
 
-  // ---------- ＋ 更多菜单：添加文件 / Skills（右展） ----------
+  // ---------- ＋ 更多菜单：添加文件 / Skills和技能（右展） ----------
   // 点 ＋ → 图标变 ✕ 并向上弹出菜单；再点一次、点别处或按 Esc 收起并复位图标。
   //   · 添加文件：Windows 走资源管理器「打开文件」对话框；Linux/Termux 走内置选择器（文件模式）。
   //     选中后把绝对路径插到输入框光标处。
-  //   · Skills：向右展开当前工作区已加载的技能，点选即插入 @技能名（与 @ 提及同款，
-  //     服务端据此把该 SKILL.md 正文注入当轮）。
+  //   · Skills和技能：向右展开两类东西 —— 工作区已加载的技能（点选插 @技能名，
+  //     服务端据此把该 SKILL.md 正文注入当轮）+ 内置插件（点选插 @插件 id，触发词）。
+  //     菜单名写全是因为它确实两类都列，写成「Skills」会让人以为只有 SKILL.md。
   const moreBtn = $('#more-btn');
   const morePop = $('#more-pop');
   const moreSkillsBtn = $('#more-skills');
@@ -4629,8 +4852,7 @@ case 'idle': {
     const after = input.value.slice(pos);
     const sep = (before && !/\s$/.test(before)) ? ' ' : '';
     const ins = text + ' ';
-    input.value = before + sep + ins + after;
-    syncInputMirror();
+    setInputValue(before + sep + ins + after);
     const np = (before + sep + ins).length;
     input.focus();
     input.setSelectionRange(np, np);
@@ -4723,7 +4945,7 @@ case 'idle': {
     openBuiltinPicker(workspaceRoot, 'file', insertPickedFile);
   });
 
-  // Skills 二级菜单：每次展开都重新拉一次（刚建的技能能立刻出现）
+  // Skills和技能 二级菜单：每次展开都重新拉一次（刚建的技能能立刻出现）
   function renderMoreSkills() {
     Promise.all([
       fetch('/api/skills').then(function (r) { return r.json(); }).catch(function () { return {}; }),
@@ -4806,17 +5028,20 @@ case 'idle': {
     if (composerCentered) return; // 居中态（无消息，无可滚动内容）不参与折叠
     // 最大位移 = 卡片自身高度 + 底部间隙（7vh），滑过即完全不可见
     const max = composerWrap.offsetHeight + window.innerHeight * 0.07 + 10;
-    if (delta > 0 || messagesEl.scrollHeight - st - messagesEl.clientHeight < 80) {
-      // 滚动条向下（或已到底部）：弹回显示
-      if (composerHide !== 0) {
-        composerHide = 0;
-        composerWrap.style.transform = 'translateX(-50%)';
-      }
-    } else if (delta < 0) {
-      // 滚动条向上翻历史：按滚动量渐进折叠
-      composerHide = Math.min(max, composerHide - delta);
-      composerWrap.style.transform = 'translateX(-50%) translateY(' + Math.round(composerHide) + 'px)';
+    if (delta !== 0) {
+      // 折叠与收回**对称**：上翻按滚动量藏，下滚同样按滚动量露。
+      //
+      // 早先只要 delta > 0 就整块弹回（composerHide = 0）：往回滑 1px 输入框就整个
+      // 跳出来。卡片位移量远大于那点滚动量，视觉上是「弹」而不是「滑」，
+      // 翻历史看到一半、想确认某句话时输入框就糊在内容上。
+      composerHide = Math.max(0, Math.min(max, composerHide - delta));
     }
+    // 只有滑到最底部才**完全**弹出；中途往下滚只是收回一部分。
+    // 判定复用 isNearBottom()（跟随态），不再另写一个 < 80 的魔数 ——
+    // 那个 80 与 FOLLOW_NEAR_BOTTOM 同值，两处各写一份，改一处就漂了。
+    if (followTail) composerHide = 0;
+    composerWrap.style.transform = 'translateX(-50%)' +
+      (composerHide ? ' translateY(' + Math.round(composerHide) + 'px)' : '');
   });
   // 聚焦输入框时恢复显示
   input.addEventListener('focus', function () {
@@ -5352,13 +5577,36 @@ case 'idle': {
           body: JSON.stringify({ id: m.id, content: v.trim() })
         }).then(function (r) { return r.json(); }).then(function (d) { if (d.ok) renderMemories(d.items); });
       });
+      // 删除记忆也走**原位**二次确认，不再用浏览器 confirm() 弹窗 ——
+      // 会话、项目、模型、供应商、MCP 都已经统一成「按钮原位变「确认删除」+ 取消」，
+      // 只有这里还弹窗，同一套操作两种交互（2026-09 审计发现）。
       const del = document.createElement('button');
       del.type = 'button'; del.className = 'label-btn'; del.textContent = '✕'; del.title = '删除';
       del.addEventListener('click', function () {
-        if (!confirm('删除这条记忆？')) return;
-        fetch('/api/memory?id=' + m.id, { method: 'DELETE' })
-          .then(function (r) { return r.json(); })
-          .then(function () { loadMemories(); });
+        const confirmBtn = document.createElement('button');
+        confirmBtn.type = 'button';
+        confirmBtn.className = 'label-btn confirming';
+        confirmBtn.textContent = '确认删除';
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button'; cancelBtn.className = 'label-btn';
+        cancelBtn.textContent = '取消';
+        function back() {
+          row.removeChild(confirmBtn);
+          row.removeChild(cancelBtn);
+          row.appendChild(del);
+        }
+        confirmBtn.addEventListener('click', function () {
+          confirmBtn.disabled = true;   // 防连点
+          fetch('/api/memory?id=' + encodeURIComponent(m.id), { method: 'DELETE' })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+              if (d && d.ok === false) { addError('删除失败：' + (d.error || '未知错误')); return; }
+              loadMemories();
+            }).catch(function (e) { addError('删除失败：' + e); });
+        });
+        cancelBtn.addEventListener('click', back);
+        row.replaceChild(confirmBtn, del);
+        row.appendChild(cancelBtn);
       });
       row.appendChild(text); row.appendChild(time); row.appendChild(edit); row.appendChild(del);
       box.appendChild(row);
@@ -5726,7 +5974,10 @@ case 'idle': {
             body: JSON.stringify({ id: s.id, archived: false })
           }).then(function () { loadArchived(); loadSessionList(); });
         } },
-        { label: '永久删除', danger: true, fn: function () {
+        // ⚠️ 必须带 confirmDelete：这是**永久**删除，删掉就没了。
+        // 侧栏 ⋯ 的同名操作（renderSessions）一直有二次确认，归档页这条漏了 ——
+        // 同一个不可逆操作，两处保护等级不一致，归档页一点就没（2026-09 审计发现）。
+        { label: '永久删除', danger: true, confirmDelete: true, fn: function () {
           fetch('/api/sessions?id=' + encodeURIComponent(s.id), { method: 'DELETE' })
             .then(function () { loadArchived(); loadSessionList(); });
         } },
@@ -5946,8 +6197,10 @@ case 'idle': {
     if (text !== undefined && text !== null) e.textContent = text;
     return e;
   }
-  function domField(label, control) {
-    const w = domEl('label', 'f-field');
+  // cls 可选：给字段加类名。供应商表单是网格布局，Base URL / 密钥这类长值
+  // 需要挂 .f-field-wide 占满整行，否则塞进半列会被压到换行。
+  function domField(label, control, cls) {
+    const w = domEl('label', 'f-field' + (cls ? ' ' + cls : ''));
     w.appendChild(domEl('span', null, label));
     w.appendChild(control);
     return w;
@@ -5972,8 +6225,10 @@ case 'idle': {
   }
 
   // 模型行：显示名 / id / 上下文 + 密钥状态 + 操作。
-  function modelRowEl(m, opts) {
-    opts = opts || {};
+  // 不再收 opts / afterChange 钩子：所有写操作统一走 refreshModelViews()，
+  // 由它决定刷哪些视图。早先这个钩子只有一个调用点（供应商详情）传，且没传 ——
+  // 于是「供应商页删模型不消失」和「编辑模型后详情不刷新」两个 bug 同源。
+  function modelRowEl(m) {
     const wrap = domEl('div', 'model-wrap');
     const row = domEl('div', 'model-item');
     const main = domEl('div', 'mi-main');
@@ -5996,18 +6251,37 @@ case 'idle': {
     }
     acts.appendChild(domButton('编辑', '', function () { toggleEdit(); }));
 
+    // 原位二次确认：首次点「删除」就地变「确认删除」+「取消」，不弹浏览器框。
+    //
+    // 三个细节，缺一个就会出事：
+    //   · busy 防连点：确认按钮点下去到响应回来之间不禁用，手快就发出两次
+    //     DELETE。服务端第二次会 404（模型已不在列表），表现为「删除报错」——
+    //     用户会以为第一次没删掉。
+    //   · 必须查 d.ok：删除失败时不能当成功刷新，否则界面显示已删、实际还在。
+    //   · 走 refreshModelViews 统一出口：本行可能渲染在「模型列表」也可能在
+    //     「供应商详情」，两个视图都得重绘。早先这里只刷 renderModelItems，
+    //     于是供应商页删完看着没反应，重新进页面才对（2026-09 实际故障）。
     const delBtn = domButton('删除', '', function () {
+      let busy = false;
       const confirmBtn = domButton('确认删除', 'confirming', function () {
+        if (busy) return;
+        busy = true;
+        confirmBtn.disabled = true;
         fetch('/api/models/delete', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ model: m.id })
-        }).then(function (r) { return r.json(); }).then(function () {
-          modelsLoaded = false; // 删掉的可能是当前模型，刷新主界面模型显示
-          loadLibrary().then(function () {
-            renderModelItems();
-            if (opts.afterChange) opts.afterChange();
-            loadModels();
-          });
+        }).then(function (r) { return r.json(); }).then(function (d) {
+          if (!d.ok) {
+            busy = false;
+            confirmBtn.disabled = false;
+            showBanner('删除失败：' + (d.error || '未知错误'), 'error');
+            return;
+          }
+          refreshModelViews();
+        }).catch(function (err) {
+          busy = false;
+          confirmBtn.disabled = false;
+          showBanner('删除失败：' + err, 'error');
         });
       });
       const cancelBtn = domButton('取消', '', function () {
@@ -6032,7 +6306,7 @@ case 'idle': {
     let editor = null;
     function toggleEdit() {
       if (editor) { wrap.removeChild(editor); editor = null; row.classList.remove('editing'); return; }
-      editor = buildModelEditor(m, opts, function () {
+      editor = buildModelEditor(m, function () {
         if (editor) { wrap.removeChild(editor); editor = null; }
         row.classList.remove('editing');
       });
@@ -6046,7 +6320,7 @@ case 'idle': {
   }
 
   // 就地编辑一个模型：只改模型自身字段，不动连接信息。
-  function buildModelEditor(m, opts, close) {
+  function buildModelEditor(m, close) {
     const box = domEl('div', 'model-editor');
     const grid = domEl('div', 'form-grid');
 
@@ -6115,12 +6389,8 @@ case 'idle': {
         body: JSON.stringify(body)
       }).then(function (r) { return r.json(); }).then(function (d) {
         if (!d.ok) { setNote(note, false, d.error || '保存失败'); saveBtn.disabled = false; return; }
-        modelsLoaded = false; // 改的可能是当前生效模型，主界面显示需刷新
-        loadLibrary().then(function () {
-          renderModelItems();
-          if (opts.afterChange) opts.afterChange();
-          loadModels();
-        });
+        // 统一出口：本编辑器既可能开在模型列表也可能开在供应商详情，两个视图都要重绘。
+        refreshModelViews().then(function () { close(); });
       }).catch(function (e) {
         setNote(note, false, '保存失败：' + e);
         saveBtn.disabled = false;
@@ -6139,12 +6409,10 @@ case 'idle': {
     }).then(function (r) { return r.json(); }).then(function (d) {
       if (!d.ok) { alert('应用失败：' + (d.error || '未知错误')); return; }
       activeModelId = id;
-      modelsLoaded = false;
-      loadModels().then(function () { renderModelBtn(); });
-      loadLibrary().then(function () {
-        renderModelItems();
-        if (document.getElementById('mtab-prov').classList.contains('active')) renderProviders();
-      });
+      // 走统一出口。「当前」徽标在两个视图里都有（模型列表行 + 供应商详情行），
+      // 早先这里按 mtab-prov.active 条件刷，实际紧接着就 showPage('general') 跳走，
+      // 条件恒真 —— 换成无条件刷新，条件判断那类漏刷就没有藏身处了。
+      refreshModelViews();
       showPage('general');
     });
   }
@@ -6157,15 +6425,17 @@ case 'idle': {
   // 与侧栏 wsFolded 同一套做法，只是作用对象换成模型分组。
   const modelGroupFolded = {};
 
+  // 纯渲染：只读 modelsCache / providersCache，**不自己取数**。
+  // 取数统一由 loadModelViews / refreshModelViews 负责。
   function renderModelItems() {
     const box = document.getElementById('model-items');
-    box.innerHTML = '<div class="mi-empty">加载中…</div>';
-    loadLibrary().then(function () {
-      box.innerHTML = '';
-      if (!modelsCache.length) {
-        box.innerHTML = '<div class="mi-empty">还没有模型：切到「添加模型」，选定供应商后只需填模型 id</div>';
-        return;
-      }
+    if (!box) return;
+    box.innerHTML = '';
+    if (!modelsCache.length) {
+      box.innerHTML = '<div class="mi-empty">还没有模型：切到「添加模型」，选定供应商后只需填模型 id</div>';
+      return;
+    }
+    {
       // 按 provider_id 分组；未归属供应商的（旧格式条目）单独成组。
       const order = [];
       const groups = {};
@@ -6193,6 +6463,9 @@ case 'idle': {
         fold.appendChild(arrow);
         fold.addEventListener('click', function () {
           modelGroupFolded[pid] = !modelGroupFolded[pid];
+          // 只重画模型列表：折叠是纯 UI 状态，且 renderProviders 会重绘详情区，
+          // 连带抹掉供应商表单里正在输入的内容。renderModelItems 现在是纯渲染，
+          // 不重新取数，所以这里直接调它。
           renderModelItems();
         });
         head.appendChild(fold);
@@ -6220,9 +6493,7 @@ case 'idle': {
         groups[pid].forEach(function (m) { kids.appendChild(modelRowEl(m)); });
         box.appendChild(kids);
       });
-    }).catch(function () {
-      box.innerHTML = '<div class="mi-empty">模型列表加载失败，请确认服务正在运行</div>';
-    });
+    }
   }
 
   // 跳到「添加模型」并预选供应商：地址与密钥继承，用户只需填 id。
@@ -6238,30 +6509,63 @@ case 'idle': {
     });
   }
 
+  // ---------- 视图刷新：模型库变更后的**唯一出口** ----------
+  //
+  // 一次取数 → 重绘两个视图 → 同步主界面。三件事缺一不可：
+  //   · 模型列表（#model-items）与供应商详情（#prov-detail）都渲染同一份 modelsCache，
+  //     任何写操作都会改动两者，只刷一个就是「删掉了但列表还在，重新进页面才对」；
+  //   · modelsLoaded 置假让 loadModels() 重拉生效配置与对话框弹层快照 ——
+  //     删掉的可能就是当前模型，或改的是当前供应商的地址/密钥。
+  //
+  // 为什么无条件刷两个视图而不判断当前 tab：两个 pane 都常驻 DOM（showMTab 只切
+  // .active），重绘成本就是几十个节点；换来的是调用点不必知道自己站在哪个 tab ——
+  // 早先 applyModel 里的 `if (mtab-prov.active) renderProviders()` 就是这类
+  // 条件判断漏掉的第二处。
+  function refreshModelViews() {
+    modelsLoaded = false;
+    return loadLibrary().then(function () {
+      renderModelItems();
+      renderProviders();
+      return loadModels();
+    });
+  }
+
+  // 只重绘、复用已有缓存：折叠/展开这类纯 UI 操作用，不该重新拉接口。
+  function renderModelViews() {
+    renderModelItems();
+    renderProviders();
+  }
+
+  // 进入页面 / 切子 Tab：数据可能来自别的进程或上一轮会话，先取数再重绘。
+  // 与 refreshModelViews 的区别是**不动** modelsLoaded —— 打开设置页不该
+  // 连带把主界面的生效配置也重拉一遍。
+  function loadModelViews() {
+    return loadLibrary().then(renderModelViews);
+  }
+
   // ---------- 供应商管理：左列供应商 / 右侧详情 ----------
+  // 纯渲染，同 renderModelItems：不自带 loadLibrary，取数由 refreshModelViews 负责。
   function renderProviders() {
     const listEl = document.getElementById('prov-list');
     const detailEl = document.getElementById('prov-detail');
     if (!listEl || !detailEl) return;
-    loadLibrary().then(function () {
-      if (!provSelected && providersCache.length) provSelected = providersCache[0].id;
-      listEl.innerHTML = '';
-      providersCache.forEach(function (p) {
-        const b = domEl('button', 'prov-item' + (p.id === provSelected ? ' active' : ''));
-        b.type = 'button';
-        b.appendChild(domEl('span', 'pv-dot' + (p.disabled ? ' off' : '')));
-        b.appendChild(domEl('span', null, p.name || p.id));
-        b.appendChild(domEl('span', 'pv-cnt', String(modelsOfProvider(p.id).length)));
-        b.addEventListener('click', function () { provSelected = p.id; renderProviders(); });
-        listEl.appendChild(b);
-      });
-      const add = domEl('button', 'prov-item prov-add', '＋ 添加供应商');
-      add.type = 'button';
-      if (provSelected === PROV_NEW) add.classList.add('active');
-      add.addEventListener('click', function () { provSelected = PROV_NEW; renderProviders(); });
-      listEl.appendChild(add);
-      renderProviderDetail(detailEl);
+    if (!provSelected && providersCache.length) provSelected = providersCache[0].id;
+    listEl.innerHTML = '';
+    providersCache.forEach(function (p) {
+      const b = domEl('button', 'prov-item' + (p.id === provSelected ? ' active' : ''));
+      b.type = 'button';
+      b.appendChild(domEl('span', 'pv-dot' + (p.disabled ? ' off' : '')));
+      b.appendChild(domEl('span', null, p.name || p.id));
+      b.appendChild(domEl('span', 'pv-cnt', String(modelsOfProvider(p.id).length)));
+      b.addEventListener('click', function () { provSelected = p.id; renderProviders(); });
+      listEl.appendChild(b);
     });
+    const add = domEl('button', 'prov-item prov-add', '＋ 添加供应商');
+    add.type = 'button';
+    if (provSelected === PROV_NEW) add.classList.add('active');
+    add.addEventListener('click', function () { provSelected = PROV_NEW; renderProviders(); });
+    listEl.appendChild(add);
+    renderProviderDetail(detailEl);
   }
 
   // 密钥输入控件（供应商表单用）：环境变量 / 明文 分段 + 眼睛。
@@ -6350,12 +6654,14 @@ case 'idle': {
       placeholder: (p && p.key_set && !p.key_plain) ? '已保存（留空保持不变）' : 'sk-...'
     });
 
+    // 字段顺序 = 网格的分行顺序（.prov-form 是两列）：
+    //   名称 | 兼容协议  →  Base URL（满行） → 密钥（满行） → 停用（满行）
     form.appendChild(domField('名称', nameIn));
-    form.appendChild(domField('Base URL', urlIn));
     form.appendChild(domField('兼容协议', protoSel));
-    form.appendChild(domField('密钥', key.node));
+    form.appendChild(domField('Base URL', urlIn, 'f-field-wide'));
+    form.appendChild(domField('密钥', key.node, 'f-field-wide'));
 
-    const disWrap = domEl('label', 'f-field');
+    const disWrap = domEl('label', 'f-field f-field-wide');
     disWrap.style.flexDirection = 'row';
     disWrap.style.alignItems = 'center';
     disWrap.style.gap = '8px';
@@ -6410,10 +6716,10 @@ case 'idle': {
       }).then(function (r) { return r.json(); }).then(function (d) {
         if (!d.ok) { setNote(result, false, d.error || '保存失败'); return; }
         provSelected = body.id;
-        modelsLoaded = false; // 改地址 / 轮换密钥会热切换当前模型，主界面显示需刷新
-        loadModels();
-        loadLibrary().then(function () {
-          renderProviders();
+        // 改地址 / 轮换密钥会热切换当前模型，主界面显示需刷新 → 走统一出口。
+        // 回执要等重绘完再写：整块是重绘的，旧的 result 节点会被丢掉，
+        // 所以按 id 找回新节点（refreshModelViews 内部已含 renderProviders）。
+        refreshModelViews().then(function () {
           const fresh = document.getElementById('pv-result');
           setNote(fresh, true, d.hot ? '已保存，当前生效模型已改用新配置' : '已保存');
         });
@@ -6422,26 +6728,39 @@ case 'idle': {
     acts.appendChild(saveBtn);
 
     if (p) {
+      // 与模型行的删除同款：原位二次确认 + busy 防连点 + 查 d.ok。
       const delBtn = domButton('删除', '', function () {
         const n = modelsOfProvider(p.id).length;
+        let busy = false;
         const confirmBtn = domButton('确认删除', 'confirming', function () {
+          if (busy) return;
+          busy = true;
+          confirmBtn.disabled = true;
           fetch('/api/providers/delete', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ provider: p.id })
           }).then(function (r) { return r.json(); }).then(function (d) {
-            if (!d.ok) { setNote(result, false, d.error || '删除失败'); return; }
+            if (!d.ok) {
+              busy = false;
+              confirmBtn.disabled = false;
+              setNote(result, false, d.error || '删除失败');
+              return;
+            }
             provSelected = '';
-            loadLibrary().then(function () {
-              if (!provSelected && providersCache.length) provSelected = providersCache[0].id;
-              renderProviders();
-              renderModelItems();
-            });
+            refreshModelViews();   // 其下模型被解绑，模型列表的分组也要跟着重画
+          }).catch(function (e) {
+            busy = false;
+            confirmBtn.disabled = false;
+            setNote(result, false, '删除失败：' + e);
           });
         });
         const cancelBtn = domButton('取消', '', function () {
           acts.removeChild(confirmBtn);
           acts.removeChild(cancelBtn);
-          acts.insertBefore(delBtn, testBtn);
+          // 用 appendChild 复位：删除按钮原本就在 acts 末尾（测试 / 保存之后），
+          // 按位置插入会让它取消一次就跳到「测试连接」前面 —— 功能没坏，
+          // 但每误点一次取消，按钮位置就变一次。
+          acts.appendChild(delBtn);
         });
         acts.replaceChild(confirmBtn, delBtn);
         acts.appendChild(cancelBtn);
@@ -6595,15 +6914,10 @@ case 'idle': {
       }).then(function (r) { return r.json(); }).then(function (d) {
         if (!d.ok) { discNoteSet(false, d.error || '批量添加失败'); return; }
         discItems = []; discPick = {};
-        modelsLoaded = false;
         // 回执写成一次性闪信再重绘 —— 直接写 DOM 会被这次重绘冲掉。
         provFlash = '已添加 ' + d.added + ' 个模型（共用该供应商的地址与密钥）' +
           (d.skipped ? '，跳过已存在 ' + d.skipped + ' 个' : '');
-        loadLibrary().then(function () {
-          renderModelItems();
-          loadModels();
-          renderProviders();   // 顺带刷新详情里的模型列表与计数
-        });
+        refreshModelViews();   // 顺带刷新详情里的模型列表、计数与左列的「N 个」
       }).catch(function (e) {
         discNoteSet(false, '批量添加失败：' + e);
       });
@@ -6805,7 +7119,7 @@ case 'idle': {
     this.classList.add('active');
     showPage('models');
     showMTab('list');
-    renderModelItems();
+    loadModelViews();
   });
   // 子 Tab：模型列表 / 供应商管理 / 添加模型
   // （点「添加模型」即回到空白新建态，编辑态复用同一表单）
@@ -6815,10 +7129,8 @@ case 'idle': {
       showMTab(name);
       if (name === 'config') {
         loadLibrary().then(function () { resetForm(); });
-      } else if (name === 'prov') {
-        renderProviders();
       } else {
-        renderModelItems();
+        loadModelViews();   // 两个子 Tab 的数据同源，一起刷新省一次请求
       }
     });
   });
@@ -6884,8 +7196,9 @@ case 'idle': {
         editingIndex = -1;
         collapseDiscover();
         showMTab('list');
-        modelsLoaded = false; // 置假后 loadModels 会重拉模型库快照，对话框的模型选择同步出现新条目
-        loadLibrary().then(function () { renderModelItems(); loadModels(); });
+        // 统一出口：modelsLoaded 置假 → loadModels 重拉模型库快照，
+        // 对话框的模型选择随之出现新条目；两个设置页视图也一起重绘。
+        refreshModelViews();
       } else {
         setTestResult(false, d.error || '保存失败');
       }
@@ -7062,8 +7375,9 @@ case 'idle': {
         (d.skipped ? '，跳过已存在 ' + d.skipped + ' 个' : '');
       setDiscResult(true, msg);
       collapseDiscover();
-      modelsLoaded = false;
-      loadLibrary().then(function () { renderModelItems(); loadModels(); });
+      // 统一出口；回执写在「添加模型」面板里，refreshModelViews 不重绘那个
+      // 面板（它只管模型列表与供应商详情），所以这里的提示不会被冲掉。
+      refreshModelViews();
     }).catch(function (e) {
       setDiscResult(false, '批量添加失败：' + e);
     });

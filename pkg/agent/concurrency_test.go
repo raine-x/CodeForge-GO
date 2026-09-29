@@ -264,7 +264,7 @@ func hotUpdateProvider() llm.Provider {
 // 里就会走到 builtinOnSnapshot），写者是紧循环的开关切换。刻意不加任何
 // 额外负载，让两侧的迭代频率都足够高 —— 反向验证过：去掉 setBuiltinOn 的锁，
 // 本用例稳定崩在 `fatal error: concurrent map iteration and map write`
-//（栈顶就是 builtinOnSnapshot ← builtinPluginSection ← systemPrompt）。
+// （栈顶就是 builtinOnSnapshot ← builtinPluginSection ← systemPrompt）。
 func TestBuiltinPluginToggleWhileReading(t *testing.T) {
 	a := newEmitTestAgent(t, hotUpdateProvider())
 	sess, err := a.History().Create("", "插件开关")

@@ -203,7 +203,9 @@ func (p *OpenAIProvider) buildPayload(req Request) map[string]any {
 		}
 		payload["tools"] = tools
 	}
-	// 推理强度：按上游规格校验枚举（minimal/low/medium/high），非法值回退默认
+	// 推理强度：按上游规格校验枚举（none/minimal/low/medium/high/xhigh/max），
+	// 非法值回退 Default 档。空串只有两种来源：Default 档（「不设置，走上游默认」）
+	// 与完全没指定 —— 两者都表示不下发该参数。
 	if effort := reasoningEffort(req.Thinking); effort != "" {
 		payload["reasoning_effort"] = effort
 	}
