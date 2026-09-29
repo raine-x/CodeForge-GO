@@ -36,6 +36,7 @@
 5. 文件写入必须走 `FS.casWrite` / `casEdit` / `casRemove`。它们把「读当前 → 比对指纹 → 写」收进同一把按路径的锁；自己 `os.WriteFile` 配一次写前检查会留下窗口，并发写会静默互相覆盖（两次都"成功"，后写的覆盖先写的，不留任何痕迹）。**不存在「只检查不写」的读门禁** —— 原先的 `requireReadSeen` 已删除，其职责由 `casCheckReadGate` 承担（在临界区内，比对用的就是写前那次读的内容，还多一道存在性断言）。落盘一律用 `atomicWriteFile`（同目录临时文件 + rename）—— 直接 `os.WriteFile` 是"打开→截断→写"，进程写一半被杀会留下半截文件。**撤销还原（`FS.restore`）同样必须走 `atomicWriteFile`**，它还原的是用户写之前的版本，半截文件丢了就再也回不去。
 5a. 写前校验的完整语义：未读过 → 拒；读取后被外部改动（`seenEntry` 存 SHA-256 指纹 + 大小）→ 拒；写入时文件存在性与调用方判断不符 → 拒。写完、编辑完、撤销后都必须刷新指纹，否则连续第二次写会被误判成外部修改而永久锁死。上下文压缩后必须调 `ForgetReads` 清登记。
 5b. `delete_file` 同样要先读。删没读过的文件与覆盖它是同一类丢数据，且更不可逆。
+5c. **所有写工作区的工具都必须走 `noWorkspace()` + `ResolveChecked*` + `casWrite`/`casEdit`/`casRemove` + `snapshot` + `markReadSeen` 五件套**，没有例外。历史反例：`create_skill` 曾只读 `fs.Root()` 然后裸 `os.WriteFile`，后果是未选工作区时技能写进**进程 CWD**（`filepath.Join("", …)` 是相对路径），且完全绕过撤销栈与围栏。审查新写类工具时按这五项逐条核对，别只看它有没有 `Metadata()`。
 6. 工具结果超过 `maxOutput` 时，输出必须仍是合法 JSON，不能在半截 JSON 处硬切。大结果由工具自己分页或限流，Executor 的截断只是兜底。
 7. 文件围栏由 `within` + `resolveReal`（逐级 `EvalSymlinks`）+ `checkScope` 组成，专防"区内软链指向区外、且目标尚不存在"的写入绕过。改动这三个函数必须带攻击用例测试。
 8. `WithScopeApproved` 只在审批确实放行了越界目标时才注入。历史 bug：被注入到了不该注入的地方。
