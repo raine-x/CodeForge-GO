@@ -1686,10 +1686,21 @@ check('未匹配到记录时不谎报「已被回退」',
   // 改动其实好好地记着 —— 说成「已被回退」是对用户说了假话。
   /按这个路径没匹配到本会话的改动记录/.test(
     fs.readFileSync(path.join(__dirname, '../..', 'pkg/server/diff_api.go'), 'utf8')));
+// 第 ③ 级现在由 pathMatchersCase 承载（大小写策略是注入参数），
+// 边界后缀的变量名从 lower 改成 key —— 断言跟到新位置。
+//
+// 顺带盯住本次修的核心：大小写折叠**只在 Windows 开启**。
+// 在区分大小写的文件系统上折叠会把 `Pkg/x.go` 与 `pkg/x.go` 判成同一个，
+// 于是 /api/diff 返回另一个文件的 diff。
 check('服务端路径查找三级容错且落在分隔符边界上',
   /func pathMatchers\(path, root string\) \[\]func\(string\) bool/.test(
     fs.readFileSync(path.join(__dirname, '../..', 'pkg/agent/checkpoints.go'), 'utf8')) &&
-  /strings\.HasSuffix\(lp, "\/"\+lower\)/.test(
+  /strings\.HasSuffix\(lp, "\/"\+key\)/.test(
+    fs.readFileSync(path.join(__dirname, '../..', 'pkg/agent/checkpoints.go'), 'utf8')));
+check('路径大小写折叠只在 Windows 生效（Linux 上 Pkg/ 与 pkg/ 是两个目录）',
+  /func caseInsensitiveOS\(\) bool \{ return platform\.OSName\(\) == "windows" \}/.test(
+    fs.readFileSync(path.join(__dirname, '../..', 'pkg/agent/checkpoints.go'), 'utf8')) &&
+  /if caseInsensitive \{/.test(
     fs.readFileSync(path.join(__dirname, '../..', 'pkg/agent/checkpoints.go'), 'utf8')));
 check('样式契约：只有可点击卡片给手型',
   /\.msg-tool\s*\{[^}]*cursor:\s*default/.test(css) &&

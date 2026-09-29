@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"codeforge/pkg/logx"
+	"codeforge/pkg/platform"
 	"codeforge/pkg/store"
 	"codeforge/pkg/tools"
 )
@@ -128,13 +129,27 @@ func pickCheckpoint(rows []store.CheckpointRow, match func(string) bool, step in
 	var earliest store.CheckpointRow
 	found := false
 	var distinct string // 后缀匹配时记录命中的**不同**存储路径，用于发现歧义
+	ambiguous := false
 	for _, r := range rows {
 		if !match(r.Path) {
 			continue
 		}
 		if step >= 0 {
-			if r.Step == step {
-				return r, true
+			if r.Step != step {
+				continue
+			}
+			// ⚠️ 这里曾经直接 return，从不检查歧义 ——
+			// 于是「<root>/x/y/f.go」与「<root>/z/y/f.go」都记在同一步时，
+			// 查后缀 + step 会静默给出其中一条。
+			// 第 ③ 级改成平台化大小写之后，「大小写不同」与「同后缀不同根」
+			// 这两类歧义在带 step 的查询上更容易命中，只查 step<0 等于修一半。
+			if distinct == "" {
+				distinct = r.Path
+			} else if distinct != r.Path {
+				ambiguous = true
+			}
+			if !found || r.Step < earliest.Step {
+				earliest, found = r, true
 			}
 			continue
 		}
@@ -149,17 +164,40 @@ func pickCheckpoint(rows []store.CheckpointRow, match func(string) bool, step in
 			return store.CheckpointRow{}, false
 		}
 	}
+	if ambiguous {
+		return store.CheckpointRow{}, false
+	}
 	return earliest, found
 }
+
+// caseInsensitiveOS 报告当前平台的文件系统是否不区分大小写。
+//
+// 只有 Windows 是 false —— Termux/Android 的 ext4 与 Linux 一样区分大小写。
+// 写 runtime.GOOS 而不用 OSName() 会漏掉 Termux 这个交叉编译目标。
+func caseInsensitiveOS() bool { return platform.OSName() == "windows" }
 
 // pathMatchers 按「由严到松」返回三级路径匹配器。
 //
 //	① 精确（Clean 后相等）
 //	② 绝对化：相对路径按工作区根展开 —— 覆盖 `pkg/x.go`、`./pkg/x.go`
-//	③ 边界后缀（大小写无关、分隔符无关）：覆盖 Windows 大小写差异、
-//	   斜杠反斜杠混用。**必须落在分隔符边界上**，否则 `partA` 会误配 `partA2`
-//	   （与 scopesOverlap 同一口径）。
+//	③ 边界后缀：覆盖分隔符差异，以及**大小写不敏感平台上的**大小写差异。
+//	   必须落在分隔符边界上，否则 `partA` 会误配 `partA2`（与 scopesOverlap 同一口径）。
+//
+// 第 ③ 级的大小写折叠**只在 Windows 开启**：在区分大小写的文件系统上，
+// 忽略大小写会把两个**不同的**文件判成同一个 —— Linux 上 `Pkg/x.go` 与
+// `pkg/x.go` 是两个文件，回放卡片点开会拿到另一个文件的 diff。
+// 代价是 macOS（默认 APFS 实际不区分）会漏配，走「没匹配到本会话的改动记录」
+// 这句实话；方向是对的 —— fail-closed（查不到）远好于 fail-open（给错 diff）。
 func pathMatchers(path, root string) []func(string) bool {
+	return pathMatchersCase(path, root, caseInsensitiveOS())
+}
+
+// pathMatchersCase 是可注入大小写策略的版本，供测试在任意平台上验证两种语义。
+//
+// 抽出来是有必要的：第 ③ 级的两种语义天然互斥，只按当前平台生效的话，
+// 开发机（Windows）上永远测不到「区分大小写时不该匹配」这一侧，
+// 而那恰恰是这次修的 bug。
+func pathMatchersCase(path, root string, caseInsensitive bool) []func(string) bool {
 	want := filepath.Clean(path)
 	out := []func(string) bool{
 		func(p string) bool { return p == want },
@@ -168,10 +206,17 @@ func pathMatchers(path, root string) []func(string) bool {
 		abs := filepath.Clean(filepath.Join(root, want))
 		out = append(out, func(p string) bool { return p == abs })
 	}
-	lower := strings.ToLower(filepath.ToSlash(want))
+	norm := func(s string) string {
+		s = filepath.ToSlash(s)
+		if caseInsensitive {
+			return strings.ToLower(s)
+		}
+		return s
+	}
+	key := norm(want)
 	out = append(out, func(p string) bool {
-		lp := strings.ToLower(filepath.ToSlash(p))
-		return lp == lower || strings.HasSuffix(lp, "/"+lower)
+		lp := norm(p)
+		return lp == key || strings.HasSuffix(lp, "/"+key)
 	})
 	return out
 }

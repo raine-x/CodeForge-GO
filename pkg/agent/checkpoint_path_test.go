@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"codeforge/pkg/platform"
 	"codeforge/pkg/store"
 )
 
@@ -77,7 +78,14 @@ func TestCheckpointForToleratesRelativePath(t *testing.T) {
 }
 
 // TestCheckpointForCaseInsensitiveOnWindows 大小写差异要能命中。
+//
+// ⚠️ 这条是**平台相关**的：第 ③ 级的大小写宽容现在只在 Windows 开启。
+// Linux / Termux 上 `Pkg/` 与 `pkg/` 是两个不同的目录，忽略大小写会给出
+// 另一个文件的 diff —— 那边由 TestCheckpointForCaseSensitiveOnLinux 覆盖。
 func TestCheckpointForCaseInsensitiveOnWindows(t *testing.T) {
+	if platform.OSName() != "windows" {
+		t.Skip("仅 Windows 上文件系统不区分大小写")
+	}
 	root := t.TempDir()
 	a, sid := newCpAgent(t, root, []store.CheckpointRow{
 		cpRow(filepath.Join(root, "Pkg", "Server", "X.go"), "旧", 1),
