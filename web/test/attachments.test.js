@@ -76,16 +76,17 @@ function harness() {
     pendingEdit: false,
     setTimeout() {},
     thinkingVal: 'high', composerSnap: false, lastUserText: '', lastReply: '',
-    runSessionID: '', runReason: '', runText: '', pendingToolEl: null
+    pendingToolEl: null
   });
   const state = src.slice(src.indexOf('  let ws = null;'), src.indexOf('  let currentTextEl = null;'));
   const names = ['mentionBody', 'mentionToken', 'pruneFileAliases', 'expandFileAliases',
     'insideWorkspace', 'attachmentKey', 'composerSnapshot', 'sameComposer', 'fileMentions',
     'prepareMentions', 'syncInputMirror', 'setInputValue', 'insertIntoInput', 'insertUploadedFile', 'pasteFiles',
-    'submitMessage', 'wsSend', 'runAway', 'setWorkspace', 'loadSession', 'doNewSession',
+    'submitMessage', 'wsSend', 'viewRunning', 'anyRunning', 'streamOf', 'setWorkspace', 'loadSession', 'doNewSession',
     'deleteWorkspace', 'connectWS'];
   vm.runInContext(state + '\n' + src.match(/  const MENTION_SPLIT = .*;/)[0] + '\n' +
-    'const fileAlias = new Map(); let workspaceRoot = "C:/work"; let running = false;\n' +
+    'const fileAlias = new Map(); let workspaceRoot = "C:/work";\n' +
+    'const runningSessions = new Set(); const streams = new Map();\n' +
     names.map(extract).join('\n') + '\n' +
     src.match(/  input.addEventListener\('paste', pasteFiles\);/)[0] + '\n' +
     src.match(/  form.addEventListener\('submit', submitMessage\);/)[0] + '\n' +

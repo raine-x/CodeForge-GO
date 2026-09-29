@@ -95,12 +95,13 @@ func TestSteerNeverTargetsAnotherSession(t *testing.T) {
 	if !strings.Contains(body, "const target = sessionID") {
 		t.Errorf("steerNow 的目标必须是当前会话的 sessionID（不能是 runSessionID）\n%s", body)
 	}
-	// 必须判 runAway：别的会话在跑时不能转向。
-	if !strings.Contains(body, "runAway()") {
-		t.Errorf("steerNow 必须检查 runAway()（当前视图是否就是正在跑的那个会话）\n%s", body)
+	// 必须判 viewRunning()：别的会话在跑时不能转向。
+	// （原判据是 runAway()，那个单槽代理已于 2026-09 随「并发会话视图隔离」删除。）
+	if !strings.Contains(body, "viewRunning()") {
+		t.Errorf("steerNow 必须检查 viewRunning()（当前视图这个会话是否在跑）\n%s", body)
 	}
 	// 拒绝时返回 false，让调用方继续按新消息发 —— 返回 true 会把消息吞掉。
-	if !strings.Contains(body, "if (runAway() || !running) return false") {
+	if !strings.Contains(body, "if (!viewRunning()) return false") {
 		t.Errorf("当前会话没在跑时 steerNow 必须 `return false`（让调用方按新消息处理）。\n"+
 			"返回 true 会让这条消息既没发出去、也没留在输入框。\n%s", body)
 	}
@@ -110,13 +111,25 @@ func TestSteerNeverTargetsAnotherSession(t *testing.T) {
 // 别的会话在跑不能让当前会话的消息走转向分支。
 func TestSendDoesNotSteerWhenAnotherSessionRunning(t *testing.T) {
 	src := uiSource(t)
-	if !strings.Contains(src, "if (running && !runAway()) {") {
-		t.Fatalf("发消息流程缺少 `if (running && !runAway())` 判据 —— " +
-			"少了 !runAway()，别的会话在跑时当前会话的消息会被 steerNow 改道")
+	// 判据是 viewRunning()（「**当前视图这个会话**在跑」），不是 anyRunning()。
+	// 两者混用就会把「别的会话在后台跑」当成「本会话在跑」，当前会话的新消息
+	// 被 steerNow 改道成转向。
+	if !strings.Contains(src, "if (viewRunning()) {") {
+		t.Fatalf("发消息流程缺少 `if (viewRunning())` 判据 —— " +
+			"少了它，别的会话在跑时当前会话的消息会被 steerNow 改道")
 	}
 	// 有字时：steerNow 返回 false 要**继续往下走**（正常发送），
 	// 不能无条件 return 把消息吞掉。
-	seg := src[strings.Index(src, "if (running && !runAway()) {"):]
+	// ⚠️ 必须锚在 submitMessage 里那处，不能取全文件第一个 `if (viewRunning())`：
+	// syncSendBtn 里也有同形的判断，取错了会截到按钮提示那段，断言必然假失败。
+	const anchor = "async function submitMessage("
+	anchorAt := strings.Index(src, anchor)
+	if anchorAt < 0 {
+		t.Fatal("ui.js 里找不到 submitMessage")
+	}
+	// ⚠️ 下标要加回 anchorAt：strings.Index 返回的是**子串内**的偏移，
+	// 直接拿去切 src 会落到文件前部，截出一段无关代码。
+	seg := src[anchorAt+strings.Index(src[anchorAt:], "if (viewRunning()) {"):]
 	end := strings.Index(seg, "\n    }")
 	if end < 0 || end > 800 {
 		end = minInt(800, len(seg))
@@ -145,8 +158,8 @@ func TestEscapeDoesNotCancelAnotherSession(t *testing.T) {
 	if cancelIdx < 0 {
 		t.Fatal("Esc 分支里找不到 cancel")
 	}
-	if !strings.Contains(seg[:cancelIdx], "runAway()") {
-		t.Errorf("Esc 打断前必须先判 runAway() —— 否则在会话 B 按 Esc 会停掉后台的 A。\n%s",
+	if !strings.Contains(seg[:cancelIdx], "viewRunning()") {
+		t.Errorf("Esc 打断前必须先判 viewRunning() —— 否则在会话 B 按 Esc 会停掉后台的 A。\n%s",
 			seg[:cancelIdx])
 	}
 	if !strings.Contains(seg, "type: 'cancel', session_id: sessionID") {
@@ -299,6 +312,7 @@ func TestFrontendHandlesWorkspaceBlocked(t *testing.T) {
 		"replayHistory",
 		"sessionID =",
 		"runSessionID =",
+		"runningSessions.",
 	} {
 		if strings.Contains(block, forbidden) {
 			t.Errorf("workspace_blocked 分支里出现了 %q —— 它必须只做提示。\n"+

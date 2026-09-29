@@ -1154,7 +1154,7 @@
       // back = 距最后一条提问的距离，与服务端 nthLastUserQuestionIndex 同一口径。
       const back = total - 1 - i;
       // 运行中不给编辑入口：这一轮的上下文正在被模型消费，就地改写会让事件与历史错位。
-      if (editableBacks.has(back) && !running) {
+      if (editableBacks.has(back) && !viewRunning()) {
         if (btn) {
           btn.dataset.back = String(back);
         } else {
@@ -1735,7 +1735,7 @@
   // 真要重来，「重新生成」与「编辑重发」才是那条显式的破坏性入口。
   function sendContinueRequest() {
     removeResumeRing();
-    if (running || sending || !wsReady) { addInfo('正在处理中，请稍候'); return; }
+    if (anyRunning() || sending || !wsReady) { addInfo('正在处理中，请稍候'); return; }
     if (!sessionID) { removeResumeRing(); return; }
     sending = true;
     if (!wsSend({ type: 'continue_turn', session_id: sessionID, thinking: thinkingVal })) {
@@ -1866,7 +1866,7 @@
   }
   // 发送一条用户消息（复用输入框提交链路：别名展开 / 气泡 / 发送）。运行中不允许。
   function sendAsUserText(text) {
-    if (running || !text || !wsReady) { if (text) addError('正在处理中，请稍后再试'); return; }
+    if (anyRunning() || !text || !wsReady) { if (text) addError('正在处理中，请稍后再试'); return; }
     // 直接走 form.requestSubmit：会把 input 的内容清空并显示气泡 —— 但我们要发送的是
     // 面板触发的文本，不是输入框内容。为了复用展开链路，先临时借用 input。
     if (!input) return;
@@ -1878,7 +1878,7 @@
   }
   // @plan 计划书回复完成后：输入框上方弹出「直接发送 / 取消」（可复用 ActionPanel）。
   function maybeShowPlanActions() {
-    if (actionPanelShown || running) return;
+    if (actionPanelShown || anyRunning()) return;
     // 只认用户主动 @plan（允许 @ plan / 大小写），别被回复里的「计划书」字样误触发
     if (!lastUserText || !/@\s*plan/i.test(lastUserText)) return;
     actionPanelShown = true;
@@ -1929,7 +1929,7 @@
     regen.title = '重新生成';
     regen.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>';
     regen.addEventListener('click', function () {
-      if (running || !lastUserText || !wsReady) return;
+      if (anyRunning() || !lastUserText || !wsReady) return;
       // 删除本列中用户消息之后的旧回复（思考/正文/工具/操作栏），原位等待新回复
       const col = bar.closest('.msg-col');
       if (col) {
@@ -2054,17 +2054,47 @@
   let reasonPinned = false;   // 用户是否手动上翻了思考过程（上翻时不自动贴底）
   let lastReply = '';         // 本轮回复全文（供复制/操作栏）
   let lastUserText = '';      // 最近一次用户消息（供重新生成）
-  // 后台运行：一个连接同时只跑一个任务（服务端 c.run 会先停旧任务），
-  // runSessionID 记录这一轮属于哪个会话；用户切走后事件继续到达，但不能画进当前视图。
-  let runSessionID = '';
-  // 后台运行会话「已流出但尚未落盘」的思考/正文片段：不随视图切换重置，
-  // 切回该会话时补渲染。落盘点与正常流程一致（正文开始弃思考、工具调用清正文）。
-  let runReason = '';
-  let runText = '';
 
-  // 本轮任务不在当前视图（用户切到别的会话去了）
-  function runAway() {
-    return running && runSessionID && runSessionID !== sessionID;
+  // ---------- 并发会话的视图状态 ----------
+  //
+  // 服务端按会话分运行槽（pkg/server/ws_handler.go 的 c.runs[sessionID]），
+  // 同一连接上**允许多个会话同时跑**。所以「正在跑」不是一个布尔、
+  // 「这一轮属于谁」也不是一个 id —— 单槽记不住并发，历史上就是因此
+  // 把 A 的输出画进了 B 的屏幕（详见下面 frameIsMine 的注释）。
+  //
+  // runningSessions：此刻有循环在跑的会话 id 集合。
+  let runningSessions = new Set();
+  // streams：每个会话「已流出但尚未落盘」的思考/正文片段，sessionID -> {reason, text}。
+  // 分桶的原因：切到别的会话时那一会话仍在流式输出，帧照样到达。若只有一个
+  // runText，别的会话的增量会污染当前这一屏；而 replayHistory 切回来时又会
+  // 把这坨被污染的内容当作「本会话的未落盘片段」补上去 —— 刷新不但没修好，
+  // 还把污染重新贴了一遍。
+  const streams = new Map();
+
+  // 当前视图这个会话此刻是否在跑。
+  // 转向/打断、发送键三态、idle 收尾都只认它。
+  function viewRunning() { return !!sessionID && runningSessions.has(sessionID); }
+  // 本连接是否有任务在跑（不分哪个会话）。用于「正在处理中，请稍候」这类
+  // 全局串行化守卫 —— 那些操作确实不该与任何一轮并行。
+  function anyRunning() { return runningSessions.size > 0; }
+  // frameIsMine：这一帧是否属于**当前视图**的会话。
+  //
+  // 这是唯一该用的归属判据。原先用的是 runAway()，它问的是「我追踪的那
+  // **一个**运行槽是否在当前视图」，不是「**这一帧**是不是当前视图的会话」。
+  // 只有一个任务在跑时两者等价（所以一直没暴露）；两个会话并发时立刻分叉：
+  // busy 会把单槽改写成最后到达的那个会话，此后另一个会话的流式帧全部
+  // 通过守卫、被 appendText/addTool 画进当前这一屏，两屏内容互相覆盖。
+  //
+  // 老服务端不带 session_id 时按原样放行 —— 与既有守卫口径一致，不因升级卡住。
+  function frameIsMine(ev) {
+    return !ev.session_id || ev.session_id === sessionID;
+  }
+  // 取某会话的流式片段桶（不存在就建）。sid 为空时归到当前视图。
+  function streamOf(sid) {
+    const key = sid || sessionID;
+    let s = streams.get(key);
+    if (!s) { s = { reason: '', text: '' }; streams.set(key, s); }
+    return s;
   }
 
   // 首帧该开哪个会话：
@@ -2600,7 +2630,7 @@
             ]);
           });
           li.appendChild(sdots);
-          if (running && s.id === runSessionID) addRunBadge(li); // 正在运行的会话：转圈提示
+          if (runningSessions.has(s.id)) addRunBadge(li); // 正在运行的会话：转圈提示
           li.addEventListener('click', function () {
             if (s.id === sessionID) return;
             loadSession(s.id); // 运行中也允许切换：后台继续跑，只切视图
@@ -2624,7 +2654,7 @@
   }
   function syncRunBadges() {
     sessionListEl.querySelectorAll('.session-item').forEach(function (li) {
-      const on = running && !!runSessionID && li.dataset.id === runSessionID;
+      const on = runningSessions.has(li.dataset.id);
       if (on) {
         addRunBadge(li);
       } else {
@@ -2637,7 +2667,7 @@
 
   // 在指定工作区新建会话：该工作区成为当前工作区（发消息时挂在它下面）
   function newSessionInWorkspace(ws) {
-    if (running) return;
+    if (anyRunning()) return;
     if (ws && ws !== workspaceRoot) {
       // 先切换工作区，再新建会话（服务端 Create 挂当前工作区）。
       // ⚠️ 必须看 res.ok：目录已被删除时服务端会拒绝，若照样往下走，
@@ -2667,7 +2697,7 @@
   // 侧栏「新建项目」：先弹窗选好 工作区 / 项目名 / 默认权限，确认后才真正创建。
   // （不再一键直建 —— 直接点一下就建好会跳过所有项目级设置。）
   document.getElementById('new-chat-btn').addEventListener('click', function () {
-    if (running) return;
+    if (anyRunning()) return;
     openNewProjectDialog();
   });
 
@@ -3106,7 +3136,7 @@
   }
 
   // 切换会话：请求服务端回放历史。
-  // 运行中也允许切换：任务继续在后台跑，只换视图；未落盘片段由 runReason/runText
+  // 运行中也允许切换：任务继续在后台跑，只换视图；未落盘片段按会话存在 streams 里
   // 跨视图保留，replayHistory 渲染完历史后自动补上。
   function loadSession(id) {
     if (!id || id === sessionID) return;
@@ -3116,8 +3146,8 @@
     sessionChanging = true;
     // 记账：这一帧 history 是**我请求的**，必须放行（case 'history' 的守卫靠它）。
     awaitingHistoryFor = id;
-    // 按钮不在这里刷：syncSendBtn 的「（正在运行的会话）」提示要看 runAway()，
-    // 而 runAway() 比的是 sessionID —— 那要等 replayHistory 把它换掉才知道。
+    // 按钮不在这里刷：syncSendBtn 的形态要看 viewRunning()，而它比的是 sessionID ——
+    // 那要等 replayHistory 把它换掉才知道。
     wsSend({ type: 'load_session', session_id: id });
   }
 
@@ -3139,7 +3169,7 @@
     // 切会话保留 lastUserText（重新生成要用），其余引用一律作废
     clearViewState({ keepLastUser: true });
     sessionID = ev.session_id || '';
-    // sessionID 换了才刷按钮：runAway()（运行中的会话是否在当前视图）刚变成真值，
+    // sessionID 换了才刷按钮：viewRunning()（当前视图是否在跑）刚变成真值，
     // 打断按钮的提示要据此标不标「（正在运行的会话）」。早先在 loadSession 里刷，
     // 那时 sessionID 还没换，提示恒为「不在当前视图」——切回正在跑的那个会话时
     // 仍然标着后台运行。
@@ -3187,10 +3217,14 @@
     closeText();
     // 切回「正在后台运行」的会话：补上已流出但尚未落盘的思考/正文片段。
     // 运行中不挂操作栏（与正常流式输出期间一致，idle 时再出现）。
-    const runningHere = running && !!runSessionID && ev.session_id === runSessionID;
+    //
+    // ⚠️ 读的是**该会话自己**的桶（streams），不是某个全局槽：并发时槽若被
+    // 别的会话占了，把它的片段贴到这一屏就是串内容。
+    const runningHere = viewRunning();
     if (runningHere) {
-      if (runReason) appendReason(runReason);
-      if (runText) appendText(runText);
+      const st = streams.get(ev.session_id) || { reason: '', text: '' };
+      if (st.reason) appendReason(st.reason);
+      if (st.text) appendText(st.text);
     }
     if (lastReply && !runningHere) addActions(lastReply);
     // 切会话/回放历史后一律回到「跟随最新」状态：用户对新会话的默认预期是看最新内容，
@@ -3606,6 +3640,9 @@
       wsReady = false;
       sending = false;
       sessionChanging = false;
+      // 切换到一半连接断了：待认领的 id 再也等不到回包，留着会让将来某一帧
+      // **非请求**的同会话 history 被误当成回包放行，把整屏拽走。必须清。
+      awaitingHistoryFor = null;
       composerEpoch++;
       setTimeout(connectWS, 2000); // 断线重连
     });
@@ -3615,7 +3652,9 @@
       switch (ev.type) {
         case 'ready':
           // 断线重连：旧任务已随连接关闭被服务端取消，复位运行态避免按钮卡在 ▶
-          running = false; runSessionID = ''; runReason = ''; runText = '';
+          // streams 一并清空：那些片段属于旧连接上的会话，再也不会被补上了。
+          runningSessions.clear();
+          streams.clear();
           syncSendBtn();
           renderSessions(ev.sessions || []);
           // 旧连接上的待决审批全部作废（服务端 handleWS 的 defer 已 stop 掉那一轮）。
@@ -3638,20 +3677,35 @@
           //   ② 服务端主动推的（编辑重发 EventEdit 之后补的那一帧）：若当前视图
           //      已经换成别的会话，无条件 replayHistory 会把整屏拽回去
           //      （loadSession 允许运行中调用，窗口真实存在）。
-          // 靠 awaitingHistoryFor 记账区分；老服务端不带 session_id 时按原样放行。
-          if (ev.session_id && awaitingHistoryFor !== ev.session_id &&
-              ev.session_id !== sessionID) {
-            awaitingHistoryFor = null;
+          //
+          // ⚠️⚠️ 只有**确实认领**的那一帧才能清 awaitingHistoryFor（2026-09 修复）。
+          // 原来是无条件清，于是这条链成立：视图停在 A、A 正在编辑重发或断点重试
+          //（服务端在 EventEdit 后补一帧 history(A)，ws_handler.go 里那个分支）→
+          // 用户点 B（awaitingHistoryFor=B）→ history(A) 到达，它因
+          // 「session_id === 当前视图」被放行，顺手把 awaitingHistoryFor 清空 →
+          // 随后真正的 history(B) 因「已无待认领」而被当成别的会话的推送丢弃 →
+          // sessionID 停在 A、侧栏高亮也停在 A → 用户以为在 B 里发的消息，被
+          // submitMessage 的 `viewRunning()` 判成「当前会话在跑」→
+          // steerNow 灌进 A，界面上还标着「转向」。
+          // 症状就是「同项目两个会话没法并发，后台那个凭空多一条转向」。
+          //
+          // 同理，被拒绝的帧也**不能**清：它不是回包，清掉等于凭空取消用户的切换。
+          const mine = !!ev.session_id && awaitingHistoryFor === ev.session_id;
+          if (ev.session_id && !mine && ev.session_id !== sessionID) {
             addInfo('另一个会话的历史更新已忽略（当前视图未切换）');
             break;
           }
-          awaitingHistoryFor = null;
+          if (mine) awaitingHistoryFor = null;
           pendingEdit = false;
           replayHistory(ev);
           break;
         case 'session':
-          // 任务运行中不接受 session 事件改视图（那是别的会话的启动回报）
-          if (ev.session_id && (!running || !runSessionID || ev.session_id === runSessionID)) {
+          // 只认两种情况：① 本会话自己的启动回报；② 还没有会话时的新建回报
+          // （doNewSession 把 sessionID 清空等这帧回填）。
+          //
+          // ⚠️ 原来判据是「没在跑就照单全收」：视图停在 A、B 起跑发来 session(B)，
+          // 视图就被拽到 B —— 于是用户以为自己在 A 里操作，实际发消息落到 B。
+          if (ev.session_id && (ev.session_id === sessionID || sessionID === '')) {
             if (sessionID !== ev.session_id) composerEpoch++;
             sessionID = ev.session_id;
             sessionChanging = false;
@@ -3672,7 +3726,7 @@
             // 页面刷新后视图是无状态的，只能靠服务端判；run 结束后的 checkpoints
             // 一定在 idle 之后到达，所以这里直接按结果挂/摘圆环即可。
             resumeBack = Math.max(-1, Number(ev.resume_back));
-            if (resumeBack >= 0 && !running) showResumeRing();
+            if (resumeBack >= 0 && !viewRunning()) showResumeRing();
             else removeResumeRing();
           }
           break;
@@ -3690,7 +3744,7 @@
           break;
         case 'rewind':
           // 文件已按检查点回滚：给一条可见反馈（含还原/删除/失败计数）。
-          if (ev.result) addInfo(describeRewind(ev.result));
+          if (ev.result && frameIsMine(ev)) addInfo(describeRewind(ev.result));
           break;
         case 'info':
           // 服务端的一般性提示（纯告知，不改状态）：如「已补上 N 条被打断的工具调用记录」。
@@ -3702,21 +3756,20 @@
           if (!ev.session_id || ev.session_id === sessionID) renderCtxUsage(ev);
           break;
         case 'busy':
+          // 运行态先无条件登记：这是「有会话在跑」的权威来源，侧栏转圈与
+          // 发送键形态都读它，**与当前视图是哪一屏无关**。
+          if (ev.session_id) { runningSessions.add(ev.session_id); }
+          else if (sessionID) { runningSessions.add(sessionID); }
+          syncRunBadges();
+          // ⚠️ 下面开始的一切都只属于**当前视图**，别的会话的 busy 一行都不许碰。
+          //
+          // 原来这里没有任何归属判定，一次做 15 件事（清流式片段 / lastReply /
+          // optimisticBubble、resetSubagentCards、expireApprovals、settleActiveTool、
+          // showThinking…）。同项目两个会话并发时，B 的 busy 到达会把 A 正在流的
+          // 内容清掉并盖上「正在思考」—— 两屏内容互相覆盖（2026-09 反馈）。
+          if (!frameIsMine(ev)) break;
           sending = false;
-          // ⚠️ runSessionID 取**服务端给的** session_id，不是当前视图的 sessionID。
-          //
-          // 曾经写 `runSessionID = sessionID`：并行两个会话时，B 的 busy 到达时
-          // 视图可能已经切回 A，于是 A 被标成「正在跑的会话」——
-          // 之后在 A 里发消息会被判成「转向」，落进 B。
-          //
-          // 服务端每个 busy/idle 都带 session_id，正是为了这个。
-          if (ev.session_id) {
-            runSessionID = ev.session_id;
-          } else {
-            runSessionID = sessionID;
-          }
-          running = true;
-          runReason = ''; runText = '';
+          const bs = streamOf(ev.session_id); bs.reason = ''; bs.text = '';
           lastReply = '';
           hasModelReplied = false; // 新一轮开始：重置回复标记
           // busy 到达 = 服务端已把用户消息追加进历史 → 乐观气泡不再是幻影，清掉引用
@@ -3725,7 +3778,7 @@
           removeRetry();
           removeResumeRing();
           resetSubagentCards();
-          // 上一轮的待决审批必然已失效（服务端 c.stop() 先执行才起新一轮）。
+          // 上一轮的待决审批必然已失效（服务端 stopSession 先执行才起新一轮）。
           expireApprovals();
           // ⚠️ 这里**不能**用 clearRunVisuals 全量：busy 紧接着要 showThinking()，
           // 全量里的 removeThinking() 会把刚要建的提示拆掉。
@@ -3739,20 +3792,20 @@
           syncUserEditButtons();
           break;
         case 'retry':
-          if (runAway()) break; // 后台会话的重试提示不画进当前视图
+          if (!frameIsMine(ev)) break; // 后台会话的重试提示不画进当前视图
           removeThinking();
           addRetry(ev.error || '', Number(ev.attempt) || 0, Number(ev.max_attempts) || 0);
           break;
         case 'steer':
           // 服务端已把转向指令并入上下文：气泡标注从「等待并入」变成「已并入」，
           // 让用户看见话确实被接住了，而不是石沉大海。
-          if (runAway()) break;
+          if (!frameIsMine(ev)) break;
           markSteerMerged();
           break;
         case 'compress':
           // 上下文越过压缩线，服务端已自动压缩。这一段是「无声发生」的关键动作，
           // 必须告诉用户：否则他会以为历史丢了（实际完整保留，只是送模内容变了）。
-          if (runAway()) break;
+          if (!frameIsMine(ev)) break;
           (function () {
             const ci = ev.compress || {};
             if (ci.degraded) {
@@ -3768,21 +3821,23 @@
           })();
           break;
         case 'reasoning':
+          // 累加**在守卫之前**、但写进**该帧自己会话的桶**：切到别的会话时
+          // 这一会话仍在流式输出，片段要留着，切回来才补得上（见 replayHistory）。
+          streamOf(ev.session_id).reason += ev.text || '';
+          if (!frameIsMine(ev)) break;
           hasModelReplied = true;
           removeResumeRing();
-          runReason += ev.text || '';
-          if (runAway()) break;
           removeThinking();
           removeRetry();
           settleActiveTool();
           appendReason(ev.text || '');
           break;
         case 'text':
+          streamOf(ev.session_id).reason = '';
+          streamOf(ev.session_id).text += ev.text || '';
+          if (!frameIsMine(ev)) { foldReason(); break; }
           hasModelReplied = true;
           removeResumeRing();
-          runReason = '';
-          runText += ev.text || '';
-          if (runAway()) { foldReason(); break; }
           removeThinking();
           removeRetry();
           foldReason();
@@ -3792,8 +3847,8 @@
         case 'tool_pending': {
           // 工具调用参数正在流式生成（大参数要生成几十 KB）：立即给出反馈，
           // 不然这几分钟界面看起来像卡死。真正的 tool_call 卡片到达后替换。
-          runReason = ''; runText = '';
-          if (runAway()) { foldReason(); closeText(); break; }
+          const st = streamOf(ev.session_id); st.reason = ''; st.text = '';
+          if (!frameIsMine(ev)) { foldReason(); closeText(); break; }
           removeThinking();
           removeRetry();
           foldReason();
@@ -3803,11 +3858,11 @@
           break;
         }
         case 'tool_call': {
+          const stc = streamOf(ev.session_id); stc.reason = ''; stc.text = '';
+          if (!frameIsMine(ev)) { foldReason(); closeText(); break; }
           hasModelReplied = true;
           if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
           // 该段内容此刻已写入会话消息：思考丢弃、正文交给历史回放，不再算未落盘
-          runReason = ''; runText = '';
-          if (runAway()) { foldReason(); closeText(); break; }
           removeThinking();
           removeRetry();
           foldReason();
@@ -3825,8 +3880,8 @@
         }
         case 'subagent': {
           // 子智能体实时进度：每个子任务一张卡片，status 驱动样式
-          runReason = ''; runText = '';
-          if (runAway()) { foldReason(); closeText(); break; }
+          const ss = streamOf(ev.session_id); ss.reason = ''; ss.text = '';
+          if (!frameIsMine(ev)) { foldReason(); closeText(); break; }
           removeThinking();
           foldReason();
           closeText();
@@ -3834,7 +3889,7 @@
           break;
         }
         case 'tool_result':
-          if (runAway()) break;
+          if (!frameIsMine(ev)) break;
           if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
           removeThinking();
           // 成功路径与以前完全一致（撤掉 spinner 即收尾）；只有失败才追加 ⛔。
@@ -3843,23 +3898,41 @@
           settleActiveTool(!!(ev.result && ev.result.success === false));
           closeText();
           // 工具执行结束后，模型通常会再次被调用；在下一段 reasoning/text 到来前明确提示等待。
-          if (running) showThinking();
+          if (viewRunning()) showThinking();
           break;
         case 'hitl_request':
-          removeThinking();
-          removeRetry();
-          settleActiveTool(); // 等待审批不算运行：撤掉 spinner
-          foldReason();
-          closeText();
+          // 审批卡**要**给后台会话也显示（并标注来源，见 addApproval）——
+          // 用户不该因为切走了就看不到「有个任务在等我点头」。
+          // 但收尾当前这一屏的流式元素只能做本视图的：后台任务停下来时
+          // 把当前会话正在流的正文 fold 掉，那一屏就凭空少了一段。
+          if (frameIsMine(ev)) {
+            removeThinking();
+            removeRetry();
+            settleActiveTool(); // 等待审批不算运行：撤掉 spinner
+            foldReason();
+            closeText();
+          }
           addApproval(ev); // 后台会话的审批会带 session_id，卡片上标注来源
           break;
         case 'error': {
           sending = false;
           sessionChanging = false;
-          if (runAway()) {
-            // 后台会话出错：在当前视图标注来源，不能静默吞掉
-            const emeta = sessionsCache.find(function (s) { return s.id === runSessionID; });
-            addError('后台会话「' + ((emeta && emeta.title) || runSessionID) + '」出错：' + describeLLMError(ev.error));
+          // ⚠️ 这里**刻意不清** awaitingHistoryFor。
+          //
+          // error 帧不只来自切换失败 —— 后台会话的报错也走这一支。若无条件清，
+          // 用户点着 B、A 的任务恰好报错，就会把待认领的 id 清掉，随后 history(B)
+          // 被判成「别的会话的推送」丢弃，sessionID 留在 A —— 正是 2026-09 修过
+          // 的那个 bug，换条路径复发。残留一个等不到回包的 id 最多让某个**别的**
+          // 会话的历史帧被误放行（需要那个会话在另一处跑编辑重发），比上面罕见得多。
+          //
+          // ⚠️ error 帧**不带** session_id（服务端 sendErr 只发 type+error），
+          // 所以只能靠「当前视图没在跑、却有别的在跑」来判定它来自后台。
+          // 拿不到具体是哪个会话时就不猜标题，只如实说「后台任务出错」。
+          if (anyRunning() && !viewRunning()) {
+            let bgId = '';
+            runningSessions.forEach(function (id) { if (!bgId) bgId = id; });
+            const emeta = sessionsCache.find(function (s) { return s.id === bgId; });
+            addError('后台会话「' + ((emeta && emeta.title) || bgId || '未命名') + '」出错：' + describeLLMError(ev.error));
             break;
           }
           expireApprovals();
@@ -3889,24 +3962,33 @@
         // 于是他发的消息被 steerNow 判成「转向后台任务」落进 A。
         // 那条「已把这条指令转向到后台正在运行的任务」就是这么来的。
         case 'workspace_blocked': {
+          // ⚠️ 这一帧**不带** session_id（服务端在 load_session 分支直接发的，
+          // 见 ws_handler.go），所以无法也不需要按会话过滤：它本来就是
+          // 「你刚点的那个会话切不过去」这一次的提示。
           addInfo(ev.text || '当前工作区与该会话不一致，继续发消息会读到当前项目的文件');
           break;
         }
         case 'idle': {
+          // ⚠️ 顺序要紧：运行态**无条件**摘除，DOM 收尾才受归属判定管。
+          //
+          // 原来是一句 `if (ev.session_id !== sessionID) break;` 把两者一起挡掉，
+          // 于是别的会话跑完后 running 永远清不掉 —— 单槽被一个已结束的会话占住，
+          // 侧栏转圈与发送键形态从此失真。
+          if (ev.session_id) { runningSessions.delete(ev.session_id); }
+          else { runningSessions.clear(); }
+          if (ev.session_id) { streams.delete(ev.session_id); }
+          if (!frameIsMine(ev)) {
+            // 后台会话跑完：只刷侧栏与按钮，不碰当前这一屏的任何节点。
+            syncRunBadges();
+            syncSendBtn();
+            break;
+          }
           sending = false;
-          // ⚠️ 只处理**当前视图这个会话**的收尾。
-          // 别的会话跑完了，它的 idle 不该把当前会话的运行态清掉
-          // （那会让「正在跑」显示消失，用户以为任务停了）。
-          if (ev.session_id && ev.session_id !== sessionID) break;
-          const backHome = !runAway();
           expireApprovals();
           clearRunVisuals();
           foldReason();
           closeText();
-          if (backHome && lastReply) addActions(lastReply);
-          running = false;
-          runSessionID = '';
-          runReason = ''; runText = '';
+          if (lastReply) addActions(lastReply);
           hasModelReplied = false;
           syncSendBtn();
           syncRunBadges();
@@ -4108,31 +4190,33 @@
   //
   // 状态只由两个事实决定：**在不在跑** + **输入框有没有字**，
   // 且必须与 submitMessage 的分支一一对应，否则按钮在骗人：
-  //   running && 无字 → 打断   点它发 cancel，本轮中止
-  //   有字            → 发送   running 时点它是「转向」：任务继续跑，把这句话插进去
+  //   当前视图在跑 && 无字 → 打断   点它发 cancel，本轮中止
+  //   当前视图在跑 && 有字 → 发送   此时点它是「转向」：任务继续跑，把这句话插进去
   //   无字 && 空闲    → 变暗   submitMessage 里 raw 为空直接 return，点了什么也不会发生；
   //                             亮着 accent 等于暗示「现在可以发」
   //
-  // 早先只看 running，于是「运行中打了字」显示的是停止方块、点下去却是转向。
-  // 单一出口 syncSendBtn()：改 running 或改 input.value 都调它，不各自改 class。
+  // 早先只看「在跑没在跑」，于是「运行中打了字」显示的是停止方块、点下去却是转向。
+  // 单一出口 syncSendBtn()：改运行态或改 input.value 都调它，不各自改 class。
   const form = $('#composer');
   const sendBtn = $('#send-btn');
   const input = $('#input');
-  let running = false;
 
   function syncSendBtn() {
     const hasText = !!String(input.value || '').trim();
-    const stop = running && !hasText;   // 打断
-    const dim = !running && !hasText;   // 无事可做
+    // ⚠️ 判据是 viewRunning()（「**当前视图这个会话**在跑」），不是 anyRunning()：
+    // 别的会话在后台跑时，当前会话并没有任务在跑，输入框里的字是**新消息**，
+    // 点下去必须是发送而不是转向。两者混用就会出现「B 的消息跑进 A」。
+    const stop = viewRunning() && !hasText;   // 打断
+    const dim = !viewRunning() && !hasText;   // 无事可做
     sendBtn.classList.toggle('running', stop);
     sendBtn.classList.toggle('dim', dim);
     let tip;
     if (stop) {
-      tip = '点击打断' + (runAway() ? '（正在运行的会话）' : '');
-    } else if (running) {
+      tip = '点击打断';
+    } else if (viewRunning()) {
       tip = '发送（转向：任务继续跑，把这句话插进去）';
     } else {
-      tip = '发送' + (hasText ? '' : '（还没有内容）');
+      tip = '发送' + (hasText ? (anyRunning() ? '（另一个会话在跑，这是新消息）' : '') : '（还没有内容）');
     }
     sendBtn.title = tip;
     sendBtn.setAttribute('aria-label', tip);
@@ -4156,7 +4240,7 @@
   function isEditing() { return !!editing; }
 
   function startEditMessage(text, back) {
-    if (running) { addInfo('正在处理中，请稍后再试'); return; }
+    if (anyRunning()) { addInfo('正在处理中，请稍后再试'); return; }
     if (!wsReady) { addError('未连接到服务，请稍候重试'); return; }
     if (editing) exitEditMode(false); // 已在编辑另一条：先复位再切过去
     editing = { back: back, original: text };
@@ -4180,7 +4264,7 @@
     if (!editing) return;
     const text = String(input.value).trim();
     if (!text) { addError('编辑后的内容不能为空'); return; }
-    if (running) { addInfo('正在处理中，请稍后再试'); return; }
+    if (anyRunning()) { addInfo('正在处理中，请稍后再试'); return; }
     if (!wsReady) { addError('未连接到服务，请稍候重试'); return; }
 
     const back = editing.back;
@@ -4545,7 +4629,7 @@
     const raw = String(input.value || '').trim();
     if (!raw) return false;
     // 当前视图这个会话没有任务在跑 → 不该走转向，交给调用方按新消息处理。
-    if (runAway() || !running) return false;
+    if (!viewRunning()) return false;
     const target = sessionID;
     if (!target) { addError('还没有会话，请先发送一条消息'); return true; }
     if (!wsSend({ type: 'steer', session_id: target, text: raw })) {
@@ -4595,14 +4679,10 @@
     if (pendingUploads) { addInfo('文件正在上传，请等待上传完成后发送'); return; }
     if (sending) { addInfo('消息正在发送，请勿重复提交'); return; }
     if (workspaceChanging || sessionChanging) { addInfo('正在切换会话或工作区，请稍候'); return; }
-    // 转向与打断都**只对当前会话**生效。
-    //
-    // `running` 是「本连接上有任务在跑」，`runAway()` 是「跑的不是当前视图这个会话」。
-    // 两个都要判：
-    //   - 不 runAway：当前会话自己在跑 → 有字转向、无字打断。
-    //   - runAway：别的会话在跑 → 当前会话没有任务，输入框里的字是**新消息**，
-    //     按正常发送处理，绝不改道。
-    if (running && !runAway()) {
+    // 转向与打断都**只对当前会话**生效，判据是 viewRunning()（「当前视图这个
+    // 会话在跑」）—— 不是「本连接有任务在跑」。别的会话在后台跑时，当前会话
+    // 并没有任务，输入框里的字是**新消息**，按正常发送处理，绝不改道。
+    if (viewRunning()) {
       if (String(input.value).trim()) { if (steerNow()) return; }
       else {
         wsSend({ type: 'cancel', session_id: sessionID });
@@ -5261,15 +5341,15 @@
   // 不用去猜该重启服务还是该清缓存。资源是 no-store（server.go 对静态资源设的），
   // 所以普通 reload 一定拿到当前二进制内嵌的那份 ui.js / app.css。
   //
-  // ⚠️ 必须在 running 时先确认：连接一断，服务端就取消该轮任务。
+  // ⚠️ 必须在任一任务在跑时先确认：连接一断，服务端就取消那一轮。
   // 已经改过的文件不会回退（回退只有「回滚 / 编辑重发」两条显式入口才会做），
   // 但这一轮模型的工作就此中断 —— 值得先问一句。
   (function bindReloadPage() {
     const btn = document.getElementById('reload-page');
     if (!btn) return;
     btn.addEventListener('click', function () {
-      if (running) {
-        const where = runAway() ? '另一个会话' : '当前会话';
+      if (anyRunning()) {
+        const where = viewRunning() ? '当前会话' : '另一个会话';
         if (!confirm('当前' + where + '还有任务在运行。\n刷新会断开连接并打断这一轮'
           + '（已改过的文件不会回退）。\n\n仍要刷新吗？')) return;
       }
@@ -5298,7 +5378,7 @@
     // 顺手把正在跑的任务停掉是灾难性的误操作。用 diffPanelOpen 而不是
     // getElementById('diff-overlay')：面板是懒创建的，首次打开前那个节点还不存在。
     if (diffPanelOpen) { e.preventDefault(); closeDiffPanel(); return; }
-    if (!running || atPop || moreOpen) return;
+    if (!viewRunning() || atPop || moreOpen) return;
     if (['settings-overlay', 'newproj-overlay', 'termux-overlay', 'picker-overlay']
       .some(function (id) {
         const el = document.getElementById(id);
@@ -5307,7 +5387,7 @@
     e.preventDefault();
     // 与发送按钮同一套判据：打断**只对当前会话**生效。
     // 别的会话在跑时，当前会话没有任务可打断 —— 用户在 B 按 Esc 不该停掉 A。
-    if (runAway() || !running) { addInfo('当前会话没有正在运行的任务'); return; }
+    if (!viewRunning()) { addInfo('当前会话没有正在运行的任务'); return; }
     if (String(input.value || '').trim()) { if (steerNow()) return; return; }
     wsSend({ type: 'cancel', session_id: sessionID });
     if (!hasModelReplied) showResumeRing();

@@ -728,7 +728,7 @@ check('点击后真的重载当前页面',
   /function bindReloadPage\(\)/.test(uiSrc) &&
   /location\.reload\(\);/.test(uiSrc));
 check('运行中刷新要先确认（连接一断服务端就取消该轮）',
-  /if \(running\) \{[\s\S]{0,400}?confirm\(/.test(uiSrc) &&
+  /if \(anyRunning\(\)\) \{[\s\S]{0,400}?confirm\(/.test(uiSrc) &&
   /打断这一轮/.test(uiSrc) &&
   /已改过的文件不会回退/.test(uiSrc));
 check('上传中刷新也要确认',
@@ -839,12 +839,41 @@ check('前端记账「我请求的那一帧 history」',
   /awaitingHistoryFor = id;/.test(extractFunction(uiSrc, 'loadSession')));
 check('非请求触发且会话不匹配的 history 必须被丢弃',
   // 场景：A 会话编辑重发 → 点 B → 服务端补的 historyEvent(A) 把整屏拽回 A。
-  /if \(ev\.session_id && awaitingHistoryFor !== ev\.session_id &&[\s\S]{0,80}?ev\.session_id !== sessionID\)/.test(uiSrc) &&
+  /if \(ev\.session_id && !mine && ev\.session_id !== sessionID\)/.test(uiSrc) &&
   /另一个会话的历史更新已忽略/.test(uiSrc));
 check('请求触发的那一帧必须放行（切会话就靠它）',
-  /awaitingHistoryFor = null;\s*\n\s*pendingEdit = false;\s*\n\s*replayHistory\(ev\);/.test(uiSrc));
+  /if \(mine\) awaitingHistoryFor = null;\s*\n\s*pendingEdit = false;\s*\n\s*replayHistory\(ev\);/.test(uiSrc));
 check('老服务端不带 session_id 时按原样放行（不因升级卡住）',
   /if \(ev\.session_id &&/.test(uiSrc));
+// ⚠️ 下面两条是这个守卫真正被咬到的地方（2026-09 反馈：同项目两个会话不能并发，
+// 后台那个会话里凭空多出一条「转向」消息）。
+//
+// 原来 awaitingHistoryFor 是**无条件**清空的，而守卫的第二个条件
+// 「ev.session_id === 当前视图」会放行「当前视图会话自己」的非请求帧
+// （编辑重发/断点重试截断后服务端补的那一帧，ws_handler.go 的 EventEdit 分支）。
+// 于是：视图停在 A 且 A 正在编辑重发 → 用户点 B（awaitingHistoryFor=B）→
+// history(A) 到达并被放行，顺手把 awaitingHistoryFor 清空 → 随后真正的
+// history(B) 因「已无待认领」而被判成别的会话的推送丢弃 → sessionID 停在 A →
+// 用户以为在 B 发的消息被 steerNow 判成转向灌进 A。
+//
+// 修法：只有**确实认领**的那一帧（mine）才能清；被拒绝的帧也不能清
+// ——它不是回包，清掉等于凭空取消用户的切换。
+check('只有认领了的那一帧 history 才能清 awaitingHistoryFor',
+  /const mine = !!ev\.session_id && awaitingHistoryFor === ev\.session_id;/.test(uiSrc) &&
+  /if \(mine\) awaitingHistoryFor = null;/.test(uiSrc));
+check('被拒绝的 history 帧不得清 awaitingHistoryFor（否则凭空取消用户的切换）',
+  /另一个会话的历史更新已忽略（当前视图未切换）'\);\s*\n\s*break;\s*\n\s*\}\s*\n\s*if \(mine\) awaitingHistoryFor = null;/.test(uiSrc));
+// 上一条把「误清」堵住了，但把风险挪到了另一头：awaitingHistoryFor 一旦残留成
+// 一个再也等不到回包的 id，将来某一帧**非请求**的同会话 history 会被当成
+// 「我请求的回包」放行，把整屏拽到那个会话去。彻底无人回包的路径必须清干净。
+check('断线必须清 awaitingHistoryFor（回包永远不会来了）',
+  /addEventListener\('close',[\s\S]{0,400}?awaitingHistoryFor = null;/.test(uiSrc));
+// 但 error 帧**不能**无条件清 —— 它也承载后台会话的报错（见 case 'error' 的
+// runAway 分支）。清了的话，用户点着 B 而 A 恰好报错，就会把待认领的 id 清掉，
+// history(B) 随后被判成「别的会话的推送」丢弃，sessionID 留在 A：
+// 本次修的 bug 换条路径复发。这条断言是防这个回退的。
+check('error 帧不得清 awaitingHistoryFor（后台会话报错也会走这一支）',
+  !uiCase('error').includes('awaitingHistoryFor = null;'));
 check('edit 帧的守卫终于生效（此前 session_id 恒为空，是死代码）',
   uiCase('edit').includes('ev.session_id === sessionID') &&
   uiCase('edit').includes('resetStreamRefs()'));
@@ -1008,16 +1037,16 @@ check('运行中的打断按钮为危险色（区别于发送按钮的 accent）
   /#send-btn\.running\s*\{[^}]*background:\s*var\(--danger\)/.test(css) &&
   !/#send-btn\.running\s*\{[^}]*background:\s*var\(--text-dim\)/.test(css));
 check('三态判定与 submitMessage 的实际分支一一对应',
-  // 提交分支：running && !runAway && 有字 → steerNow（只转向**当前会话**）；
-  // running && !runAway && 无字 → cancel（打断，同样只针对当前会话）；
+  // 提交分支：当前视图在跑 && 有字 → steerNow（只转向**当前会话**）；
+  // 当前视图在跑 && 无字 → cancel（打断，同样只针对当前会话）；
   // 否则 raw 为空直接 return。按钮显示的必须是「点下去会发生什么」。
   //
-  // ⚠️ runAway() 那半个条件是 2026-09-29 加的：别的会话在后台跑时，
+  // ⚠️ 必须用 viewRunning() 而不是「本连接有任务在跑」：别的会话在后台跑时，
   // 当前会话并没有任务在跑，输入框里的字是**新消息**，不能被改道成转向。
-  // 少了它就会出现「B 会话的消息跑进 A 会话」。
-  /const stop = running && !hasText;/.test(uiSrc) &&
-  /const dim = !running && !hasText;/.test(uiSrc) &&
-  /if \(running && !runAway\(\)\) \{[\s\S]{0,400}?steerNow\(\)/.test(uiSrc) &&
+  // 少了这个区分就会出现「B 会话的消息跑进 A 会话」。
+  /const stop = viewRunning\(\) && !hasText;/.test(uiSrc) &&
+  /const dim = !viewRunning\(\) && !hasText;/.test(uiSrc) &&
+  /if \(viewRunning\(\)\) \{[\s\S]{0,400}?steerNow\(\)/.test(uiSrc) &&
   /type: 'cancel', session_id: sessionID/.test(uiSrc) &&
   /const raw = String\([^)]*\)\.trim\(\);\s*\n\s*if \(!raw\) return;/.test(uiSrc));
 check('单一定态出口：改 running / 写 input.value 都走 syncSendBtn',
@@ -1028,10 +1057,69 @@ check('单一定态出口：改 running / 写 input.value 都走 syncSendBtn',
 check('无内容时按钮变暗，且 hover 不再提亮成「能点」',
   /#send-btn\.dim\s*\{[^}]*background:\s*var\(--bg-elev\)[^}]*cursor:\s*default/.test(css) &&
   /#send-btn\.dim:hover \{ filter: none; \}/.test(css));
-check('打断提示随「运行中的会话是否在当前视图」变化',
-  // runAway() 比的是 sessionID，所以必须在 sessionID 换掉之后才刷新
+
+// ---------- 8.5 并发会话的视图隔离 ----------
+//
+// 这一整组是 2026-09 加的，起因：同项目两个会话并发时，一个会话的输出整段
+// 出现在另一个会话里，两屏内容互相覆盖。根因是视图状态是**单槽**的
+// （running / runSessionID / runText / runReason），而服务端按会话分运行槽、
+// 允许多个会话同时跑 —— 单任务时代码里两套概念恰好等价，并发时立刻分叉。
+group('并发会话：帧级归属判定（不再靠单槽代理）');
+check('frameIsMine 是唯一的归属判据：按**这一帧**的 session_id 比',
+  /function frameIsMine\(ev\) \{/.test(uiSrc) &&
+  /return !ev\.session_id \|\| ev\.session_id === sessionID;/.test(uiSrc));
+check('删除单槽代理 runAway()（它问的是「槽在不在视图」，不是「这帧是不是我的」）',
+  // 允许注释里提到它（那里正是在解释为什么删），但不许再有定义或调用。
+  !/function runAway\(/.test(uiSrc) &&
+  !/[^/]\brunAway\(\)/.test(uiSrc.replace(/^\s*\/\/.*$/gm, '')));
+check('每个会改视图的 case 都必须先过 frameIsMine',
+  // 结构断言，防止以后再漏一个 case —— 这次的根因正是「一半 case 有守卫、
+  // 一半没有」，靠人肉 review 拦不住。
+  ['retry', 'steer', 'compress', 'reasoning', 'text', 'tool_pending',
+   'tool_call', 'subagent', 'tool_result', 'rewind', 'busy']
+    .every(function (c) { return uiCase(c).includes('frameIsMine(ev)'); }));
+check('busy 帧：先按归属分流，后台会话的 busy 一行视图状态都不许碰',
+  // 原来 busy 无守卫却做了 15 件事（清 runText / lastReply / optimisticBubble、
+  // resetSubagentCards / expireApprovals / settleActiveTool / showThinking…），
+  // 别的会话一起跑，它会把当前这一屏正在流的内容清掉。
+  uiCase('busy').indexOf('frameIsMine(ev)') >= 0 &&
+  uiCase('busy').indexOf('frameIsMine(ev)') <
+  uiCase('busy').indexOf('resetSubagentCards()') &&
+  uiCase('busy').indexOf('frameIsMine(ev)') < uiCase('busy').indexOf('showThinking()'));
+check('idle 帧：先摘运行态，再按归属决定要不要做 DOM 收尾',
+  uiCase('idle').includes('runningSessions.delete(') &&
+  uiCase('idle').indexOf('runningSessions.delete(') < uiCase('idle').indexOf('clearRunVisuals()'));
+check('session 帧：只认本视图的，别把用户拽去别的会话',
+  // 原来判据是「没在跑就照单全收」：视图停在 A、B 起跑发来 session(B)，
+  // 视图就被拽到 B。合法场景只有两个 —— 新建会话（sessionID 为空）
+  // 与本会话自己的启动回报。
+  /if \(ev\.session_id && \(ev\.session_id === sessionID \|\| sessionID === ''\)\)/.test(uiSrc));
+check('流式片段按会话分桶，切回正在跑的会话不丢最后一截',
+  /const streams = new Map\(\)/.test(uiSrc) &&
+  /function streamOf\(/.test(uiSrc) &&
+  uiCase('text').includes('streamOf(') &&
+  uiCase('reasoning').includes('streamOf(') &&
+  extractFunction(uiSrc, 'replayHistory').includes('streams.get('));
+check('运行态是集合而不是单个 id（单 id 记不住「同时有两个在跑」）',
+  /let runningSessions = new Set\(\)/.test(uiSrc) &&
+  !/let runSessionID = /.test(uiSrc) &&
+  !/^  let running = false;$/m.test(uiSrc));
+check('两种运行态语义必须分开：当前视图在跑 vs 本连接有任务在跑',
+  // 混用就会出现「别的会话在跑，当前会话被当成在跑」——输入框里的新消息
+  // 被改道成转向，正是最初那个症状。
+  /function viewRunning\(\)/.test(uiSrc) &&
+  /function anyRunning\(\)/.test(uiSrc) &&
+  /runningSessions\.has\(sessionID\)/.test(uiSrc));
+check('侧栏转圈按会话查集合（两个会话可以同时转）',
+  /runningSessions\.has\(s\.id\)\) addRunBadge\(li\)/.test(uiSrc) &&
+  /const on = runningSessions\.has\(li\.dataset\.id\);/.test(uiSrc));
+check('打断提示随「当前视图是否在跑」变化',
+  // viewRunning() 比的是 sessionID，所以必须在 sessionID 换掉之后才刷新
   /sessionID = ev\.session_id \|\| '';[\s\S]{0,200}?syncSendBtn\(\);/.test(uiSrc) &&
-  /runAway\(\) \? '（正在运行的会话）' : ''/.test(uiSrc) &&
+  // 打断态只由「当前视图在跑」决定：别的会话在后台跑时不该把本会话的
+  // 发送键变成停止方块（点下去会变成打断一个不存在的任务）。
+  /const stop = viewRunning\(\) && !hasText;/.test(uiSrc) &&
+  /!viewRunning\(\) && !hasText/.test(uiSrc) &&
   !/if \(running\) sendBtn\.title/.test(uiSrc));
 
 // ---------- 10. 任务等待提示：模型响应前 / 工具返回后 ----------
@@ -1046,7 +1134,7 @@ check('busy 事件显示等待提示',
 check('tool_result 后模型再次等待时显示提示',
   // 窗口放宽：tool_result 分支里现在多了失败判定的注释（2026-09-27），
   // 350 字符刚好卡在边界上，改动无关的行就会假失败。
-  /case 'tool_result':[\s\S]{0,600}?if \(running\) showThinking\(\)/.test(uiSrc));
+  /case 'tool_result':[\s\S]{0,900}?if \(viewRunning\(\)\) showThinking\(\)/.test(uiSrc));
 check('reasoning/text/tool_call 到来时移除等待提示',
   uiCase('reasoning').includes('removeThinking()') &&
   uiCase('text').includes('removeThinking()') &&
@@ -1432,19 +1520,28 @@ check('运行中允许切换会话（点击不再被 running 挡住）',
 check('正在运行的会话带转圈标记',
   /function addRunBadge\(li\)/.test(uiSrc) &&
   /function syncRunBadges\(\)/.test(uiSrc) &&
-  /if \(running && s\.id === runSessionID\) addRunBadge\(li\)/.test(uiSrc) &&
+  /if \(runningSessions\.has\(s\.id\)\) addRunBadge\(li\)/.test(uiSrc) &&
   /#session-list\s+li\.session-item\s+>\s*\.session-spin\s*\{[^}]*animation:\s*toolSpin/.test(css));
-check('后台事件不画进当前视图（runAway 路由）',
-  /function runAway\(\)/.test(uiSrc) &&
-  /runReason \+= ev\.text \|\| '';\s*\n\s*if \(runAway\(\)\) break;/.test(uiSrc) &&
-  /runText \+= ev\.text \|\| '';\s*\n\s*if \(runAway\(\)\) \{ foldReason\(\); break; \}/.test(uiSrc));
-check('切回运行中会话补渲染未落盘片段',
-  /if \(runReason\) appendReason\(runReason\);/.test(uiSrc) &&
-  /if \(runText\) appendText\(runText\);/.test(uiSrc) &&
-  /runReason = ''; runText = '';/.test(uiSrc));
-check('idle 复位运行态并撤销转圈',
-  /runSessionID = '';/.test(uiSrc) && /syncRunBadges\(\);/.test(uiSrc) &&
-  /running = false;\s*\n\s*runSessionID = '';/.test(uiSrc));
+// ⚠️ 判据必须是「**这一帧**的 session_id」而不是单槽代理 runAway()。后者问的是
+  // 「我追踪的那一个运行槽在不在当前视图」—— 单任务时与前者等价（所以长期没暴露），
+  // 两个会话并发时立刻分叉：A 的流式帧被 appendText 画进 B 的屏幕。
+check('后台事件不画进当前视图（按帧的 session_id 判定）',
+  /function frameIsMine\(ev\)/.test(uiSrc) &&
+  uiCase('reasoning').includes('streamOf(ev.session_id).reason +=') &&
+  uiCase('reasoning').indexOf('streamOf(ev.session_id)') < uiCase('reasoning').indexOf('if (!frameIsMine(ev)) break;') &&
+  uiCase('text').includes("if (!frameIsMine(ev)) { foldReason(); break; }"));
+// 补的必须是**该会话自己**的桶：并发时若读一个全局槽，就会把别的会话的片段
+  // 贴到这一屏 —— 切换不但没修好，还把污染重新贴一遍。
+check('切回运行中会话补渲染未落盘片段（读该会话自己的桶）',
+  extractFunction(uiSrc, 'replayHistory').includes('streams.get(ev.session_id)') &&
+  extractFunction(uiSrc, 'replayHistory').includes('if (st.reason) appendReason(st.reason);') &&
+  extractFunction(uiSrc, 'replayHistory').includes('if (st.text) appendText(st.text);'));
+// 运行态必须**无条件**摘除。原实现用一句 `if (session_id !== sessionID) break;`
+  // 把「摘运行态」和「DOM 收尾」一起挡掉，别的会话跑完后运行态永远清不掉。
+check('idle 复位运行态并撤销转圈（运行态无条件摘除）',
+  uiCase('idle').includes('runningSessions.delete(') &&
+  uiCase('idle').includes('streams.delete(') &&
+  uiCase('idle').indexOf('runningSessions.delete(') < uiCase('idle').indexOf('clearRunVisuals()'));
 // HITL 审批可能来自用户切走的后台会话：服务端必须带上 session_id，前端要标注来源。
 const wsHandlerSrc = fs.readFileSync(
   path.join(__dirname, '..', '..', 'pkg', 'server', 'ws_handler.go'), 'utf8');
@@ -1752,7 +1849,7 @@ check('提问行计数排除 steer 插话，且与定位共用同一个取行函
   // findEditableUserRow 也必须走它，两处各写一份选择器必然漂
   /function findEditableUserRow\(back\)[\s\S]{0,220}?userQuestionRows\(\)/.test(uiSrc));
 check('运行中不给编辑入口（上下文正在被消费）',
-  /editableBacks\.has\(back\) && !running/.test(uiSrc));
+  /editableBacks\.has\(back\) && !viewRunning\(\)/.test(uiSrc));
 check('编辑按钮默认隐形、悬停整行显形（CSS 契约）',
   /\.msg-user \.edit-btn \{[\s\S]*?opacity: 0;/.test(css) &&
   /\.msg-user:hover \.edit-btn \{ opacity: 1; \}/.test(css));
@@ -1829,7 +1926,7 @@ check('点「继续」发 continue_turn，不再发送字面量「继续」',
   !/sendAsUserText\('继续'\)/.test(uiCode));
 check('「继续」带当前会话与思考强度，且有运行中/未连接的守卫',
   /session_id: sessionID, thinking: thinkingVal/.test(uiSrc) &&
-  /if \(running \|\| sending \|\| !wsReady\)/.test(uiSrc));
+  /if \(anyRunning\(\) \|\| sending \|\| !wsReady\)/.test(uiSrc));
 check('圆环提示讲清语义：不回退文件、不新增提问',
   /保留已完成的记录，不回退文件，不新增提问/.test(uiSrc));
 check('服务端实现了 ContinueTurn（不追加用户消息，只挂一次性系统提示）',
