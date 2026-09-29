@@ -169,7 +169,18 @@ func NewFS(root string) *FS {
 }
 
 // Root 返回工作区根目录（空字符串表示未选择工作区）。
-func (f *FS) Root() string { return f.root }
+//
+// 必须持锁：它被 pkg/server 的 5 处 handler 从 HTTP goroutine 调用，
+// 而 SetRoot 能从 /api/workspace 热切换工作区 —— 无锁读会与写形成 data race。
+// 症状是「切工作区后偶发读到旧路径或半个字符串」，无法稳定复现。
+//
+// 历史上这里是无锁的 `return f.root`，是 f.root 8 个读点里唯一漏锁的一个。
+// 本机无 gcc 跑不了 -race，改由 root_race_test.go 的 AST 结构断言钉住。
+func (f *FS) Root() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.root
+}
 
 // noWorkspace 未选择工作区时返回统一的错误结果，否则返回 nil。
 func (f *FS) noWorkspace() *tools.ToolResult {
@@ -1259,6 +1270,12 @@ func (t *WriteFileTool) PreviewDiff(args json.RawMessage) (string, error) {
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", err
 	}
+	// 与 Execute 同一道守门：未选工作区时 Resolve 会返回进程 CWD 下的相对路径。
+	// PreviewDiff 只在审批时调，但审批卡片展示的正是待写路径 ——
+	// 漏了这道守卫，用户看到的是一份指向 CWD 的 diff。
+	if t.fs.noWorkspace() != nil {
+		return "", errors.New("未选择工作区，无法预览 diff")
+	}
 	path, err := t.fs.ResolveChecked(p.Path)
 	if err != nil {
 		return "", err
@@ -1519,6 +1536,10 @@ func (t *EditFileTool) PreviewDiff(args json.RawMessage) (string, error) {
 	pairs, err := p.normalizeEdits()
 	if err != nil {
 		return "", err
+	}
+	// 与 Execute 同一道守门，理由同 WriteFileTool.PreviewDiff。
+	if t.fs.noWorkspace() != nil {
+		return "", errors.New("未选择工作区，无法预览 diff")
 	}
 	path, err := t.fs.ResolveChecked(p.Path)
 	if err != nil {
