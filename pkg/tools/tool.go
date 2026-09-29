@@ -159,6 +159,37 @@ func Err(format string, a ...any) *ToolResult {
 	return &ToolResult{Success: false, Error: fmt.Sprintf(format, a...)}
 }
 
+// ErrStaleContent 表示「写入前置条件已不成立」：文件在本会话读取之后被
+// 外部改动、或本会话从未读过、或「期望新建」时文件已被别人创建。
+//
+// 为什么要有这个类型而不是 fmt.Errorf：这类失败**不该和普通 I/O 错误混在
+// 一起**。前者是「有并发/有他人改动，需要重读再来」，处理方式是提示模型重新
+// read_file；后者是磁盘坏了或权限不足，重试没用。审计与界面提示要能分开。
+type ErrStaleContent struct {
+	Path   string
+	Reason string // 面向模型的中文说明，已含可执行的补救指引
+}
+
+func (e *ErrStaleContent) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%s：%s", e.Path, e.Reason)
+}
+
+// Message 返回面向用户的说明。
+func (e *ErrStaleContent) Message() string {
+	if e == nil {
+		return ""
+	}
+	return e.Reason
+}
+
+// NewErrStaleContent 构造一个「内容已变」错误。
+func NewErrStaleContent(path, reason string) *ErrStaleContent {
+	return &ErrStaleContent{Path: path, Reason: reason}
+}
+
 // ApprovalRequest 描述一次待审批的危险操作。
 type ApprovalRequest struct {
 	Tool   string `json:"tool"`

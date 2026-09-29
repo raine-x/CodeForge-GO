@@ -44,6 +44,12 @@ type FS struct {
 	// 整个工作区共用一份 FS，故键必须带上会话 ID：子智能体与各会话之间
 	// 不能拿别人读过的原文下自己的笔。
 	readSeen map[string]seenEntry
+	// pathLocks 给每个规范路径一把互斥锁，用于 CAS 写入的临界区。
+	//
+	// 用 sync.Map 而非普通 map：casWrite 持路径锁期间还要取 f.mu（读 readSeen），
+	// 若 pathLocks 由 f.mu 保护，就形成 f.mu → 路径锁 的顺序；
+	// 任何反向顺序都会死锁。sync.Map 的读路径不占全局锁，天然避免。
+	pathLocks sync.Map // path → *sync.Mutex
 }
 
 // NewFS 构造文件工具工作区。root 为空表示「未选择工作区」，
@@ -273,16 +279,28 @@ func (f *FS) OutsideScopePath(args json.RawMessage) bool {
 //     是「回退回某条用户消息之前」的基础（Plan.md #4）。
 //
 // 上报必须发生在写入之前：sink 拿到的是读出的旧内容，晚一步就只能读到新内容。
-func (f *FS) snapshot(ctx context.Context, path string) {
-	data, err := os.ReadFile(path)
+// snapshot 记录一次「写入前」的状态，并（可选）上报给会话级检查点槽。
+//
+// before / existed 必须由**调用方**给出，且必须来自 CAS 临界区内读到的那份字节。
+// 早先这里是自己 os.ReadFile 一次 —— 那次读发生在写入之后（写路径调整顺序后）
+// 或不在临界区内（改造前），记下来的可能是新内容，于是 Undo 变成「再写一遍新内容」。
+// 撤销栈记错东西的后果是静默的：撤销看起来成功了，文件却没回到原样。
+//
+// 两条路径的分工：
+//   - 内存 undo 栈：进程内「撤销上一步」，会话结束即失效；
+//   - 检查点槽（ctx）：按 (会话, 步骤, 路径) 落库，支持跨重启、按步回滚，
+//     是「回退回某条用户消息之前」的基础（Plan.md #4）。
+//
+// 上报必须发生在写入之前：sink 拿到的是读出的旧内容，晚一步就只能读到新内容。
+func (f *FS) snapshot(ctx context.Context, path string, before []byte, existed bool) {
 	snap := Snapshot{Path: path, Time: time.Now()}
 	// 记下是谁写的，会话级撤销（UndoSession）全靠它。
 	if sc, ok := tools.SessionFrom(ctx); ok {
 		snap.SessionID = sc.SessionID
 	}
-	if err == nil {
+	if existed {
 		snap.Existed = true
-		snap.Content = data
+		snap.Content = before
 	}
 	f.mu.Lock()
 	f.undo = append(f.undo, snap)
@@ -298,7 +316,7 @@ func (f *FS) snapshot(ctx context.Context, path string) {
 		sink(tools.CheckpointEvent{
 			Path:       path,
 			Existed:    snap.Existed,
-			OldContent: string(data), // 文件不存在时 data 为 nil，转成空串
+			OldContent: string(before), // 文件不存在时 before 为 nil，转成空串
 		})
 	}
 }
@@ -479,6 +497,148 @@ func (f *FS) markReadSeen(ctx context.Context, path string, content []byte) {
 // 两种情形不拦：
 //   - 目标文件不存在（新建）：没有可丢的旧内容；
 //   - 调用不在会话运行域内：无法判定「谁读过」，此时拦截只会让工具不可用。
+// ---------------------------------------------------------------------------
+// CAS 写入：把「读当前 → 比对 → 写」收进同一把按路径的锁
+// ---------------------------------------------------------------------------
+
+// lockPath 取出某路径的互斥锁，首次调用时创建。
+//
+// 为什么不用一张普通 map：需要一个「按 key 懒创建」的结构，而 mutex 本身
+// 会被调用方持有，**不能**把 f.mu 一起带上（否则持路径锁时再取 f.mu
+// 就有死锁风险）。所以用 sync.Map —— 它的读路径不占全局锁。
+func (f *FS) lockPath(path string) *sync.Mutex {
+	v, _ := f.pathLocks.LoadOrStore(path, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+// casWrite 在「内容仍与调用方看到的一致」的前提下原子写入，返回写入前的内容。
+//
+// existed 是调用方**自己**的判断（true = 它认为自己覆盖的是个已有文件，
+// false = 它认为自己是在新建）。这个参数不是多余的：新建路径上同样有
+// 竞态 —— 两个会话都认为「文件不存在」而同时创建，后者会静默覆盖前者。
+//
+// 返回值是「写入前的实际内容」，让调用方做改动行数统计时不必再读一次盘
+// —— 那些读已经不在临界区里，值可能过期。
+func (f *FS) casWrite(ctx context.Context, path string, existed bool, next []byte) ([]byte, error) {
+	mu := f.lockPath(path)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// —— 临界区：读当前 ——
+	cur, readErr := os.ReadFile(path)
+	nowExists := readErr == nil
+
+	if nowExists != existed {
+		if existed {
+			return nil, tools.NewErrStaleContent(path,
+				"写入时发现该文件已不存在（可能刚被删除或重命名）。"+
+					"请重新 read_file 确认现状，再基于它提交修改。")
+		}
+		return nil, tools.NewErrStaleContent(path,
+			"写入时发现该文件已经存在 —— 它的存在不是你这次读到的状态。"+
+				"请先 read_file 看看现在的内容，确认是要覆盖它还是换用别的路径。")
+	}
+
+	// 前置条件：读门禁。未读过 / 指纹不符 → 拒绝。
+	if err := f.casCheckReadGate(ctx, path, cur, existed); err != nil {
+		return nil, err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	if err := atomicWriteFile(path, next, 0o644); err != nil {
+		return nil, err
+	}
+	return cur, nil
+}
+
+// casCheckReadGate 是 CAS 内部的前置条件检查，**必须在临界区内调用**。
+//
+// 拆成独立函数是为了让「锁的边界」在代码里一目了然：casWrite 里读与写之间
+// 只允许出现这个纯检查，不能再有别的读盘或可能失败的 IO。
+func (f *FS) casCheckReadGate(ctx context.Context, path string, cur []byte, existed bool) error {
+	// 新建：没有可丢的旧内容，不拦读门禁（与改造前 requireReadSeen 对
+	// !existed 直接返回 nil 一致）。
+	//
+	// 「仍不存在」这件事 casWrite 已经断言过了 —— 那是这条路径上真正有价值的
+	// 新增防护（挡住两个会话同时创建同一文件）。
+	if !existed {
+		return nil
+	}
+	// 以下只针对已存在的文件。
+	//
+	// 两种情形仍不拦：
+	//   - 调用不在会话运行域内：无法判定「谁读过」，此时拦截只会让工具不可用。
+	sc, ok := tools.SessionFrom(ctx)
+	if !ok || sc.SessionID == "" {
+		return nil
+	}
+	f.mu.Lock()
+	entry, seen := f.readSeen[seenKey(sc.SessionID, path)]
+	f.mu.Unlock()
+
+	if !seen {
+		return tools.NewErrStaleContent(path,
+			"本会话还没读过这个文件，不能凭记忆改写。先用 read_file 读取"+
+				"（大文件按返回末尾的行号窗口分段读），看到原文后再提交精确替换。")
+	}
+	if entry.matches(fingerprint(cur)) {
+		return nil
+	}
+	return tools.NewErrStaleContent(path,
+		"在本会话读取之后被外部修改过"+sizeDelta(entry.size, int64(len(cur)))+"。"+
+			"请先重新 read_file 看到最新内容，再基于它提交修改 —— "+
+			"否则会覆盖掉这段时间别人做的改动。")
+}
+
+// atomicWriteFile 用「同目录临时文件 + rename」落盘。
+//
+// 为什么不直接 os.WriteFile：WriteFile 是「打开 → 截断 → 写」，
+// 进程在写一半被杀（OOM、用户 Ctrl+C、崩溃）会留下**半截文件**。
+// rename 在同一文件系统内是原子的，读者只会看到完整的旧内容或完整的新内容。
+//
+// 同目录是必须的：跨文件系统 rename 会失败。
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".cf-tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	// 任何失败路径都要清掉临时文件，否则目录里会积累垃圾
+	// （这也是「落盘后目录里多了残留文件」那条测试要守的东西）。
+	defer func() {
+		if tmpName != "" {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	// CreateTemp 用 0600 建文件；显式改成目标权限，否则产物权限会莫名变严。
+	if err := os.Chmod(tmpName, perm); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	tmpName = "" // 已消费，defer 不再删
+	return nil
+}
+
+// requireReadSeen 保留给只需要「检查」而不需要「写入」的场景。
+//
+// 写路径**不再**用它 —— 那是 CAS 之前的做法，窗口太大。
 func (f *FS) requireReadSeen(ctx context.Context, path string, existed bool) error {
 	if !existed {
 		return nil
@@ -891,29 +1051,29 @@ func (t *WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (*too
 	if err != nil {
 		return tools.Err("%s", errs.FriendlyOr("写入文件", err)), nil
 	}
-	// 先取旧内容：既是为了判断目标是否已存在（先读后写闸门），
-	// 也是为了把「这次到底改了多少行」回给模型。
-	// 只报字节数的话，模型永远不知道自己把一份 2200 行的文件整体重写了，
-	// 也就没有回到精确替换的机会 —— 界面上的 +2200/-2170 只有人看得到。
-	old, readErr := os.ReadFile(path)
+	// 这里只需要知道「目标是否已存在」。刻意不取内容：CAS 内部会在临界区里
+	// 读一次并把旧内容一并返回，早先这里再读一份纯属浪费，且那次读不在临界区
+	// 里、值可能已经过期。
+	//
+	// 用 ReadFile 而非 Stat 探测存在性：目标是目录时 Stat 会成功，
+	// 而 ReadFile 失败 —— 后者才是「不是可写文件」的正确判据。
+	_, readErr := os.ReadFile(path)
 	existed := readErr == nil
-	if err := t.fs.requireReadSeen(ctx, path, existed); err != nil {
-		return tools.Err("%s", errs.FriendlyOr("写入文件", err)), nil
+	// 全部收进同一把按路径的锁里：读当前 → 比对 → 原子写。
+	// 返回的 before 是临界区内读到的真实旧内容，直接用于改动行数统计 ——
+	// 早先这里另开一次 os.ReadFile，那次读已经不在临界区里，值可能过期。
+	before, casErr := t.fs.casWrite(ctx, path, existed, []byte(content))
+	if casErr != nil {
+		return tools.Err("%s", casErr), nil
 	}
-	t.fs.snapshot(ctx, path)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return tools.Err("创建目录失败: %v", err), nil
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		return tools.Err("写入文件失败: %v", err), nil
-	}
+	t.fs.snapshot(ctx, path, before, existed)
 	t.fs.markReadSeen(ctx, path, []byte(content))
 	out := map[string]any{"path": path, "bytes": len(content), "created": !existed}
 	if existed {
-		added, removed := LineChurn(string(old), content)
+		added, removed := LineChurn(string(before), content)
 		out["added"], out["removed"] = added, removed
-		out["lines_before"], out["lines_after"] = len(splitLines(string(old))), len(splitLines(content))
-		if hint := overwriteHint(string(old), content, added, removed); hint != "" {
+		out["lines_before"], out["lines_after"] = len(splitLines(string(before))), len(splitLines(content))
+		if hint := overwriteHint(string(before), content, added, removed); hint != "" {
 			out["hint"] = hint
 		}
 	}
@@ -946,6 +1106,71 @@ func overwriteHint(old, new string, added, removed int) string {
 			"若本意只是局部修改，请改用精确替换（同一文件的多处改动一次提交），"+
 			"避免整份重写带入无关改动、或丢掉本次没读到的内容。",
 		oldLines, newLines, added, removed, pct)
+}
+
+// casEdit 在同一把路径锁内完成「读当前 → 校验 → 替换 → 原子写」。
+//
+// 为什么不能拆成「读 → 算 updated → 写」三步（改造前就是这样）：
+// updated 是从**读到的内容**算出来的，而写发生在之后。若中途有别人改动，
+// 我们会拿着基于旧内容算出的结果去覆盖 —— 而且 applyPairs 很可能匹配失败
+// 或匹配到错误位置。校验放在写之前只能证明「写之前没变过」，不能证明
+// 「我算 updated 时看到的就是我要覆盖的那份」。
+//
+// 收进一个临界区后，「我编辑的对象」与「我校验的对象」是同一份字节。
+func (f *FS) casEdit(ctx context.Context, path string, pairs []editPair) (updated string, count int, before []byte, err error) {
+	mu := f.lockPath(path)
+	mu.Lock()
+	defer mu.Unlock()
+
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		return "", 0, nil, readErr
+	}
+	// edit_file 只处理已存在的文件；这里要求 existed=true，
+	// 顺带把「文件刚被别人删了」也纳入同一套拒绝逻辑。
+	if err := f.casCheckReadGate(ctx, path, data, true); err != nil {
+		return "", 0, nil, err
+	}
+	updated, count, err = applyPairs(string(data), pairs)
+	if err != nil {
+		return "", 0, nil, err
+	}
+	if err := atomicWriteFile(path, []byte(updated), 0o644); err != nil {
+		return "", 0, nil, err
+	}
+	return updated, count, data, nil
+}
+
+// casRemove 在同一把路径锁内完成「确认存在 → 校验读门禁 → 快照 → 删除」。
+//
+// 改造前是 os.Stat 之后 os.Remove，中间有窗口；而且**完全没有读门禁** ——
+// 删一个没读过的文件与覆盖它是同一类丢数据，且更不可逆。
+func (f *FS) casRemove(ctx context.Context, path string) error {
+	mu := f.lockPath(path)
+	mu.Lock()
+	defer mu.Unlock()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return tools.NewErrStaleContent(path,
+			"删除时发现该文件已不存在（可能刚被别人删了或重命名）。请先 read_file 确认现状。")
+	}
+	if info.IsDir() {
+		return fmt.Errorf("delete_file 不支持删除目录: %s", path)
+	}
+	cur, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("无法确认 %s 的内容：%w", path, err)
+	}
+	if err := f.casCheckReadGate(ctx, path, cur, true); err != nil {
+		return err
+	}
+	// 快照必须在删除前记，且记的是刚在锁内读到的内容。
+	f.snapshot(ctx, path, cur, true)
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,21 +1309,14 @@ func (t *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (*tool
 	if err != nil {
 		return tools.Err("%s", errs.FriendlyOr("编辑文件", err)), nil
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return tools.Err("读取文件失败: %v", err), nil
+	// 读、校验、替换、写全部在 casEdit 的一次临界区内完成。
+	// 改造前是「先 os.ReadFile → applyPairs → os.WriteFile」三步裸奔，
+	// updated 基于旧内容算出、写入却无保护。
+	updated, count, data, casErr := t.fs.casEdit(ctx, path, pairs)
+	if casErr != nil {
+		return tools.Err("%s", casErr), nil
 	}
-	if err := t.fs.requireReadSeen(ctx, path, true); err != nil {
-		return tools.Err("%s", errs.FriendlyOr("读取文件", err)), nil
-	}
-	updated, count, err := applyPairs(string(data), pairs)
-	if err != nil {
-		return tools.Err("%s", errs.FriendlyOr("编辑文件", err)), nil
-	}
-	t.fs.snapshot(ctx, path)
-	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
-		return tools.Err("写入文件失败: %v", err), nil
-	}
+	t.fs.snapshot(ctx, path, data, true)
 	t.fs.markReadSeen(ctx, path, []byte(updated))
 	added, removed := LineChurn(string(data), updated)
 	return tools.OkMeta(map[string]any{
@@ -1246,16 +1464,8 @@ func (t *DeleteFileTool) Execute(ctx context.Context, args json.RawMessage) (*to
 	if err != nil {
 		return tools.Err("%s", errs.FriendlyOr("删除文件", err)), nil
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return tools.Err("文件不存在: %v", err), nil
-	}
-	if info.IsDir() {
-		return tools.Err("delete_file 不支持删除目录: %s", path), nil
-	}
-	t.fs.snapshot(ctx, path)
-	if err := os.Remove(path); err != nil {
-		return tools.Err("删除失败: %v", err), nil
+	if err := t.fs.casRemove(ctx, path); err != nil {
+		return tools.Err("%s", err), nil
 	}
 	return tools.OkMeta(map[string]any{"path": path, "deleted": true}, map[string]any{"path": path}), nil
 }
