@@ -29,9 +29,13 @@
 
 1. 工具调用**只经 `Executor.Execute`**，它负责策略判定、审批、围栏、审计、截断。不要绕过它直接调工具。
 2. 构造 Executor 时 **audit 不许传 nil**。历史：子智能体曾传 nil，操作不进审计且不报错。
-3. 工具的越界检查、审批 diff、只读判定靠可选接口发现（`ScopeChecker` / `DiffProvider` / `ReadOnlyTool` 等共 7 个，见 `pkg/tools/tool.go`）。**漏实现是静默降级**，例如漏 `DiffProvider` = 用户盲批。新增写类工具必须逐个核对。
+3. **每个工具必须实现 `Metadata() Metadata` 声明 `SideEffect`**（none / write / external / destructive）。有逐工具回归测试兜底（`pkg/tools/builtin/side_effect_test.go`，漏声明直接 CI 红）。**副作用等级只能由工具自己声明** —— 历史上有过一张按名字硬编码的只读表，已删：它在两个方向上都错（真只读的工具被误拒；零声明的工具被凭名字放行，而工具名是插件可控的）。未声明或取值非法一律按最严处理（只读模式下拒绝）。
+3a. 工具的**其余**可选能力（`ScopeChecker` / `DiffProvider` / `ReadGate` / `TimeoutPolicy`，见 `pkg/tools/tool.go`）目前仍是运行时类型断言，**漏实现是静默降级**，例如漏 `DiffProvider` = 用户盲批。新增写类工具必须逐个核对。`ReadOnlyTool` 已废弃，请改用 3。
+3b. 工具的**越界检查、审批 diff** 仍靠上述可选接口发现 —— 这部分尚未有编译期或注册期校验，是已知缺口。
 4. 内置工具里**不要新增**直接的 `os.*` / `exec.*` 调用，文件与命令访问走现有抽象点（迁移中，见第 5 节）。平台差异放 `pkg/platform`，`terminal.go` 不直接碰 `syscall`。子进程管理走 `platform.StartGrouped` / `platform.CloseGroup`：Unix 用 `Setpgid` + 负 pgid 发信号，Windows 用 Job Object + `taskkill /T` 补 `AssignProcessToJobObject` 之前的竞态窗口；`cmd.WaitDelay` 必须一起设，否则孙进程攥着管道会让 `cmd.Wait()` 永久阻塞。
-5. 写文件前必须校验"读过"（`requireReadSeen`），**并校验内容自读取后未被外部改动**（`seenEntry` 存 SHA-256 指纹 + 大小）。写完、编辑完、撤销后都必须刷新指纹，否则连续第二次写会被误判成外部修改而永久锁死。上下文压缩后必须调 `ForgetReads` 清登记。
+5. 文件写入必须走 `FS.casWrite` / `casEdit` / `casRemove`，**不要**自己 `os.WriteFile` 配一次写前的 `requireReadSeen`。前者把「读当前 → 比对 → 写」收进同一把按路径的锁；后者两步之间留有窗口，并发写会静默互相覆盖（两次都"成功"，后写的覆盖先写的，不留任何痕迹）。落盘用 `atomicWriteFile`（同目录临时文件 + rename）—— 直接 `os.WriteFile` 是"打开→截断→写"，进程写一半被杀会留下半截文件。
+5a. 写前校验的完整语义：未读过 → 拒；读取后被外部改动（`seenEntry` 存 SHA-256 指纹 + 大小）→ 拒；写入时文件存在性与调用方判断不符 → 拒。写完、编辑完、撤销后都必须刷新指纹，否则连续第二次写会被误判成外部修改而永久锁死。上下文压缩后必须调 `ForgetReads` 清登记。
+5b. `delete_file` 同样要先读。删没读过的文件与覆盖它是同一类丢数据，且更不可逆。
 6. 工具结果超过 `maxOutput` 时，输出必须仍是合法 JSON，不能在半截 JSON 处硬切。大结果由工具自己分页或限流，Executor 的截断只是兜底。
 7. 文件围栏由 `within` + `resolveReal`（逐级 `EvalSymlinks`）+ `checkScope` 组成，专防"区内软链指向区外、且目标尚不存在"的写入绕过。改动这三个函数必须带攻击用例测试。
 8. `WithScopeApproved` 只在审批确实放行了越界目标时才注入。历史 bug：被注入到了不该注入的地方。
@@ -114,6 +118,8 @@
 
 - `checkpoints.go` 路径匹配第三级大小写不敏感，Linux 上可能把 `partA` / `partA2` 判为同一文件
 - 撤销栈只限条数，不限字节
+- `ScopeChecker` / `DiffProvider` / `ReadGate` / `TimeoutPolicy` 仍是运行时断言，漏实现即静默降级（见硬规则 3a）
+- CAS 只保证**同一进程内**并发调用互斥，未用 OS 级文件锁防「另一个进程在临界区内改文件」
 - 未决审批在**刷新页面**后丢失（服务端 `pending` 挂在旧连接的 `wsApprover` 上，页面刷新即失去渠道；注意这与「审批无上界」已修是两件事）
 - 审计日志的 `run.json` 里 token 明文落盘
 - `History.cache` 只增不减
