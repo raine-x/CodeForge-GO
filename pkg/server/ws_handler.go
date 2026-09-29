@@ -433,7 +433,14 @@ func (c *wsClient) run(sessionID, thinking, trigger, label string, agentFn func(
 		return
 	}
 	if runErr != nil && ctx.Err() == nil {
-		c.send(map[string]any{"type": "error", "error": runErr.Error()})
+		// 走 errs.FriendlyOr：上游 429 / 401 会被翻译成「被上游限流…」
+		// 「鉴权失败，去检查密钥」，而不是把 {"code":"1305",...} 甩到界面上。
+		//
+		// 同一个文件里的 sendErr 就是这么做的（ws_handler.go:94），只是只用在
+		// 250/263/320 三处非 LLM 错误上 —— LLM 主链路一直漏着。
+		//
+		// FriendlyOr 对未识别的错误原样返回，所以既有的前端断言不受影响。
+		c.send(map[string]any{"type": "error", "error": errs.FriendlyOr("生成回复", runErr)})
 	}
 	c.send(map[string]any{"type": "idle"})
 	c.send(map[string]any{"type": "sessions", "items": c.srv.agent.History().List("", false)})

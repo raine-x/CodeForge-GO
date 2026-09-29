@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"codeforge/pkg/errs"
 	"codeforge/pkg/logx"
 )
 
@@ -198,17 +199,33 @@ func postJSON(
 		retryAfter := parseRetryAfter(resp)
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		_ = resp.Body.Close()
-		apiErr := fmt.Errorf("LLM 请求失败 (%d): %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+		// 用带状态码的类型化错误，别用 fmt.Errorf —— 状态码拍平成字符串之后
+		// errs.Classify 就只能去猜 body 文本，而实测 GLM 的 429 body
+		// （{"code":"1305","message":"你设置的当前模型正在被其他人使用…"}）
+		// 一个限流关键词都没有，猜不中就掉进 KindUnknown。
+		// Retry-After 也一并带上去，上层才能说清「上游让你等 7 秒」而不是干等。
+		apiErr := errs.NewStatus(resp.StatusCode, strings.TrimSpace(string(msg)), retryAfter, nil)
 		// 上游点名要「思考签名」时，把我们**实际送出去**的情况附在错误里。
 		// 少了这一句，用户只看到上游那句 missing a thought_signature，无法区分
 		// 「我们没回送」「上游压根没给签名」「旧会话里的历史调用本来就没签名」
 		// —— 三种成因的修法完全不同，甚至相反。
+		//
+		// ⚠️ 这里必须用 %w：用 %s 会断掉 Unwrap 链，状态码取不到、分类静默失效。
 		if bytes.Contains(msg, []byte("thought_signature")) {
-			apiErr = fmt.Errorf("%w（本次送出：%s）", apiErr, signatureSummary(body))
+			apiErr2 := fmt.Errorf("%w（本次送出：%s）", apiErr, signatureSummary(body))
+			apiErr = errs.NewStatus(resp.StatusCode, strings.TrimSpace(string(msg)), retryAfter, apiErr2)
 		}
 		lastErr = apiErr
 
-		if !transientStatus[resp.StatusCode] || isQuotaExceeded(msg) || attempt >= policy.MaxAttempts {
+		// 判定交给 errs 统一裁决：先分类，再问能不能重试。
+		// 这样「限流可退避 / 鉴权立即上报 / 配额耗尽不白等」三条不同处置
+		// 落在一处，不再靠 transientStatus 这张表猜 ——
+		// 之前 403 在表里（可重试），而 errs 里 403 是 KindAuth（不可重试），
+		// 两层对同一状态码给出相反答案。
+		//
+		// isQuotaExceeded 保留：它做的是「429 还要再分两类」——
+		// 限流等一等可能恢复，配额耗尽等多久都没用，白等 18 秒。
+		if !errs.Retryable(errs.Classify(apiErr)) || isQuotaExceeded(msg) || attempt >= policy.MaxAttempts {
 			return nil, apiErr
 		}
 		nextDelay := policy.attemptDelay(attempt + 1)

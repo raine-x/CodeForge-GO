@@ -111,6 +111,29 @@ func Classify(err error) Kind {
 		return KindStreamCut
 	}
 
+	// ---- 1.5 HTTP 状态码：最可靠，且能覆盖 body 里没有任何关键词的上游 ----
+	//
+	// 必须排在字符串兜底之前。实测 GLM 的 429 body 是
+	// {"code":"1305","message":"你设置的当前模型正在被其他人使用，请稍后重试"}，
+	// 一个 "rate limit" / "too many requests" 都没有；401 同理。
+	// 只靠猜文本这两类一律掉进 KindUnknown —— 限流不触发退避建议、
+	// 鉴权失败不触发「去检查密钥」的建议，用户在界面上看到的是裸 JSON。
+	if code := StatusCode(err); code > 0 {
+		// ⚠️ 400 里混着「上下文超窗」，它不是格式错而是**可自救**的拒绝：
+		// agent 靠 KindContextOverflow 驱动「压缩历史后重发」这条命脉。
+		// 所以超窗必须先判，否则这里会把 400 直接判成 KindParse，自救路断掉，
+		// 而且既有的 TestClassifyContextOverflow（用裸 errors.New）抓不到。
+		if isContextOverflowMessage(strings.ToLower(err.Error())) {
+			return KindContextOverflow
+		}
+		if k := ClassifyStatus(code); k != KindUnknown {
+			return k
+		}
+		// 有状态码但不落在已知区间：按上游故障处理。
+		// 比 KindUnknown 更好 —— 上游确实明确报错了，提示语应说清是上游问题。
+		return KindUpstream
+	}
+
 	// ---- 2. 网络错误：用接口判断，不猜字符串 ----
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {

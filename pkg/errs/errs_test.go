@@ -269,6 +269,7 @@ func TestEveryKindHasCause(t *testing.T) {
 		KindUnknown, KindTimeout, KindNetUnreachable, KindConnRefused, KindConnReset,
 		KindStreamCut, KindTLS, KindAuth, KindRateLimit, KindUpstream,
 		KindPermission, KindNotFound, KindDiskFull, KindParse, KindCanceled,
+		KindContextOverflow, // 此前漏掉：有 Cause 实现却没被这条断言覆盖
 	}
 	for _, k := range all {
 		if strings.TrimSpace(Cause(k)) == "" {
