@@ -6437,6 +6437,19 @@
     main.appendChild(domEl('div', 'mi-id',
       m.id + ' · 上下文 ' + fmtCtx(m.ctx_in) + ' / ' + fmtCtx(m.ctx_out)));
 
+    // 多模态徽标：**只标显式声明过的**。
+    //
+    // 不标「未声明」是因为它占绝大多数（models.yaml 由设置页生成，多数条目没写），
+    // 全标出来等于没标；而「声明支持」才是用户需要一眼看到的信息 ——
+    // 「贴截图它到底看没看见」只能靠这里判断。
+    [['vision', '图'], ['video', '视频']].forEach(function (pair) {
+      if (m[pair[0]] === true) {
+        const b = domEl('span', 'mi-badge ok', pair[1]);
+        b.style.marginLeft = '8px';
+        nm.appendChild(b);
+      }
+    });
+
     const badge = domEl('span', 'mi-badge' + (m.key_set ? '' : ' err'),
       m.key_set ? '密钥✓' : '无密钥');
 
@@ -7210,6 +7223,8 @@
     document.getElementById('mf-proto').value = proto === 'custom' ? 'openai' : proto; // 旧数据 custom ≡ openai
     if (ctxInPicker) ctxInPicker.set(m.ctx_in || 262144);
     if (ctxOutPicker) ctxOutPicker.set(m.ctx_out || 131072);
+    setCap('vision', m.vision);
+    setCap('video', m.video);
     populateProviderSelect(m.provider_id || '');
     syncProviderForm();
     setTestResult('', '');
@@ -7232,6 +7247,12 @@
       ctx_in: ctxInPicker ? ctxInPicker.value() : 262144,
       ctx_out: ctxOutPicker ? ctxOutPicker.value() : 131072
     };
+    // 能力声明是三态：留「不声明」时字段**整个不下发**，而不是下发 null/false ——
+    // 后端把它读成「不知道」，与「不支持」是两回事（判错会让模型永久收不到图）。
+    const vision = getCap('vision');
+    const video = getCap('video');
+    if (vision !== null) f.vision = vision;
+    if (video !== null) f.video = video;
     if (pid) {
       // 归属供应商：连接信息全部继承，条目上不写任何覆盖值；
       // inherit_key 让服务端清掉条目上历史遗留的自带密钥，否则它会一直压着供应商的密钥。
@@ -7255,6 +7276,40 @@
   // 密钥来源分段；keyTouched 记录本次编辑是否动过密钥（决定保存时是否提交 key_value）。
   let keySrc = 'env';
   let keyTouched = false;
+
+  // ---------- 多模态能力（图片 / 视频）：三态分段 ----------
+  //
+  // 「不声明」与「不支持」**必须**是分开的两档。服务端按三态处理：
+  // 不声明 = 不知道 → 照常尝试发送，真被上游拒了才自动记住并中止；
+  // 不支持 = 提前拦下，附件根本不发。
+  //
+  // 如果把「不声明」当成「不支持」，用户随手点错就会让这个模型永久收不到图片，
+  // 而界面上看不出任何异常（表现为「粘贴截图后它就是看不见」）。
+  const capState = { vision: 'unset', video: 'unset' };
+  function capSegId(which) { return 'mf-' + which + '-seg'; }
+  function setCap(which, value) {
+    // value 是后端下发的三态：true / false / null|undefined。
+    const state = value === true ? 'yes' : value === false ? 'no' : 'unset';
+    capState[which] = state;
+    document.querySelectorAll('#' + capSegId(which) + ' button').forEach(function (b) {
+      b.classList.toggle('active', b.dataset.cap === state);
+    });
+  }
+  function getCap(which) {
+    const v = capState[which];
+    if (v === 'yes') return true;
+    if (v === 'no') return false;
+    return null; // 不声明
+  }
+  ['vision', 'video'].forEach(function (which) {
+    const seg = document.getElementById(capSegId(which));
+    if (!seg) return;
+    seg.addEventListener('click', function (e) {
+      const b = e.target.closest('button[data-cap]');
+      if (!b) return;
+      setCap(which, b.dataset.cap === 'yes' ? true : b.dataset.cap === 'no' ? false : null);
+    });
+  });
 
   // 上下文输入/输出控件（预置档位 + 自定义）。在下方 init 里挂到 #mf-ctx-*-host 上，
   // 表单其余部分一律通过这两个对象读写，不再直接碰 DOM —— 免得预置/自定义两套状态各写各的。

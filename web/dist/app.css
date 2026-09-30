@@ -1257,6 +1257,15 @@ body.has-bg .settings-card { background: transparent; }
 .key-row input { flex: 1; min-width: 0; }
 .key-eye-wrap { display: inline-flex; align-items: center; gap: 6px; flex: 1; min-width: 0; }
 .key-eye-wrap input { flex: 1; min-width: 0; }
+/* 多模态能力两行（图片 / 视频）。行内标签固定宽度，两个分段控件左边对齐，
+   否则两个宽度不同的控件会因为 label 宽度不同而错位。 */
+.cap-rows { display: flex; flex-direction: column; gap: 8px; }
+.cap-row {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 12.5px; color: var(--text-dim); font-weight: 400;
+}
+.cap-row > :first-child { flex: 0 0 32px; }
+.cap-hint { margin: 2px 0 0; font-size: 11.5px; line-height: 1.5; color: var(--text-dim); opacity: .85; }
 .key-eye {
   flex: 0 0 auto; border: none; background: transparent; cursor: pointer;
   font-size: 15px; line-height: 1; padding: 4px 6px; border-radius: 6px;

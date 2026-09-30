@@ -71,6 +71,10 @@ comit时直接使用简短的中文描述此次更改完成了什么，示例：
 14. `Compress` 必须对输入深拷贝，**绝不写回原历史**。历史 bug：浅拷贝导致发一次请求顺手删掉自己的历史。
 15. 目标模式：审查者与 `goal_verify` 工具必须**一起**注册；审查者的 audit 传真 logger。
 16. 错误用 `%w` 包装，`errs.Classify` 才能生效。按 Kind 驱动重试、压缩、上报，不要在调用点靠字符串匹配。
+16a. **附件（图片/视频）必须过能力门**（`pkg/agent/capability.go`），且顺序不能改：先过门再入历史 → 被拒时从历史摘掉媒体块。历史里留着媒体块 = 这个会话之后每轮都被同一个上游错误拒绝，用户只能新建会话。
+16b. **能力声明是三态**（`vision` / `video`，`*bool`）：`nil` = 不知道（照常发送，被拒后记住）、`true` = 支持、`false` = 不支持（发之前就拦）。**别改成裸 bool** —— models.yaml 由设置页生成且被 gitignore，绝大多数条目没写这两个字段；裸 bool 会把「没写」读成 false，让每一个模型都从此收不到图，而用户没有任何入口纠正。前端「不声明」时必须**不下发该字段**（而非下发 null/false），测试有断言钉住。
+16c. 图片与视频的处置**刻意不同**：图片送不出去 → **中止**整轮（图往往就是问题本身，丢掉继续答 = 自信的错误答案）；视频 → **提示 + 忽略 + 继续**（视频通常是补充材料，且能力在发之前就能判定，没有上游失败可中止）。
+16d. 本项目**不做本地视频抽帧**。抽帧需要真解码器，而标准库没有，且零依赖 + `CGO_ENABLED=0` 是产品目标。视频只做**原生透传**（整段交给上游，由它自己抽帧/转写音轨），仅对声明 `video: true` 的模型有效。`read_file` 遇到视频必须**明确报「读不了」**，不能落到 `string(data)` 那步吐乱码 —— 模型会认真地照着乱码编出一段描述。
 
 ### 前端
 
@@ -95,6 +99,8 @@ comit时直接使用简短的中文描述此次更改完成了什么，示例：
 | 系统提示与项目记忆 | `prompt.go` / `project_memory.go`（AGENTS.md 优先于 CLAUDE.md） | `pkg/agent` |
 | 策略判定 | `Policy.Evaluate`（有序判定链） | `pkg/security/policy.go` |
 | 按暴露面裁剪工具表 | `registry.DefinitionsFor` + Exposure | `pkg/tools/registry.go` |
+| 判断模型能不能收下附件 | `mediaVerdict` / `ForgetMediaCapability` | `pkg/agent/capability.go` |
+| 把多格式文件读成纯文本 | `extractDocText`（docx/pptx/xlsx/pdf，视频在此明确报「读不了」） | `pkg/tools/builtin/doc_extract.go` |
 
 **规则**：新增功能前，先 grep 上表和相邻包。确实要新增，在提交说明里写清"现有的为什么不够"。
 
@@ -148,3 +154,10 @@ comit时直接使用简短的中文描述此次更改完成了什么，示例：
 - 撤销还原（`FS.restore`）的落盘**未过 `checkScope`**：写入后若 `SetRoot` 切了工作区，撤销会写到新工作区之外
 - `FS.pathLocks` 只增不减（`lockPath` 从不删条目），每个被写过的不同路径留一把 `*sync.Mutex`
 - `markReadSeen` 溢出时**清空整表**而非本会话（`len >= 20000` 时 `readSeen = map{}`）—— 一个会话撑爆会连带清掉所有会话的登记。方向 fail-closed，安全但粗暴
+- **能力记忆是进程级的**（`pkg/agent/capability.go` 的 `mediaMemory`），重启即失效。刻意如此：它是「少撞一次墙」的性能优化，正确性由「回滚历史」保证；落盘那份错了反而会让一个支持的模型永久收不到图
+- **视频 token 按字节估算**（`videoTokens`，1 token/KiB），因为算时长需要真解码器。估不准只会让压缩线偏高/偏低一档；若将来接了抽帧或 ffprobe，这里应改成按秒计
+- **视频只做原生透传，不做本地抽帧**。不支持视频的模型（Claude / OpenAI）拿到视频会被能力门跳过 —— 它们只能看抽帧后的图片，而抽帧需要外部解码器，与「零依赖 + `CGO_ENABLED=0`」冲突。要支持只能绑 ffmpeg 外部进程，那是产品决策不是补丁
+- **`isUnsupportedMediaMessage` 靠文本匹配**（`pkg/errs`），各家文案差异大，漏一种就退化成 `KindParse`（「数据格式不对」）。新增适配层时若发现新的拒收文案，补进那个列表
+- **能力记忆是进程级的**（`pkg/agent/capability.go` 的 `mediaMemory`），重启即失效。刻意如此：它是「少撞一次墙」的性能优化，正确性由「回滚历史」保证；落盘那份一旦记错，反而会让一个本来支持的模型永久收不到图
+- **视频 token 按字节估算**（`agent.videoTokens`，1 token/KiB），因为算时长需要真解码器。估不准只会让压缩线偏高/偏低一档；若将来接了抽帧或 ffprobe，这里应改成按秒计
+- **视频只做原生透传，不做本地抽帧**。不支持视频的模型（Claude / OpenAI）拿到视频会被能力门跳过并提示 —— 它们只能看抽帧后的图片，而抽帧需要外部解码器，与「零依赖 + `CGO_ENABLED=0`」冲突。要支持只能绑 ffmpeg 外部进程，那是产品决策不是补丁

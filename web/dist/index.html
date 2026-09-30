@@ -643,6 +643,31 @@
                       <label>输出 <span id="mf-ctx-out-host"></span></label>
                     </div>
                   </div>
+                  <!-- 多模态能力：每个模态三态（不声明 / 支持 / 不支持）。
+                       「不声明」是**独立**的一档，不是「不支持」的另一种写法：
+                       没声明 = 系统不知道，会照常尝试发送、失败后自动记住；
+                       误勾成「不支持」会让这个模型永久收不到图片，而用户
+                       只能靠「试试取消勾选」才发现是自己配错了。 -->
+                  <div class="f-field f-field-wide">
+                    <span>多模态能力</span>
+                    <div class="cap-rows">
+                      <label class="cap-row">图片
+                        <div class="key-seg" id="mf-vision-seg">
+                          <button type="button" data-cap="unset" class="active">不声明</button>
+                          <button type="button" data-cap="yes">支持</button>
+                          <button type="button" data-cap="no">不支持</button>
+                        </div>
+                      </label>
+                      <label class="cap-row">视频
+                        <div class="key-seg" id="mf-video-seg">
+                          <button type="button" data-cap="unset" class="active">不声明</button>
+                          <button type="button" data-cap="yes">支持</button>
+                          <button type="button" data-cap="no">不支持</button>
+                        </div>
+                      </label>
+                    </div>
+                    <p class="cap-hint">视频指模型原生解析（整段视频直接交给上游），不是本地抽帧。填错会让附件发不出去或被静默忽略。</p>
+                  </div>
                 </div>
                 <!-- 从上游 /models 拉取的模型列表（点「获取模型列表」后展开，选中后填入模型 id） -->
                 <div id="mf-discover-panel" class="discover-panel hidden">

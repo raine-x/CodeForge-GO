@@ -1371,6 +1371,35 @@ check('编辑未动密钥时不提交 key_value（不删除已存 key）',
   /keyTouched = false; \/\/ 刚回填的表单没有改过密钥/.test(uiSrc) &&
   /keyTouched = true/.test(uiSrc));
 
+// ---------- 模型多模态能力（vision / video）：三态，不是布尔 ----------
+//
+// 「不声明」与「不支持」混为一谈是这个功能最容易出的错，且症状极隐蔽：
+// 用户点错一次 → 该模型永久收不到图片 → 界面上看不出任何异常。
+// 所以这三条钉的是「三态存在」与「留空时不下发字段」。
+check('多模态能力是三态分段（不声明 / 支持 / 不支持），不是两个复选框',
+  /capState = \{ vision: 'unset', video: 'unset' \}/.test(uiSrc) &&
+  /value === true \? 'yes' : value === false \? 'no' : 'unset'/.test(uiSrc) &&
+  /v === 'yes'\) return true;[\s\S]{0,80}?v === 'no'\) return false;[\s\S]{0,40}?return null; \/\/ 不声明/.test(uiSrc) &&
+  /id="mf-vision-seg"/.test(htmlSrc) && /id="mf-video-seg"/.test(htmlSrc) &&
+  /data-cap="unset"[^>]*>不声明</.test(htmlSrc) &&
+  /data-cap="yes"[^>]*>支持</.test(htmlSrc) &&
+  /data-cap="no"[^>]*>不支持</.test(htmlSrc));
+check('留「不声明」时不下发 vision/video 字段（而非下发 false）',
+  // 服务端把「没写」读成三态里的 unknown；下发 false 会被读成「明确不支持」，
+  // 于是模型永久收不到图，而用户没有任何入口纠正。
+  /const vision = getCap\('vision'\);[\s\S]{0,120}?if \(vision !== null\) f\.vision = vision;/.test(uiSrc) &&
+  /if \(video !== null\) f\.video = video;/.test(uiSrc));
+check('表单回填按三态还原（下发 true/false/null 各落到对应档位）',
+  /setCap\('vision', m\.vision\);/.test(uiSrc) && /setCap\('video', m\.video\);/.test(uiSrc) &&
+  /setCap\(which, b\.dataset\.cap === 'yes' \? true : b\.dataset\.cap === 'no' \? false : null\)/.test(uiSrc));
+check('模型列表只给「显式声明支持」加徽标（未声明不加）',
+  // 未声明是绝大多数，全标出来等于没标；而用户判断「贴截图它看没看见」
+  // 只能看这个徽标。
+  /\[\['vision', '图'\], \['video', '视频'\]\]/.test(uiSrc) &&
+  /if \(m\[pair\[0\]\] === true\)/.test(uiSrc));
+check('能力文案说清「视频是原生解析，不是本地抽帧」',
+  /原生解析（整段视频直接交给上游），不是本地抽帧/.test(htmlSrc));
+
 // ---------- 模型管理页：tab 条独占一行且居中；供应商管理收敛成一屏 ----------
 group('模型管理页：tab 条独占一行且居中');
 check('HTML 里有独立的 tab 条行，里面只有那颗 pill',
