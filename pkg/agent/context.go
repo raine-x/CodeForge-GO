@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -102,6 +103,10 @@ const (
 	uncalibratedTokenFactor = 1.15
 	// summaryOutputCap 是摘要请求输出上限的绝对上限（不沿用模型的大输出上限）。
 	summaryOutputCap = 8192
+	// imageTokens 是单张图片的固定估算值（不再写死 4096，见 EstimateTokens）。
+	imageTokens = 4096
+	// videoTokensFloor 是视频估算的固定下限，保证「哪怕是空视频也占一点预算」。
+	videoTokensFloor = 1024
 )
 
 // summarySystemPrompt 是摘要压缩的系统提示词（%d 处填摘要字数上限）。
@@ -142,8 +147,12 @@ func EstimateTokens(msgs []llm.Message) int {
 	wide, narrow := 0, 0
 	for _, m := range msgs {
 		for _, b := range m.Content {
-			if b.Type == llm.BlockImage {
-				wide += 4096
+			switch b.Type {
+			case llm.BlockImage:
+				wide += imageTokens
+				continue
+			case llm.BlockVideo:
+				wide += videoTokens(b)
 				continue
 			}
 			wide, narrow = countRunes(b.Text, wide, narrow)
@@ -159,6 +168,33 @@ func EstimateTokens(msgs []llm.Message) int {
 	}
 	// narrow/4 向上取整，避免大量短消息时被逐条抹零。
 	return wide + (narrow+3)/4
+}
+
+// videoTokens 估算一段视频的 token 数。
+//
+// 图片可以拍一个常数（4096，各家高分辨率 tile 的量级都差不多），视频不行：
+// 它的开销主要由**时长**决定 —— Gemini 公开的口径是 1 FPS 抽帧、每帧
+// 66（低分辨率）/258（高分辨率）token，加音频 32 token/秒，合计约
+// 100~300 token/秒。我们不知道时长（那要真解码器，见 capability.go），
+// 于是退到按**字节**估：H.264 1080p 大约 4~8 Mbps，即 1 秒 ≈ 0.5~1 MiB。
+//
+// 取 1 token/KiB 相当于 1000 token/秒上下，正好落在 Gemini 高分辨率那一档
+// （300）之上留了 3 倍余量。宁可高估：低估的后果是「估算没到阈值、请求已超窗」，
+// 而视频又特别容易超窗（20MiB 已经是上传上限了）。
+//
+// 估不准的代价是压缩线偏高或偏低一档，不是安全问题。
+func videoTokens(b llm.ContentBlock) int {
+	raw := base64.StdEncoding.DecodedLen(len(b.Data))
+	padding := len(b.Data) - len(strings.TrimRight(b.Data, "="))
+	if padding > 0 {
+		raw -= padding
+	}
+	if raw < 0 {
+		raw = 0
+	}
+	// 一段视频至少也要占掉一点预算（哪怕是空文件），否则它的存在对
+	// 压缩决策完全不可见。
+	return raw/1024 + videoTokensFloor
 }
 
 // countRunes 按「宽字符（CJK）1 字 1 token、窄字符 4 字 1 token」累计计数。
@@ -232,8 +268,11 @@ func Compress(msgs []llm.Message, budget int) []llm.Message {
 			break
 		}
 		for j := range out[i].Content {
-			if out[i].Content[j].Type == llm.BlockImage {
+			switch out[i].Content[j].Type {
+			case llm.BlockImage:
 				out[i].Content[j] = llm.ContentBlock{Type: llm.BlockText, Text: "（历史图像已省略）"}
+			case llm.BlockVideo:
+				out[i].Content[j] = llm.ContentBlock{Type: llm.BlockText, Text: "（历史视频已省略）"}
 			}
 		}
 	}
@@ -359,6 +398,10 @@ func isPlainUserText(m llm.Message) bool {
 			return false
 		case llm.BlockImage:
 			hasContent = true
+		case llm.BlockVideo:
+			// 视频同样算「这一轮真的有内容」：只有视频没有文字的用户发言
+			// 依然是合法提问（「这个视频讲了什么」），不该被当成空回合丢掉。
+			hasContent = true
 		case llm.BlockText:
 			if strings.TrimSpace(b.Text) != "" {
 				hasContent = true
@@ -452,6 +495,8 @@ func renderMessage(m llm.Message) string {
 			fmt.Fprintf(&sb, "[%s] %s\n", m.Role, clipRunes(b.Text, transcriptBlockRunes))
 		case llm.BlockImage:
 			fmt.Fprintf(&sb, "[%s] （图像内容已省略）\n", m.Role)
+		case llm.BlockVideo:
+			fmt.Fprintf(&sb, "[%s] （视频内容已省略）\n", m.Role)
 		case llm.BlockToolUse:
 			fmt.Fprintf(&sb, "[%s 调用工具] %s %s\n", m.Role, b.Name, clipRunes(string(b.Input), toolArgsRunes))
 		case llm.BlockToolResult:

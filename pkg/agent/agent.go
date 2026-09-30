@@ -637,10 +637,18 @@ func (a *Agent) systemPrompt(lastInput string) string {
 
 // Run 执行一轮完整的用户交互（含 ReAct 迭代）：追加用户消息后进入循环。
 func (a *Agent) Run(ctx context.Context, sessionID, input string, emit Emitter) error {
-	return a.RunWithImages(ctx, sessionID, input, nil, emit)
+	return a.RunWithMedia(ctx, sessionID, input, nil, emit)
 }
 
-func (a *Agent) RunWithImages(ctx context.Context, sessionID, input string, images []llm.ContentBlock, emit Emitter) error {
+// RunWithMedia 执行一轮对话，media 是本轮随消息送出的媒体块（图片 / 视频）。
+//
+// 三处刻意的设计（细节见 capability.go 的文件头）：
+//  1. 媒体块过能力门后才**入历史** —— 送不出去的附件不该留下痕迹；
+//  2. 图片送不出去时**中止**整轮，理由写成人话，不再让上游的 400 变成
+//     「数据格式不对」；
+//  3. 上游拒收后把已入历史的媒体块**摘掉**并落盘，否则该会话之后
+//     每轮都会被同一面墙挡住。
+func (a *Agent) RunWithMedia(ctx context.Context, sessionID, input string, media []llm.ContentBlock, emit Emitter) error {
 	limit := a.MaxSteps()
 	// 同会话互斥（跨连接）：WS 的 stop 只能停本连接的旧任务，两个标签页可同时
 	// 驱动同一会话。后到者等前者在步骤边界退出，拿不到就报错 —— 否则两个循环
@@ -655,6 +663,23 @@ func (a *Agent) RunWithImages(ctx context.Context, sessionID, input string, imag
 		return fmt.Errorf("会话不存在: %s", sessionID)
 	}
 
+	// 能力门：必须在拼消息**之前**判，否则被丢掉的块已经进了历史。
+	//
+	// 取一次配置快照并全程复用：逐字段读两次会读到热更新的中间态
+	// （判能力时用新模型、送请求时用旧模型），与 llmCfgSnapshot 的理由同源。
+	llmCfg := a.llmCfgSnapshot()
+	kept, droppedImages, reason := a.filterMedia(llmCfg, media)
+	if droppedImages > 0 {
+		// 图片是提问的本体，丢掉它继续答等于给一个自信的错误答案。
+		// 中止，并明确告诉用户换模型或改成文字描述。
+		emit(Event{Type: EventInfo, Text: reason + "，本轮已中止（图片通常就是问题本身，继续答只会给出错误答案）"})
+		return errs.NewUnsupportedMedia("%s。请在「设置 → 模型」里确认该模型是否支持视觉输入，或改用支持的模型；也可以直接把内容用文字描述出来", reason)
+	}
+	if reason != "" {
+		// 只掉了视频：跳过即可，问题本身还在，答案不因少一段视频而失效。
+		emit(Event{Type: EventInfo, Text: reason + "，已跳过该视频继续回答本轮问题"})
+	}
+
 	// 续跑前的历史自愈：上一轮若在「工具执行到一半」被强杀，末尾会挂着一条
 	// 没有结果的 tool_use，上游对消息序列有硬约束，带着它请求会被 400 拒绝。
 	// 补一条说明性结果（而不是删掉调用记录）——见 Session.repairDanglingToolUse。
@@ -667,12 +692,35 @@ func (a *Agent) RunWithImages(ctx context.Context, sessionID, input string, imag
 	}
 
 	message := llm.TextMessage(llm.RoleUser, input)
-	message.Content = append(message.Content, images...)
-	sess.appendMessages(message)
+	message.Content = append(message.Content, kept...)
+	// 记下这条消息的下标：失败回滚要用它，不能靠「最后一条」定位
+	// （运行中转向会在尾部追加指令，那时就指错了）。
+	mediaIdx := sess.appendMessages(message)
 	emit(Event{Type: EventUser, Text: input})
 	sess.SetLastUserInput(input) // 供 systemPrompt 里技能触发词匹配
 
-	return a.runLoopWithLimit(ctx, sess, emit, true, limit)
+	err := a.runLoopWithLimit(ctx, sess, emit, true, limit)
+	if err == nil || errs.Classify(err) != errs.KindUnsupportedMedia {
+		return err
+	}
+
+	// 到这里说明：能力门当时判为「可送」（多半是没声明、也没记住），
+	// 上游却拒收了。这是**唯一一次**不透明的失败，必须收敛成可理解的状态：
+	//   - 记住它，此后不再拿媒体撞同一面墙；
+	//   - 摘掉历史里的媒体块，否则这个会话之后每轮都被同样拒一次。
+	sess.mu.Lock()
+	removed := 0
+	if mediaIdx >= 0 && mediaIdx < len(sess.Messages) {
+		removed = stripMediaFromMessage(&sess.Messages[mediaIdx])
+	}
+	sess.mu.Unlock()
+	noteRejectedMedia(llmCfg, kept)
+	if removed > 0 {
+		logx.Infof("会话=%s 模型=%s 拒收媒体，已从历史摘掉 %d 个块（否则该会话每轮都会被拒）",
+			sessionID, llmCfg.Model, removed)
+		a.save(sess, true, emit)
+	}
+	return err
 }
 
 // Regenerate 重新生成最后一轮回复：把会话回退到最近一条用户消息

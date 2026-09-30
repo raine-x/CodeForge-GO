@@ -29,6 +29,19 @@ const (
 	maxImageTotal  = 20 << 20
 	maxImages      = 4
 	maxImagePixels = 16_000_000
+
+	// maxVideoBytes / maxVideos 是视频的独立预算，**不与图片预算合并计算**。
+	//
+	// 上限刻意沿用 maxUploadFile（20MiB），不因为「视频通常更大」就放宽：
+	// 视频是**整段 base64 塞进请求体**（再经 data URI 前缀放大约 1.37 倍），
+	// 一段 20MiB 的视频会让单次请求体到 ~27MiB，且明文与 base64 两份
+	// 同时驻留内存。再放宽就要改 multipart 的 body 级上限
+	//（http.MaxBytesReader，那是一道兜底刹车，不该为附件类型单独抬高）。
+	//
+	// 20MiB 约等于 1080p 的 8~10 秒，够「贴一段录屏问一句」这个真实用法。
+	// 真要看长视频，正确做法是先自行抽帧再附图 —— 那条路本地不需要解码器。
+	maxVideoBytes = 20 << 20
+	maxVideos     = 1
 )
 
 func openAttachmentWorkspace(workspace string) (*os.Root, error) {
@@ -197,7 +210,13 @@ func (s *Server) handleUploadFile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "staged_path": "attachments/" + staged, "name": original})
 }
 
-func readAttachmentImages(workspace string, attachments []string) ([]llm.ContentBlock, error) {
+// readAttachmentMedia 把本轮附件读成可送给模型的内容块。
+//
+// 图片与视频都在这里产出，原因只有一条：**能力判定不在本层**。
+// 本层不知道当前是哪个模型（那是 agent 的事，见 agent/capability.go 的能力门），
+// 所以它只负责「如实识别」；模型收不了的那一类由上层丢弃并提示用户。
+// 若在这里就按模型过滤，就得把模型信息透传进来，附件层与模型配置就耦合了。
+func readAttachmentMedia(workspace string, attachments []string) ([]llm.ContentBlock, error) {
 	if len(attachments) == 0 {
 		return nil, nil
 	}
@@ -206,80 +225,198 @@ func readAttachmentImages(workspace string, attachments []string) ([]llm.Content
 		return nil, err
 	}
 	defer root.Close()
-	var images []llm.ContentBlock
-	total := 0
+	var blocks []llm.ContentBlock
+	imageTotal, videos := 0, 0
 	for _, name := range attachments {
-		block, err := readAttachmentImage(root, workspace, name)
+		block, kind, err := readAttachmentBlock(root, workspace, name)
 		if err != nil {
 			return nil, fmt.Errorf("附件 %q: %w", name, err)
 		}
 		if block == nil {
 			continue
 		}
-		padding := len(block.Data) - len(strings.TrimRight(block.Data, "="))
-		total += base64.StdEncoding.DecodedLen(len(block.Data)) - padding
-		if len(images) >= maxImages || total > maxImageTotal {
-			return nil, fmt.Errorf("图片最多4张，总大小不能超过20MiB")
+		switch kind {
+		case mediaImage:
+			// base64 解出来的字节数才是真正进请求体的量（Data 是编码后的），
+			// 拿 len(Data) 去比会把 4/3 的膨胀算漏。
+			padding := len(block.Data) - len(strings.TrimRight(block.Data, "="))
+			imageTotal += base64.StdEncoding.DecodedLen(len(block.Data)) - padding
+			if len(blocks) >= maxImages || imageTotal > maxImageTotal {
+				return nil, fmt.Errorf("图片最多4张，总大小不能超过20MiB")
+			}
+		case mediaVideo:
+			videos++
+			if videos > maxVideos {
+				return nil, fmt.Errorf("一次最多只能发送1段视频")
+			}
 		}
-		images = append(images, *block)
+		blocks = append(blocks, *block)
 	}
-	return images, nil
+	return blocks, nil
 }
 
-func readAttachmentImage(root *os.Root, workspace, name string) (*llm.ContentBlock, error) {
+// mediaKind 是附件被识别出的模态。
+type mediaKind int
+
+const (
+	mediaNone mediaKind = iota // 不是模型能吃的媒体（纯文本等），不产出内容块
+	mediaImage
+	mediaVideo
+)
+
+// readAttachmentBlock 识别单个附件并读成内容块。
+//
+// 返回 block=nil 表示「不是图片也不是视频」—— 那不是错误：
+// 用户 @ 一个 .go / .md 文件是正常用法，模型走 read_file 自己去读，
+// 这里不产出任何块（见 file_ops.go 的多格式文档提取）。
+func readAttachmentBlock(root *os.Root, workspace, name string) (*llm.ContentBlock, mediaKind, error) {
 	rel, err := attachmentRelative(root, workspace, name)
 	if err != nil {
-		return nil, err
+		return nil, mediaNone, err
 	}
 	info, err := root.Stat(rel)
 	if err != nil {
-		return nil, err
+		return nil, mediaNone, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("附件必须是普通文件")
+		return nil, mediaNone, fmt.Errorf("附件必须是普通文件")
 	}
 	file, err := root.Open(rel)
 	if err != nil {
-		return nil, err
+		return nil, mediaNone, err
 	}
 	defer file.Close()
 	info, err = file.Stat()
 	if err != nil {
-		return nil, err
+		return nil, mediaNone, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("附件必须是普通文件")
+		// 竞态：Stat 时还是文件，打开时已换成目录/软链。不认。
+		return nil, mediaNone, fmt.Errorf("附件必须是普通文件")
 	}
 	header := make([]byte, 512)
 	n, err := io.ReadFull(file, header)
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		return nil, err
+		return nil, mediaNone, err
 	}
 	header = header[:n]
+
+	// 视频先判：它的判据不依赖 http.DetectContentType（那只认得 mp4/webm），
+	// 靠容器魔数 + 扩展名，且体积上限与图片完全不同，两者不能混进一条分支。
+	if mediaType, ok := videoMediaType(header, name); ok {
+		if info.Size() > maxVideoBytes {
+			return nil, mediaNone, fmt.Errorf("每段视频不能超过20MiB")
+		}
+		data, err := readLimited(file, header, maxVideoBytes)
+		if err != nil {
+			return nil, mediaNone, err
+		}
+		if len(data) > maxVideoBytes {
+			return nil, mediaNone, fmt.Errorf("每段视频不能超过20MiB")
+		}
+		return &llm.ContentBlock{
+			Type:      llm.BlockVideo,
+			MediaType: mediaType,
+			Data:      base64.StdEncoding.EncodeToString(data),
+		}, mediaVideo, nil
+	}
+
 	mediaType := http.DetectContentType(header)
 	switch mediaType {
 	case "image/png", "image/jpeg", "image/gif", "image/webp":
 	default:
 		switch strings.ToLower(filepath.Ext(name)) {
 		case ".jpg", ".jpeg", ".png", ".gif", ".webp":
-			return nil, fmt.Errorf("图片内容无效或已损坏")
+			return nil, mediaNone, fmt.Errorf("图片内容无效或已损坏")
 		}
-		return nil, nil
+		return nil, mediaNone, nil
 	}
 	if info.Size() > maxImageBytes {
-		return nil, fmt.Errorf("每张图片不能超过5MiB")
+		return nil, mediaNone, fmt.Errorf("每张图片不能超过5MiB")
 	}
-	data, err := io.ReadAll(io.LimitReader(io.MultiReader(bytes.NewReader(header), file), maxImageBytes+1))
+	data, err := readLimited(file, header, maxImageBytes)
 	if err != nil {
-		return nil, err
+		return nil, mediaNone, err
 	}
 	if len(data) > maxImageBytes {
-		return nil, fmt.Errorf("每张图片不能超过5MiB")
+		return nil, mediaNone, fmt.Errorf("每张图片不能超过5MiB")
 	}
 	if err := validateAttachmentImage(data, mediaType); err != nil {
-		return nil, err
+		return nil, mediaNone, err
 	}
-	return &llm.ContentBlock{Type: llm.BlockImage, MediaType: mediaType, Data: base64.StdEncoding.EncodeToString(data)}, nil
+	return &llm.ContentBlock{Type: llm.BlockImage, MediaType: mediaType, Data: base64.StdEncoding.EncodeToString(data)}, mediaImage, nil
+}
+
+// readLimited 读整个文件并施加硬上限，超限时返回的长度会超过 limit（由调用方判定）。
+//
+// 半截视频/图片被当成完整内容送上去，是最坏的一种错：模型会对着
+// 损坏的数据认真作答，界面上看不出任何异常。
+func readLimited(file *os.File, header []byte, limit int64) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(io.MultiReader(bytes.NewReader(header), file), limit+1))
+}
+
+// videoMediaType 判定是不是视频，并给出要送上游的 MIME。
+//
+// 判据是**容器魔数 + 扩展名的交叉验证**，不是「扩展名像视频就算」：
+// 只信扩展名会把任意二进制（改个 .mp4 后缀就）标成 video/mp4 送上去，
+// 上游要么报错、要么对着一段垃圾给出言之凿凿的描述。
+//
+// 为什么不直接用 http.DetectContentType：它只认得 mp4（ftyp）与 webm（EBML），
+// mov / mkv / avi 一律落到 application/octet-stream。而这些容器在
+// Gemini 支持的格式列表里（mov / avi / webm / mpeg / 3gpp 都在）。
+func videoMediaType(head []byte, name string) (string, bool) {
+	ext := strings.ToLower(filepath.Ext(name))
+	want, known := videoExtTypes[ext]
+	if !known {
+		// 扩展名不在列表里就不猜：靠魔数救不了 file:/// 这类无扩展名路径，
+		// 而猜错的代价（把垃圾当视频送出去）远大于漏掉一个冷门容器。
+		return "", false
+	}
+	if len(head) < 12 {
+		return "", false
+	}
+	if !videoContainerMagic(head) {
+		return "", false
+	}
+	return want, true
+}
+
+// videoExtTypes 是按扩展名索引的视频 MIME。
+//
+// 键为含点的**小写**扩展名；值即送上游的 media_type（不要改成容器名，
+// 上游按 media_type 选解码器）。
+var videoExtTypes = map[string]string{
+	".mp4":  "video/mp4",
+	".m4v":  "video/mp4",
+	".webm": "video/webm",
+	".mov":  "video/quicktime",
+	".qt":   "video/quicktime",
+	".mkv":  "video/x-matroska",
+	".avi":  "video/x-msvideo",
+	".mpeg": "video/mpeg",
+	".mpg":  "video/mpeg",
+	".3gp":  "video/3gpp",
+}
+
+// videoContainerMagic 判断头部是否是已知视频容器的起始特征。
+//
+// 覆盖：ISO BMFF（mp4/mov/m4v 的 ftyp）、Matroska/WebM（EBML）、
+// AVI（RIFF….AVI ）、MPEG-PS/TS（0x000001BA / 188 字节包的 0x47 同步字节）。
+// 只做魔数判定，不校验内部结构 —— 完整校验需要真解码器，那是模型侧的事。
+func videoContainerMagic(head []byte) bool {
+	switch {
+	case bytes.HasPrefix(head, []byte{0x1A, 0x45, 0xDF, 0xA3}): // EBML：matroska / webm
+		return true
+	case len(head) >= 12 && string(head[4:8]) == "ftyp": // ISO BMFF：mp4 / mov
+		return true
+	case len(head) >= 12 && string(head[:4]) == "RIFF" && string(head[8:12]) == "AVI ":
+		return true
+	case bytes.HasPrefix(head, []byte{0x00, 0x00, 0x01, 0xBA}): // MPEG-PS
+		return true
+	case len(head) >= 189 && head[0] == 0x47 && head[188] == 0x47: // MPEG-TS：相邻两包的首字节
+		return true
+	}
+	return false
 }
 
 func validateAttachmentImage(data []byte, mediaType string) error {

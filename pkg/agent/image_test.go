@@ -12,6 +12,9 @@ import (
 
 type imageRequestProvider struct {
 	requests []llm.Request
+	// streamErr 非空时，Stream 在记录请求后直接返回它 ——
+	// 用来模拟「请求确实发出去了，但上游拒收内容块」。
+	streamErr error
 }
 
 func (p *imageRequestProvider) Name() string { return "image-test" }
@@ -19,6 +22,9 @@ func (p *imageRequestProvider) Name() string { return "image-test" }
 func (p *imageRequestProvider) Stream(_ context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
 	req.Messages = cloneMessages(req.Messages)
 	p.requests = append(p.requests, req)
+	if p.streamErr != nil {
+		return nil, p.streamErr
+	}
 	ch := make(chan llm.StreamEvent, 2)
 	ch <- llm.StreamEvent{Type: llm.EventTextDelta, Text: "answer"}
 	ch <- llm.StreamEvent{Type: llm.EventMessageStop}
@@ -42,7 +48,7 @@ func TestRunWithImagesHistoryAndRegenerate(t *testing.T) {
 			images := testImageMessage("aW1hZ2U=").Content
 			var events []Event
 			emit := func(ev Event) { events = append(events, ev) }
-			if err := a.RunWithImages(context.Background(), sess.ID, input, images, emit); err != nil {
+			if err := a.RunWithMedia(context.Background(), sess.ID, input, images, emit); err != nil {
 				t.Fatal(err)
 			}
 			if len(p.requests) != 1 || len(sess.Messages) != 2 {
@@ -196,7 +202,7 @@ func TestRunWithImagesOverBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	var done bool
-	err = a.RunWithImages(context.Background(), sess.ID, "", testImageMessage("current").Content, func(ev Event) { done = done || ev.Type == EventDone })
+	err = a.RunWithMedia(context.Background(), sess.ID, "", testImageMessage("current").Content, func(ev Event) { done = done || ev.Type == EventDone })
 	if err == nil || !strings.Contains(err.Error(), "压缩后仍超过上下文预算") {
 		t.Fatalf("expected context budget error, got %v", err)
 	}

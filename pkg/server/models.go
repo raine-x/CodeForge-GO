@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"codeforge/config"
+	"codeforge/pkg/agent"
 	"codeforge/pkg/errs"
 	"codeforge/pkg/logx"
 )
@@ -356,6 +357,18 @@ func (s *Server) handleModelSave(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "保存模型", err)
 			return
 		}
+	}
+	// 能力声明被显式改成「支持」时，清掉本进程对该模型的记忆。
+	//
+	// 不清的后果很隐蔽：用户在设置页勾上「支持图片」并保存，界面显示成功、
+	// 配置也落盘了，但 agent 仍按旧的「此前已确认不支持」拦下附件 ——
+	// 表现为「勾了也没用，重启一下就好了」。记忆是为了少撞一次墙而存在的
+	// 优化，绝不能盖过用户刚刚做出的显式声明（见 capability.go 的 mediaVerdict）。
+	if m.Vision != nil && *m.Vision {
+		agent.ForgetMediaCapability(m.ID)
+	}
+	if m.Video != nil && *m.Video {
+		agent.ForgetMediaCapability(m.ID)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":        true,

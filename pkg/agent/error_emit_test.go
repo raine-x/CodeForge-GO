@@ -167,6 +167,13 @@ func TestPartialTurnDropsUnsignedToolCall(t *testing.T) {
 // （systemPromptFor 会读 History 的任务清单，history 为 nil 会 panic）。
 func newEmitTestAgent(t *testing.T, p llm.Provider) *Agent {
 	t.Helper()
+	return newEmitTestAgentWithCfg(t, p, config.LLMConfig{})
+}
+
+// newEmitTestAgentWithCfg 与 newEmitTestAgent 相同，但可指定请求参数 ——
+// 能力门要读 LLMConfig 里的 vision / video 声明（见 capability_test.go）。
+func newEmitTestAgentWithCfg(t *testing.T, p llm.Provider, cfg config.LLMConfig) *Agent {
+	t.Helper()
 	registry := tools.NewRegistry()
 	executor := tools.NewExecutor(registry, security.NewPolicy(config.SecurityConfig{}), nil, nil, 0, 0)
 	st, err := store.Open(filepath.Join(t.TempDir(), "data.db"))
@@ -174,7 +181,7 @@ func newEmitTestAgent(t *testing.T, p llm.Provider) *Agent {
 		t.Fatalf("打开测试库失败: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	return New(config.AgentConfig{MaxSteps: 3}, config.LLMConfig{}, p, executor, NewHistory(st), "")
+	return New(config.AgentConfig{MaxSteps: 3}, cfg, p, executor, NewHistory(st), "")
 }
 
 // countEmitter 统计各类事件（重点数 EventError 出现次数）。

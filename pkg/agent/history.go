@@ -172,11 +172,18 @@ func (s *Session) ContinueHint() string {
 	return s.continueHint
 }
 
-// appendMessages 追加消息到历史（写者须为持有运行权的循环 goroutine）。
-func (s *Session) appendMessages(msgs ...llm.Message) {
+// appendMessages 追加消息到历史（写者须为持有运行权的循环 goroutine），
+// 返回**第一条**被追加消息的下标。
+//
+// 返回下标是因为调用方有时需要「自己刚写进去的那条」的位置：往回滚一段
+// 历史时不能用「最后一条」—— appendSteers 会在循环运行中往尾部追加转向
+// 指令，那时的最后一条并不是本轮写的。
+func (s *Session) appendMessages(msgs ...llm.Message) int {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	base := len(s.Messages)
 	s.Messages = append(s.Messages, msgs...)
-	s.mu.Unlock()
+	return base
 }
 
 // setReqEstimate 记录「上一次真正发给上游的请求」的估算总量。

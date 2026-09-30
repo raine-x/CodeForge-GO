@@ -511,11 +511,11 @@ func (c *wsClient) startUserMessage(msg wsMessage) {
 	// 于是「在 B 会话发消息」会先把「A 会话正在跑的那轮」杀掉，
 	// 同一连接上也无法并行跑两个会话。
 	go c.run(sessionID, msg.Thinking, "用户消息", msg.Text, func(ctx context.Context, emit func(agent.Event)) error {
-		images, err := readAttachmentImages(ws, msg.Attachments)
+		media, err := readAttachmentMedia(ws, msg.Attachments)
 		if err != nil {
 			return err
 		}
-		return c.srv.agent.RunWithImages(ctx, sessionID, msg.Text, images, emit)
+		return c.srv.agent.RunWithMedia(ctx, sessionID, msg.Text, media, emit)
 	})
 }
 

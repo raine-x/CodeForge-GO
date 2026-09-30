@@ -17,6 +17,8 @@ import (
 //     用标准库 archive/zip 解开、抽出文本节点，零新增依赖；
 //   - .pdf：轻量文本流抽取（BT…ET 之间的 Tj/TJ 操作数），只覆盖文本型 PDF。
 //
+// 视频走第三条路：明确报「读不了」并给出替代做法（见那个分支的注释）。
+//
 // 设计取向：不追求排版还原，只把「正文文字」喂给模型 —— Agent 要的是内容，
 // 不是版式。需要精确版式时请用户转 Markdown / 纯文本。
 
@@ -35,6 +37,18 @@ func extractDocText(data []byte, name string) (string, bool, error) {
 	case ".pdf":
 		t, err := pdfText(data)
 		return t, true, err
+	case ".mp4", ".m4v", ".webm", ".mov", ".qt", ".mkv", ".avi",
+		".mpeg", ".mpg", ".3gp":
+		// 视频明确报「读不了」，而不是让它落到下面 `string(data)` 那一步。
+		//
+		// 后者会把整段二进制按行切开返回给模型：一屏乱码，
+		// 而模型会**认真地**照着乱码编出一段描述。此前附件层对视频
+		// 静默返回 nil（连一个块都不给），模型只能自己去 read_file，
+		// 于是走的正是这条吐乱码的路。
+		return "", true, fmt.Errorf(
+			"视频文件无法按文本读取（需要真正的解码器才能取出画面与声音）。" +
+				"请改用随对话附件发送：支持视频的模型会直接解析它；" +
+				"不支持的模型请自行抽取关键帧后以图片形式附上")
 	}
 	return "", false, nil
 }
