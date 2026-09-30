@@ -270,10 +270,87 @@ func TestEveryKindHasCause(t *testing.T) {
 		KindStreamCut, KindTLS, KindAuth, KindRateLimit, KindUpstream,
 		KindPermission, KindNotFound, KindDiskFull, KindParse, KindCanceled,
 		KindContextOverflow, // 此前漏掉：有 Cause 实现却没被这条断言覆盖
+		KindUnsupportedMedia,
 	}
 	for _, k := range all {
 		if strings.TrimSpace(Cause(k)) == "" {
 			t.Errorf("Kind %v 缺少中文成因说明", k)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 拒收图片 / 视频
+//
+// 这一类此前会掉进 KindParse，界面上显示成「数据格式不对（解析失败）」——
+// 用户看到「格式错误」只会去检查自己的图片有没有坏，真凶（模型看不见图）
+// 永远不会被发现。这组测试钉住「它必须有自己的类别」。
+// ---------------------------------------------------------------------------
+
+func TestClassifyUnsupportedMedia(t *testing.T) {
+	// 带状态码的实测形态：必须优先于 ClassifyStatus(400) = KindParse。
+	real := NewStatus(400, `{"error":{"message":"Invalid content type in request: `+
+		`'image_url' is not supported by this model","type":"invalid_request_error"}}`,
+		0, nil)
+	if got := Classify(real); got != KindUnsupportedMedia {
+		t.Fatalf("上游拒收图片应归为 KindUnsupportedMedia，实际 %v", got)
+	}
+
+	// 各家文案（裸 error，不带状态码）
+	others := []string{
+		"The model does not support image inputs",
+		"unsupported content type: image",
+		"messages.1.content.0.type: unexpected content block type 'video_url'",
+		"unexpected `image` content block",
+		"该模型不支持图片输入",
+		"模型不支持视频",
+	}
+	for _, m := range others {
+		if got := Classify(errors.New(m)); got != KindUnsupportedMedia {
+			t.Errorf("%q 应归为拒收媒体，实际 %v", m, got)
+		}
+	}
+}
+
+// 判据要求「模态名 + 拒绝词」同时出现，否则会误伤两类**处置方式完全不同**的错误：
+// 图片太大（该换小图）、图片损坏（该换文件）。判错会让用户去改错的东西。
+func TestUnsupportedMediaDoesNotSwallowSizeOrCorruption(t *testing.T) {
+	notMedia := []string{
+		"image exceeds the maximum allowed size",
+		"image is too large, please use a smaller file",
+		"failed to decode image: invalid JPEG data",
+		"unsupported image format: bmp", // 格式级拒绝：换个文件就行，不该中止整轮
+		"不支持该图片格式，请先转为 png",
+		"this feature is not supported in your plan",
+		"video_url is required for this endpoint",
+		"unexpected EOF while reading image data", // 流截断，判据里的 "unexpected" 不该压过它
+	}
+	for _, m := range notMedia {
+		if got := Classify(errors.New(m)); got == KindUnsupportedMedia {
+			t.Errorf("%q 不该被判为「模型不支持媒体」", m)
+		}
+	}
+}
+
+// 不可原样重试：模型看不见图片，重发一万次上游还是拒。
+func TestUnsupportedMediaIsNotBlindlyRetryable(t *testing.T) {
+	if Retryable(KindUnsupportedMedia) {
+		t.Error("拒收媒体不该被当成可原样重试的瞬时故障")
+	}
+}
+
+// 成因与建议都必须说清「是模型的问题」并给出下一步，
+// 否则用户只会反复检查自己的附件。
+func TestUnsupportedMediaCauseAndHint(t *testing.T) {
+	c := Cause(KindUnsupportedMedia)
+	if !strings.Contains(c, "模型") {
+		t.Errorf("成因应指向模型，实际 %q", c)
+	}
+	if strings.Contains(c, "格式") {
+		t.Errorf("成因不该再出现「格式」（那正是要消掉的误导），实际 %q", c)
+	}
+	h := Hint(KindUnsupportedMedia)
+	if !strings.Contains(h, "设置") {
+		t.Errorf("建议应给出可操作入口（设置 → 模型），实际 %q", h)
 	}
 }

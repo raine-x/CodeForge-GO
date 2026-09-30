@@ -75,6 +75,18 @@ const (
 	KindContextOverflow
 	// KindCanceled 被主动取消（用户点了停止、切走页面等）。
 	KindCanceled
+	// KindUnsupportedMedia 上游**拒收图片/视频**内容块：模型（或那条兼容网关）
+	// 不具备该模态的输入能力。
+	//
+	// 单独归类的理由：它本来会掉进 KindParse（400 → 「数据格式不对，解析失败」），
+	// 那条文案对用户毫无意义 —— 真实原因是「这个模型看不见图片」，而用户看到
+	// 的是「格式错误」，于是会去检查自己的文件有没有坏，永远查不到真凶。
+	// 更糟的是这类失败**不可重试且不可自救**：重发一百次仍是同一个结果。
+	//
+	// 上层靠它做两件事（见 agent 的能力门）：中止本轮并回滚已写入历史的
+	// 媒体块（否则图片留在历史里，这个会话之后每次请求都被同样拒绝），
+	// 以及记住该模型不支持，从此不再拿媒体去撞上游。
+	KindUnsupportedMedia
 )
 
 // 常见 HTTP 状态码，供 ClassifyStatus 使用。
@@ -125,6 +137,13 @@ func Classify(err error) Kind {
 		// 而且既有的 TestClassifyContextOverflow（用裸 errors.New）抓不到。
 		if isContextOverflowMessage(strings.ToLower(err.Error())) {
 			return KindContextOverflow
+		}
+		// ⚠️ 「拒收图片/视频」同样必须先于 ClassifyStatus：它也常是 400，
+		// 而 ClassifyStatus(400) = KindParse →「数据格式不对（解析失败）」。
+		// 不在这里截住，用户看到的就是「格式错误」，永远想不到是模型看不见图，
+		// 于是去反复检查自己的图片有没有坏 —— 真凶在模型侧，跟文件无关。
+		if isUnsupportedMediaMessage(strings.ToLower(err.Error())) {
+			return KindUnsupportedMedia
 		}
 		if k := ClassifyStatus(code); k != KindUnknown {
 			return k
@@ -220,6 +239,12 @@ func Classify(err error) Kind {
 	case strings.Contains(msg, "unexpected end of json"), strings.Contains(msg, "invalid character"):
 		return KindParse
 	}
+	// 拒收媒体放在**最后**：它的判据含 "unexpected" 这个宽词，
+	// 必须让前面那些更精确的判断先跑完 —— 否则「unexpected EOF of image」
+	// 会被当成「模型不支持图片」，把一次流截断误判成能力问题并中止整轮。
+	if isUnsupportedMediaMessage(msg) {
+		return KindUnsupportedMedia
+	}
 	return KindUnknown
 }
 
@@ -257,6 +282,57 @@ func isContextOverflowMessage(msg string) bool {
 	}
 	for _, p := range patterns {
 		if strings.Contains(msg, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isUnsupportedMediaMessage 识别「上游拒收图片/视频内容块」。
+//
+// msg 必须是**小写**后的错误全文。
+//
+// 判据刻意要求**同时**出现「模态名」与「拒绝/不支持」两类词：
+// 只匹配 "image" 会把「图片过大（too large）」「图片已损坏」这类同样提到
+// image 的错误误判成「模型不支持图片」—— 而那两类的正确处置完全不同
+// （换小图 / 换文件），判错会让用户去改错的东西。只匹配 "unsupported" 会把
+// 「该功能在你的订阅计划中不支持」这类无关的 403 也拖进来。
+//
+// 已实测/已知的文案：
+//
+//	OpenAI 兼容层:
+//	  "Invalid content type in request... 'image_url' is not supported"
+//	  "The model does not support image inputs" / "unsupported content type: image"
+//	Anthropic:
+//	  "messages.1.content.0.type: unexpected content block type 'video_url'"
+//	  "unexpected `image` content block"
+//	中文网关（GLM / 通义 / DeepSeek 一类）:
+//	  "该模型不支持图片输入" / "模型不支持视频"
+//
+// **排除格式级拒绝**："unsupported image format: bmp" 说的是这**一个文件**
+// 的编码不被接受，而 "model does not support image" 说的是这个**模型**
+// 根本收不到图片。前者换个文件就好（该报错、该让用户去转格式），
+// 后者只能换模型（该中止、该记住）——判错会让用户去改一个根本不用改的东西。
+func isUnsupportedMediaMessage(msg string) bool {
+	if !hasAnyToken(msg, "image", "video", "图片", "图像", "视频") {
+		return false
+	}
+	if hasAnyToken(msg, "image format", "video format", "图片格式", "视频格式", "格式不支持") {
+		return false
+	}
+	return hasAnyToken(msg,
+		"not support", "unsupported", "unexpected",
+		"invalid content type", "unknown content type",
+		"不支持", "无法处理", "不能识别",
+	)
+}
+
+// hasAnyToken 报告 msg 是否含有其中任一子串。**不做分词切分**：
+// 这些词都是 ASCII 词组或完整中文词，出现在错误正文里几乎不会有歧义，
+// 而引入分词依赖会让 errs 依赖标准库之外的东西 —— 这个包的定位就是零依赖兜底。
+func hasAnyToken(msg string, tokens ...string) bool {
+	for _, t := range tokens {
+		if strings.Contains(msg, t) {
 			return true
 		}
 	}
@@ -314,6 +390,11 @@ func Cause(k Kind) string {
 		return "输入 + 输出超过了模型的上下文窗口"
 	case KindCanceled:
 		return "操作被取消"
+	case KindUnsupportedMedia:
+		// 不猜是图片还是视频：同一条判据同时覆盖两种模态，
+		// 猜错会让用户去检查他根本没附的那类文件。
+		// 「附件」是两者共同的上位词 —— 界面上删掉的那一栏就是这个。
+		return "当前模型不支持接收图片/视频附件"
 	}
 	return "发生了未预期的错误"
 }
@@ -353,6 +434,10 @@ func Hint(k Kind) string {
 		return "系统会自动压缩历史后重试；若反复出现，请在「设置 → 模型」调小该条目的「输出上限」"
 	case KindCanceled:
 		return ""
+	case KindUnsupportedMedia:
+		// 这条建议要给出**下一步能做什么**，否则用户只能干瞪眼：
+		// 换模型（模型库里勾上能力声明）、或把内容转成文字描述再问一次。
+		return "在「设置 → 模型」里给该模型勾上「支持图片 / 支持视频」声明（仅当它确实支持时），或改用支持视觉的模型；也可以直接把内容用文字描述给你看"
 	}
 	return ""
 }
@@ -364,6 +449,9 @@ func Hint(k Kind) string {
 // ⚠️ 注意 KindContextOverflow 返回 false —— 它需要的是**压缩后重发**，
 // 而不是把同一个超窗请求再发一遍（那只会再被拒一次）。
 // 调用方要单独识别它并走「先压缩、再重试」的路径（见 pkg/agent 的步骤循环）。
+//
+// KindUnsupportedMedia 同理不可重试：模型看不见图片这件事，重发一万次
+// 上游还是会拒。它需要的是**换模型**或**去掉附件**，两者都在请求之外。
 func Retryable(k Kind) bool {
 	switch k {
 	case KindTimeout, KindNetUnreachable, KindConnReset, KindStreamCut,
