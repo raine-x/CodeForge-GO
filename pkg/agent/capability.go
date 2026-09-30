@@ -241,6 +241,52 @@ func noteRejectedMedia(cfg config.LLMConfig, sent []llm.ContentBlock) {
 	}
 }
 
+// onMediaRejected 是「上游拒收媒体」的唯一收敛点。
+//
+// 放在 runLoopWithLimit 的错误返回处、而不是 RunWithMedia 里，是因为
+// **所有入口都会撞上同一件事**，而只有循环层知道「真正发出去的那份请求视图」：
+//
+//	RunWithMedia   —— 本轮新加的媒体块，已过能力门；
+//	Regenerate     —— 用户在历史里贴过图，之后换了纯文本模型；
+//	EditAndResend /
+//	RerunFrom      —— 同上，断点重试会反复重发同一批历史块；
+//	ContinueTurn   —— 同上。
+//
+// 后四种入口**不新增**媒体块，因此它们没有「能力门」可依赖 ——
+// 历史里那些块是在上一个模型下验证过的，换模型后可能正好是收不下的那一种。
+// 若只在本轮入口回滚，这条路上会话仍会被毒化（每轮重发、每轮被拒）。
+//
+// 两件事，缺一不可：
+//   - **记住**该模型收不下这类附件（否则下一轮又去撞同一面墙）；
+//   - **摘掉**历史里的媒体块（否则摘了记忆，历史那份 base64 每轮仍被重发）。
+func (a *Agent) onMediaRejected(sess *Session, view []llm.Message, cfg config.LLMConfig, persist bool, emit Emitter) {
+	// 模态判定按「真正送出去的那份」而不是本轮 —— 重新生成这类入口里，
+	// 被拒的媒体块可能来自很早以前的一条消息。
+	var sent []llm.ContentBlock
+	for _, m := range view {
+		for _, b := range m.Content {
+			if b.Type == llm.BlockImage || b.Type == llm.BlockVideo {
+				sent = append(sent, b)
+			}
+		}
+	}
+	noteRejectedMedia(cfg, sent)
+
+	sess.mu.Lock()
+	removed := 0
+	for i := range sess.Messages {
+		removed += stripMediaFromMessage(&sess.Messages[i])
+	}
+	sess.mu.Unlock()
+	if removed == 0 {
+		return
+	}
+	logx.Infof("会话=%s 模型=%s 拒收媒体，已从历史摘掉 %d 个块（否则该会话每轮都会被拒）",
+		sess.ID, cfg.Model, removed)
+	// 必须落盘：不落盘的话用户刷新一下页面，毒化的历史又回来了。
+	a.save(sess, persist, emit)
+}
+
 // stripMediaFromMessage 把一条消息里的媒体块摘掉，返回摘掉的数量。
 //
 // 存在的理由：媒体块一旦留在历史里，**这个会话之后每一轮都会被重发**，

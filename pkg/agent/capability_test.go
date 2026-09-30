@@ -402,3 +402,39 @@ func TestTextOnlyTurnUnaffected(t *testing.T) {
 		t.Errorf("应正常发一次请求，实际 %d", len(p.requests))
 	}
 }
+
+// 重新生成是**不经过本轮能力门**的入口：它重发既有历史，而历史里的媒体块
+// 是在上一个（可能支持视觉的）模型下验证过的。换到收不下的模型后再点
+// 「重新生成」，回滚若只做在 RunWithMedia 里，这个会话就会被毒化。
+func TestRegenerateAlsoRollsBackMediaFromHistory(t *testing.T) {
+	resetMemory(t)
+	// 先用「支持图片」的模型正常跑一轮，让图片真的进历史。
+	capable := config.LLMConfig{Model: modelVideoOnly, Vision: boolPtr(true)}
+	p := &imageRequestProvider{}
+	a, sess := newMediaSession(t, p, capable)
+	if err := a.RunWithMedia(context.Background(), sess.ID, "看这张图", []llm.ContentBlock{imageBlock}, func(Event) {}); err != nil {
+		t.Fatalf("第一轮应成功: %v", err)
+	}
+	if countMediaBlocks(sess) != 1 {
+		t.Fatalf("图片应已进历史，实际 %d", countMediaBlocks(sess))
+	}
+
+	// 换成一个收不下图片的模型（模拟用户改了配置），并清掉记忆，
+	// 让这次重新生成真的会把请求发出去并被拒。
+	plain := config.LLMConfig{Model: modelRejectsImg}
+	a.SetLLMConfig(plain)
+	p.streamErr = errs.NewUnsupportedMedia("'image_url' is not supported by this model")
+
+	if err := a.Regenerate(context.Background(), sess.ID, func(Event) {}); err == nil {
+		t.Fatal("模型收不下图片时重新生成应失败")
+	}
+	if !rejectedMedia.remembers(modelRejectsImg, "image") {
+		t.Error("应记住该模型不收图片")
+	}
+	if n := countMediaBlocks(sess); n != 0 {
+		t.Errorf("重新生成这条路也必须摘掉历史里的媒体块，否则会话被毒化；实际还剩 %d", n)
+	}
+	if !sessHasText(sess, "看这张图") {
+		t.Error("提问原文必须保留")
+	}
+}

@@ -693,34 +693,14 @@ func (a *Agent) RunWithMedia(ctx context.Context, sessionID, input string, media
 
 	message := llm.TextMessage(llm.RoleUser, input)
 	message.Content = append(message.Content, kept...)
-	// 记下这条消息的下标：失败回滚要用它，不能靠「最后一条」定位
-	// （运行中转向会在尾部追加指令，那时就指错了）。
-	mediaIdx := sess.appendMessages(message)
+	sess.appendMessages(message)
 	emit(Event{Type: EventUser, Text: input})
 	sess.SetLastUserInput(input) // 供 systemPrompt 里技能触发词匹配
 
-	err := a.runLoopWithLimit(ctx, sess, emit, true, limit)
-	if err == nil || errs.Classify(err) != errs.KindUnsupportedMedia {
-		return err
-	}
-
-	// 到这里说明：能力门当时判为「可送」（多半是没声明、也没记住），
-	// 上游却拒收了。这是**唯一一次**不透明的失败，必须收敛成可理解的状态：
-	//   - 记住它，此后不再拿媒体撞同一面墙；
-	//   - 摘掉历史里的媒体块，否则这个会话之后每轮都被同样拒一次。
-	sess.mu.Lock()
-	removed := 0
-	if mediaIdx >= 0 && mediaIdx < len(sess.Messages) {
-		removed = stripMediaFromMessage(&sess.Messages[mediaIdx])
-	}
-	sess.mu.Unlock()
-	noteRejectedMedia(llmCfg, kept)
-	if removed > 0 {
-		logx.Infof("会话=%s 模型=%s 拒收媒体，已从历史摘掉 %d 个块（否则该会话每轮都会被拒）",
-			sessionID, llmCfg.Model, removed)
-		a.save(sess, true, emit)
-	}
-	return err
+	// 上游拒收媒体后的「记住 + 回滚」不在这里做：那是 runLoopWithLimit 的职责，
+	// 因为重新生成 / 编辑重发 / 断点重试同样会撞上同一件事，且只有那里能拿到
+	// 「真正发出去的那份请求视图」。详见 onMediaRejected。
+	return a.runLoopWithLimit(ctx, sess, emit, true, limit)
 }
 
 // Regenerate 重新生成最后一轮回复：把会话回退到最近一条用户消息
@@ -1149,6 +1129,10 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 		// 收紧后重发是安全的：压缩是幂等的，且这里不改变用户可见的历史
 		//（压缩只影响「送模视图」，sess.Messages 始终完整）。
 		var stream <-chan llm.StreamEvent
+		// sentView 是「最终真正送出去的那份消息」，供循环外的错误处理判断
+		// 该记住哪种媒体。它必须提到循环外：consumeStream 的失败点在循环之后，
+		// 而「上游拒收媒体」的收敛恰好也要在那里发生（见 onMediaRejected）。
+		var sentView []llm.Message
 		shrink := 1.0
 		for attempt := 1; ; attempt++ {
 			base := a.compressBudget() - overhead
@@ -1194,6 +1178,12 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 			//（见 Session.calibrateTokenFactor）。必须**含**系统提示与工具定义，
 			// 否则比值口径对不上，校准会偏。
 			sess.setReqEstimate(EstimateTokens(messages) + overhead)
+			// 记下这次**尝试**送出的视图（在调 Stream 之前）。
+			//
+			// 必须早于调用：上游拒收媒体恰恰是 Stream **返回错误**那条路，
+			// 而那时若还没记，错误处理就看不到任何媒体块，也就无从判断
+			// 该记住图片还是视频（见 onMediaRejected）。
+			sentView = messages
 
 			// 注入重试通知：上游瞬时故障自动重试时，向前端透出「请求失败，正在重试…」。
 			// 连「第几次 / 共几次」一起带上 —— 只给一句笼统的「正在重试」，用户无法判断
@@ -1227,6 +1217,7 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 			// 不在这里 emit：错误返回给调用方后，WS 层（ws_handler.run）会统一
 			// 下发一次 error 事件；这里再 emit 就会显示两遍（如 402 余额不足）。
 			a.save(sess, persist, emit)
+			a.onMediaRejected(sess, sentView, a.llmCfgSnapshot(), persist, emit)
 			return err
 		}
 
@@ -1236,6 +1227,7 @@ func (a *Agent) runLoopWithLimit(ctx context.Context, sess *Session, emit Emitte
 			// 丢掉就会出现「界面上显示着一段历史里不存在的回复」，刷新后凭空消失。
 			a.recordPartialTurn(sess, turn, partialTurnReason(ctx, err))
 			a.save(sess, persist, emit)
+			a.onMediaRejected(sess, sentView, a.llmCfgSnapshot(), persist, emit)
 			return err
 		}
 
