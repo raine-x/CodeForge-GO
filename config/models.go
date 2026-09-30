@@ -16,12 +16,21 @@
 //	    provider_id: p-discovery-api-intern-ai-org-cn   # 地址与密钥都在供应商上
 //	    ctx_in: 262144
 //	    ctx_out: 131072
+//	  - id: models/gemini-3.8-flash                      # 声明多模态能力（可省略）
+//	    name: Gemini 3.8 Flash
+//	    provider_id: p-ai
+//	    vision: true        # 收得到图片
+//	    video: true         # 收得到视频（原生透传，不是抽帧）
 //	  - id: gpt-4o                                     # 自带连接信息（旧格式，仍支持）
 //	    name: GPT-4o
 //	    base_url: https://api.openai.com/v1
 //	    protocol: openai
 //	    key_source: env
 //	    key_name: OPENAI_API_KEY
+//
+// vision / video 是**三态**：字段不写 = 未声明（= 不知道），写 true / false 才是
+// 显式声明。别把它们当普通 bool 用 —— 未声明必须与「不支持」区分开，
+// 理由见 ModelEntry.Vision。
 package config
 
 import (
@@ -50,6 +59,40 @@ type ModelEntry struct {
 	KeyValue   string `yaml:"key_value,omitempty" json:"-"`                       // 覆盖：明文 Key（KeySource=plain 时），绝不序列化到 JSON
 	CtxIn      int    `yaml:"ctx_in,omitempty" json:"ctx_in,omitempty"`           // 输入上下文上限（tokens，无单位直填），0 表示未设置
 	CtxOut     int    `yaml:"ctx_out,omitempty" json:"ctx_out,omitempty"`         // 输出上限（tokens，无单位直填），应用时写入 LLM.MaxTokens
+
+	// Vision / Video 声明该模型的多模态能力，**三态**（nil 未声明 / true / false）。
+	//
+	// 为什么刻意不用裸 bool：models.yaml 由设置页生成、被 .gitignore 忽略，
+	// 绝大多数条目**本来就没有**这两个字段。裸 bool 会把「没写」读成 false，
+	// 于是每个未声明的模型都被判成「不支持图片」而从此收不到图片 ——
+	// 新装用户一条都没声明，图片功能直接全废；已有配置里的 Gemini 条目也会
+	// 突然收不到图。**声明缺失必须等于「不知道」，不能等于「不支持」。**
+	//
+	// 三态各自的用途（见 agent 的能力门）：
+	//   nil   未知 → 照旧乐观发送，撞到上游拒收时记住该模型并中止（一次性代价）；
+	//   true  显式支持 → 发之前就拦下不支持的附件，不浪费请求；
+	//   false 显式不支持 → 附件根本不该进来。
+	Vision *bool `yaml:"vision,omitempty" json:"vision,omitempty"` // 支持图片输入
+	Video  *bool `yaml:"video,omitempty" json:"video,omitempty"`   // 支持视频输入（原生透传，非抽帧）
+}
+
+// SupportsVision 报告该模型是否声明支持图片输入。
+//
+// ok=false 表示**未声明**（未知）：调用方必须按「乐观发送，失败再记忆」处理，
+// 绝不能把未知当成不支持 —— 见 Vision 字段注释里 models.yaml 被 gitignore 的后果。
+func (m ModelEntry) SupportsVision() (ok, supported bool) {
+	if m.Vision == nil {
+		return false, false
+	}
+	return true, *m.Vision
+}
+
+// SupportsVideo 与 SupportsVision 同构，判的是视频输入。
+func (m ModelEntry) SupportsVideo() (ok, supported bool) {
+	if m.Video == nil {
+		return false, false
+	}
+	return true, *m.Video
 }
 
 // DisplayName 返回界面展示名：优先 name，回退 id。
@@ -268,6 +311,11 @@ func sanitizeEntries(entries []ModelEntry, ps *ProviderStore) []map[string]any {
 			// 早前漏了这两项，表单只能落到前端默认值（262144），用户改过也看不到。
 			"ctx_in":  m.CtxIn,
 			"ctx_out": m.CtxOut,
+			// 多模态能力**按三态下发**：未声明是 null（不是 false）。
+			// 前端据此把开关留在「未设置」而不是替用户猜一个值 ——
+			// 猜错的后果是模型永久收不到图，而用户没有任何入口去纠正它。
+			"vision": raw.Vision,
+			"video":  raw.Video,
 		}
 	}
 	return out

@@ -60,6 +60,16 @@ func ResolveModelCredentials(cfg *Config, ms *ModelStore, ps *ProviderStore) str
 	// 用户还能在设置页手动覆盖。持久化下来的那份才是权威 ——
 	// 这里再按模型条目盖一次，用户的手动设置就白改了。
 
+	// 多模态能力声明：整体覆盖（含 nil）。
+	//
+	// ⚠️ 必须是**无条件赋值**，不能写成「条目声明了才覆盖」——
+	// 那是「store 有值才覆盖」原则在这里的例外：换模型时若新条目没声明
+	// vision/video 而旧模型声明过，不清空就会把**上一个模型的能力**扣在
+	// 新模型头上（症状：换到纯文本模型，图片仍在静默被拒）。
+	// 能力声明是模型的内在属性，不存在「继承上一任」这回事。
+	cfg.LLM.Vision = entry.Vision
+	cfg.LLM.Video = entry.Video
+
 	if key := resolveModelKey(e); key != "" {
 		cfg.LLM.APIKey = key
 		return "已从模型库解析 " + id

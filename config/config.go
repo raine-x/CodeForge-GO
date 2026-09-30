@@ -52,6 +52,16 @@ type LLMConfig struct {
 	// RetryBackoffMs 是基础间隔（毫秒）：fixed 模式即每次等待时长；
 	// backoff 模式是序列基准（1000ms → 1s/2s/3s/6s），默认 1000。
 	RetryBackoffMs int `yaml:"retry_backoff_ms"`
+
+	// Vision / Video 是当前生效模型的**多模态能力声明**，由模型库条目
+	// （ModelEntry.Vision / .Video）解析而来 —— 与 provider / base_url /
+	// display_name 同属派生值，因此**刻意不进 StateLLM**：存旧副本只会陈旧。
+	// 三态语义见 ModelEntry.Vision（nil = 未声明 = 不知道，绝不等于不支持）。
+	//
+	// agent 的能力门据此在**发请求之前**拦下模型必然拒收的附件；
+	// 未声明时仍乐观发送，撞到拒收再记住该模型（见 agent 包的失败记忆）。
+	Vision *bool `yaml:"vision,omitempty"`
+	Video  *bool `yaml:"video,omitempty"`
 }
 
 // AgentConfig 描述 Agent 引擎行为。

@@ -498,6 +498,12 @@ func (s *Server) applyModelEntry(m config.ModelEntry, supplied string) error {
 	if m.CtxOut > 0 {
 		llm.MaxTokens = m.CtxOut
 	}
+	// 多模态能力声明：整体覆盖，含 nil。
+	//
+	// ⚠️ 必须无条件赋值 —— 见 config.ResolveModelCredentials 里同名注释：
+	// 新条目没声明而不清空，会把上一个模型的能力扣到新模型头上。
+	llm.Vision = m.Vision
+	llm.Video = m.Video
 	if err := s.rebuildProvider(); err != nil {
 		return err
 	}
