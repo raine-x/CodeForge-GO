@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"codeforge/config"
+	"codeforge/pkg/errs"
 )
 
 const (
@@ -42,7 +43,10 @@ func (p *AnthropicProvider) Name() string { return "anthropic" }
 
 // Stream 实现 Provider。
 func (p *AnthropicProvider) Stream(ctx context.Context, req Request) (<-chan StreamEvent, error) {
-	payload := p.buildPayload(req)
+	payload, err := p.buildPayload(req)
+	if err != nil {
+		return nil, err
+	}
 	headers := map[string]string{
 		"x-api-key":         p.apiKey,
 		"anthropic-version": anthropicVersion,
@@ -64,7 +68,7 @@ func (p *AnthropicProvider) Stream(ctx context.Context, req Request) (<-chan Str
 	return out, nil
 }
 
-func (p *AnthropicProvider) buildPayload(req Request) map[string]any {
+func (p *AnthropicProvider) buildPayload(req Request) (map[string]any, error) {
 	system := req.System
 	messages := make([]map[string]any, 0, len(req.Messages))
 	for _, m := range req.Messages {
@@ -79,7 +83,11 @@ func (p *AnthropicProvider) buildPayload(req Request) map[string]any {
 			}
 			continue
 		}
-		if blocks := convertAnthropicBlocks(m); len(blocks) > 0 {
+		blocks, err := convertAnthropicBlocks(m)
+		if err != nil {
+			return nil, err
+		}
+		if len(blocks) > 0 {
 			messages = append(messages, map[string]any{
 				"role":    string(m.Role),
 				"content": blocks,
@@ -125,14 +133,23 @@ func (p *AnthropicProvider) buildPayload(req Request) map[string]any {
 		}
 		payload["tools"] = tools
 	}
-	return payload
+	return payload, nil
 }
 
 // convertAnthropicBlocks 将统一消息内容转换为 Anthropic content blocks。
-func convertAnthropicBlocks(m Message) []map[string]any {
+//
+// 对视频**显式报错**而不是跳过：Anthropic 的 content block 只有
+// text / image / document / tool_use / tool_result，没有视频。
+// 原实现靠 switch 没有 default 来「自然丢弃」未知块 —— 那正是让
+// 「视频附加了但模型压根没收到」静默发生的入口。丢掉一个用户明确
+// 附上的附件等于伪造「模型已经看过了」，比直接失败糟得多。
+func convertAnthropicBlocks(m Message) ([]map[string]any, error) {
 	blocks := make([]map[string]any, 0, len(m.Content))
 	for _, b := range m.Content {
 		switch b.Type {
+		case BlockVideo:
+			return nil, errs.NewUnsupportedMedia(
+				"Anthropic 协议没有视频内容块，无法送出行 %s 的视频附件（%s）", m.Role, b.MediaType)
 		case BlockText:
 			if b.Text == "" {
 				continue
@@ -167,7 +184,7 @@ func convertAnthropicBlocks(m Message) []map[string]any {
 			})
 		}
 	}
-	return blocks
+	return blocks, nil
 }
 
 type anthropicEvent struct {

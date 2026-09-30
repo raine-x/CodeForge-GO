@@ -108,6 +108,12 @@ func Classify(err error) Kind {
 		return KindUnknown
 	}
 
+	// ---- 0. 显式带类别的本地错误：构造时就已知 Kind，无需任何猜测 ----
+	var ke *kindError
+	if errors.As(err, &ke) {
+		return ke.kind
+	}
+
 	// ---- 1. 哨兵错误：最可靠 ----
 	switch {
 	case errors.Is(err, context.Canceled):
@@ -511,6 +517,33 @@ func FriendlyOr(action string, err error) string {
 		return err.Error()
 	}
 	return Friendly(action, err)
+}
+
+// kindError 是「本地就能判定类别」的错误：不经过上游，构造那一刻就已知 Kind。
+//
+// 为什么需要它：Classify 的常规路径要么认哨兵/接口，要么**猜错误文本**。
+// 而「Anthropic 协议不承载视频内容块」这种错误是我们自己造出来的 —���
+// 若用普通 errors.New，就只能靠匹配中文措辞来分类，措辞一改就静默退化成
+// KindUnknown，上层的「记住该模型不支持」与「显式中止」两条命脉同时失效，
+// 而且失效得毫无痕迹（症状：视频被静默丢弃，模型压根没收到）。
+type kindError struct {
+	kind Kind
+	msg  string
+}
+
+func (e *kindError) Error() string { return e.msg }
+
+// NewUnsupportedMedia 构造「这个模型 / 这条协议收不了这类附件」的错误。
+//
+// 两条来源共用它，上层处理方式因此一致：
+//   - 本地判定：适配器在构造 payload 时就知道自己承载不了（见 llm 的 anthropic.go）；
+//   - 上游拒收：由 isUnsupportedMediaMessage 识别并归到同一 Kind。
+//
+// ⚠️ 给用户看的话由 agent 的能力门生成（那里知道是哪个模型、哪个附件），
+// 本错误只负责把类别带上去 —— Friendly 会用 Cause/Hint 覆写文案，
+// 具体细节请写进日志而不是指望它出现在界面上。
+func NewUnsupportedMedia(format string, a ...any) error {
+	return &kindError{kind: KindUnsupportedMedia, msg: fmt.Sprintf(format, a...)}
 }
 
 // wrapped 同时携带「给人看的说明」与「原始错误」。

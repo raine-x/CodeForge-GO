@@ -29,6 +29,16 @@ const (
 	BlockText       = "text"
 	BlockToolUse    = "tool_use"
 	BlockToolResult = "tool_result"
+	// BlockVideo 是一整段视频，**原样透传**给上游。
+	//
+	// 只对原生支持视频的模型有意义（Gemini / Qwen-VL 一类）：由上游自己抽帧、
+	// 转写音轨并插入时间戳 —— 那是模型侧的解码能力，本地复现不了
+	// （标准库没有任何视频解码器，而项目要求零第三方依赖 + CGO_ENABLED=0
+	// 静态编译，见 AGENTS.md）。因此本项目**不做本地抽帧**：
+	// 不支持视频的模型走能力门提示忽略，不做降级采样。
+	//
+	// 复用 ContentBlock 的 MediaType / Data（base64），不另立字段。
+	BlockVideo = "video"
 )
 
 // ContentBlock 是统一的内容块，覆盖文本、工具调用与工具结果。

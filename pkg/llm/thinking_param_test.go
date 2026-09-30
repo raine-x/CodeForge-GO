@@ -29,7 +29,7 @@ func TestThinkingParams(t *testing.T) {
 
 	// Anthropic 路径
 	a := NewAnthropic(config.LLMConfig{Model: "claude-sonnet-4-20250514"})
-	ap := a.buildPayload(Request{Thinking: "medium", MaxTokens: 8192, Temperature: 0.2})
+	ap := anthropicPayload(t, a, Request{Thinking: "medium", MaxTokens: 8192, Temperature: 0.2})
 	th, ok := ap["thinking"].(map[string]any)
 	if !ok {
 		t.Fatalf("anthropic thinking missing: %v", ap["thinking"])
@@ -44,14 +44,14 @@ func TestThinkingParams(t *testing.T) {
 	t.Logf("anthropic max_tokens = %s (须 > budget)", b)
 
 	// Anthropic 数字预算：直接夹紧到 [1024,16384] 并对齐步进
-	apNum := a.buildPayload(Request{Thinking: "9999", MaxTokens: 8192})
+	apNum := anthropicPayload(t, a, Request{Thinking: "9999", MaxTokens: 8192})
 	thNum := apNum["thinking"].(map[string]any)
 	if thNum["budget_tokens"] != 9728 { // 9999 → 对齐 512 步进
 		t.Fatalf("numeric budget = %v, want 9728", thNum["budget_tokens"])
 	}
 
 	// 低于开启下限：夹到 1024（而不是 0/512 这种非法值）
-	apLow := a.buildPayload(Request{Thinking: "512", MaxTokens: 8192})
+	apLow := anthropicPayload(t, a, Request{Thinking: "512", MaxTokens: 8192})
 	if got := apLow["thinking"].(map[string]any)["budget_tokens"]; got != 1024 {
 		t.Fatalf("512 应夹到开启下限 1024，实际 %v", got)
 	}
@@ -79,12 +79,12 @@ func TestThinkingParams(t *testing.T) {
 		if got := oBad.buildPayload(Request{Thinking: legacy})["reasoning_effort"]; got != "none" {
 			t.Fatalf("openai 旧关闭值 %q 应归到 none，实际 %v", legacy, got)
 		}
-		if _, exists := a.buildPayload(Request{Thinking: legacy, MaxTokens: 8192})["thinking"]; exists {
+		if _, exists := anthropicPayload(t, a, Request{Thinking: legacy, MaxTokens: 8192})["thinking"]; exists {
 			t.Fatalf("anthropic 关闭值 %q 不应携带 thinking", legacy)
 		}
 	}
 	// Anthropic 侧 none 仍表示「不发 thinking 字段」（该协议没有 none 取值）
-	if _, exists := a.buildPayload(Request{Thinking: "none", MaxTokens: 8192})["thinking"]; exists {
+	if _, exists := anthropicPayload(t, a, Request{Thinking: "none", MaxTokens: 8192})["thinking"]; exists {
 		t.Fatal("anthropic 关闭档 none 不应携带 thinking")
 	}
 
@@ -96,7 +96,7 @@ func TestThinkingParams(t *testing.T) {
 	}
 
 	// 不启用时不应带参数
-	ap2 := a.buildPayload(Request{MaxTokens: 8192, Temperature: 0.2})
+	ap2 := anthropicPayload(t, a, Request{MaxTokens: 8192, Temperature: 0.2})
 	if _, exists := ap2["thinking"]; exists {
 		t.Fatal("未指定 thinking 时不应携带 thinking 字段")
 	}

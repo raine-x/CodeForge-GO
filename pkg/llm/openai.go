@@ -235,6 +235,19 @@ func convertOAIMessages(m Message) []oaiMessage {
 					"url": "data:" + b.MediaType + ";base64," + b.Data,
 				},
 			})
+		case BlockVideo:
+			// 原生视频：整段透传，由上游自己抽帧 / 转写音轨 / 插时间戳。
+			// 标准 OpenAI 没有这个 part（Chat Completions 与 Responses 都不收），
+			// 但 OpenAI 兼容层是各家的公共出口 —— Qwen-VL 一类走
+			// video_url，OpenRouter 也用它转给 Gemini。不支持的模型会在
+			// 能力门被拦下（见 agent），走到这里说明上游自认能收。
+			hasImages = true
+			parts = append(parts, map[string]any{
+				"type": "video_url",
+				"video_url": map[string]any{
+					"url": "data:" + b.MediaType + ";base64," + b.Data,
+				},
+			})
 		case BlockToolUse:
 			args := string(b.Input)
 			if strings.TrimSpace(args) == "" {
