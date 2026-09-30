@@ -2816,9 +2816,53 @@ check('黑/白档都重映射了 --bg-elev-2（#composer 的底色取的就是�
 check('实心按钮填充用 --accent-solid 而非 --accent（白字对比度）',
   /#composer\.cbox-black\s*\{[\s\S]*?--accent-solid:[\s\S]*?--on-accent:/.test(css));
 
-check('透明档只去掉填充、不重映射任何变量（文字继续跟随主题）',
-  /#composer\.cbox-clear\s*\{\s*background:\s*transparent;\s*\}/.test(css) &&
-  !/#composer\.cbox-clear\s*\{[^}]*--/.test(css));
+check('透明档不重映射 --text/--bg-*（正文配色继续跟随主题）', (function () {
+  // 允许重映射 --text-dim：它是给实色底调的，半透明底上偏浅，
+  // 提一档是必要的（见下一条）。但 --text（正文）不能动 ——
+  // 一动就和主题脱钩，切换深浅色时会明显不对。
+  const m = /#composer\.cbox-clear\s*\{([^}]*)\}/.exec(css);
+  if (!m) return false;
+  const blk = m[1];
+  if (/--text\s*:/.test(blk)) return false;
+  if (/--bg\s*:|--bg-elev\s*:|--bg-elev-2\s*:/.test(blk)) return false;
+  return true;
+})());
+
+check('透明档仍要压一层文字遮罩，否则叠在背景图上看不清', (function () {
+  // 输入文字不是 textarea 画的（textarea 是 color: transparent，只留光标），
+  // 字由 .input-mirror 用 var(--text) 画。透明档下没有自己的底色，
+  // 背景图明暗不定时文字对比度会失控 —— 亮图上的深色字还行，
+  // 暗图上的**深色**字直接糊掉，而 body.bg-dark 只按图片整体亮度翻，
+  // 局部明暗（一张图里既有天空又有树影）它管不了。
+  //
+  // 做法：铺一层半透明底（不是把 --text-dim 之类重映射 —— 那样主题一切换就乱）。
+  // 这层底只影响可读性，不影响「透出背景」这个诉求。
+  const m = /#composer\.cbox-clear\s*\{([^}]*)\}/.exec(css);
+  if (!m) return false;
+  const blk = m[1];
+  if (!/background:\s*rgba\(/.test(blk) && !/background:\s*color-mix\(/.test(blk)
+      && !/background:\s*linear-gradient\(/.test(blk)) {
+    return false;
+  }
+  // 透明度必须够低（还能看见背景），又够高（字能读）
+  if (!/rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*0?\.\d+\s*\)/.test(blk)
+      && !/color-mix\([^)]*,\s*transparent/.test(blk)) {
+    return false;
+  }
+  return true;
+})());
+
+check('透明档的遮罩同时兜住 placeholder（--text-dim 在亮图上会太浅）', (function () {
+  // placeholder 用 var(--text-dim)。透明档下它不吃任何重映射，
+  // 于是浅色主题的 #6b7280 落在亮背景图上几乎消失 —— 「随心输入」看不见。
+  // 正文靠上面那层底解决；placeholder 需要额外提一档对比度。
+  const m = /#composer\.cbox-clear\s*\{([^}]*)\}/.exec(css);
+  if (!m) return false;
+  // 允许两种解法：给 --text-dim 提亮，或单出一条 placeholder 规则
+  return /--text-dim\s*:/.test(m[1]) ||
+    /#composer\.cbox-clear\s+textarea::placeholder/.test(css) ||
+    /#composer\.cbox-clear\s+::placeholder/.test(css);
+})());
 
 check('黑档补了黑投影（原浅色阴影落在近黑底上等于没有）',
   /#composer\.cbox-black\s*\{[\s\S]*?box-shadow:[\s\S]*?rgba\(0,\s*0,\s*0/.test(css));
@@ -2932,13 +2976,23 @@ check('入组范围只含只读探索工具，不含写/改/删与运行命令',
     !/write_file|edit_file|delete_file|run_command/.test(m[1]);
 })());
 check('判定「连续」靠分组是否仍贴着消息列末尾，不靠标志位', (function () {
-  // 少一个状态变量，也不会漏掉某条边界：期间插进任何内容它就不再是末尾，
+  // 少一个状态变量，也不会漏掉某条边界：期间插进任何**内容**它就不再是末尾，
   // 下一个探索卡片自然另起一组。
+  //
+  // ⚠️ 但「等待模型响应」那条提示**不算**内容 —— 它在每个 ReAct 步骤前都会插到
+  // 列末尾、工具到达时又被移除。拿它当插队信号，症状是「连续 read_file 被拆成
+  // 一个个单独的『已探索』」，一次分组彻底失效。所以判定要经 lastContentIn
+  // 跳过 TRANSIENT_COL_CLASSES。
   return /function lastElementIn\(node\)/.test(uiSrc) &&
-    /if \(!exploreGroup \|\| exploreGroup\.parentNode !== col \|\| lastElementIn\(col\) !== exploreGroup\) \{/.test(uiSrc) &&
-    /exploreGroup\.parentNode === col && lastElementIn\(col\) === exploreGroup/.test(uiSrc) &&
     // lastElementIn 必须跳过文本节点：列里夹着文本节点，直接看 lastChild 拿不到元素
-    /if \(n\.nodeType === 1\) return n;/.test(uiSrc);
+    /if \(n\.nodeType === 1\) return n;/.test(uiSrc) &&
+    /function lastContentIn\(node\)/.test(uiSrc) &&
+    /const TRANSIENT_COL_CLASSES = \['msg-thinking'\]/.test(uiSrc) &&
+    /function isTransientColNode\(n\)/.test(uiSrc) &&
+    /function exploreStillLast\(col\)/.test(uiSrc) &&
+    // 三个判定点都必须走 exploreStillLast
+    (uiSrc.match(/exploreStillLast\(/g) || []).length >= 3 &&
+    !/lastElementIn\(col\) === exploreGroup/.test(uiSrc);
 })());
 check('收尾挂在列的 appendChild（追加之后判，不是追加之前）', (function () {
   // ⚠️ 这里踩过一个坑：检查早先挂在 ensureCol() 里，而 ensureCol() 是
@@ -2953,16 +3007,41 @@ check('收尾挂在列的 appendChild（追加之后判，不是追加之前）'
 check('一轮结束时收起末尾那组，用户手动开过的不动', /function collapseExploreGroup\(\)[\s\S]*?if \(exploreUserToggled\) return;/.test(uiSrc) &&
   /function clearRunVisuals\(\)[\s\S]*?collapseExploreGroup\(\);/.test(uiSrc) &&
   /exploreUserToggled = false;/.test(uiSrc));
-check('折叠禁令只有一处判定（⛔ 绝不能被藏进折叠块）', (function () {
+check('折叠禁令只有一处判定，且只看「失败」不看「运行中」', (function () {
   // 早先 update 因「有失败」强制展开、collapse 又无条件折上，两处各判各的，
   // 结果组内失败时仍然被折起来 —— 正是这个功能最该避免的事。
-  return /function exploreMustStayOpen\(g\)[\s\S]*?\.msg-tool\.denied[\s\S]*?\.msg-tool\.running/.test(uiSrc) &&
-    /function updateExploreSummary\(g\)[\s\S]*?if \(exploreMustStayOpen\(g\)\) setExploreOpen\(g, true\);/.test(uiSrc) &&
+  //
+  // 2026-09-30 去掉 `.msg-tool.running` 这一条：每张新卡片都是 running 状态，
+  // 而 updateExploreSummary 每次都据此 setExploreOpen(true) —— 于是**连续读取时
+  // 分组永远是展开的**，用户要读十几行卡片，真正的回答被挤出视野。
+  // 「模型此刻在读什么」由折叠块标题的计数与展开状态共同表达，不需要强制摊开。
+  const fn = extractFunction(uiSrc, 'exploreMustStayOpen');
+  if (!fn) return false;
+  if (!/\.msg-tool\.denied/.test(fn)) return false;          // 失败仍必须看得见
+  if (/\.msg-tool\.running/.test(fn)) return false;          // 运行中不再强制展开
+  return /function updateExploreSummary\(g\)[\s\S]*?if \(exploreMustStayOpen\(g\)\) setExploreOpen\(g, true\);/.test(uiSrc) &&
     /function collapseExploreGroup\(\)[\s\S]*?updateExploreSummary\(g\);\s*\n\s*if \(exploreMustStayOpen\(g\)\) return;/.test(uiSrc) &&
     /function syncExploreGroup\(col\)[\s\S]*?if \(exploreMustStayOpen\(g\)\) return;/.test(uiSrc) &&
     // 判定只写一次：open 的写入都经 setExploreOpen（靠 _auto 区分自动/用户）
     (uiSrc.match(/function exploreMustStayOpen\(/g) || []).length === 1 &&
     !/g\._auto = true;\s*\n\s*g\.open = true/.test(uiSrc);
+})());
+check('新分组默认收起（details 不带 open）', (function () {
+  // <details> 不加 open 属性默认就是收起态；这里钉住「别顺手加上 open」。
+  const fn = extractFunction(uiSrc, 'createExploreGroup');
+  if (!fn) return false;
+  if (/\.open\s*=\s*true/.test(fn)) return false;
+  if (/setAttribute\(.open./.test(fn)) return false;
+  if (/'open'/.test(fn)) return false;
+  return /createElement\('details'\)/.test(fn);
+})());
+check('创建后立即折上，不等下一张卡片或轮次收尾', (function () {
+  // 早先新组是「开着」的，要等 collapseExploreGroup（轮次收尾）才折 ——
+  // 于是模型跑的那段时间里它一直摊着，正是要改掉的。
+  const fn = extractFunction(uiSrc, 'appendExploreCard');
+  if (!fn) return false;
+  // 建组之后必须有一次显式收起
+  return /setExploreOpen\(exploreGroup, false\)|exploreGroup\.open = false/.test(fn);
 })());
 check('写 open 走 setExploreOpen，靠 _auto 区分自动与用户点击', /function setExploreOpen\(g, on\) \{[\s\S]*?g\._auto = true;/.test(uiSrc) &&
   /g\.addEventListener\('toggle', function \(\) \{\s*\n\s*if \(!g\._auto\) exploreUserToggled = true;/.test(uiSrc));

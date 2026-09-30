@@ -784,6 +784,36 @@
     }
     return null;
   }
+  // 分组「是否仍贴着末尾」判定时要忽略的**瞬态**元素。
+  //
+  // 「等待模型响应」这条提示在每个步骤前都会插到列末尾、工具到达时又被移除。
+  // 它不是内容，只是节奏指示器 —— 拿它当插队信号，症状是
+  // 「连续 read_file 每次都另起一个『已探索』块」，一次分组彻底失效。
+  const TRANSIENT_COL_CLASSES = ['msg-thinking'];
+  // isTransientColNode 报告该节点是否只是节奏指示器（会被随即移除）。
+  function isTransientColNode(n) {
+    if (!n || n.nodeType !== 1) return false;
+    for (let i = 0; i < TRANSIENT_COL_CLASSES.length; i++) {
+      if (n.classList && n.classList.contains(TRANSIENT_COL_CLASSES[i])) return true;
+    }
+    return false;
+  }
+  // lastContentIn 列里最后一个**非瞬态**元素节点。
+  //
+  // 与 lastElementIn 的区别就是跳过 TRANSIENT_COL_CLASSES ——
+  // 少这一个跳过，探索分组在「工具 → 等待提示 → 下一个工具」这个
+  // 每个 ReAct 步骤都会出现的节奏里被切得七零八落。
+  function lastContentIn(node) {
+    for (let n = node && node.lastChild; n; n = n.previousSibling) {
+      if (n.nodeType === 1 && !isTransientColNode(n)) return n;
+    }
+    return null;
+  }
+  // exploreStillLast 分组是否仍紧贴列末尾（忽略瞬态提示）。
+  function exploreStillLast(col) {
+    return !!exploreGroup && exploreGroup.parentNode === col &&
+      lastContentIn(col) === exploreGroup;
+  }
   function exploreCountText(counts) {
     const parts = [];
     EXPLORE_ORDER.forEach(function (k) {
@@ -820,11 +850,16 @@
   // 折叠禁令 —— 只此一处判定，别让 update / sync / collapse 各判各的：
   // 早先 update 因为有失败强制展开、collapse 又无条件折上，两处各写一套条件，
   // 结果「组内有失败时仍然被折起来」，⛔ 被藏进折叠块 —— 正是这个功能最该避免的事。
+  //
+  // ⚠️ 这里**只看失败，不看运行中**（2026-09-30 去掉 .msg-tool.running）。
+  // 每张新卡片都是 running 状态，而 updateExploreSummary 每次都据此
+  // setExploreOpen(true) —— 于是「连续读取十几次」时分组永远是展开的，
+  // 十几张卡片把真正的回答挤出视野，正是这个功能要解决的问题本身。
+  // 「模型此刻在读什么」由标题上的计数（3 次读取 · 2 次搜索）表达就够了。
   function exploreMustStayOpen(g) {
     const body = g._body;
-    // · 有失败：⛔ 必须看得见，藏起来等于把「这一步没跑成」藏起来；
-    // · 正在跑：折起来用户就不知道模型此刻在读什么。
-    return !!body.querySelector('.msg-tool.denied') || !!body.querySelector('.msg-tool.running');
+    // 有失败：⛔ 必须看得见，藏起来等于把「这一步没跑成」藏起来。
+    return !!body.querySelector('.msg-tool.denied');
   }
   function updateExploreSummary(g) {
     g._count.textContent = exploreCountText(g._counts);
@@ -842,7 +877,8 @@
   // 分组不再贴着列末尾 → 自动收起（用户手动开过的除外）。
   function syncExploreGroup(col) {
     if (!exploreGroup) return;
-    if (exploreGroup.parentNode === col && lastElementIn(col) === exploreGroup) return;
+    // 用 exploreStillLast：等待提示这类瞬态节点插在分组之后不算「插队」。
+    if (exploreStillLast(col)) return;
     const g = exploreGroup;
     exploreGroup = null;
     if (exploreUserToggled) return;   // 用户自己开着的，不抢
@@ -863,11 +899,18 @@
   }
   function appendExploreCard(card, kind) {
     const col = ensureCol();
-    if (!exploreGroup || exploreGroup.parentNode !== col || lastElementIn(col) !== exploreGroup) {
+    // ⚠️ 用 exploreStillLast（忽略「等待模型响应」这类瞬态节点），不用
+    // 「分组是不是最后一个元素」—— 后者会被每个 ReAct 步骤都会出现的
+    // 等待提示切掉，症状是「连续读取被拆成一个个单独的『已探索』」。
+    if (!exploreStillLast(col)) {
       collapseExploreGroup();   // 上一组已被插队 / 已收尾：先收掉再开新的
       exploreGroup = createExploreGroup();
       exploreUserToggled = false;
       col.appendChild(exploreGroup);   // 追加的是分组本身，包装层会跳过同步
+      // 新组立刻折上：不等下一张卡片、也不等轮次收尾。
+      // 早先新组是开着的，要等 collapseExploreGroup 才折 ——
+      // 于是模型跑的那段时间里它一直摊着，正是要改掉的。
+      setExploreOpen(exploreGroup, false);
     }
     const g = exploreGroup;
     g._counts[kind] = (g._counts[kind] || 0) + 1;

@@ -2246,12 +2246,29 @@ body.bg-dark .msg-user.msg-steer .bubble { border-left-color: #f6b8ce; }
   --warn: #d97706;
   --danger: #dc2626;
 }
-/* 透明档刻意**不重映射任何变量**：文字、placeholder、@提及继续跟随主题，
-   于是它在浅色与深色主题下都自洽。已实测：设了背景图时 syncBgTheme 会按
-   图片亮度自动翻 body.bg-dark，透明档的对比度因此不需要额外处理。
-   只把填充去掉 —— 描边留着（border 取 var(--border)，自动跟随主题），
-   否则有背景图时输入区会跟背景糊在一起、看不出哪里能点。 */
-#composer.cbox-clear { background: transparent; }
+/* 透明档：去掉不透明填充，但仍压一层半透明底。
+   --
+   为什么不完全不铺底：「透背景」不等于「文字直接压在图上」。
+   body.bg-dark 只按整张图的**平均**亮度翻主题，而一张图里局部明暗差异很大
+   （天空亮、树影暗）。结果是：亮区上的深色字还凑合，暗区上的深色字直接糊掉，
+   而 placeholder 用的 --text-dim（浅色主题 #6b7280）在亮图上更几乎消失 ——
+   「随心输入」看不见。
+
+   为什么不用变量重映射（黑/白档那种做法）：那会把整个卡片的配色钉死，
+   主题一切换就乱。这里只铺一层**与主题无关**的半透明黑/白 ——
+   它不参与文字配色，只保证任何底图上都有可读性。
+
+   透明度取得很低（0.12~0.18）：仍能看清背景图，只是文字稳住了。 */
+#composer.cbox-clear {
+  background: rgba(0, 0, 0, .14);
+  /* placeholder 在半透明底上仍偏浅（--text-dim 是为实色底调的），
+     单独提一档，不动 --text —— 正文颜色要继续跟随主题。 */
+  --text-dim: color-mix(in srgb, var(--text) 62%, transparent);
+}
+/* 深色主题下黑底会压暗背景图，改用白底薄层 */
+body.bg-dark #composer.cbox-clear {
+  background: rgba(255, 255, 255, .10);
+}
 
 /* 底部操作栏 */
 .composer-bottom {

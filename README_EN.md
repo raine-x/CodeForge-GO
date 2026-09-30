@@ -8,6 +8,10 @@ A single static binary with zero runtime dependencies, for Windows / Linux / And
 
 **The UI is just a web page** — not merely a stylistic choice: it lets the same binary run on **servers with no GUI**. SSH in, start it, open it from your phone or laptop browser and you're set. On Android Termux it's the same thing, with no desktop environment dependency.
 
+PC
+![Interface](test/cf-screenshot-chat.png)
+Android WebView
+![Interface](test/phone.png)
 ---
 
 ## Features

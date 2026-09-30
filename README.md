@@ -8,6 +8,11 @@ Go 编写的跨平台 Web Agent。在浏览器里对话，Agent 在你的项目�
 
 **界面就是一个网页** —— 这不只是形态选择，它让同一份程序能跑在**没有图形界面的服务器**上：SSH 进去启动，用手机或笔记本的浏览器打开就能用；在 Android Termux 上也是同一套，没有任何桌面环境依赖。
 
+PC
+![界面](test/cf-screenshot-chat.png)
+安卓 WebView
+![界面](test/phone.png)
+
 ---
 
 ## 特性
