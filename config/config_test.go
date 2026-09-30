@@ -7,75 +7,6 @@ import (
 	"testing"
 )
 
-func TestLoadDotEnvParsesForms(t *testing.T) {
-	keys := []string{
-		"CODEFORGE_TEST_A", "CODEFORGE_TEST_B", "CODEFORGE_TEST_C", "CODEFORGE_TEST_D",
-	}
-	unsetAll(keys)
-	t.Cleanup(func() { unsetAll(keys) })
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, ".env")
-	content := `# 这是注释
-CODEFORGE_TEST_A=plain
-export CODEFORGE_TEST_B="quoted value"
-CODEFORGE_TEST_C='single quoted'
-CODEFORGE_TEST_D=
-这不是一条赋值语句
-`
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatalf("写入 .env 失败: %v", err)
-	}
-
-	got, err := LoadDotEnv(path)
-	if err != nil {
-		t.Fatalf("LoadDotEnv 报错: %v", err)
-	}
-	if got != path {
-		t.Errorf("返回路径期望 %q，实际 %q", path, got)
-	}
-	if v := os.Getenv("CODEFORGE_TEST_A"); v != "plain" {
-		t.Errorf("普通赋值解析错误: %q", v)
-	}
-	if v := os.Getenv("CODEFORGE_TEST_B"); v != "quoted value" {
-		t.Errorf("export + 双引号解析错误: %q", v)
-	}
-	if v := os.Getenv("CODEFORGE_TEST_C"); v != "single quoted" {
-		t.Errorf("单引号解析错误: %q", v)
-	}
-	if _, ok := os.LookupEnv("CODEFORGE_TEST_D"); !ok {
-		t.Error("空值变量也应被注入（存在即为已设置）")
-	}
-}
-
-func TestLoadDotEnvDoesNotOverrideRealEnv(t *testing.T) {
-	t.Setenv("CODEFORGE_TEST_KEEP", "from-env")
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, ".env")
-	if err := os.WriteFile(path, []byte("CODEFORGE_TEST_KEEP=from-file\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := LoadDotEnv(path); err != nil {
-		t.Fatalf("LoadDotEnv 报错: %v", err)
-	}
-	if v := os.Getenv("CODEFORGE_TEST_KEEP"); v != "from-env" {
-		t.Errorf("真实环境变量优先级更高，期望 from-env，实际 %q", v)
-	}
-}
-
-func TestLoadDotEnvMissingFileIsSilent(t *testing.T) {
-	got, err := LoadDotEnv(filepath.Join(t.TempDir(), "not-exists.env"))
-	if err != nil {
-		t.Fatalf("文件不存在时不应报错: %v", err)
-	}
-	if got != "" {
-		t.Errorf("未加载时期望返回空串，实际 %q", got)
-	}
-}
-
-// TestEnsureLocalTemplate 验证模板可自动生成，且不会覆盖默认配置。
 func TestEnsureLocalTemplate(t *testing.T) {
 	dir := t.TempDir()
 
@@ -240,9 +171,92 @@ func pluginNames(ps []PluginConfig) []string {
 	return out
 }
 
-func unsetAll(keys []string) {
-	for _, k := range keys {
-		_ = os.Unsetenv(k)
+// TestAPIKeyComesFromSystemEnvOnly 密钥只从**系统环境变量**读。
+//
+// 这条钉住「不读密钥文件」这个契约：优先级链是
+// CODEFORGE_API_KEY → 厂商专用名 → LLM_API_KEY；
+// 而 local.yaml 里写了 api_key 时**优先于**环境变量（那是用户显式配置，
+// 不该被环境悄悄盖掉）。
+func TestAPIKeyComesFromSystemEnvOnly(t *testing.T) {
+	t.Run("系统环境变量可解析出密钥", func(t *testing.T) {
+		t.Setenv("CODEFORGE_API_KEY", "from-system-env")
+		cfg := &Config{}
+		cfg.LLM.Provider = "openai"
+		applyEnvFallback(cfg)
+		if cfg.LLM.APIKey != "from-system-env" {
+			t.Errorf("应取到 CODEFORGE_API_KEY，实际 %q", cfg.LLM.APIKey)
+		}
+	})
+
+	t.Run("厂商专用名次之", func(t *testing.T) {
+		t.Setenv("ANTHROPIC_API_KEY", "anthropic-key")
+		cfg := &Config{}
+		cfg.LLM.Provider = "anthropic"
+		applyEnvFallback(cfg)
+		if cfg.LLM.APIKey != "anthropic-key" {
+			t.Errorf("应取到 ANTHROPIC_API_KEY，实际 %q", cfg.LLM.APIKey)
+		}
+	})
+
+	t.Run("LLM_API_KEY 是最后一档", func(t *testing.T) {
+		t.Setenv("LLM_API_KEY", "generic-key")
+		cfg := &Config{}
+		cfg.LLM.Provider = "openai"
+		applyEnvFallback(cfg)
+		if cfg.LLM.APIKey != "generic-key" {
+			t.Errorf("应回退到 LLM_API_KEY，实际 %q", cfg.LLM.APIKey)
+		}
+	})
+
+	t.Run("CODEFORGE_API_KEY 优先级最高", func(t *testing.T) {
+		t.Setenv("CODEFORGE_API_KEY", "top")
+		t.Setenv("OPENAI_API_KEY", "second")
+		cfg := &Config{}
+		cfg.LLM.Provider = "openai"
+		applyEnvFallback(cfg)
+		if cfg.LLM.APIKey != "top" {
+			t.Errorf("CODEFORGE_API_KEY 应覆盖 OPENAI_API_KEY，实际 %q", cfg.LLM.APIKey)
+		}
+	})
+
+	t.Run("配置里已有值时不被环境覆盖", func(t *testing.T) {
+		t.Setenv("CODEFORGE_API_KEY", "from-env")
+		cfg := &Config{}
+		cfg.LLM.Provider = "openai"
+		cfg.LLM.APIKey = "explicit-in-config"
+		applyEnvFallback(cfg)
+		if cfg.LLM.APIKey != "explicit-in-config" {
+			t.Errorf("配置里的显式值应保留，实际被改成 %q", cfg.LLM.APIKey)
+		}
+	})
+
+	t.Run("没有任何来源时保持为空", func(t *testing.T) {
+		for _, k := range []string{"CODEFORGE_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY"} {
+			_ = os.Unsetenv(k)
+		}
+		cfg := &Config{}
+		cfg.LLM.Provider = "openai"
+		applyEnvFallback(cfg)
+		if cfg.LLM.APIKey != "" {
+			t.Errorf("无任何来源时应为空，实际 %q", cfg.LLM.APIKey)
+		}
+	})
+}
+
+// TestNoDotEnvLoading 确认代码里已无「读密钥文件」的加载路径。
+//
+// 这条是**结构性**护栏：只看行为测不出来
+// （加载一个不存在的文件本来就静默成功），所以直接查源码。
+func TestNoDotEnvLoading(t *testing.T) {
+	b, err := os.ReadFile("config.go")
+	if err != nil {
+		t.Fatalf("读取 config.go 失败: %v", err)
+	}
+	src := string(b)
+	for _, banned := range []string{"LoadDotEnv", "applyDotEnv"} {
+		if strings.Contains(src, banned) {
+			t.Errorf("config.go 里仍有 %s —— 密钥只应从系统环境变量读", banned)
+		}
 	}
 }
 

@@ -20,9 +20,11 @@ config/codeforge.run
 
 # ============================================================== 密钥与本地配置
 # 严禁提交任何包含 API Key 的内容。
-# 下列文件均可自动生成（见 README「配置与密钥」一节）：
-#   config/local.yaml  → 首次启动自动生成模板；界面「设置」保存时写入密钥
-#   .env / tests/.env  → 由 .env.example 复制生成
+# 密钥只从**系统环境变量**读，程序不读密钥文件（见 AGENTS.md 硬规则 10a）。
+# 下列文件会自动生成（见 README「配置与密钥」一节）：
+#   config/local.yaml     → 首次启动自动生成模板
+#   config/models.yaml     → 界面「设置」保存模型库
+#   config/providers.yaml  → 界面「设置」保存供应商
 
 # --- 本地覆盖配置（可能含 API Key）
 config/local.yaml
@@ -39,12 +41,6 @@ config/models.yaml
 # 与 models.yaml 是一对，漏掉它等于把密钥原样暴露给 git。
 config/providers.yaml
 *providers.yaml
-
-# --- 环境变量文件（密钥入口）
-.env
-.env.*
-!.env.example
-!.env.*.example
 
 # --- 按命名约定兜底的密钥文件
 # ⚠️ 下面几条匹配的是**文件名**，不是内容。代价：名字里带 secret / credential

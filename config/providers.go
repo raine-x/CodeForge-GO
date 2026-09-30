@@ -107,6 +107,11 @@ func (s *ProviderStore) loadLocked() error {
 		}
 		return fmt.Errorf("读取供应商库 %s 失败: %w", s.path, err)
 	}
+	// 环境变量展开：YAML 里可写 `${VAR}`，值从进程环境取。
+	// 这样密钥不必躺在文件里 —— 文件会被同步盘/备份/打包带走，环境变量不会。
+	data, missing := expandEnvYAML(data)
+	reportMissingEnvVars("供应商库 "+s.path, missing)
+
 	var f providersFile
 	if err := yaml.Unmarshal(data, &f); err != nil {
 		return fmt.Errorf("解析供应商库 %s 失败: %w", s.path, err)

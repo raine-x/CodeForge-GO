@@ -241,20 +241,11 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 	// 配置目录体检：缺少 default.yaml 时给出醒目告警（最常见原因是 CWD 不对）。
 	warnConfigDir(configDir)
 
-	// 加载 .env（若存在）：仅填充尚未设置的环境变量，不覆盖真实环境变量。
+	// 密钥只从**系统环境变量**读，不再加载 .env 文件。
 	//
-	// 查找顺序：CWD/.env → <configDir>/.env → <configDir>/../.env。
-	// 最后一项对应仓库约定（<root>/.env 与 <root>/config 同级），
-	// 使得从别处用 -config 指向该配置目录时也能取到项目根目录的 .env。
-	if path, err := config.LoadDotEnv(
-		".env",
-		filepath.Join(configDir, ".env"),
-		filepath.Join(configDir, "..", ".env"),
-	); err != nil {
-		logx.Warnf("读取 .env 失败: %v", err)
-	} else if path != "" {
-		logx.Infof("已加载环境变量文件：%s", path)
-	}
+	// 为什么去掉 .env：它躺在项目目录里，会被同步盘、备份脚本、docker cp
+	// 随手带走 —— 而系统环境变量不会。代价是首次配置要 export 一次。
+	// 名字沿用 CODEFORGE_API_KEY（见 config.applyEnvFallback 的优先级链）。
 
 	// 本地覆盖配置：缺失时自动生成带注释的模板（该文件被 .gitignore 忽略）。
 	if path, err := config.EnsureLocalTemplate(configDir); err != nil {

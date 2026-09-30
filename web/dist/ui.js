@@ -6702,9 +6702,13 @@
     plainBtn.type = 'button';
     seg.appendChild(envBtn); seg.appendChild(plainBtn);
 
-    const envIn = domInput('text', state.name, '变量名，如 OPENAI_API_KEY');
+    const envIn = domInput('text', state.name, '变量名，如 CODEFORGE_API_KEY');
     const eyeWrap = domEl('span', 'key-eye-wrap');
-    const plainIn = domInput('password', state.plain, state.placeholder || 'sk-...');
+    // 明文那一档同样支持 ${VAR}：填进去的是变量引用，文件里就不落密钥。
+    // 与「环境变量」档的区别是后者只记变量名（key_source=env），
+    // 前者把引用写在 key_value 里 —— 适合「地址和密钥要用同一个变量拼」的情况。
+    const plainIn = domInput('password', state.plain,
+      state.placeholder || 'sk-... 或 ${VAR}');
     const eye = domEl('button', 'key-eye', '👁');
     eye.type = 'button';
     eyeWrap.appendChild(plainIn); eyeWrap.appendChild(eye);

@@ -519,6 +519,11 @@ func mergeYAML(cfg *Config, path string) error {
 		}
 		return fmt.Errorf("读取配置 %s 失败: %w", path, err)
 	}
+	// 环境变量展开：YAML 里可写 `${VAR}`（如 llm.api_key: ${MY_KEY}）。
+	// 这样密钥可以留在环境变量里，配置文件只留引用。
+	data, missing := expandEnvYAML(data)
+	reportMissingEnvVars("配置 "+path, missing)
+
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return fmt.Errorf("解析配置 %s 失败: %w", path, err)
 	}
@@ -660,54 +665,4 @@ func EnsureLocalTemplate(configDir string) (string, error) {
 		return "", err
 	}
 	return path, nil
-}
-
-// LoadDotEnv 依次尝试给定的 .env 路径，读取其中的 KEY=VALUE 并注入进程环境。
-//
-// 约定：
-//   - 支持 `KEY=VALUE`、`export KEY=VALUE`、`#` 注释、单双引号包裹的值；
-//   - **已存在于进程环境中的变量不会被覆盖**（真实环境变量优先级更高）；
-//   - 所有路径都不存在时静默返回空串，不报错。
-//
-// 返回实际加载的文件路径（未加载时为 ""）。
-func LoadDotEnv(paths ...string) (string, error) {
-	for _, p := range paths {
-		if strings.TrimSpace(p) == "" {
-			continue
-		}
-		data, err := os.ReadFile(p)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return "", fmt.Errorf("读取 %s 失败: %w", p, err)
-		}
-		applyDotEnv(string(data))
-		return p, nil
-	}
-	return "", nil
-}
-
-// applyDotEnv 解析 .env 内容并设置环境变量。
-func applyDotEnv(content string) {
-	for _, raw := range strings.Split(content, "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		line = strings.TrimPrefix(line, "export ")
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		if key == "" {
-			continue
-		}
-		value = strings.Trim(strings.TrimSpace(value), `"'`)
-		if _, exists := os.LookupEnv(key); exists {
-			continue // 环境变量优先
-		}
-		_ = os.Setenv(key, value)
-	}
 }

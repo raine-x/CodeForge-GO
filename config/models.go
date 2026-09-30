@@ -105,6 +105,10 @@ func (s *ModelStore) loadLocked() error {
 		}
 		return fmt.Errorf("读取模型库 %s 失败: %w", s.path, err)
 	}
+	// 环境变量展开：YAML 里可写 `${VAR}`，值从进程环境取（同 providers.yaml）。
+	data, missing := expandEnvYAML(data)
+	reportMissingEnvVars("模型库 "+s.path, missing)
+
 	var f modelsFile
 	if err := yaml.Unmarshal(data, &f); err != nil {
 		return fmt.Errorf("解析模型库 %s 失败: %w", s.path, err)

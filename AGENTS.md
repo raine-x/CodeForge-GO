@@ -56,6 +56,8 @@ comit时直接使用简短的中文描述此次更改完成了什么，示例：
 
 9. `agent.hidden_tools`（Exposure，控制发给 LLM 的工具表）与 `security.Policy`（控制是否放行）是**刻意分离**的：隐藏不等于禁止。不要合并成一个开关。
 10. **禁止调用 `Config.SaveWholeConfig()`**（原名 `Save`，已改名并标 `Deprecated`，旧名删除后调用即编译失败）。它整份序列化，yaml 对切片是替换而非合并，会静默吃掉规则。历史：`security.rules` 曾因此丢过 `todo_write`、`web_*`。界面可改项走 `stateProjection` + `SaveState`（`pkg/config/state.go` 头部有纪律说明）。
+10a. **密钥只从系统环境变量读，程序不读任何密钥文件**（`LoadDotEnv` 及其辅助函数已移除，有测试钉住源码里不得再出现）。配置文件里用 `${VAR}` 引用环境变量 —— `config/providers.yaml` / `models.yaml` / `local.yaml` 三个加载点都过 `expandEnvYAML`。**新增 yaml 字段不需要改展开逻辑**（它在 Unmarshal 之前处理原始字节），但**新增 yaml 加载点必须接上**，否则那个文件里的 `${…}` 会静默当字面量。
+10b. **未设置的环境变量按空处理 + 启动日志点名，不报错终止。** 前者让「配了十项错一项」时其余九项仍可用；后者是因为症状是「明明配了却连不上」、错误指向 401，完全看不出是变量没设。留 `${VAR}` 字面量是最坏解 —— 会变成一把字面量是 `${VAR}` 的密钥去请求上游。
 11. 策略规则的条件解析失败 = 拒绝（fail-closed），不是跳过。
 
 ### 审批

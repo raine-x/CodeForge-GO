@@ -8,9 +8,9 @@
 #   Termux 的 `go env` 本来就报 android/<本机架构>，所以这里刻意不覆盖
 #   GOOS/GOARCH —— 覆盖成别的值会得到一个 Termux 跑不起来的产物。
 #
-#   另一个理由与 cf.cmd 相同：-config 与 .env 相对**当前工作目录**解析，
-#   不是相对可执行文件。从别处调用会静默退回内置默认值（provider=anthropic、
-#   无 API Key）。所以脚本开头无条件 cd 到项目根。
+#   另一个理由与 cf.cmd 相同：-config 相对**当前工作目录**解析，
+#   不是相对可执行文件。从别处调用会静默退回内置默认值（provider=anthropic）。
+#   所以脚本开头无条件 cd 到项目根。
 #
 # 用法（在 Termux 中）：
 #   bash cf-termux.sh              拉最新代码 → 编译 → 前台启动（默认）

@@ -69,7 +69,7 @@ func TestResolveModelCredentials(t *testing.T) {
 		}
 	})
 
-	t.Run("⚠️ store 没密钥时**保留**已有的（.env / local.yaml），不能清空", func(t *testing.T) {
+	t.Run("⚠️ store 没密钥时**保留**已有的（local.yaml / 环境变量），不能清空", func(t *testing.T) {
 		// 这是兼容性的关键：很多用户的密钥从没进过模型库，只在 local.yaml。
 		// 那时 store 查不到是正常的，清空就等于「升级即登不上」。
 		ms, ps := writeStores(t, "models:\n  - id: m1\n    base_url: https://x.invalid\n", "")

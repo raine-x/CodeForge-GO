@@ -6,7 +6,7 @@
 // 落盘那份旧副本还在，按它建客户端就会连错地址。
 //
 // 核心原则：**store 有值才覆盖**。
-// 解析不出密钥时保留 cfg 里已有的（来自 .env / local.yaml.llm），
+// 解析不出密钥时保留 cfg 里已有的（来自 local.yaml.llm），
 // 而不是清空。理由是兼容期：不少用户的密钥从来没进过模型库，只在
 // local.yaml 或环境变量里 —— 那种情况下 store 查不到是正常的，
 // 把它清空就等于「升级即登不上」。
@@ -65,7 +65,7 @@ func ResolveModelCredentials(cfg *Config, ms *ModelStore, ps *ProviderStore) str
 		return "已从模型库解析 " + id
 	}
 	if strings.TrimSpace(cfg.LLM.APIKey) != "" {
-		// 模型库没给密钥，但配置里已有（.env / local.yaml）→ 沿用它。
+		// 模型库没给密钥，但配置里已有（local.yaml / 环境变量）→ 沿用它。
 		return "模型 " + id + " 未在模型库存密钥，沿用环境变量/local.yaml 中的配置"
 	}
 	return "⚠️ 模型 " + id + " 未能取到密钥，可能无法调用"

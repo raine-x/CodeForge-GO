@@ -32,11 +32,12 @@ all: build
 build:
 	CGO_ENABLED=0 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(LOCALBIN) $(CMD)
 
-## 构建并启动服务（自动读取 .env 与 config/local.yaml，Windows 下为 bin/codeforge.exe）
+## 构建并启动服务（自动读取系统环境变量里的 CODEFORGE_API_KEY 与 config/local.yaml，
+## Windows 下为 bin/codeforge.exe）
 ##
 ## 端口由全局配置 config/default.yaml 决定，不做自动换端口；
 ## 端口被占用时请先 `make stop` 关闭旧实例，或改配置。
-## 另注：-config 与 .env 都相对当前工作目录解析，因此必须在项目根目录执行。
+## 另注：-config 相对当前工作目录解析，因此必须在项目根目录执行。
 run: build
 	./$(LOCALBIN) -config config
 
@@ -80,7 +81,7 @@ test-web:
 	$(NODE) web/test/render_md.test.js
 	$(NODE) web/test/attachments.test.js
 
-## LLM 端点协议测试（pytest，读取 .env 中的 LLM_API_KEY）
+## LLM 端点协议测试（pytest，读取系统环境变量 CODEFORGE_API_KEY）
 test-llm:
 	$(PYTHON) -m pytest tests/ -v
 
