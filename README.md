@@ -1,5 +1,7 @@
 # CodeForge-Go
 
+[English](README_EN.md) | [简体中文](README.md)
+
 Go 编写的跨平台 Web Agent。在浏览器里对话，Agent 在你的项目目录里读写文件、跑命令、调模型。
 
 单文件静态二进制，零运行时依赖，Windows / Linux / Android Termux 通用。
@@ -371,6 +373,28 @@ chmod +x codeforge
 `-no-open` 在 Termux 上是必需的 —— 否则它会尝试拉起系统浏览器，多数情况下会失败。
 
 启动后用手机浏览器打开 <http://127.0.0.1:8420>。若想用外部网络访问同一台服务，按「无 GUI 服务器」那节改 `server.host`。
+
+> ⚠️ **不要把程序放在 `~/storage/shared/` 下运行。**
+>
+> 那是 Android 的共享存储（内部存储的 FUSE 挂载点），有两个问题：
+>
+> 1. **执行权限被剥掉** —— 共享存储默认 `noexec`，`chmod +x` 不生效，
+>    跑起来会得到 `Permission denied`。
+> 2. **性能差一到两个数量级** —— 每次文件读写都穿过 FUSE + sdcardfs，
+>    Agent 的工具调用（尤其 `search_files` 遍历）会明显变慢。
+>
+> 放在 `~/`（Termux 自己的 ext4 目录）即可：
+>
+> ```bash
+> # 正确
+> cd ~ && ./codeforge -no-open -config ~/codeforge-go/config
+>
+> # 错误：Permission denied
+> cd ~/storage/shared && ./codeforge
+> ```
+>
+> 工作区**可以**指向 `~/storage/shared/...`（那是数据，读写没问题），
+> 只有**程序本身**不能放在那里。
 
 选工作区时 Termux 权限需要注意：
 
