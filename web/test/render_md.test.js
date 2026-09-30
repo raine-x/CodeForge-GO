@@ -2816,49 +2816,86 @@ check('黑/白档都重映射了 --bg-elev-2（#composer 的底色取的就是�
 check('实心按钮填充用 --accent-solid 而非 --accent（白字对比度）',
   /#composer\.cbox-black\s*\{[\s\S]*?--accent-solid:[\s\S]*?--on-accent:/.test(css));
 
-check('透明档不重映射 --text/--bg-*（正文配色继续跟随主题）', (function () {
-  // 允许重映射 --text-dim：它是给实色底调的，半透明底上偏浅，
-  // 提一档是必要的（见下一条）。但 --text（正文）不能动 ——
-  // 一动就和主题脱钩，切换深浅色时会明显不对。
-  const m = /#composer\.cbox-clear\s*\{([^}]*)\}/.exec(css);
+// 透明档的三条契约（2026-09-30 重写）：
+// 目标从「别让文字看不见」改成「输入框只透背景图，不透被覆盖的消息文字」。
+// 后者严格更强 —— 前者是后者的一种特殊情况。
+
+check('透明档：无背景图时退回不透明底（半透明在纯色背景上必然叠字）', (function () {
+  // 这条钉的是一个真实缺陷：曾经 cbox-clear 无条件用 rgba(0,0,0,.14)，
+  // 而 14% 的黑**挡不住文字** —— 后面的消息照样清晰可读地透出来。
+  // 没有 has-bg 限定时，纯色背景（没设背景图）下叠字尤其明显。
+  const m = /^#composer\.cbox-clear\s*\{([^}]*)\}/m.exec(css);
   if (!m) return false;
-  const blk = m[1];
-  if (/--text\s*:/.test(blk)) return false;
-  if (/--bg\s*:|--bg-elev\s*:|--bg-elev-2\s*:/.test(blk)) return false;
-  return true;
+  // 默认必须是**不透明**的 --bg-elev-2（与黑/白档同源）
+  if (!/background:\s*var\(--bg-elev-2\)/.test(m[1])) return false;
+  // 半透明只允许出现在 body.has-bg 限定的那条里
+  if (/background:\s*rgba\(/.test(m[1])) return false;
+  return /body\.has-bg #composer\.cbox-clear\s*\{[^}]*background:\s*rgba\(/.test(css);
 })());
 
-check('透明档仍要压一层文字遮罩，否则叠在背景图上看不清', (function () {
-  // 输入文字不是 textarea 画的（textarea 是 color: transparent，只留光标），
-  // 字由 .input-mirror 用 var(--text) 画。透明档下没有自己的底色，
-  // 背景图明暗不定时文字对比度会失控 —— 亮图上的深色字还行，
-  // 暗图上的**深色**字直接糊掉，而 body.bg-dark 只按图片整体亮度翻，
-  // 局部明暗（一张图里既有天空又有树影）它管不了。
+check('透明档：消息列在输入区那一段淡出（只透背景图、不透被覆盖的文字）', (function () {
+  // 故障机理：#messages 的底部留白只在**跟随态**把内容顶上来；上翻看历史时
+  // 内容填满视口就钻到卡片底下。而 #composer-wrap 是 position:absolute、
+  // #messages 是在流块 —— CSS 绘制顺序决定卡片**必然画在消息之上**。
   //
-  // 做法：铺一层半透明底（不是把 --text-dim 之类重映射 —— 那样主题一切换就乱）。
-  // 这层底只影响可读性，不影响「透出背景」这个诉求。
-  const m = /#composer\.cbox-clear\s*\{([^}]*)\}/.exec(css);
+  // 解法给消息列加底部 mask：背景图在 #bg-layer（body 子节点、z-index:-1），
+  // **不在 #messages 的绘制范围内**，所以 mask 只吃掉文字，图原样透出且清晰。
+  //
+  // 为什么不用 backdrop-filter：毛玻璃会把背景图一起模糊，而要的是图清晰。
+  // 为什么不用不透明底：那等于退回黑/白档，透明档失去意义。
+  const m = /body\.has-bg #messages\s*\{([^}]*)\}/.exec(css);
   if (!m) return false;
   const blk = m[1];
-  if (!/background:\s*rgba\(/.test(blk) && !/background:\s*color-mix\(/.test(blk)
-      && !/background:\s*linear-gradient\(/.test(blk)) {
-    return false;
-  }
-  // 透明度必须够低（还能看见背景），又够高（字能读）
-  if (!/rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*0?\.\d+\s*\)/.test(blk)
-      && !/color-mix\([^)]*,\s*transparent/.test(blk)) {
-    return false;
-  }
-  return true;
+  if (!/mask-image:\s*linear-gradient/.test(blk)) return false;
+  // 渐变末端必须是全透明（这才是「淡出」）
+  if (!/transparent\s+100%\)/.test(blk)) return false;
+  // 高度必须走动态变量，不能写死 —— 卡片会随任务清单/打字变高变矮
+  if (!/var\(--composer-mask-h/.test(blk)) return false;
+  // 必须同时给 -webkit- 前缀（旧 Safari / 部分 Chromium 需要）
+  return /-webkit-mask-image:/.test(css);
 })());
 
-check('透明档的遮罩同时兜住 placeholder（--text-dim 在亮图上会太浅）', (function () {
-  // placeholder 用 var(--text-dim)。透明档下它不吃任何重映射，
-  // 于是浅色主题的 #6b7280 落在亮背景图上几乎消失 —— 「随心输入」看不见。
-  // 正文靠上面那层底解决；placeholder 需要额外提一档对比度。
-  const m = /#composer\.cbox-clear\s*\{([^}]*)\}/.exec(css);
+check('透明档：--composer-mask-h 跟着折叠实时收窄，且初始化时就算一次', (function () {
+  // 这个变量有**两处**写入，各管一件事，缺一不可：
+  //   ① syncComposerPadding（初始化 + ResizeObserver + resize）
+  //      —— 页面刚加载、用户没滚动时那个 scroll 回调不会跑，只靠它；
+  //      任务清单展开 / 输入框长高 / 底栏换行也要跟着重算。
+  //   ② scroll 回调 —— 折叠时实时收窄。少了它，卡片滑下去之后遮罩还是满高，
+  //      底部糊着一条无意义的淡出带：「翻历史时靠近屏幕底部的文字凭空消失」。
+  //
+  // ① 要去抖（值没变不写 DOM，否则 ResizeObserver 会自激）→ 用 lastMaskH 记一份，
+  //    且不能与 lastComposerPad 共用：折叠时 mask 变了而 pad 不变，共用会误判。
+  if (!/lastMaskH/.test(uiSrc)) return false;
+  if (!/lastComposerPad/.test(uiSrc)) return false;
+  if (!/function syncComposerPadding\(\)[\s\S]{0,900}?--composer-mask-h/.test(uiSrc)) {
+    return false;
+  }
+
+  // ② scroll 回调那处：同一个表达式里必须同时有卡片高度与 composerHide。
+  //    按写入点切段，第 2 段（index 1）的前文就是 scroll 回调里的计算。
+  const parts = uiSrc.split("setProperty('--composer-mask-h'");
+  if (parts.length < 3) return false;                // 至少两处写入
+  const calc = parts[1].slice(-400);                 // 第 2 处写入之前的代码
+  if (!/composerHide/.test(calc)) return false;
+  if (!/offsetHeight/.test(calc)) return false;
+  // 收起到底会算出负高度（渐变两端颠倒 → 整列反色），必须夹住
+  return /Math\.max\(\s*0\s*,/.test(calc);
+})());
+
+check('黑/白档不加消息遮罩（它们本就不透明，加了纯浪费合成层）', (function () {
+  // 遮罩只能挂在 has-bg + 透明档这条路径上。挂到全局或黑/白档上，
+  // 会让「不透明输入框 + 底部消息淡出」这种视觉自相矛盾的组合出现。
+  const g = /body\.has-bg #messages\s*\{[^}]*mask-image/.test(css);
+  if (!g) return false;
+  // 不得出现「不带条件」的全局 #messages mask
+  return !/^\s*#messages\s*\{[^}]*mask-image/m.test(css);
+})());
+
+check('透明档的 placeholder 提一档对比度（--text-dim 是为实色底调的）', (function () {
+  // 浅色主题的 --text-dim 是 #6b7280，落在亮背景图上几乎消失 —— 「随心输入」看不见。
+  // 允许两种解法：给 --text-dim 提亮，或单出一条 placeholder 规则。
+  const m = /body\.has-bg #composer\.cbox-clear\s*\{([^}]*)\}/.exec(css);
   if (!m) return false;
-  // 允许两种解法：给 --text-dim 提亮，或单出一条 placeholder 规则
   return /--text-dim\s*:/.test(m[1]) ||
     /#composer\.cbox-clear\s+textarea::placeholder/.test(css) ||
     /#composer\.cbox-clear\s+::placeholder/.test(css);

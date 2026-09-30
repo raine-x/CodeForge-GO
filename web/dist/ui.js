@@ -1043,14 +1043,27 @@
   //    更靠下的位置声明，在它之前访问会撞 TDZ（const 没有变量提升）。
   const composerPadEl = $('#composer-wrap');
   let lastComposerPad = -1;
+  // 「消息列底部淡出带」的高度，与 --composer-pad-bottom 同一套算法。
+  // 单独记一份是为了让 ResizeObserver 的「值没变就不写 DOM」判断能独立生效 ——
+  // 折叠时 mask 要变但 pad 不变（pad 本来就够），两者不能共用同一个 last 值。
+  let lastMaskH = -1;
   function syncComposerPadding() {
     const h = composerPadEl.offsetHeight;
     if (h <= 0) return;
     // 卡片离底部还留了 5vh 的空档，多补一点让最后一条能滚到舒服的位置
     const pad = Math.round(h + window.innerHeight * 0.07);
-    if (pad === lastComposerPad) return;   // 值没变就不写 DOM，避免 ResizeObserver 抖动
-    lastComposerPad = pad;
-    document.documentElement.style.setProperty('--composer-pad-bottom', pad + 'px');
+    if (pad !== lastComposerPad) {   // 值没变就不写 DOM，避免 ResizeObserver 抖动
+      lastComposerPad = pad;
+      document.documentElement.style.setProperty('--composer-pad-bottom', pad + 'px');
+    }
+    // 淡出带同样要在初始化时算一次 —— 页面刚加载、用户还没滚动过时
+    // 那个 scroll 回调不会跑，若只在那里写，遮罩就一直缺省 200px；
+    // 任务清单展开后卡片高过 200px，底部就会露出没被淡出的文字。
+    const maskH = Math.round(h + window.innerHeight * 0.05 + 24);
+    if (maskH !== lastMaskH) {
+      lastMaskH = maskH;
+      document.documentElement.style.setProperty('--composer-mask-h', maskH + 'px');
+    }
   }
   syncComposerPadding();
   if (typeof ResizeObserver === 'function') {
@@ -5206,6 +5219,18 @@
     if (followTail) composerHide = 0;
     composerWrap.style.transform = 'translateX(-50%)' +
       (composerHide ? ' translateY(' + Math.round(composerHide) + 'px)' : '');
+
+    // 透明档下同步「消息列底部淡出带」的高度（app.css 的 #messages mask 读它）。
+    //
+    // 为什么必须跟着 composerHide 走：卡片收起时它已经滑下去了，
+    // 若遮罩还是满高，底部就糊着一条无意义的淡出带 ——
+    // 表现为「向上翻历史时，靠近屏幕底部的文字凭空消失」。
+    //
+    // 24px 是渐变过渡带：不留它字会被硬切在半途，看着像渲染错误。
+    // Math.max(0, …) 防收起到底时算出负高度（那会让渐变两端颠倒、整列反色）。
+    const maskH = Math.max(0,
+      Math.round(composerWrap.offsetHeight + window.innerHeight * 0.05 + 24 - composerHide));
+    document.documentElement.style.setProperty('--composer-mask-h', maskH + 'px');
   });
   // 聚焦输入框时恢复显示
   input.addEventListener('focus', function () {
@@ -5487,6 +5512,10 @@
     if (!box) return;
     const style = CBOX_STYLES.indexOf(v) >= 0 ? v : CBOX_DEFAULT;
     CBOX_STYLES.forEach(function (s) { box.classList.toggle('cbox-' + s, s === style); });
+    // 「透明」档要给**消息列**加底部 mask（只透背景图、不透被覆盖的文字），
+    // 而 #messages 是 #composer-wrap 的**前一个兄弟** ——
+    // #composer 上的 class 选不中它。所以同步在 <html> 上打个标记。
+    document.documentElement.classList.toggle('cbox-clear-on', style === 'clear');
     const seg = document.getElementById('composer-seg');
     if (seg) {
       seg.querySelectorAll('button').forEach(function (b) {

@@ -2246,28 +2246,61 @@ body.bg-dark .msg-user.msg-steer .bubble { border-left-color: #f6b8ce; }
   --warn: #d97706;
   --danger: #dc2626;
 }
-/* 透明档：去掉不透明填充，但仍压一层半透明底。
-   --
-   为什么不完全不铺底：「透背景」不等于「文字直接压在图上」。
-   body.bg-dark 只按整张图的**平均**亮度翻主题，而一张图里局部明暗差异很大
-   （天空亮、树影暗）。结果是：亮区上的深色字还凑合，暗区上的深色字直接糊掉，
-   而 placeholder 用的 --text-dim（浅色主题 #6b7280）在亮图上更几乎消失 ——
-   「随心输入」看不见。
+/* ---------- 输入框「透明」档：只透背景图，不透被覆盖的消息文字 ----------
 
-   为什么不用变量重映射（黑/白档那种做法）：那会把整个卡片的配色钉死，
-   主题一切换就乱。这里只铺一层**与主题无关**的半透明黑/白 ——
-   它不参与文字配色，只保证任何底图上都有可读性。
+   目标（用户原话）：输入框只能透背景图，不透被覆盖到下面的文字。
 
-   透明度取得很低（0.12~0.18）：仍能看清背景图，只是文字稳住了。 */
+   故障机理有两条，缺一条都还会叠字：
+
+   ① 半透明底没限定在「有背景图」时。
+      rgba(0,0,0,.14) 挡不住文字 —— 14% 的黑覆在消息上，后面的字照样清晰。
+      纯色背景（没设背景图）下尤其明显。所以**无背景图时透明档必须退回
+      不透明底**，与黑/白档一致；只有真的有背景图时才半透明。
+
+   ② 消息列在输入区那一段要淡出。
+      #messages 的底部留白（--composer-pad-bottom）只在**跟随态**把内容顶上来；
+      一旦上翻看历史，内容填满视口就钻到卡片底下。而 #composer-wrap 是
+      position:absolute、#messages 是在流块 —— CSS 绘制顺序决定卡片**必然画在
+      消息之上**，于是半透明底把那些字透了出来。
+
+      解法是给**消息列**加底部 mask，让它在输入区那一段淡出到全透明。
+      背景图在 #bg-layer（body 的子节点、z-index:-1），**不在 #messages 的
+      绘制范围内** —— 所以 mask 只吃掉消息文字，背景图原样透上来，且保持清晰。
+
+   为什么不用 backdrop-filter 毛玻璃：毛玻璃会把背景图一起模糊，而要的是
+   背景图清晰（草叶、边缘锐利）。为什么不用不透明底：那等于退回黑/白档，
+   透明档就没有意义了。
+
+   为什么不重映射主题变量（黑/白档那种做法）：那会把整个卡片配色钉死，
+   主题一切换就乱。这里只动底色与 placeholder 一档，--text 继续跟随主题。 */
 #composer.cbox-clear {
+  /* 无背景图时的默认底：**不透明**。半透明在纯色背景上必然叠字。 */
+  background: var(--bg-elev-2);
+}
+/* 有背景图时才半透明 + 提 placeholder 对比度 */
+body.has-bg #composer.cbox-clear {
   background: rgba(0, 0, 0, .14);
   /* placeholder 在半透明底上仍偏浅（--text-dim 是为实色底调的），
      单独提一档，不动 --text —— 正文颜色要继续跟随主题。 */
   --text-dim: color-mix(in srgb, var(--text) 62%, transparent);
 }
 /* 深色主题下黑底会压暗背景图，改用白底薄层 */
-body.bg-dark #composer.cbox-clear {
+body.bg-dark.has-bg #composer.cbox-clear {
   background: rgba(255, 255, 255, .10);
+}
+
+/* 消息列在输入区那一段淡出到全透明。
+   --composer-mask-h 由 JS 写：输入卡片当前占据的高度（滚动折叠时随之收窄，
+   卡片滑走后底部不该还糊着一条）。渐变留一段实色再淡出，避免字被硬切。 */
+body.has-bg #messages {
+  -webkit-mask-image: linear-gradient(to bottom,
+    #000 0,
+    #000 calc(100% - var(--composer-mask-h, 200px)),
+    transparent 100%);
+  mask-image: linear-gradient(to bottom,
+    #000 0,
+    #000 calc(100% - var(--composer-mask-h, 200px)),
+    transparent 100%);
 }
 
 /* 底部操作栏 */
