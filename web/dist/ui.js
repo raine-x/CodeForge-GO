@@ -1245,6 +1245,17 @@
     syncComposerMode();
     return d;
   }
+  // 黄色警告：本轮没完成，但不是用户的错（目前只有限流）。
+  // 刻意不落进 addError：error 帧会删乐观气泡，于是用户那句提问从界面上凭空消失，
+  // 而限流时那句话明明还等着回答 —— 删掉比标红更糟。
+  function addWarn(text) {
+    const d = document.createElement('div');
+    d.className = 'msg-warn';
+    d.textContent = text;
+    ensureCol().appendChild(d);
+    scrollBottom();
+    return d;
+  }
   // 工具中文名映射（内置工具 + 内置插件工具）：审批条等只显示短语、不暴露参数的场景使用。
   // 未识别的工具（MCP 插件等）回退显示原始工具名。
   const toolPhrases = {
@@ -3970,6 +3981,21 @@
           }
           addApproval(ev); // 后台会话的审批会带 session_id，卡片上标注来源
           break;
+        case 'warn': {
+          // 警告帧（目前只有限流）。**刻意不走 error 分支的任何收尾动作**：
+          // clearRunVisuals / foldReason / closeText / dropOptimisticBubble
+          // 全是「这轮彻底作废」用的，而限流时这轮只是没跑完 —— 用户的提问
+          // 还挂在界面上等着回答，把它抹掉比标红更糟。
+          // 只做两件收尾：解锁发送态 + 折叠思考区（否则「正在思考」一直转）。
+          if (!frameIsMine(ev)) break;
+          sending = false;
+          sessionChanging = false;
+          expireApprovals();
+          removeThinking();
+          foldReason();
+          addWarn(describeLLMError(ev.error || '请求被限流，请稍后重试'));
+          break;
+        }
         case 'error': {
           sending = false;
           sessionChanging = false;
@@ -6435,7 +6461,8 @@
     }
     main.appendChild(nm);
     main.appendChild(domEl('div', 'mi-id',
-      m.id + ' · 上下文 ' + fmtCtx(m.ctx_in) + ' / ' + fmtCtx(m.ctx_out)));
+      m.id + ' · 上下文 ' + fmtCtx(m.ctx_in) + ' / ' + fmtCtx(m.ctx_out) +
+      (m.rpm > 0 ? ' · 每分钟限 ' + m.rpm + ' 请求' : '')));
 
     // 多模态徽标：**只标显式声明过的**。
     //
@@ -7225,6 +7252,8 @@
     if (ctxOutPicker) ctxOutPicker.set(m.ctx_out || 131072);
     setCap('vision', m.vision);
     setCap('video', m.video);
+    // RPM 是标量不是三态：0 与「未设置」都表示不限制，回填成空框即可。
+    document.getElementById('mf-rpm').value = m.rpm > 0 ? String(m.rpm) : '';
     populateProviderSelect(m.provider_id || '');
     syncProviderForm();
     setTestResult('', '');
@@ -7253,6 +7282,9 @@
     const video = getCap('video');
     if (vision !== null) f.vision = vision;
     if (video !== null) f.video = video;
+    // RPM：空 = 不限制 = 0。**必须下发 0 而不是省略** —— 服务端把它当标量，
+    // 省略会让「上一条模型限到 60」的旧值留在表单里（与 vision 的三态不同）。
+    f.rpm = Math.max(0, parseInt(document.getElementById('mf-rpm').value, 10) || 0);
     if (pid) {
       // 归属供应商：连接信息全部继承，条目上不写任何覆盖值；
       // inherit_key 让服务端清掉条目上历史遗留的自带密钥，否则它会一直压着供应商的密钥。

@@ -22,6 +22,9 @@ type AnthropicProvider struct {
 	apiKey  string
 	model   string
 	retry   RetryPolicy
+	// rpm / gate 见 OpenAIProvider 的同名字段（客户端 RPM 节流）。
+	rpm  int
+	gate *rateLimiter
 }
 
 // NewAnthropic 构造 Anthropic 适配器。
@@ -35,6 +38,8 @@ func NewAnthropic(cfg config.LLMConfig) *AnthropicProvider {
 		apiKey:  cfg.APIKey,
 		model:   cfg.Model,
 		retry:   retryPolicyFromConfig(cfg),
+		rpm:     cfg.RPM,
+		gate:    limiterFor(cfg.Model),
 	}
 }
 
@@ -52,7 +57,7 @@ func (p *AnthropicProvider) Stream(ctx context.Context, req Request) (<-chan Str
 		"anthropic-version": anthropicVersion,
 	}
 	reopen := func() (*http.Response, error) {
-		return postJSON(ctx, p.baseURL+"/v1/messages", headers, payload, p.retry)
+		return postJSON(ctx, p.baseURL+"/v1/messages", headers, payload, p.retry, p.gate, p.rpm)
 	}
 	resp, err := reopen()
 	if err != nil {

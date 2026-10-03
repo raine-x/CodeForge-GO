@@ -15,6 +15,7 @@ import (
 	"codeforge/config"
 	"codeforge/pkg/agent"
 	"codeforge/pkg/errs"
+	"codeforge/pkg/llm"
 	"codeforge/pkg/logx"
 )
 
@@ -100,10 +101,23 @@ func (s *Server) handleModelTest(w http.ResponseWriter, r *http.Request) {
 		headers["Authorization"] = "Bearer " + key
 	}
 
+	// 也走客户端 RPM 节流：测试连接用的是**同一把密钥、同一个上游**，
+	// 用户在这里连点十次，打满的正是随后对话要用的那份额度。
+	// 不限它的话，用户能在设置页把配额耗光，然后在对话里莫名 429。
+	// 上限从模型库条目按 id 查 —— 测的可能是非当前模型。
+	testRPM := 0
+	if entry, ok := s.ModelStore().Find(model); ok {
+		testRPM = entry.RPM
+	}
+	if err := llm.AcquireSlot(ctx, model, testRPM); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": errs.FriendlyOr("等待请求配额", err)})
+		return
+	}
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(payload))
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok": false, "error": errs.FriendlyOr("测试模型连接", err)})
+			"ok": false, "error": errs.FriendlyOr("构造模型测试请求", err)})
 		return
 	}
 	for k, v := range headers {
@@ -517,6 +531,8 @@ func (s *Server) applyModelEntry(m config.ModelEntry, supplied string) error {
 	// 新条目没声明而不清空，会把上一个模型的能力扣到新模型头上。
 	llm.Vision = m.Vision
 	llm.Video = m.Video
+	// RPM 整体覆盖（含 0），理由同 vision/video：不能把上一个模型的值留下来。
+	llm.RPM = m.RPM
 	if err := s.rebuildProvider(); err != nil {
 		return err
 	}

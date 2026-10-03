@@ -210,6 +210,20 @@ func (c *wsClient) sendErr(action string, err error) {
 	c.send(map[string]any{"type": "error", "error": errs.FriendlyOr(action, err)})
 }
 
+// sendRunErr 下发一轮失败的原因，**按错误类别选 error / warn**。
+//
+// 分流的理由见 agent.EventWarn 的注释：限流不是「你那句话有问题」，
+// 红色报错会诱导用户去改自己的提问，而实际上什么都不用改。
+// 用 type 区分而不是让前端去猜文案，是因为文案随时可能被改写，
+// 一旦前端靠字符串匹配判断，这条分流就静默失效了。
+func (c *wsClient) sendRunErr(action string, err error) {
+	kind := "error"
+	if errs.Classify(err) == errs.KindRateLimit {
+		kind = "warn"
+	}
+	c.send(map[string]any{"type": kind, "error": errs.FriendlyOr(action, err)})
+}
+
 // handleWS 处理 WebSocket 连接：接收用户消息、推送事件流、处理 HITL 决策。
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -630,7 +644,7 @@ func (c *wsClient) run(sessionID, thinking, trigger, label string, agentFn func(
 		// 250/263/320 三处非 LLM 错误上 —— LLM 主链路一直漏着。
 		//
 		// FriendlyOr 对未识别的错误原样返回，所以既有的前端断言不受影响。
-		c.send(map[string]any{"type": "error", "error": errs.FriendlyOr("生成回复", runErr)})
+		c.sendRunErr("生成回复", runErr)
 	}
 	c.send(map[string]any{"type": "idle", "session_id": sessionID})
 	c.send(map[string]any{"type": "sessions", "items": c.srv.agent.History().List("", false)})

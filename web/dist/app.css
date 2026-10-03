@@ -1667,6 +1667,13 @@ body.bg-dark .msg-user.msg-steer .bubble { border-left-color: #f6b8ce; }
   font-size: 13px;
   color: var(--text-dim);
 }
+/* 黄色警告：限流这类「不是你的错、稍后重试就好」的失败。
+   与 .msg-info（灰色、纯告知）的区别是**它表示一件事没做成**，
+   用暖色提醒，但绝不用红色的错误样式 —— 那会诱导用户去改自己的提问。 */
+.msg-warn {
+  font-size: 13px;
+  color: var(--warn);
+}
 /* 工具条目：如「运行了命令」（无图标） */
 .msg-tool {
   display: inline-flex; align-items: center;

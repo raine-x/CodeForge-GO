@@ -33,7 +33,7 @@ func TestPostJSONErrorCarriesStatusCode(t *testing.T) {
 
 	// MaxAttempts=1：第一次就返回，既能拿到带字段的错误，又不必真等那 7 秒。
 	// 「429 会不会退避重试」由 TestPostJSONStillRetriesRateLimit429 单独验。
-	_, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, testPolicy(1))
+	_, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, testPolicy(1), nil, 0)
 	if err == nil {
 		t.Fatal("429 应报错")
 	}
@@ -66,7 +66,7 @@ func TestPostJSONDoesNotRetryForbidden(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, testPolicy(5))
+	_, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, testPolicy(5), nil, 0)
 	if err == nil {
 		t.Fatal("403 应直接失败")
 	}
@@ -91,7 +91,7 @@ func TestPostJSONDoesNotRetryUnauthorized(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, testPolicy(5))
+	_, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, testPolicy(5), nil, 0)
 	if err == nil {
 		t.Fatal("401 应直接失败")
 	}
@@ -113,7 +113,7 @@ func TestPostJSONStillRetriesServerErrors(t *testing.T) {
 			atomic.AddInt32(&calls, 1)
 			w.WriteHeader(c)
 		}))
-		_, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, testPolicy(3))
+		_, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, testPolicy(3), nil, 0)
 		srv.Close()
 		if err == nil {
 			t.Errorf("%d 应最终报错", c)
@@ -134,7 +134,7 @@ func TestPostJSONStillRetriesRateLimit429(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, _ = postJSON(context.Background(), srv.URL, nil, map[string]any{}, testPolicy(3))
+	_, _ = postJSON(context.Background(), srv.URL, nil, map[string]any{}, testPolicy(3), nil, 0)
 	if got := atomic.LoadInt32(&calls); got != 3 {
 		t.Errorf("429 应重试满 3 次，实际 %d 次", got)
 	}
@@ -151,7 +151,7 @@ func TestPostJSONStillDoesNotRetryQuota(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, _ = postJSON(context.Background(), srv.URL, nil, map[string]any{}, testPolicy(5))
+	_, _ = postJSON(context.Background(), srv.URL, nil, map[string]any{}, testPolicy(5), nil, 0)
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Errorf("配额耗尽不该重试，实际 %d 次", got)
 	}
@@ -165,7 +165,7 @@ func TestStatusErrorKeepsFrontendFormat(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, testPolicy(1))
+	_, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, testPolicy(1), nil, 0)
 	if err == nil {
 		t.Fatal("应报错")
 	}

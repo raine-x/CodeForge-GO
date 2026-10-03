@@ -668,6 +668,13 @@
                     </div>
                     <p class="cap-hint">视频指模型原生解析（整段视频直接交给上游），不是本地抽帧。填错会让附件发不出去或被静默忽略。</p>
                   </div>
+                  <!-- RPM：客户端节流上限，留空 = 不限制（默认）。
+                       语义是「每分钟最多发几个请求」，从**请求发起前**就错开，
+                       不去撞上游 429；与「撞了 429 之后等 10 秒」是两套机制。 -->
+                  <label class="f-field"><span>每分钟请求上限（RPM）</span>
+                    <input id="mf-rpm" type="number" min="0" step="1"
+                           placeholder="留空 = 不限制">
+                  </label>
                 </div>
                 <!-- 从上游 /models 拉取的模型列表（点「获取模型列表」后展开，选中后填入模型 id） -->
                 <div id="mf-discover-panel" class="discover-panel hidden">

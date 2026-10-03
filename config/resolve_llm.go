@@ -70,6 +70,11 @@ func ResolveModelCredentials(cfg *Config, ms *ModelStore, ps *ProviderStore) str
 	cfg.LLM.Vision = entry.Vision
 	cfg.LLM.Video = entry.Video
 
+	// RPM 同样整体覆盖（含 0 = 不限制）：换模型时若新条目没设，
+	// 而不清空，就会把**上一个模型的节流上限**扣在新模型头上 ——
+	// 症状是「换了个快模型却莫名其妙变慢了」。
+	cfg.LLM.RPM = entry.RPM
+
 	if key := resolveModelKey(e); key != "" {
 		cfg.LLM.APIKey = key
 		return "已从模型库解析 " + id

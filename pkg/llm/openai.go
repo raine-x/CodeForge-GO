@@ -21,6 +21,14 @@ type OpenAIProvider struct {
 	apiKey  string
 	model   string
 	retry   RetryPolicy
+	// rpm 是客户端节流上限（0 = 不限制），gate 是它对应的计数状态。
+	//
+	// gate **每个 provider 实例一个**：实例本身是按模型构造的（model 在
+	// 构造时固定），所以「一个模型一套配额」天然成立，且换模型时
+	// rebuildProvider 会重建实例 —— 计数随之清零，这没问题
+	// （节流是为了少撞 429，不是安全边界）。
+	rpm  int
+	gate *rateLimiter
 }
 
 // NewOpenAI 构造 OpenAI 适配器。
@@ -34,6 +42,8 @@ func NewOpenAI(cfg config.LLMConfig) *OpenAIProvider {
 		apiKey:  cfg.APIKey,
 		model:   cfg.Model,
 		retry:   retryPolicyFromConfig(cfg),
+		rpm:     cfg.RPM,
+		gate:    limiterFor(cfg.Model),
 	}
 }
 
@@ -123,7 +133,7 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req Request) (<-chan Stream
 		headers["Authorization"] = "Bearer " + p.apiKey
 	}
 	reopen := func() (*http.Response, error) {
-		return postJSON(ctx, p.baseURL+"/chat/completions", headers, payload, p.retry)
+		return postJSON(ctx, p.baseURL+"/chat/completions", headers, payload, p.retry, p.gate, p.rpm)
 	}
 	resp, err := reopen()
 	if err != nil {

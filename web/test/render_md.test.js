@@ -1400,6 +1400,38 @@ check('模型列表只给「显式声明支持」加徽标（未声明不加）'
 check('能力文案说清「视频是原生解析，不是本地抽帧」',
   /原生解析（整段视频直接交给上游），不是本地抽帧/.test(htmlSrc));
 
+// ---------- 模型 RPM 限制 ----------
+//
+// 三个容易搞错的地方，各钉一条：
+//   1. 空值必须回填成**空框**而不是 0（0 在界面上长得像「限 0 个」）；
+//   2. 采集时必须**下发 0** 而不是省略 —— 它是标量，省略会让旧值留存
+//      （与 vision 的三态处理恰好相反）；
+//   3. 列表只在 >0 时才显示，0 是默认值不该占位。
+check('RPM 回填：0 与未设置都回填成空框（默认不限制）',
+  /document\.getElementById\('mf-rpm'\)\.value = m\.rpm > 0 \? String\(m\.rpm\) : ''/.test(uiSrc) &&
+  /<input id="mf-rpm" type="number" min="0"/.test(htmlSrc) &&
+  /placeholder="留空 = 不限制"/.test(htmlSrc));
+check('RPM 采集：无条件下发数值（0 表示不限制，不靠省略）',
+  /f\.rpm = Math\.max\(0, parseInt\(document\.getElementById\('mf-rpm'\)\.value, 10\) \|\| 0\)/.test(uiSrc));
+check('模型列表只在限速生效时显示 RPM',
+  /m\.rpm > 0 \? ' · 每分钟限 ' \+ m\.rpm \+ ' 请求' : ''/.test(uiSrc));
+
+// ---------- 限流最终失败走黄色警告，不是红色错误 ----------
+//
+// error 帧在前端会删乐观气泡 —— 限流时用户那句提问还等着回答，
+// 把它抹掉比标红更糟。所以必须是独立的 warn 帧，且不走 error 分支的收尾。
+check('限流走独立的 warn 帧（黄色），不进 error 分支的收尾动作',
+  /case 'warn': \{[\s\S]{0,900}?addWarn\(describeLLMError\(ev\.error \|\| '请求被限流，请稍后重试'\)\)/.test(uiSrc) &&
+  /case 'warn': \{[\s\S]{0,900}?removeThinking\(\);[\s\S]{0,200}?foldReason\(\);/.test(uiSrc));
+check('warn 分支绝不调用 dropOptimisticBubble / clearRunVisuals',
+  // 这两个是「这轮彻底作废」的收尾；限流时这轮只是没跑完。
+  /case 'warn': \{[\s\S]{0,900}?\}/.test(uiSrc) &&
+  !/case 'warn': \{[\s\S]{0,900}?dropOptimisticBubble\(\)/.test(uiSrc) &&
+  !/case 'warn': \{[\s\S]{0,900}?clearRunVisuals\(\)/.test(uiSrc));
+check('黄色提示有独立样式（不用红色错误色）',
+  /\.msg-warn \{[^}]*color: var\(--warn\)/.test(css) &&
+  /function addWarn\(text\)/.test(uiSrc) && /d\.className = 'msg-warn'/.test(uiSrc));
+
 // ---------- 模型管理页：tab 条独占一行且居中；供应商管理收敛成一屏 ----------
 group('模型管理页：tab 条独占一行且居中');
 check('HTML 里有独立的 tab 条行，里面只有那颗 pill',

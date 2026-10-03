@@ -62,6 +62,13 @@ type LLMConfig struct {
 	// 未声明时仍乐观发送，撞到拒收再记住该模型（见 agent 包的失败记忆）。
 	Vision *bool `yaml:"vision,omitempty"`
 	Video  *bool `yaml:"video,omitempty"`
+
+	// RPM 是当前生效模型的客户端节流上限（每分钟请求数），0 = 不限制。
+	//
+	// 与 Vision/Video 不同，**它是标量而不是三态**：0 与「未设置」语义相同
+	//（都是不限制），不存在「不知道」与「不支持」的区分 —— 用户没填就是没填，
+	// 没有信息可丢。同样不进 StateLLM：由模型条目解析而来，存副本只会陈旧。
+	RPM int `yaml:"rpm,omitempty"`
 }
 
 // AgentConfig 描述 Agent 引擎行为。

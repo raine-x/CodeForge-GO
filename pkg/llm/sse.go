@@ -75,6 +75,12 @@ const (
 	maxErrorBodyBytes   = 8192
 	maxStreamLineBytes  = 8 << 20
 	streamReadBufBytes  = 64 * 1024
+	// statusTooManyRequests 是 429。**刻意不查 transientStatus**：
+	// 那张表回答的是「这个码可不可以重试」，而这里要回答「等多久」，
+	// 两者不是一回事（403 也在表里，但它等 10 秒毫无意义）。
+	statusTooManyRequests = 429
+	// rateLimitRetryDelay 是未配置 RPM 时撞上 429 的固定等待时长。
+	rateLimitRetryDelay = 10 * time.Second
 )
 
 // backoffMultipliers 是常用退避序列：1×→2×→3×→6×（之后封顶 6×）。
@@ -131,12 +137,17 @@ func (p RetryPolicy) attemptDelay(attempt int) time.Duration {
 //
 // 重试仅作用于「首次响应」阶段：一旦开始读取流式响应体便不再重试，
 // 以免重复计费或产生重复内容。
+//
+// gate 是客户端 RPM 节流闸（nil = 不限制），在**每次** httpClient.Do 之前
+// 过一次 —— 包括退避重试，因为重试同样消耗上游配额，不计就等于自己骗自己。
 func postJSON(
 	ctx context.Context,
 	url string,
 	headers map[string]string,
 	payload any,
 	policy RetryPolicy,
+	gate *rateLimiter,
+	rpm int,
 ) (*http.Response, error) {
 	policy = policy.normalize()
 
@@ -167,6 +178,17 @@ func postJSON(
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
+		}
+		// RPM 节流：先**预订**发送时刻再等，等到点了才真的发。
+		// 顺序不能反 —— 先等后占位会让并发请求同时通过（见 ratelimit.go）。
+		if gate != nil && rpm > 0 {
+			until := gate.reserve(nowFunc(), rpm)
+			if wait := until.Sub(nowFunc()); wait > 0 {
+				logx.Infof("已达每分钟 %d 个请求的上限，本次延后 %s 发出（模型节流）", rpm, wait.Round(time.Second))
+				if err := waitUntil(ctx, until); err != nil {
+					return nil, err
+				}
+			}
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "text/event-stream")
@@ -232,6 +254,17 @@ func postJSON(
 		if retryAfter > 0 {
 			overrideDelay = retryAfter
 			nextDelay = retryAfter
+		} else if resp.StatusCode == statusTooManyRequests && rpm <= 0 {
+			// 429 且**没配 RPM** 时固定等 10 秒，覆盖本地退避序列。
+			//
+			// 为什么序列不够用：序列是 1→2→3→6s（封顶 6s），而绝大多数网关的
+			// 限流窗口是**一分钟**。等 6 秒重发几乎必然再撞一次，白等一轮、
+			// 还多消耗一次配额。10 秒是「多半已经滑出窗口」的保守值。
+			//
+			// 配了 RPM 就不走这条：那种情况下是我们自己发太快，
+			// 已经由 reserve 错开过了，再额外等 10 秒是双重惩罚。
+			nextDelay = rateLimitRetryDelay
+			overrideDelay = nextDelay
 		}
 		if hook := retryHookFrom(ctx); hook != nil {
 			hook(attempt+1, policy.MaxAttempts, apiErr.Error())

@@ -354,3 +354,19 @@ func TestUnsupportedMediaCauseAndHint(t *testing.T) {
 		t.Errorf("建议应给出可操作入口（设置 → 模型），实际 %q", h)
 	}
 }
+
+// 限流的成因/建议必须引导「等一下再试」，而不是「改点东西」。
+//
+// 它被 WS 层单独分流成**黄色警告**而非红色错误（见 ws_handler.sendRunErr），
+// 前提就是它确实属于「稍后就好」—— 若哪天上游把它改成要用户改配置，
+// 那条黄色分流就该跟着撤掉。这条钉住文案方向。
+func TestRateLimitGuidanceIsToWait(t *testing.T) {
+	c := Cause(KindRateLimit)
+	if !strings.Contains(c, "限流") && !strings.Contains(c, "频繁") {
+		t.Errorf("成因应说明被限流，实际 %q", c)
+	}
+	h := Hint(KindRateLimit)
+	if !strings.Contains(h, "重试") && !strings.Contains(h, "稍后") {
+		t.Errorf("建议应引导「稍后重试」，实际 %q", h)
+	}
+}

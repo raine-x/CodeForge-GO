@@ -21,6 +21,7 @@
 //	    provider_id: p-ai
 //	    vision: true        # 收得到图片
 //	    video: true         # 收得到视频（原生透传，不是抽帧）
+//	    rpm: 60             # 每分钟最多 60 个请求；不写 / 0 = 不限制
 //	  - id: gpt-4o                                     # 自带连接信息（旧格式，仍支持）
 //	    name: GPT-4o
 //	    base_url: https://api.openai.com/v1
@@ -74,6 +75,18 @@ type ModelEntry struct {
 	//   false 显式不支持 → 附件根本不该进来。
 	Vision *bool `yaml:"vision,omitempty" json:"vision,omitempty"` // 支持图片输入
 	Video  *bool `yaml:"video,omitempty" json:"video,omitempty"`   // 支持视频输入（原生透传，非抽帧）
+
+	// RPM 是该模型的**客户端节流上限**（每分钟最多几个请求），0 或未设置 = 不限制。
+	//
+	// 与「上游返回 429」是两件事，别混：
+	//   - 429 = 上游嫌我们快（可能是**别人**共用这把密钥挤占了额度），
+	//     只能事后等，且默认要等 10 秒（见 pkg/llm 的 postJSON）；
+	//   - RPM = 用户自己知道这把密钥每分钟只能发几个，于是**发之前**就错开，
+	//     从不撞墙。免费额度 / 共享密钥 / 有明确配额公告的场合才需要设。
+	//
+	// 为什么不用更常见的「令牌桶」：那允许短时突发，而突发正是撞 429 的原因。
+	// 这里用严格滑动窗口（见 pkg/llm/ratelimit.go），宁可慢也不越线。
+	RPM int `yaml:"rpm,omitempty" json:"rpm,omitempty"`
 }
 
 // SupportsVision 报告该模型是否声明支持图片输入。
@@ -316,6 +329,9 @@ func sanitizeEntries(entries []ModelEntry, ps *ProviderStore) []map[string]any {
 			// 猜错的后果是模型永久收不到图，而用户没有任何入口去纠正它。
 			"vision": raw.Vision,
 			"video":  raw.Video,
+			// rpm 必须下发：设置页表单要回显，且「0 = 不限制」这个语义
+			// 只能靠真值传达（不写该字段会被读成「未知」）。
+			"rpm": raw.RPM,
 		}
 	}
 	return out

@@ -27,7 +27,7 @@ func TestPostJSONRetriesTransientStatus(t *testing.T) {
 	defer srv.Close()
 
 	policy := RetryPolicy{MaxAttempts: 5, Backoff: 5 * time.Millisecond}
-	resp, err := postJSON(context.Background(), srv.URL, nil, map[string]any{"a": 1}, policy)
+	resp, err := postJSON(context.Background(), srv.URL, nil, map[string]any{"a": 1}, policy, nil, 0)
 	if err != nil {
 		t.Fatalf("期望重试后成功，实际报错: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestPostJSONDoesNotRetryClientError(t *testing.T) {
 	defer srv.Close()
 
 	policy := RetryPolicy{MaxAttempts: 5, Backoff: 5 * time.Millisecond}
-	if _, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, policy); err == nil {
+	if _, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, policy, nil, 0); err == nil {
 		t.Fatal("401 应直接失败，不应重试")
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
@@ -69,7 +69,7 @@ func TestPostJSONExhaustsRetries(t *testing.T) {
 	defer srv.Close()
 
 	policy := RetryPolicy{MaxAttempts: 3, Backoff: 5 * time.Millisecond}
-	if _, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, policy); err == nil {
+	if _, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, policy, nil, 0); err == nil {
 		t.Fatal("持续 503 应最终返回错误")
 	}
 	if got := atomic.LoadInt32(&calls); got != 3 {
@@ -89,7 +89,7 @@ func TestPostJSONRespectsContextCancellation(t *testing.T) {
 	defer cancel()
 
 	policy := RetryPolicy{MaxAttempts: 20, Backoff: 200 * time.Millisecond}
-	if _, err := postJSON(ctx, srv.URL, nil, map[string]any{}, policy); err == nil {
+	if _, err := postJSON(ctx, srv.URL, nil, map[string]any{}, policy, nil, 0); err == nil {
 		t.Fatal("context 超时后应返回错误")
 	}
 	if got := atomic.LoadInt32(&calls); got > 5 {
@@ -123,7 +123,7 @@ func TestPostJSONDoesNotRetryQuotaExceeded(t *testing.T) {
 	defer srv.Close()
 
 	policy := RetryPolicy{MaxAttempts: 5, Backoff: 5 * time.Millisecond}
-	_, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, policy)
+	_, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, policy, nil, 0)
 	if err == nil || !strings.Contains(err.Error(), "quota") {
 		t.Fatalf("quota_exceeded 应直接报错，实际 %v", err)
 	}
@@ -147,7 +147,7 @@ func TestPostJSONRetriesRateLimit429(t *testing.T) {
 	defer srv.Close()
 
 	policy := RetryPolicy{MaxAttempts: 5, Backoff: 5 * time.Millisecond}
-	resp, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, policy)
+	resp, err := postJSON(context.Background(), srv.URL, nil, map[string]any{}, policy, nil, 0)
 	if err != nil {
 		t.Fatalf("rate limit 重试后应成功，实际 %v", err)
 	}
