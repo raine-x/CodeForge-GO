@@ -3468,13 +3468,14 @@ body.bg-dark .fs-tip {
     border-right: none;
     border-bottom: 1px solid var(--border);
     overflow-x: auto;
-    /* 与 .models-tabs-bar 同理：给了横向 overflow 之后，横向以外的
-       visible 会计算成 auto，这里显式钉死，免得这排自己也能竖着滚。 */
+    /* 横向滚动容器必须**两轴都钉死**：只给横向 auto 的话，规范规定另一轴的
+       visible 计算成 auto，Chrome 会在右缘画出一条竖滚动条；而
+       ::-webkit-scrollbar 少写 width:0 的话那条竖条根本藏不掉。 */
     overflow-y: hidden;
     -webkit-overflow-scrolling: touch;
     scrollbar-width: none;
   }
-  .settings-nav::-webkit-scrollbar { height: 0; }
+  .settings-nav::-webkit-scrollbar { width: 0; height: 0; }
   .settings-nav .nav-group { display: none; }
   .settings-nav .nav-item {
     flex: none;
@@ -3558,24 +3559,32 @@ body.bg-dark .fs-tip {
   .mf-inherit .ir { flex-wrap: wrap; }
   .mf-inherit .ir > span { width: auto; }
 
-  /* 模型页那排三枚 pill：窄屏允许横向滚动，不硬挤。
-     ⚠️ 两处必须一起改，否则它会贴到上面那条设置导航上：
-       · margin:0 —— 桌面上这里有 `margin: -10px 0 14px`，是给
-         .settings-content 的 **26px** 内边距做视觉对齐的负边距。
-         手机内边距是 18px，负 10 之后两排横条只差 8px，看着就是叠上了。
-       · overflow-x —— 一旦给了非 visible 的横向 overflow，CSS 规定
-         另一轴的 visible 会**计算成 auto**，这行于是变成滚动容器，
-         再叠上负边距，pills 的上缘会被它自己裁掉。
-     两排横条之间留 14px，是它们各自滚动、互不遮挡的最低要求。 */
+  /* 模型页那排三枚 pill。
+     ⚠️ 这里**故意不做横向滚动容器**。踩过的坑：
+       · 给 .models-tabs-bar 加 overflow-x:auto 之后，规范规定另一轴的
+         visible 会计算成 auto（写成 hidden 也拦不住 Chrome 画滚动条，
+         因为 ::-webkit-scrollbar 我一开始只写了 height:0、漏了 width:0）。
+       · 于是这行要么出现一条竖滚动条把内容切掉，要么 pills 被自己裁掉上缘，
+         视觉上就是「和上面那条导航叠在一起」。
+       · 而它只有三枚 —— 平分宽度就放得下（358px / 3 ≈ 119px，
+         「供应商管理」5 个字 ≈ 60px），根本不需要滚动。
+     结论：能用平分解决的，就别引入滚动容器。 */
   .models-tabs-bar {
-    margin: 0 0 14px;
-    overflow-x: auto;
-    overflow-y: hidden;
-    scrollbar-width: none;
-    -webkit-overflow-scrolling: touch;
+    margin: 0 0 16px;      /* 撤掉桌面那条 -10px 负边距（它是给 26px 内边距做
+                              视觉对齐的，手机内边距 18px，减 10 只剩 8px） */
+    overflow: visible;      /* 彻底不是滚动容器 */
   }
-  .models-tabs-bar::-webkit-scrollbar { height: 0; }
-  .models-tabs { margin: 0; }             /* 撤掉桌面那个居中，手机贴左 */
+  .models-tabs {
+    width: 100%;            /* 撤掉桌面的 width:fit-content + margin:0 auto */
+    margin: 0;
+  }
+  .models-tab {
+    flex: 1 1 0;            /* 三等分，不再靠 fit-content 猜宽 */
+    min-width: 0;
+    padding: 7px 6px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
 
   /* ══ 触摸端 hover 撤除（清单式）══════════════════════════════
      为什么用「撤除」而不是把桌面规则包进 @media (hover:hover)：
