@@ -3468,6 +3468,9 @@ body.bg-dark .fs-tip {
     border-right: none;
     border-bottom: 1px solid var(--border);
     overflow-x: auto;
+    /* 与 .models-tabs-bar 同理：给了横向 overflow 之后，横向以外的
+       visible 会计算成 auto，这里显式钉死，免得这排自己也能竖着滚。 */
+    overflow-y: hidden;
     -webkit-overflow-scrolling: touch;
     scrollbar-width: none;
   }
@@ -3555,8 +3558,22 @@ body.bg-dark .fs-tip {
   .mf-inherit .ir { flex-wrap: wrap; }
   .mf-inherit .ir > span { width: auto; }
 
-  /* 模型页那排三枚 pill：窄屏允许横向滚动，不硬挤 */
-  .models-tabs-bar { overflow-x: auto; scrollbar-width: none; }
+  /* 模型页那排三枚 pill：窄屏允许横向滚动，不硬挤。
+     ⚠️ 两处必须一起改，否则它会贴到上面那条设置导航上：
+       · margin:0 —— 桌面上这里有 `margin: -10px 0 14px`，是给
+         .settings-content 的 **26px** 内边距做视觉对齐的负边距。
+         手机内边距是 18px，负 10 之后两排横条只差 8px，看着就是叠上了。
+       · overflow-x —— 一旦给了非 visible 的横向 overflow，CSS 规定
+         另一轴的 visible 会**计算成 auto**，这行于是变成滚动容器，
+         再叠上负边距，pills 的上缘会被它自己裁掉。
+     两排横条之间留 14px，是它们各自滚动、互不遮挡的最低要求。 */
+  .models-tabs-bar {
+    margin: 0 0 14px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
   .models-tabs-bar::-webkit-scrollbar { height: 0; }
   .models-tabs { margin: 0; }             /* 撤掉桌面那个居中，手机贴左 */
 
