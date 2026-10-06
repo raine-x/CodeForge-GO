@@ -3172,4 +3172,328 @@ body.bg-dark .fs-tip {
   .inline-menu { animation: none; }
   /* 尊重「减少动态效果」：＋↔✕ 的旋转过渡也去掉 */
   #more-btn svg { transition: none; }
+  /* 移动端抽屉的滑入与子项逐条入场同样要撤掉 —— 否则开了「减少动态效果」的
+     用户在手机上仍会看到整屏位移动画。这两条与上面那组同属一次性进出场动画。 */
+  #sidebar { transition: none !important; }
+  #sidebar .sidebar-card,
+  #sidebar .sidebar-footer,
+  #sidebar .sidebar-sep { animation: none !important; }
+  .m-tb-btn, #m-scrim { transition: none !important; }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   移动端适配
+   ══════════════════════════════════════════════════════════════════════
+
+   断点为什么是「宽 OR 矮」而不是「竖屏」：
+     判 portrait 只覆盖手机竖着拿。但手机一横屏就是 844×390 —— **宽度比 820 还宽**，
+     只写 (orientation: portrait) 的话横屏会掉回桌面版：侧栏 240px + 主区挤在
+     390px 高里，直接不可用。所以必须把「矮屏」也算进来。
+     820 取的是「侧栏(200~340) + 主区至少还能读一行」的临界宽度；
+     520 取的是「顶栏 + 至少 3 行消息 + 输入框」的临界高度。
+
+   整体策略：**一套 DOM，纯 CSS 切布局**。
+     ui.js 里 25 个 renderXxx() 全部往固定 ID 容器写 DOM；web/test/render_md.test.js
+     的 711 条断言里大量是针对 #messages 内部结构的**源码正则**。做两套 DOM 必然要
+     改这些断言，而项目纪律是「纯重构时任何一个原有测试变红立即回滚」。
+     一套 DOM 的另一个好处：工作区归会话不归进程，两端是同一个会话，状态天然一致。
+
+   本节只写「移动端专属」规则，**不改任何桌面规则** —— 这样桌面端零回归风险。
+   （代价是 hover 只能用「撤除清单」而非「允许清单」，见本节最后一组。）
+
+   顶部两枚按钮（左=会话 / 右=设置）是移动端专用 DOM，桌面端 display:none，
+   所以不污染桌面的 getElementById 校验（见 test/audit_dom_refs.mjs）。
+*/
+#m-topbar, #m-scrim { display: none; }
+
+@media (max-width: 820px), (max-height: 520px) {
+
+  /* ── 令牌：把画布灰收掉，正文抬到手机档位 ──────────────────────
+     桌面 html/body 是 14px；手机小屏上 14px 偏小，且 iOS 会对
+     字号 <16px 的输入框**自动放大页面**（见下面「输入区」那组）。 */
+  html {
+    /* 防止 iOS 横屏时按文字宽度自动放大整页 */
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+  :root {
+    --m-gutter: 12px;
+    /* 抽屉/弹层的弹簧曲线，和 mockup 一致 */
+    --m-spring: cubic-bezier(.34, 1.32, .44, 1);
+  }
+
+  /* ── 画布去缝：桌面的「灰底 + 卡片留 6px 间隙」在手机上只剩缝隙 ── */
+  #app {
+    padding: 0;
+    background: var(--bg);
+  }
+
+  /* ── 主区：去掉卡片边框与圆角，吃满整屏 ─────────────────────── */
+  #main {
+    border: none;
+    border-radius: 0;
+  }
+
+  /* ── 拖拽把手：手机上侧栏宽度由抽屉规则定，拖拽无意义 ───────── */
+  #drag-handle { display: none; }
+
+  /* ══ 侧栏 → 左侧抽屉 ══════════════════════════════════════════
+     position:fixed 之后它脱离 #app 的 flex 流，#main 自动吃满整宽，
+     不需要额外给 #main 设 width。 */
+  #sidebar {
+    position: fixed;
+    top: 0; left: 0; bottom: 0;
+    z-index: 400;
+    width: 86vw;
+    max-width: 340px;
+    min-width: 0;
+    /* 抽屉默认在屏外；open 由 body.m-drawer-open 翻开 */
+    transform: translateX(-101%);
+    transition: transform .40s var(--m-spring);
+    border-right: 1px solid var(--border);
+    border-radius: 0 18px 18px 0;
+    box-shadow: 6px 0 32px rgba(15, 23, 42, .16);
+    padding: max(14px, env(safe-area-inset-top)) 12px
+             max(12px, env(safe-area-inset-bottom));
+    /* 抽屉内可滚：会话多时不能把底部页脚顶出屏外 */
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  body.m-drawer-open #sidebar { transform: translateX(0); }
+
+  /* 遮罩：夹在 #main 与 #sidebar 之间 */
+  #m-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 390;
+    background: rgba(15, 23, 42, .38);
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity .28s ease, visibility .28s;
+  }
+  body.m-drawer-open #m-scrim { opacity: 1; visibility: visible; }
+
+  /* 抽屉内元素上滑淡入。--i 由 ui.js 的 mobileShell 逐项赋值，
+     不用 JS 的话纯 CSS nth-child 也行，但抽屉里子元素结构会变，
+     用自定义属性更耐改。 */
+  #sidebar .sidebar-card,
+  #sidebar .sidebar-footer,
+  #sidebar .sidebar-sep {
+    animation: mSlideIn .34s var(--m-spring) both;
+    animation-delay: calc(var(--i, 0) * 30ms);
+  }
+  @keyframes mSlideIn {
+    from { opacity: 0; transform: translateX(-16px); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  /* 抽屉内的可点行：手机上放大到 44px 触摸目标 */
+  .new-chat-btn,
+  .session-item,
+  .settings-btn,
+  .ctx-meter { min-height: 44px; }
+  .settings-btn, .ctx-meter { padding: 0 6px; }
+
+  /* ══ 顶部浮条（会话 / 设置）═══════════════════════════════════
+     做成**浮动毛玻璃条**而不是流内一栏：这样不需要给 #messages 加
+     padding-top 去避让，滚动时内容自然从条下面滑过去。 */
+  #m-topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    z-index: 120;
+    padding: max(8px, env(safe-area-inset-top)) 12px 8px;
+    background: color-mix(in srgb, var(--bg) 78%, transparent);
+    backdrop-filter: blur(14px) saturate(160%);
+    -webkit-backdrop-filter: blur(14px) saturate(160%);
+    pointer-events: none;   /* 只有两枚按钮吃事件，其余穿透到消息流 */
+  }
+  #m-topbar > * { pointer-events: auto; }
+  .m-tb-btn {
+    width: 40px; height: 40px;
+    flex: none;
+    display: grid; place-items: center;
+    border: none;
+    border-radius: 50%;
+    background: var(--bg-elev-2);
+    color: var(--text);
+    cursor: pointer;
+    transition: transform .12s var(--m-spring), background .16s;
+  }
+  .m-tb-btn:active { transform: scale(.9); background: var(--bg-elev); }
+  /* 上下文占用贴在顶条底缘，占满可用宽度 */
+  #m-topbar .m-ctx {
+    flex: 1 1 auto;
+    height: 3px;
+    border-radius: 999px;
+    background: var(--bg-elev-2);
+    overflow: hidden;
+  }
+  #m-topbar .m-ctx i {
+    display: block; height: 100%; width: 0;
+    background: var(--accent);
+    border-radius: 999px;
+    transition: width .25s ease, background-color .25s ease;
+  }
+  #m-topbar .m-ctx.warn i { background: var(--warn); }
+  #m-topbar .m-ctx.danger i { background: var(--danger); }
+
+  /* ══ 对话区 ═══════════════════════════════════════════════════
+     顶部留出浮条的高度 + 刘海；左右从 32/44px 收到 14px
+     （桌面那两个值是为了给消息卡的呼吸空间，手机上纯浪费宽度）。 */
+  #messages {
+    padding: calc(max(8px, env(safe-area-inset-top)) + 52px) 14px
+             var(--composer-pad-bottom, 210px) 14px;
+  }
+  .msg-col { max-width: 100%; gap: 12px; }
+  .msg-assistant.md p { font-size: 16px; line-height: 1.55; }
+  .msg-assistant.md pre { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .msg-user .bubble { max-width: 86%; }
+
+  /* ══ 输入区 ═════════════════════════════════════════════════
+     ⚠️ 桌面是 min(80%, 760px) + bottom:5vh + 居中 translateX(-50%)，
+        空态还会叠一层 .composer-centered 的垂直居中数学（那套算式
+        假设 #main 高度 = 100vh，手机上不成立，且软键盘弹起时会错位）。
+        所以移动端改成**贴底通栏**并强制 transform:none。 */
+  #composer-wrap {
+    left: var(--m-gutter);
+    right: var(--m-gutter);
+    width: auto;              /* 必须给 auto：桌面那条 min(80%,…) 优先级相同但会覆盖 left/right 之一 */
+    bottom: calc(env(safe-area-inset-bottom, 0px) + 10px);
+    transform: none !important;   /* 同时废掉 .composer-centered 的居中 */
+  }
+
+  /* ⚠️⚠️ 本节最容易踩的坑：字号必须**两个元素一起**改。
+     iOS 对 font-size < 16px 的聚焦输入框会自动放大整页，
+     而 #composer textarea 的字是 transparent（真字由 .input-mirror 画），
+     两者的 font / line-height / padding 必须逐项一致，
+     只改一个 = 镜像层与真实文字错行（见上面 2190 那段的警告）。 */
+  #composer textarea,
+  .input-mirror {
+    font-size: 16px;
+    line-height: 1.5;
+  }
+
+  /* 输入卡片在手机上加一层浮起感（桌面已有阴影，这里只补一点） */
+  #composer {
+    border-radius: 20px;
+  }
+  .input-wrap { min-height: 48px; }
+
+  /* 底部一排：触摸目标放大；模型按钮允许占更多宽度 */
+  .composer-bottom { gap: 8px; }
+  .icon-btn { width: 40px; height: 40px; }
+  #model-btn { max-width: 46vw; }
+  #send-btn { width: 40px; height: 40px; }
+
+  /* 弹层：宽度不许撑出屏幕；模型列表可能很长，给个高度上限自己滚 */
+  .popup {
+    max-width: calc(100vw - 24px);
+    max-height: 56vh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+  }
+  /* 锚在右下角那一组（模型按钮）的弹层改成**右对齐**：
+     桌面用 left:0 从锚点左侧展开，锚点贴屏幕右边时会溢出右边。 */
+  .bottom-right .popup {
+    left: auto;
+    right: 0;
+  }
+
+  /* 「回到底部」浮箭：桌面贴 118px，手机上输入卡更高、且有安全区 */
+  .to-bottom {
+    right: 14px;
+    bottom: calc(env(safe-area-inset-bottom, 0px) + 128px);
+  }
+
+  /* ══ 设置页 ═════════════════════════════════════════════════
+     桌面是 200px 左导航 + 右内容。手机上把左导航改成**顶部横向
+     滚动条**：竖排 200px 在 390px 宽里会把内容挤到只剩 190px。 */
+  .settings-overlay { background: var(--bg); }
+  .settings-shell { flex-direction: column; }
+  .settings-nav {
+    flex: 0 0 auto;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    padding: max(8px, env(safe-area-inset-top)) 12px 8px;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .settings-nav::-webkit-scrollbar { height: 0; }
+  .settings-nav .nav-group { display: none; }
+  .settings-nav .nav-item {
+    flex: none;
+    padding: 8px 14px;
+    min-height: 40px;
+    white-space: nowrap;
+  }
+  .settings-nav .nav-item.nav-back {
+    /* 「返回」在横向条里就是第一个按钮，去掉它自己的分隔线 */
+    margin-bottom: 0;
+    padding-bottom: 8px;
+    border-bottom: none;
+  }
+  .settings-content { padding: 18px 16px 40px; }
+  .settings-page h2 { font-size: 17px; }
+  /* 卡片行：手机上 label 与控件挤在一行会撞，允许换行 */
+  .settings-card .row { flex-wrap: wrap; gap: 10px; }
+  .settings-card .row > label,
+  .settings-card .row > input,
+  .settings-card .row > select { flex: 1 1 140px; min-width: 0; }
+
+  /* 通用弹窗：手机上贴边、留出安全区 */
+  .overlay { padding: 12px; align-items: flex-end; }
+  .modal {
+    width: 100%;
+    max-height: 88vh;
+    max-height: 88dvh;
+    padding: 16px;
+  }
+  .picker-modal { max-height: 86vh; max-height: 86dvh; }
+
+  /* ══ 触摸端 hover 撤除（清单式）══════════════════════════════
+     为什么用「撤除」而不是把桌面规则包进 @media (hover:hover)：
+     包桌面规则要改 82 处 :hover，任何一处改错就是一处桌面回归，
+     而桌面回归在手机上验不出来。这里反过来 —— 只在**移动端断点内**
+     把会在点击后「粘住」的 hover 底色撤掉，桌面规则一个字不动。
+     代价是新增 hover 规则时要记得往这个清单里补一行（已写在
+     AGENTS.md 的检查清单里）。 */
+  .icon-btn:hover,
+  .pop-opt:hover,
+  .settings-btn:hover,
+  .ctx-meter:hover,
+  .nav-item:hover,
+  .to-bottom:hover,
+  .session-item:hover,
+  .label-btn:hover,
+  .msg-tool.clickable:hover,
+  .msg-tool.retry:hover,
+  .msg-explore summary:hover,
+  .msg-reasoning summary:hover,
+  .msg-user .edit-btn:hover {
+    background: transparent;
+    color: var(--text-dim);
+  }
+  .msg-user .edit-btn:hover { opacity: 0; }
+  .nav-item:hover { color: var(--text); }
+  .nav-item.active:hover { background: var(--bg-elev-2); }
+  .session-item:hover { color: var(--text); }
+  .settings-btn:hover svg { color: var(--text-dim); }
+  .icon-btn:hover { color: var(--text-dim); }
+
+  /* ══ 背景图 ═════════════════════════════════════════════════
+     桌面把 #app / #sidebar / #main 都设成 transparent 让背景图透上来。
+     手机上主区整屏铺满，背景图会盖在正文后面 —— 保持透，
+     但降低亮度一档以免影响正文对比度（桌面那张亮度滑条在手机上
+     仍然可调，这里只给个下限保护）。 */
+  body.has-bg #messages { background: transparent; }
 }

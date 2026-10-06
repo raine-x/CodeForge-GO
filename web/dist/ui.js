@@ -7677,4 +7677,130 @@
     document.getElementById('disc-filter').addEventListener('input', renderDiscList);
     document.getElementById('disc-add').addEventListener('click', addSelectedDiscModels);
   })();
+
+  /* ══════════════════════════════════════════════════════════════════
+     移动端壳层
+     ══════════════════════════════════════════════════════════════════
+
+     为什么整块追加在文件末尾、而不是改上面的既有函数：
+       web/test/render_md.test.js 里有针对 ui.js **源码文本**的断言，其中
+       至少一条是**顺序断言**（indexOf(head.appendChild(add)) 必须早于
+       indexOf(head.appendChild(dots))）。移动既有代码的位置就可能把它弄红，
+       而项目纪律是「纯重构：任何一个原有测试变红立即回滚」。追加在末尾
+       改动面最小 —— 上面一行都不动。
+
+     职责边界：**布局切换全部交给 CSS**（app.css 的移动端断点块），这里只做
+     CSS 做不到的三件事：
+       1. 抽屉开合（要改 body 的类名，纯 CSS 无法响应点击）
+       2. 断点切换时清掉上一侧留下的内联状态
+       3. 上下文占用条（桌面是 #ctx-fill，移动端是 #m-ctx-fill，两个都要更新）
+
+     断点条件必须与 app.css **逐字一致**，否则会出现「CSS 已切移动端但 JS
+     仍按桌面处理」的错位。改一处记得改另一处。 */
+  (function mobileShell() {
+    // 与 app.css 的 @media (max-width: 820px), (max-height: 520px) 对齐
+    const MQ = '(max-width: 820px), (max-height: 520px)';
+    const mq = window.matchMedia ? window.matchMedia(MQ) : null;
+
+    const scrim = document.getElementById('m-scrim');
+    const btnSessions = document.getElementById('m-sessions');
+    const btnSettings = document.getElementById('m-settings');
+    const openSettingsBtn = document.getElementById('open-settings');
+    const sidebar = document.getElementById('sidebar');
+
+    function isMobile() { return mq ? mq.matches : false; }
+
+    function openDrawer() {
+      document.body.classList.add('m-drawer-open');
+      // 抽屉内的卡片逐项延迟入场；--i 由顺序决定（app.css 里读它）
+      if (sidebar) {
+        const kids = Array.prototype.filter.call(
+          sidebar.children,
+          function (el) { return el.matches('.sidebar-card, .sidebar-footer, .sidebar-sep'); }
+        );
+        kids.forEach(function (el, i) { el.style.setProperty('--i', String(i)); });
+      }
+    }
+    function closeDrawer() { document.body.classList.remove('m-drawer-open'); }
+    function toggleDrawer() {
+      if (document.body.classList.contains('m-drawer-open')) closeDrawer();
+      else openDrawer();
+    }
+
+    if (scrim) scrim.addEventListener('click', closeDrawer);
+    if (btnSessions) btnSessions.addEventListener('click', toggleDrawer);
+    // 右上角「设置」转成一次对既有按钮的 click —— 设置的打开/关闭/记忆
+    // 全部由 openSettingsBtn 的既有逻辑负责，这里不复制一份，避免两套真相。
+    if (btnSettings && openSettingsBtn) {
+      btnSettings.addEventListener('click', function () {
+        closeDrawer();
+        openSettingsBtn.click();
+      });
+    }
+
+    // 选完会话就收起抽屉：手机上不点遮罩的话，抽屉会一直盖着对话。
+    // 用捕获阶段挂在 #sidebar 上，这样无论会话项由谁渲染都拦得住，
+    // 不必去改 renderSessions。
+    if (sidebar) {
+      sidebar.addEventListener('click', function (e) {
+        if (!isMobile()) return;
+        if (e.target.closest('.session-item, .new-chat-btn')) closeDrawer();
+      }, true);
+    }
+
+    /* 上下文占用：桌面 #ctx-fill 与移动 #m-ctx-fill 一起更新。
+       renderCtxUsage() 只认得前者（它要算 warn/danger/compressed 三种态，
+       规则在那边），所以这里只在渲染**之后**把结果镜像过去，
+       不重算一遍 —— 重算就会出现第二个判定真相。 */
+    const ctxFill = document.getElementById('m-ctx-fill');
+    const ctxBar = document.getElementById('m-ctx');
+    function mirrorCtx() {
+      const src = document.getElementById('ctx-fill');
+      const meter = document.getElementById('ctx-meter');
+      if (!ctxFill || !src) return;
+      ctxFill.style.width = src.style.width;
+      if (ctxBar && meter) {
+        ctxBar.classList.toggle('warn', meter.classList.contains('warn'));
+        ctxBar.classList.toggle('danger', meter.classList.contains('danger'));
+      }
+    }
+    if (ctxFill) {
+      const src = document.getElementById('ctx-fill');
+      if (src && window.MutationObserver) {
+        new MutationObserver(mirrorCtx).observe(src, {
+          attributes: true, attributeFilter: ['style', 'class']
+        });
+      }
+    }
+
+    /* 断点切换：把上一侧残留的状态清干净。
+       漏清的后果是具体的，不是「可能有点怪」：
+         · 桌面拖拽过侧栏 → inline width 会被搬进手机抽屉，抽屉宽度失控
+         · 手机上开着抽屉 → 转桌面后侧栏被 transform 藏在屏外，看起来像侧栏坏了
+         · 设置页开着 → 转桌面后设置还占着全屏 */
+    function resetForBreakpoint(mobile) {
+      if (mobile) {
+        // 内联宽度由 CSS 的 86vw/max-width 接管
+        if (sidebar) sidebar.style.width = '';
+      } else {
+        closeDrawer();
+        if (sidebar) { sidebar.style.width = ''; sidebar.style.transform = ''; }
+        document.querySelectorAll('.popup:not(.hidden)').forEach(function (p) {
+          p.classList.add('hidden');
+        });
+      }
+      mirrorCtx();
+    }
+    if (mq) {
+      if (mq.addEventListener) mq.addEventListener('change', function (e) { resetForBreakpoint(e.matches); });
+      else if (mq.addListener) mq.addListener(function (e) { resetForBreakpoint(e.matches); });
+    }
+
+    // 抽屉开着时按 Esc 关掉（桌面无此行为）
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && isMobile()) closeDrawer();
+    });
+
+    mirrorCtx();
+  })();
 })();
