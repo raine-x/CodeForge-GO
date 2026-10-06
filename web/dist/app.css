@@ -3503,6 +3503,63 @@ body.bg-dark .fs-tip {
   }
   .picker-modal { max-height: 86vh; max-height: 86dvh; }
 
+  /* ══ 供应商管理：双栏在手机上必须拆掉 ═══════════════════════
+     桌面是 .prov-md { grid-template-columns: 190px minmax(0,1fr) }，
+     窄屏下 .settings-content 内宽只剩 358px，被切成 190 + 168 两半：
+     名称/兼容协议两个字段挤成两行、输入框小到放不下四个字符、
+     key-seg 撑出横向滚动条。这里改单列。
+
+     但「单列堆叠」不是终点 —— 那样每次改一个供应商都得先滚过整张列表。
+     所以做成**下钻**：默认只显示列表，点某个才切到详情（body 上的
+     .m-prov-detail 由 ui.js 的 mobileShell 切），详情顶部有返回。
+     桌面不受影响：那两个 class 在桌面不匹配本断点。 */
+  .prov-md { grid-template-columns: 1fr; overflow: visible; }
+  .prov-list {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    padding: 8px;
+  }
+  .prov-item { min-height: 44px; }          /* 触摸目标 */
+  body:not(.m-prov-detail) .prov-detail { display: none; }
+  body.m-prov-detail .prov-list { display: none; }
+  .prov-detail { padding: 14px 14px 18px; }
+
+  /* 返回键：默认不渲染，窄屏下由 .m-prov-detail 决定显不显示 */
+  #m-prov-back { display: none; }
+  body.m-prov-detail #m-prov-back {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    width: fit-content;
+    margin: 0 0 10px;
+    padding: 7px 12px;
+    border: none;
+    border-radius: 999px;
+    background: var(--bg-elev-2);
+    color: var(--accent);
+    font: inherit;
+    font-size: 15px;
+    cursor: pointer;
+  }
+
+  /* 添加模型页是两列网格（#mtab-config .form-grid），窄屏同样收成单列 */
+  #mtab-config .form-grid { grid-template-columns: 1fr; }
+
+  /* 密钥行是「分段控件 + 输入框 + 眼睛」三件并排，窄屏必溢出。
+     flex-wrap 让它们换行，input 仍占满整行（flex-basis 100%）。 */
+  .key-row { flex-wrap: wrap; }
+  .key-row input, .key-eye-wrap { flex: 1 1 100%; }
+  .id-row { flex-wrap: wrap; }
+  .id-row input { flex: 1 1 100%; }
+  /* 继承信息里的 label 固定 74px，窄屏会把代码挤没 */
+  .mf-inherit .ir { flex-wrap: wrap; }
+  .mf-inherit .ir > span { width: auto; }
+
+  /* 模型页那排三枚 pill：窄屏允许横向滚动，不硬挤 */
+  .models-tabs-bar { overflow-x: auto; scrollbar-width: none; }
+  .models-tabs-bar::-webkit-scrollbar { height: 0; }
+  .models-tabs { margin: 0; }             /* 撤掉桌面那个居中，手机贴左 */
+
   /* ══ 触摸端 hover 撤除（清单式）══════════════════════════════
      为什么用「撤除」而不是把桌面规则包进 @media (hover:hover)：
      包桌面规则要改 82 处 :hover，任何一处改错就是一处桌面回归，

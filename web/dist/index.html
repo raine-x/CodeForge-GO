@@ -602,6 +602,11 @@
 
           <!-- 供应商管理：左列供应商 / 右侧详情（连接信息 + 其下模型） -->
           <div id="mtab-prov" class="mtab-pane">
+            <!-- 移动端下钻的返回键。桌面端不显示（见 app.css 的 #m-prov-back）：
+                 桌面是左右双栏，列表一直在左边，没有"回列表"这一步。
+                 放在 .prov-md **外面** —— #prov-detail 的内容由
+                 renderProviderDetail() 整块重写，放里面会被一起清掉。 -->
+            <button type="button" id="m-prov-back">‹ 供应商列表</button>
             <div class="prov-md">
               <div class="prov-list" id="prov-list"></div>
               <div class="prov-detail" id="prov-detail"></div>

@@ -7826,6 +7826,35 @@
     window.addEventListener('orientationchange', syncViewportStable);
     if (screen.orientation) screen.orientation.addEventListener('change', syncViewportStable);
 
+    /* 供应商管理下钻：窄屏下 .prov-md 从左右双栏变单列，只靠堆叠会让用户
+       每改一个供应商都先滚过整张列表，所以改成「列表 → 详情」两级。
+
+       用**事件委托**挂在 .prov-list 上，而不是改 renderProviders：
+       renderProviders 每次都重建全部 .prov-item，挂在按钮上的监听器会被
+       冲掉，挂在静态父节点上的不会。捕获阶段是为了不受 stopPropagation 影响。
+
+       同理不需要调 renderProviders() —— 详情本来就是渲染好的，
+       这里只是决定显示哪一半。 */
+    const provList = document.getElementById('prov-list');
+    const provBack = document.getElementById('m-prov-back');
+    function showProvList() { document.body.classList.remove('m-prov-detail'); }
+    if (provList) {
+      provList.addEventListener('click', function (e) {
+        if (!isMobile()) return;
+        if (e.target.closest('.prov-item')) document.body.classList.add('m-prov-detail');
+      }, true);
+    }
+    if (provBack) provBack.addEventListener('click', showProvList);
+
+    // 切到模型列表/添加模型时撤掉下钻，否则再切回供应商管理会直接落在详情上，
+    // 而用户上一眼看到的其实是列表 —— 状态与记忆不一致。
+    const modelsTabs = document.querySelector('.models-tabs');
+    if (modelsTabs) {
+      modelsTabs.addEventListener('click', function (e) {
+        if (e.target.closest('[data-mtab]')) showProvList();
+      }, true);
+    }
+
     /* 断点切换：把上一侧残留的状态清干净。
        漏清的后果是具体的，不是「可能有点怪」：
          · 桌面拖拽过侧栏 → inline width 会被搬进手机抽屉，抽屉宽度失控
@@ -7838,6 +7867,7 @@
         syncViewport();
       } else {
         closeDrawer();
+        showProvList();
         if (sidebar) { sidebar.style.width = ''; sidebar.style.transform = ''; }
         document.querySelectorAll('.popup:not(.hidden)').forEach(function (p) {
           p.classList.add('hidden');
