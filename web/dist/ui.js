@@ -7773,6 +7773,59 @@
       }
     }
 
+    /* ── 容器高度：写 --app-h ───────────────────────────────────
+       CSS 单位在这里都不可靠（详见 app.css 那段注释）：
+         100vh  = 地址栏收起时的视口高 → 聊天时容器高过可见区，
+                  #composer-wrap 贴的那个底边看不见，输入框被切在屏幕外；
+         100dvh = Chrome Android 上会朝收起态取值，首屏常常直接给大的那个，
+                  实测与 100vh 同症状。
+       visualViewport.height 才是「当前真正看得见的那块高度」——
+       已扣掉地址栏，也会在软键盘弹出时缩小，于是 composer 会自己升上去。
+
+       仍然取 innerHeight 的较小值兜底：visualViewport 是较新的 API，
+       缺失时 innerHeight 至少是「跟着地址栏变」的那个，比 100vh 强。 */
+    const vv = window.visualViewport;
+    function measureH() {
+      let h = window.innerHeight;
+      if (vv && vv.height) h = Math.min(h, vv.height);
+      return Math.round(h);
+    }
+    function syncViewport() {
+      if (!isMobile()) return;
+      document.documentElement.style.setProperty('--app-h', measureH() + 'px');
+    }
+
+    /* 旋转与键盘动画都不是「一次到位」：
+       orientationchange 在旋转**开始**时就触发，那刻读 innerHeight
+       拿到的还是旋转前的值；而真正的 resize 有些浏览器补发、有些干脆不发。
+       只挂事件就会卡在旧高度上 —— 正是最初报的「没有适配实际高度」。
+       所以额外连续量到稳定为止：连续 3 帧同值即认定稳定并停手，
+       最多量 30 帧（约 0.5 秒）。代价是旋转瞬间几十次 rect 读取，可忽略。
+
+       注意横屏↔竖屏**不跨断点**（844×390 命中 max-height:520px，
+       390×844 命中 max-width:820px，两边都是移动端），所以
+       resetForBreakpoint 那条路不会触发，状态不会在这里被继承，
+       只会在这里被重新量出来。 */
+    function syncViewportStable() {
+      syncViewport();
+      let last = measureH(), same = 0, tries = 0;
+      (function tick() {
+        const h = measureH();
+        if (h !== last) {
+          last = h; same = 0;
+          document.documentElement.style.setProperty('--app-h', h + 'px');
+        } else if (++same >= 3) return;
+        if (++tries < 30) requestAnimationFrame(tick);
+      })();
+    }
+    if (vv) {
+      vv.addEventListener('resize', syncViewportStable);
+      vv.addEventListener('scroll', syncViewport);
+    }
+    window.addEventListener('resize', syncViewportStable);
+    window.addEventListener('orientationchange', syncViewportStable);
+    if (screen.orientation) screen.orientation.addEventListener('change', syncViewportStable);
+
     /* 断点切换：把上一侧残留的状态清干净。
        漏清的后果是具体的，不是「可能有点怪」：
          · 桌面拖拽过侧栏 → inline width 会被搬进手机抽屉，抽屉宽度失控
@@ -7782,12 +7835,15 @@
       if (mobile) {
         // 内联宽度由 CSS 的 86vw/max-width 接管
         if (sidebar) sidebar.style.width = '';
+        syncViewport();
       } else {
         closeDrawer();
         if (sidebar) { sidebar.style.width = ''; sidebar.style.transform = ''; }
         document.querySelectorAll('.popup:not(.hidden)').forEach(function (p) {
           p.classList.add('hidden');
         });
+        // 桌面不读 --app-h，留着就是个没人用的内联值；清掉避免调试时误导
+        document.documentElement.style.removeProperty('--app-h');
       }
       mirrorCtx();
     }
@@ -7802,5 +7858,6 @@
     });
 
     mirrorCtx();
+    syncViewport();
   })();
 })();

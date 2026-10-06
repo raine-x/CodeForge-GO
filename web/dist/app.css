@@ -3222,25 +3222,45 @@ body.bg-dark .fs-tip {
     --m-spring: cubic-bezier(.34, 1.32, .44, 1);
   }
 
-  /* ── 画布去缝 + 高度改用动态视口 ──────────────────────────────
-     桌面的 #app 是 `height: 100vh`（app.css 那行）。在手机上 100vh 是
-     **地址栏收起时**的视口高，而聊天时地址栏多数时间是展开的 —— 实际可见
-     区域比 100vh 矮几十到一百多 px，于是 #main 底部被顶出屏幕，而
-     #composer-wrap 是 position:absolute 贴 #main 底的，结果就是
-     **输入框跑到可视区外**。这是「没有适配实际高度」的直接原因。
+  /* ── 容器高度：改由 --app-h 驱动 ──────────────────────────────
+     为什么不用 100vh / 100dvh：
+       · 100vh = 地址栏**收起**时的视口高。聊天时地址栏多数是展开的，
+         实际可见区比它矮几十到一百多 px → 容器高过可见区，
+         #composer-wrap 贴着的那个「底边」根本看不见，输入框被切在屏幕外。
+       · 100dvh 也不可靠：Chrome Android 的 dvh 会朝「收起态」取值，
+         首屏常常直接给大的那个，等价于 100vh（实测仍被切）。
+     唯一稳的是 visualViewport.height —— 它就是**当前真正看得见的那块高度**
+     （已扣掉地址栏与软键盘），并且随两者收放实时变化。
+     JS 侧在 ui.js 的 mobileShell() 里用 getBoundingClientRect 量出
+     --app-h 写进 :root；这里拿不到时回退 100dvh。
 
-     100dvh = dynamic viewport height，随地址栏收放实时变化；100svh 则是
-     地址栏展开时的最小值（适合「宁可留白也别跳动」的场景，这里不用）。
-     写法沿用本文件 .settings-shell 已有的「先 vh 再 dvh」回退模式 ——
-     不支持 dvh 的浏览器拿到 100vh，与改动前完全一致。
+     html/body 一并锁高并禁滚动：body 若还是布局视口高（比可见区高），
+     页面就能被拖出一条空白 —— 这正是「高度差」的另一半。
+     #app 改回 height:100%，高度由父级 body 传导，避免两处各写一次数值。 */
+  html, body { overflow: hidden; }
+  body { height: var(--app-h, 100dvh); }
 
-     ⚠️ 桌面不需要动：桌面没有地址栏，100dvh 与 100vh 等值，
-        所以这一条只写在移动端断点里。 */
   #app {
     padding: 0;
     background: var(--bg);
-    height: 100vh;    /* 老浏览器回退 */
-    height: 100dvh;   /* 实际视口高 */
+    height: 100%;
+  }
+
+  /* 设置页外壳同理：它上面那行 100dvh 同样是猜的，窄屏下会被切掉底部。 */
+  .settings-shell { height: var(--app-h, 100dvh); }
+
+  /* ── 所有 fixed 覆盖层 ────────────────────────────────────────
+     .settings-overlay / #picker-overlay / .overlay 都是
+     `position: fixed; inset: 0` —— inset:0 量的是**布局视口**
+     （手机上 = 地址栏收起时的高度），比可见区高出一截。后果不是
+     「多了一条空白边」这么简单：
+       · .overlay 是 align-items:flex-end（弹窗贴底）→ 弹窗底部落在
+         屏幕外，标题和关闭按钮都点不到；
+       · .settings-overlay 是居中 → 整页下移半个差值。
+     所以统一压到 --app-h 并解掉 bottom:0（否则 inset 的 bottom 会盖掉 height）。 */
+  .settings-overlay, #picker-overlay, .overlay {
+    height: var(--app-h, 100dvh);
+    bottom: auto;
   }
 
   /* ── 主区：去掉卡片边框与圆角，吃满整屏 ─────────────────────── */
