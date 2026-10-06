@@ -3222,10 +3222,25 @@ body.bg-dark .fs-tip {
     --m-spring: cubic-bezier(.34, 1.32, .44, 1);
   }
 
-  /* ── 画布去缝：桌面的「灰底 + 卡片留 6px 间隙」在手机上只剩缝隙 ── */
+  /* ── 画布去缝 + 高度改用动态视口 ──────────────────────────────
+     桌面的 #app 是 `height: 100vh`（app.css 那行）。在手机上 100vh 是
+     **地址栏收起时**的视口高，而聊天时地址栏多数时间是展开的 —— 实际可见
+     区域比 100vh 矮几十到一百多 px，于是 #main 底部被顶出屏幕，而
+     #composer-wrap 是 position:absolute 贴 #main 底的，结果就是
+     **输入框跑到可视区外**。这是「没有适配实际高度」的直接原因。
+
+     100dvh = dynamic viewport height，随地址栏收放实时变化；100svh 则是
+     地址栏展开时的最小值（适合「宁可留白也别跳动」的场景，这里不用）。
+     写法沿用本文件 .settings-shell 已有的「先 vh 再 dvh」回退模式 ——
+     不支持 dvh 的浏览器拿到 100vh，与改动前完全一致。
+
+     ⚠️ 桌面不需要动：桌面没有地址栏，100dvh 与 100vh 等值，
+        所以这一条只写在移动端断点里。 */
   #app {
     padding: 0;
     background: var(--bg);
+    height: 100vh;    /* 老浏览器回退 */
+    height: 100dvh;   /* 实际视口高 */
   }
 
   /* ── 主区：去掉卡片边框与圆角，吃满整屏 ─────────────────────── */
@@ -3287,6 +3302,13 @@ body.bg-dark .fs-tip {
     from { opacity: 0; transform: translateX(-16px); }
     to   { opacity: 1; transform: none; }
   }
+
+  /* 设置入口去重：抽屉里这枚与顶部浮条右上角是同一个动作
+     （mobileShell 是把右枚**转成一次对 #open-settings 的 click**，
+     走的是同一条通道），同一个动作摆两处就是让用户猜哪个是入口。
+     移动端只保留右上角那枚；抽屉页脚只剩上下文计量器。 */
+  #sidebar #open-settings { display: none; }
+  #sidebar .sidebar-footer { justify-content: flex-start; }
 
   /* 抽屉内的可点行：手机上放大到 44px 触摸目标 */
   .new-chat-btn,
@@ -3394,6 +3416,7 @@ body.bg-dark .fs-tip {
   .popup {
     max-width: calc(100vw - 24px);
     max-height: 56vh;
+    max-height: 56dvh;   /* 同 #app：按实际视口算，否则地址栏展开时会超出屏幕 */
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
     overscroll-behavior: contain;
