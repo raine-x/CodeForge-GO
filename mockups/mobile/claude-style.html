@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CodeForge 移动端 · Claude 式</title>
+<style>
+/* ============================================================
+   视觉基调参考 Claude 移动端：
+   暖奶油底（非纯白非灰）+ 陶土色强调 + 衬线大标题 +
+   悬浮输入卡（大圆角、软阴影、四周留白）+ 全程无边框。
+   分层只靠留白与同色系深浅两档。
+   ============================================================ */
+:root{
+  --bg:#F5F4EF;
+  --surface:#FAF9F5;
+  --card:#FFFFFF;
+  --bubble:#E8E6E1;
+  --pill:#EDEBE5;
+  --ink:#1F1E1D;
+  --ink-2:#6E6B64;
+  --ink-3:#A5A29A;
+  --line:#E4E2DB;
+  --accent:#D97757;
+  --accent-ink:#B75B3C;
+  --accent-soft:#F4E3DC;
+  --dark:#1F1E1D;
+  --shadow:0 1px 2px rgba(31,30,29,.04),0 8px 24px rgba(31,30,29,.07);
+  --shadow-lift:0 2px 6px rgba(31,30,29,.06),0 18px 44px rgba(31,30,29,.12);
+  --serif:Georgia,"Songti SC","Noto Serif SC","Times New Roman",serif;
+  --sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei",sans-serif;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+body.dark{
+  --bg:#262624;
+  --surface:#2E2E2B;
+  --card:#33332F;
+  --bubble:#3D3D39;
+  --pill:#3A3A36;
+  --ink:#EDEBE6;
+  --ink-2:#A8A59E;
+  --ink-3:#77746E;
+  --line:#3C3C38;
+  --accent:#E08A67;
+  --accent-ink:#EDA183;
+  --accent-soft:#4A3428;
+  --dark:#EDEBE6;
+  --shadow:0 1px 2px rgba(0,0,0,.2),0 8px 24px rgba(0,0,0,.28);
+  --shadow-lift:0 2px 6px rgba(0,0,0,.24),0 18px 44px rgba(0,0,0,.36);
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%}
+body{
+  background:#0d0d0c;color:var(--ink);font-family:var(--sans);
+  -webkit-font-smoothing:antialiased;display:flex;align-items:center;justify-content:center;
+}
+@media (max-width:520px){body{background:var(--bg)}}
+
+.phone{
+  width:390px;height:844px;position:relative;overflow:hidden;
+  background:var(--bg);display:flex;flex-direction:column;
+}
+@media (min-width:521px){.phone{border-radius:46px;box-shadow:0 40px 90px rgba(0,0,0,.55),0 0 0 10px #1a1a19,0 0 0 11.5px #46453f}}
+
+/* ---- 状态栏 / 灵动岛 ---- */
+.island{position:absolute;top:11px;left:50%;transform:translateX(-50%);width:124px;height:35px;background:#000;border-radius:20px;z-index:80;pointer-events:none}
+.sb{flex:none;height:52px;display:flex;align-items:center;justify-content:space-between;padding:12px 30px 0;font-size:14.5px;font-weight:600;z-index:50;pointer-events:none}
+.sb .r{display:flex;gap:5px;align-items:center;opacity:.9}
+
+/* ---- 顶栏 ---- */
+.topbar{flex:none;display:flex;align-items:center;justify-content:space-between;padding:2px 20px 10px;z-index:30}
+.iconbtn{
+  width:40px;height:40px;border:none;background:none;cursor:pointer;color:var(--ink);
+  display:grid;place-items:center;border-radius:50%;transition:background .16s;
+}
+.iconbtn:active{background:var(--bubble)}
+
+/* CodeForge 星芒标（12 条圆头放射线） */
+.mark{width:26px;height:26px;display:block;color:var(--accent)}
+.mark path{stroke:currentColor;stroke-width:3.1;stroke-linecap:round}
+
+/* ---- 对话区 ---- */
+.scroll{flex:1 1 auto;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch}
+.scroll::-webkit-scrollbar{width:0}
+.thread{padding:6px 20px 20px}
+.gap{height:26px}
+
+/* 用户：暖灰气泡，右对齐，20px 圆角 + 右下 6px 收角 */
+.you{max-width:84%;margin-left:auto;background:var(--bubble);border-radius:20px 20px 6px 20px;
+  padding:12px 17px;font-size:16.5px;line-height:1.5;letter-spacing:-.2px;color:var(--ink);word-break:break-word}
+
+/* 助手：星芒标 + 正文，无气泡 */
+.bot{display:flex;gap:12px;align-items:flex-start}
+.bot .mark{flex:none;margin-top:4px;width:21px;height:21px}
+.bot .mark path{stroke-width:3.4}
+.bot .bx{flex:1;min-width:0}
+.bot p{margin:0 0 13px;font-size:16.5px;line-height:1.58;letter-spacing:-.2px}
+.bot p:last-child{margin-bottom:0}
+.bot code{font-family:var(--mono);font-size:14.5px;background:var(--pill);padding:2px 6px;border-radius:6px}
+.bot pre{background:var(--pill);border-radius:14px;padding:14px 15px;margin:0 0 13px;overflow-x:auto}
+.bot pre code{background:none;padding:0;font-size:13.5px;line-height:1.6}
+.bot strong{font-weight:600}
+
+/* 工具轨迹：一行可展开，暖灰底，与用户气泡同族 */
+.act{background:var(--bubble);border-radius:18px;margin:0 0 13px;overflow:hidden}
+.act-h{width:100%;display:flex;align-items:center;gap:10px;padding:13px 16px;border:none;background:none;cursor:pointer;font-family:inherit;text-align:left}
+.act-h .ic{flex:none;color:var(--ink-2);display:flex}
+.act-h .t{flex:1;min-width:0;font-size:15px;letter-spacing:-.1px;color:var(--ink-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.act-h .cv{flex:none;color:var(--ink-3);display:flex;transition:transform .22s cubic-bezier(.32,.72,0,1)}
+.act.open .act-h .cv{transform:rotate(90deg)}
+.act-h .t.ink{color:var(--ink)}
+.act.ok .act-h .ic,.act.ok .act-h .t{color:var(--accent-ink)}
+.act.ask .act-h .ic,.act.ask .act-h .t{color:var(--accent-ink)}
+.act.ask{background:var(--accent-soft)}
+.act-b{display:none;padding:0 16px 14px}
+.act.open .act-b{display:block}
+.act-r{display:flex;align-items:baseline;gap:10px;padding:8px 0;font-size:14.5px;color:var(--ink-2)}
+.act-r+.act-r{border-top:1px solid var(--line)}
+.act-r .n{font-family:var(--mono);font-size:13.5px;color:var(--ink);flex:none}
+.act-r .d{flex:1;min-width:0;text-align:right;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.add{color:var(--accent-ink);font-family:var(--mono);font-size:12.5px;flex:none}
+.del{color:var(--ink-3);font-family:var(--mono);font-size:12.5px;flex:none}
+
+/* 提示条 */
+.note{display:flex;gap:10px;align-items:flex-start;padding:12px 15px;border-radius:16px;
+  background:var(--pill);margin:0 0 13px;font-size:14.5px;line-height:1.45;color:var(--ink-2)}
+.note .ic{flex:none;color:var(--accent);display:flex;margin-top:1px}
+.note b{color:var(--ink);font-weight:600}
+
+/* 审批卡 */
+.approve{background:var(--card);border-radius:20px;padding:16px;margin:0 0 13px;box-shadow:var(--shadow)}
+body.dark .approve{background:var(--pill)}
+.approve .ah{display:flex;align-items:center;gap:9px;margin-bottom:8px}
+.approve .ah .ic{flex:none;color:var(--accent);display:flex}
+.approve .ah .t{font-size:16.5px;font-weight:600;letter-spacing:-.2px}
+.approve .ad{font-size:14.5px;line-height:1.5;color:var(--ink-2);margin-bottom:14px}
+.approve .ad code{font-family:var(--mono);font-size:13.5px}
+.approve .btns{display:flex;gap:9px}
+.pillbtn{
+  height:44px;padding:0 22px;border:none;border-radius:999px;cursor:pointer;
+  font-family:inherit;font-size:15.5px;font-weight:500;letter-spacing:-.1px;
+}
+.pillbtn.dark{background:var(--dark);color:var(--bg)}
+.pillbtn.ghost{background:var(--pill);color:var(--ink)}
+.pillbtn:active{opacity:.75}
+
+/* 消息下方动作行（裸图标，无底色） */
+.acts{display:flex;gap:20px;padding:2px 0 0;margin-left:33px}
+.acts button{border:none;background:none;padding:4px;color:var(--ink-3);cursor:pointer;display:flex}
+.acts button:active{color:var(--ink-2)}
+
+/* ---- 底部悬浮输入卡 ---- */
+.dockwrap{flex:none;padding:0 16px calc(14px + env(safe-area-inset-bottom));z-index:30}
+.dock{
+  background:var(--card);border-radius:28px;box-shadow:var(--shadow-lift);
+  padding:6px 8px 8px;position:relative;overflow:hidden;
+}
+.dock textarea{
+  width:100%;resize:none;max-height:110px;border:none;outline:none;background:none;
+  color:var(--ink);font-family:inherit;font-size:16.5px;line-height:1.45;letter-spacing:-.2px;
+  padding:11px 13px 4px;display:block;
+}
+.dock textarea::placeholder{color:var(--ink-3)}
+.dock .row{display:flex;align-items:center;gap:7px;padding:2px 4px 2px}
+.ring{
+  flex:none;width:40px;height:40px;border-radius:50%;border:none;cursor:pointer;
+  background:var(--pill);color:var(--ink);display:grid;place-items:center;
+}
+.ring:active{background:var(--bubble)}
+.modelpill{
+  flex:1;min-width:0;height:40px;padding:0 16px;border:none;border-radius:999px;cursor:pointer;
+  background:var(--pill);color:var(--ink);font-family:inherit;font-size:15px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left;
+}
+.sendbtn{
+  flex:none;width:40px;height:40px;border-radius:50%;border:none;cursor:pointer;
+  background:var(--dark);color:var(--bg);display:grid;place-items:center;
+}
+.sendbtn.armed{background:var(--accent);color:#fff}
+.sendbtn:disabled{background:var(--pill);color:var(--ink-3);cursor:default}
+/* 上下文占用：贴着卡片底缘 2px，几乎看不见 */
+.ctxline{position:absolute;left:20px;right:20px;bottom:0;height:2px;background:transparent}
+.ctxline i{display:block;height:100%;width:34%;background:var(--accent);opacity:.5;border-radius:0 2px 2px 0}
+
+/* ---- 抽屉（会话） ---- */
+.scrim{position:absolute;inset:0;background:rgba(31,30,29,.34);z-index:60;opacity:0;visibility:hidden;transition:opacity .3s,visibility .3s}
+.scrim.on{opacity:1;visibility:visible}
+.drawer{
+  position:absolute;top:0;bottom:0;left:0;width:87%;max-width:340px;z-index:61;
+  background:var(--surface);border-radius:0 22px 22px 0;
+  display:flex;flex-direction:column;box-shadow:8px 0 40px rgba(31,30,29,.14);
+  transform:translateX(-101%);transition:transform .34s cubic-bezier(.32,.72,0,1);
+}
+.drawer.open{transform:translateX(0)}
+.drawer .dbody{flex:1 1 auto;min-height:0;overflow-y:auto;padding:0 0 10px}
+.drawer .dbody::-webkit-scrollbar{width:0}
+.dtitle{font-family:var(--serif);font-size:38px;letter-spacing:-.5px;padding:66px 26px 24px;color:var(--ink)}
+.dnav{padding:0 14px}
+.dnav a{
+  display:flex;align-items:center;gap:15px;height:52px;padding:0 12px;border-radius:14px;
+  color:var(--ink);text-decoration:none;font-size:17.5px;letter-spacing:-.2px;cursor:pointer;
+}
+.dnav a:active{background:var(--pill)}
+.dnav a.on{background:var(--pill)}
+.dnav a .ic{flex:none;color:var(--ink);display:flex}
+.dsep{height:1px;background:var(--line);margin:20px 26px 6px}
+.dhead{padding:16px 26px 8px;font-size:14.5px;color:var(--ink-3);letter-spacing:-.1px}
+.drow{
+  display:flex;align-items:center;gap:14px;min-height:52px;padding:6px 26px;cursor:pointer;
+}
+.drow:active{background:var(--pill)}
+.drow.on{background:var(--pill);border-radius:0}
+.drow .dot{flex:none;width:8px;height:8px;border-radius:50%;background:var(--ink-3)}
+.drow .dt{flex:1;min-width:0;font-size:16.5px;letter-spacing:-.2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dfoot{
+  flex:none;display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:14px 22px calc(20px + env(safe-area-inset-bottom));
+}
+.avatar{
+  flex:none;width:48px;height:48px;border-radius:50%;background:var(--accent);color:#fff;
+  display:grid;place-items:center;font-size:17px;font-weight:600;border:none;cursor:pointer;
+}
+.newchat{
+  flex:none;height:48px;padding:0 26px;border:none;border-radius:999px;cursor:pointer;
+  background:var(--dark);color:var(--bg);font-family:inherit;font-size:16.5px;font-weight:500;
+  letter-spacing:-.2px;display:flex;align-items:center;gap:8px;
+}
+
+/* ---- 设置：整页推入 ---- */
+.page{
+  position:absolute;inset:0;z-index:70;background:var(--bg);display:flex;flex-direction:column;
+  transform:translateX(100%);transition:transform .34s cubic-bezier(.32,.72,0,1);
+}
+.page.pushed{transform:translateX(0)}
+.page .ptitle{font-family:var(--serif);font-size:34px;letter-spacing:-.4px;padding:64px 26px 6px}
+.page .pbody{flex:1 1 auto;min-height:0;overflow-y:auto;padding:0 26px 40px}
+.page .pbody::-webkit-scrollbar{width:0}
+.backrow{padding:58px 14px 2px;display:flex}
+.backrow button{
+  border:none;background:none;color:var(--ink);font-family:inherit;font-size:16.5px;
+  display:flex;align-items:center;gap:5px;cursor:pointer;padding:6px 10px;border-radius:999px;
+}
+.backrow button:active{background:var(--pill)}
+.grouplabel{padding:26px 0 10px;font-size:14.5px;color:var(--ink-3);letter-spacing:-.1px}
+.srow{
+  display:flex;align-items:center;gap:14px;min-height:56px;padding:9px 0;cursor:pointer;
+}
+.srow+.srow{border-top:1px solid var(--line)}
+.srow .ic{flex:none;width:20px;color:var(--ink-2);display:flex}
+.srow .lb{flex:1;min-width:0;font-size:16.5px;letter-spacing:-.2px}
+.srow .lb small{display:block;font-size:13.5px;color:var(--ink-2);margin-top:3px;line-height:1.4}
+.srow .vl{flex:none;color:var(--ink-2);font-size:16px;max-width:46%;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.srow .cv{flex:none;color:var(--ink-3);display:flex}
+select{
+  appearance:none;-webkit-appearance:none;border:none;background:none;outline:none;cursor:pointer;
+  color:var(--ink-2);font-family:inherit;font-size:16px;max-width:50%;text-align:right;padding:0;
+}
+.seg{display:flex;background:var(--pill);border-radius:999px;padding:3px;flex:none}
+.seg button{
+  border:none;background:none;font-family:inherit;font-size:14px;color:var(--ink-2);
+  padding:6px 14px;border-radius:999px;cursor:pointer;
+}
+.seg button.on{background:var(--card);color:var(--ink);font-weight:500;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+body.dark .seg button.on{background:var(--ink)}
+.sw{position:relative;width:50px;height:30px;flex:none}
+.sw input{position:absolute;inset:0;opacity:0;width:100%;height:100%;margin:0;cursor:pointer;z-index:2}
+.sw i{position:absolute;inset:0;background:var(--pill);border-radius:30px;transition:.24s cubic-bezier(.32,.72,0,1)}
+.sw i::after{content:'';position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;
+  background:var(--ink-3);transition:.24s cubic-bezier(.32,.72,0,1)}
+.sw input:checked+i{background:var(--accent)}
+.sw input:checked+i::after{transform:translateX(20px);background:#fff}
+
+/* ---- 桌面说明 ---- */
+.note{position:absolute;left:calc(50% + 232px);top:50%;transform:translateY(-50%);width:290px;color:#a9a79f;font-size:12.5px;line-height:1.9}
+.note h4{margin:0 0 12px;color:#fff;font-size:15px;font-weight:600}
+.note li{margin-bottom:9px;list-style:none;padding-left:15px;position:relative}
+.note li::before{content:'—';position:absolute;left:0;color:#55534c}
+.note .thr{display:flex;gap:8px;margin-top:18px;flex-wrap:wrap}
+.note .thr button{border:1px solid #302f2b;background:#1a1a18;color:#a9a79f;border-radius:999px;padding:7px 14px;font-size:12px;cursor:pointer;font-family:inherit}
+.note .thr button:hover{background:#252521;color:#fff}
+@media (max-width:1150px){.note{display:none}}
+</style>
+</head>
+<body>
+
+<div class="phone">
+  <div class="island"></div>
+  <div class="sb"><span>9:41</span><span class="r">
+    <svg width="17" height="11" viewBox="0 0 17 11" fill="currentColor"><rect y="7.5" width="3" height="3.5" rx="1"/><rect x="4.7" y="5" width="3" height="6" rx="1"/><rect x="9.4" y="2.5" width="3" height="8.5" rx="1"/><rect x="14" y="0" width="3" height="11" rx="1"/></svg>
+    <svg width="16" height="11" viewBox="0 0 16 11" fill="currentColor"><path d="M8 9.9 5.9 7.8a3 3 0 0 1 4.2 0zM8 4.6a6.2 6.2 0 0 0-4.3 1.8L2.4 5a8.3 8.3 0 0 1 11.2 0L12.3 6.4A6.2 6.2 0 0 0 8 4.6m0-3.8a10 10 0 0 0-7 2.8L0 2.2A12 12 0 0 1 8 .2a12 12 0 0 1 8 2l-1.3 1.4A10 10 0 0 0 8 .8"/></svg>
+    <svg width="25" height="12" viewBox="0 0 25 12" fill="none"><rect x=".6" y=".6" width="20" height="10.8" rx="3.3" stroke="currentColor" stroke-opacity=".4" stroke-width="1.1"/><rect x="2.2" y="2.2" width="16.8" height="7.6" rx="2.1" fill="currentColor"/><path d="M22.4 4.2v3.6a2.2 2.2 0 0 0 0-3.6" fill="currentColor" fill-opacity=".45"/></svg>
+  </span></div>
+
+  <!-- ═════ 对话 ═════ -->
+  <header class="topbar">
+    <button class="iconbtn" onclick="openD()" aria-label="会话">
+      <svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M3.5 6.5h17M3.5 12h17M3.5 17.5h11"/></svg>
+    </button>
+    <button class="iconbtn" onclick="push()" aria-label="设置">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h9M17.5 7H20M4 17h3.5M12 17h8M4 12h12M19.5 12H20"/><circle cx="15.2" cy="7" r="2.3"/><circle cx="9.8" cy="17" r="2.3"/><circle cx="18.2" cy="12" r="2.3"/></svg>
+    </button>
+  </header>
+
+  <div class="scroll">
+    <div class="thread">
+
+      <div class="you">设置页的模型列表点一下没反应，帮我看看。</div>
+
+      <div class="bot">
+        <svg class="mark" viewBox="0 0 24 24"><g id="a"></g></svg>
+        <div class="bx">
+          <p>找到了。事件只在一处绑定，重渲染把它冲掉了。</p>
+          <pre><code>tbody.innerHTML = rows.join("");
+tbody.onclick = onRowClick;   // ← 只有这里</code></pre>
+          <p>另外两处 <code>innerHTML</code> 直写绕开了绑定，所以点到的行没有 handler。改用事件委托，把绑定挂到容器上就行。</p>
+        </div>
+      </div>
+
+      <div class="acts">
+        <button title="复制"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="8.5" y="8.5" width="12" height="12" rx="2.4"/><path d="M15.5 5.5v-1a1 1 0 0 0-1-1h-9a2 2 0 0 0-2 2v9a1 1 0 0 0 1 1h1"/></svg></button>
+        <button title="重试"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11.5A8 8 0 1 0 18 17"/><path d="M20 5.5v6h-6"/></svg></button>
+        <button title="编辑重发"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 3.5 20.5 7.5 8 20H4v-4z"/></svg></button>
+      </div>
+
+      <div class="note">
+        <span class="ic"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5M12 15.5v.5"/></svg></span>
+        <span><b>上游限流</b> · 排队约 12 秒后已发出，消息没有丢失。</span>
+      </div>
+
+      <div class="act ok open">
+        <button class="act-h">
+          <span class="ic"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6.5 9.5 17 4.5 12"/></svg></span>
+          <span class="t">子智能体 · 探索事件绑定</span>
+          <span class="cv"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m9 5 7 7-7 7"/></svg></span>
+        </button>
+        <div class="act-b">
+          <div class="act-r"><span class="n">explore</span><span class="d">找到 3 处重渲染写入口</span></div>
+        </div>
+      </div>
+
+      <div class="act ask">
+        <button class="act-h">
+          <span class="ic"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14.6 3.6 20.4 9.4 9.2 20.6H4.2v-5z"/><path d="M12.6 5.6 18.4 11.4"/></svg></span>
+          <span class="t">edit_file · ui.js</span>
+          <span class="cv"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m9 5 7 7-7 7"/></svg></span>
+        </button>
+        <div class="act-b">
+          <div class="act-r"><span class="n">改为事件委托</span><span class="d">模型列表段</span><span class="add">+12</span><span class="del">−3</span></div>
+          <div class="act-r"><span class="n">同步 3 处调用</span><span class="d">renderModelList</span><span class="add">+5</span><span class="del">−5</span></div>
+        </div>
+      </div>
+
+      <div class="approve">
+        <div class="ah">
+          <span class="ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5M12 15.5v.5"/></svg></span>
+          <span class="t">需要你的确认</span>
+        </div>
+        <div class="ad">将修改 <code>ui.js</code>（+17 −8）。写操作，已生成快照，可随时撤销。</div>
+        <div class="btns">
+          <button class="pillbtn ghost" style="padding:0 16px">拒绝</button>
+          <button class="pillbtn ghost" style="padding:0 16px">看 diff</button>
+          <button class="pillbtn dark" style="flex:1">批准</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="dockwrap">
+    <div class="dock">
+      <textarea rows="1" placeholder="回复 CodeForge…"></textarea>
+      <div class="row">
+        <button class="ring" title="附件 / @ 提及">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+        <button class="modelpill">AD · 中等思考</button>
+        <button class="sendbtn armed" title="发送">
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19.5V5M6 11l6-6 6 6"/></svg>
+        </button>
+      </div>
+      <div class="ctxline"><i></i></div>
+    </div>
+  </div>
+
+  <div class="scrim" onclick="closeAll()"></div>
+
+  <!-- ═════ 抽屉：会话 ═════ -->
+  <aside class="drawer" id="drw">
+    <div class="dbody">
+      <h1 class="dtitle">CodeForge</h1>
+      <nav class="dnav">
+        <a class="on" onclick="closeAll()">
+          <span class="ic"><svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 11.3a7.7 7.7 0 0 1-8 7.7c-.9 0-1.7-.15-2.5-.44L4.6 20l1.3-5.4a8 8 0 0 1-.45-2.6 7.7 7.7 0 0 1 7.7-8h.35a7.7 7.7 0 0 1 7 7.3z"/></svg></span>会话
+        </a>
+        <a><span class="ic"><svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7.5h18v12H3z"/><path d="M3 7.5 5.4 4h13.2L21 7.5"/></svg></span>项目</a>
+        <a><span class="ic"><svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m8.5 7-4 5 4 5M15.5 7l4 5-4 5M13.5 4l-3 16"/></svg></span>技能</a>
+        <a><span class="ic"><svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="12" r="2.4"/><circle cx="18" cy="12" r="2.4"/><circle cx="12" cy="6" r="2.4"/><circle cx="12" cy="18" r="2.4"/><path d="m8 10.8 2.5-3.2M16 10.8l-2.5-3.2M8 13.2l2.5 3.2M16 13.2l-2.5 3.2"/></svg></span>MCP 服务</a>
+      </nav>
+      <div class="dsep"></div>
+      <div class="dhead">最近</div>
+      <div class="drow on"><span class="dot"></span><span class="dt">修复输入框无法弹出的问题</span></div>
+      <div class="drow"><span class="dot"></span><span class="dt">给工具加 SideEffect 声明</span></div>
+      <div class="drow"><span class="dot"></span><span class="dt">限流器并发压测复现</span></div>
+      <div class="drow"><span class="dot"></span><span class="dt">工作区围栏攻击用例</span></div>
+      <div class="drow"><span class="dot"></span><span class="dt">重写 README 架构章节</span></div>
+      <div class="drow"><span class="dot"></span><span class="dt">MCP 插件调试草稿</span></div>
+    </div>
+    <div class="dfoot">
+      <button class="avatar">CF</button>
+      <button class="newchat">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>新建对话
+      </button>
+    </div>
+  </aside>
+
+  <!-- ═════ 设置（整页） ═════ -->
+  <section class="page" id="pgSet">
+    <div class="backrow">
+      <button onclick="pop()"><svg width="11" height="19" viewBox="0 0 11 19" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2 3 9.5l6.5 7.5"/></svg>返回</button>
+    </div>
+    <h1 class="ptitle">设置</h1>
+    <div class="pbody">
+
+      <div class="grouplabel">模型</div>
+      <div class="srow" data-go>
+        <span class="ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3.4 2.1 5.3 5.5.2-4.3 3.5 1.6 5.3L12 15l-4.9 2.7 1.6-5.3L4.4 8.9l5.5-.2z"/></svg></span>
+        <span class="lb">当前模型</span>
+        <select><option>AD (Atria-Dawn)</option><option>DeepSeek V4.1 Flash</option></select>
+        <span class="cv"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m9 5 7 7-7 7"/></svg></span>
+      </div>
+      <div class="srow">
+        <span class="ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 12h4l3-7 2 14 3-7h4"/></svg></span>
+        <span class="lb">思考强度</span>
+        <div class="seg"><button>低</button><button class="on">中</button><button>高</button></div>
+      </div>
+      <div class="srow">
+        <span class="ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.6"/><path d="M12 7.2V12l3.2 2"/></svg></span>
+        <span class="lb">RPM 上限<small>0 = 不限制，发请求前预约错开</small></span>
+        <select><option>不限</option><option>60</option><option>20</option></select>
+      </div>
+
+      <div class="grouplabel">多模态能力</div>
+      <div class="srow">
+        <span class="ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.6" width="18" height="14.8" rx="2.4"/><circle cx="8.4" cy="9.6" r="1.6"/><path d="m4 17 5-5 4 4 3-2 4 4"/></svg></span>
+        <span class="lb">图片<small>不声明 = 照常发，被拒后记住</small></span>
+        <div class="seg"><button class="on">不声明</button><button>支持</button><button>否</button></div>
+      </div>
+      <div class="srow">
+        <span class="ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.6" y="5" width="18.8" height="14" rx="2.4"/><path d="m10 9.4 5 2.6-5 2.6z"/></svg></span>
+        <span class="lb">视频<small>仅原生透传，不做本地抽帧</small></span>
+        <div class="seg"><button class="on">不声明</button><button>支持</button><button>否</button></div>
+      </div>
+
+      <div class="grouplabel">权限与安全</div>
+      <div class="srow" data-go>
+        <span class="ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.2 4.6 6.3v5.2c0 4.4 3 8.3 7.4 9.3 4.4-1 7.4-4.9 7.4-9.3V6.3z"/></svg></span>
+        <span class="lb">权限模式</span>
+        <select><option>自动</option><option>询问</option><option>只读</option></select>
+        <span class="cv"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m9 5 7 7-7 7"/></svg></span>
+      </div>
+      <div class="srow">
+        <span class="ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="10.5" width="15" height="10" rx="2.2"/><path d="M8 10.5V7.4a4 4 0 0 1 8 0v3.1"/></svg></span>
+        <span class="lb">允许工作区外写入<small>默认关闭；越界需要单独审批</small></span>
+        <label class="sw"><input type="checkbox"><i></i></label>
+      </div>
+
+      <div class="grouplabel">智能体</div>
+      <div class="srow">
+        <span class="ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8.5" r="3"/><path d="M3.6 19a5.4 5.4 0 0 1 10.8 0"/><circle cx="17" cy="9.5" r="2.3"/><path d="M16.4 18.6a4.4 4.4 0 0 1 4-3.4"/></svg></span>
+        <span class="lb">子智能体并发上限</span>
+        <select><option>5</option><option>3</option><option>1</option></select>
+      </div>
+      <div class="srow">
+        <span class="ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6.5 9.5 17 4.5 12"/></svg></span>
+        <span class="lb">目标模式<small>独立审查者验证通过后才允许宣布完成</small></span>
+        <label class="sw"><input type="checkbox" checked><i></i></label>
+      </div>
+
+      <div class="grouplabel">外观</div>
+      <div class="srow">
+        <span class="ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.6"/><path d="M12 3.4v17.2a8.6 8.6 0 0 0 0-17.2" fill="currentColor" stroke="none"/></svg></span>
+        <span class="lb">深色</span>
+        <label class="sw"><input type="checkbox" id="dk"><i></i></label>
+      </div>
+      <div class="srow">
+        <span class="ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 2.2 5.6L20 10.8l-4.3 3.6L17 20l-5-2.9L7 20l1.3-5.6L4 10.8l5.8-2.2z"/></svg></span>
+        <span class="lb">液态玻璃</span>
+        <label class="sw"><input type="checkbox"><i></i></label>
+      </div>
+
+      <div class="grouplabel">连接</div>
+      <div class="srow" data-go>
+        <span class="ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4.5 12 3l3 1.5 3.5-1v15L15 20l-3-1.5L9 20l-3.5 1.5v-15z"/><path d="M12 3v15.5"/></svg></span>
+        <span class="lb">MCP 服务<small>parallel_search 在线</small></span>
+        <span class="cv"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m9 5 7 7-7 7"/></svg></span>
+      </div>
+
+    </div>
+  </section>
+</div>
+
+<div class="note">
+  <h4>Claude 式 · CodeForge</h4>
+  <ul>
+    <li>暖奶油底 <code>#F5F4EF</code>，不是白也不是灰；陶土色 <code>#D97757</code> 只用在三处：星芒标、发送键、头像</li>
+    <li>衬线大字做标题（38px / 34px），正文全用无衬线 16.5px —— Claude 的排版签名</li>
+    <li>输入框是<b>悬浮白卡</b>：28px 圆角、软阴影、四周 16px 留白，不贴边</li>
+    <li>用户气泡暖灰 <code>#E8E6E1</code> 右对齐；助手只放星芒标 + 正文，<b>完全没有气泡</b></li>
+    <li>工具轨迹压成<b>一行可展开</b>，底色复用气泡灰；待审批整行换成陶土浅底</li>
+    <li>审批按钮按 Claude 的药丸语汇：拒绝 / 看 diff 在左，<b>黑色主按钮「批准」撑满右侧</b></li>
+    <li>左上角汉堡线 → 左侧抽屉（衬线大标题 + 图标导航 + 最近列表 + 黑色「新建对话」药丸）</li>
+    <li>右上角滑块图标 → 设置整页推入，行为与 Claude 的项目页一致</li>
+  </ul>
+  <div class="thr">
+    <button onclick="document.body.classList.toggle('dark')">切换深色</button>
+    <button onclick="location.href='ios-native.html'">对比 iOS 那版</button>
+  </div>
+</div>
+
+<script>
+/* 12 条圆头放射线画星芒标 */
+(function(){
+  var g=document.getElementById('a'),ns='http://www.w3.org/2000/svg';
+  for(var i=0;i<12;i++){
+    var ang=i*30*Math.PI/180;
+    var l=document.createElementNS(ns,'line');
+    l.setAttribute('x1',12-Math.cos(ang)*9.4);
+    l.setAttribute('y1',12-Math.sin(ang)*9.4);
+    l.setAttribute('x2',12+Math.cos(ang)*9.4);
+    l.setAttribute('y2',12+Math.sin(ang)*9.4);
+    g.appendChild(l);
+  }
+})();
+var scrim=document.querySelector('.scrim');
+function openD(){document.getElementById('drw').classList.add('open');scrim.classList.add('on')}
+function push(){document.getElementById('pgSet').classList.add('pushed')}
+function pop(){document.getElementById('pgSet').classList.remove('pushed')}
+function closeAll(){document.getElementById('drw').classList.remove('open');pop();scrim.classList.remove('on')}
+[].forEach.call(document.querySelectorAll('.act-h'),function(h){
+  h.addEventListener('click',function(){h.parentNode.classList.toggle('open')});
+});
+document.getElementById('dk').onchange=function(){document.body.classList.toggle('dark',this.checked)};
+document.addEventListener('keydown',function(e){if(e.key==='Escape')closeAll()});
+</script>
+</body>
+</html>
