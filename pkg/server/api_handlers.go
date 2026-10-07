@@ -18,6 +18,7 @@ import (
 	"codeforge/pkg/agent"
 	"codeforge/pkg/errs"
 	"codeforge/pkg/llm"
+	"codeforge/pkg/platform"
 )
 
 // writeJSON 输出 JSON 响应。
@@ -288,15 +289,56 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	items, readErr := listTree(target, depth)
+	resp := map[string]any{
 		"root":  root,
 		"path":  target,
-		"items": listTree(target, depth),
+		"items": items,
 		// parent 供内置选择器渲染「.. 返回上一级」。放在服务端算而不是让前端
 		// 切字符串：根目录（/ 与 C:\）、UNC 前缀、结尾分隔符这些规则各平台不同，
 		// 前端自己拼会在 Termux/Windows 上错位。已经在根上时返回空串，前端据此隐藏该行。
 		"parent": parentDir(target),
-	})
+	}
+	// read_error 与「items 为空」是两回事，必须分开报。
+	//
+	// 目录 stat 成功但 ReadDir 失败（安卓未授权时的 /storage/emulated/0、
+	// Linux 上 root 拥有的目录）原先被 listTree 吞掉 → 回 200 + 空列表 →
+	// 前端渲染成「无子目录」。用户看到的是一个**看起来正常、实则读不到任何东西**
+	// 的挂载点，唯一的线索（权限）被丢掉了（安卓 2026-10 反馈：弹出来一个空挂载）。
+	if readErr != nil {
+		resp["read_error"] = describeTreeReadError(target, readErr)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// describeTreeReadError 把「目录存在但读不出来」翻译成用户能照做的下一步。
+//
+// 分两类：
+//   - 安卓 Termux 上读手机存储失败 → 分区存储未授权，唯一出路是 termux-setup-storage；
+//   - 其他 → 原样带上 errno，但换成中文可读的说法。
+func describeTreeReadError(dir string, err error) string {
+	if platform.IsTermux() && isStoragePath(dir) {
+		return "无法读取手机存储：" + err.Error() +
+			"。这是安卓分区存储未授权，请在 Termux 执行 termux-setup-storage 后重试"
+	}
+	if errors.Is(err, os.ErrPermission) {
+		return "无权限读取此目录（" + err.Error() + "）"
+	}
+	return "无法读取此目录：" + err.Error()
+}
+
+// isStoragePath 判断路径是否指向安卓的外部存储（软链 ~/storage/shared、
+// /storage/emulated/0、/sdcard 三种写法都算）。
+// 三个判据各自独立，不能塞进一个 for 里靠 `p` 复用 ——
+// "/sdcard" 只需要前缀匹配，另两个是「路径中任意位置出现」，
+// 混在一起写成前缀判断时 ~/storage/shared 会被漏掉（它是 Termux 里的
+// 软链路径，不以 /storage/ 开头）。
+func isStoragePath(dir string) bool {
+	d := filepath.ToSlash(dir)
+	return strings.HasPrefix(d, "/storage/") ||
+		strings.HasPrefix(d, "/sdcard") ||
+		strings.Contains(d, "/storage/shared") ||
+		strings.Contains(d, "/storage/emulated/")
 }
 
 // parentDir 返回上一级目录；已在根上时返回空串。
@@ -309,10 +351,15 @@ func parentDir(dir string) string {
 }
 
 // listTree 递归列出目录内容。
-func listTree(dir string, depth int) []treeNode {
+//
+// 第二返回值是**读取失败**（与「目录为空」严格区分）：调用方必须把它透出，
+// 否则权限问题会被渲染成「空目录」，用户无从下手。
+// 递归子层失败只跳过该子树，不影响本层 —— 一个子目录读不到
+// （典型：Android/data）不该让整个列表失败。
+func listTree(dir string, depth int) ([]treeNode, error) {
 	items, err := os.ReadDir(dir)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	out := make([]treeNode, 0, len(items))
 	for _, it := range items {
@@ -344,7 +391,8 @@ func listTree(dir string, depth int) []treeNode {
 			Size:  info.Size(),
 		}
 		if isDir && depth > 1 {
-			node.Children = listTree(filepath.Join(dir, it.Name()), depth-1)
+			// 子层失败留 nil：调用方只关心顶层是否可读。
+			node.Children, _ = listTree(filepath.Join(dir, it.Name()), depth-1)
 		}
 		out = append(out, node)
 	}
@@ -354,7 +402,7 @@ func listTree(dir string, depth int) []treeNode {
 		}
 		return out[i].Name < out[j].Name
 	})
-	return out
+	return out, nil
 }
 
 // pathWithin 词法判断 path 是否位于 root 之内（含 root 自身；不做软链解析，

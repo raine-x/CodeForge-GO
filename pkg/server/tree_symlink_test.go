@@ -38,7 +38,7 @@ func TestListTreeSymlinkToDirIsDir(t *testing.T) {
 		t.Skipf("无法创建指向目录的符号链接: %v", err)
 	}
 
-	items := listTree(root, 1)
+	items, _ := listTree(root, 1)
 	byName := map[string]treeNode{}
 	for _, it := range items {
 		byName[it.Name] = it
@@ -74,7 +74,7 @@ func TestListTreeDanglingSymlink(t *testing.T) {
 	}
 	// 关键：不 panic。Stat 失败时保留 IsDir() 的原值（false），
 	// 让它以「文件」出现 —— 选不选得动由用户判断，而不是服务崩溃。
-	items := listTree(root, 1)
+	items, _ := listTree(root, 1)
 	for _, it := range items {
 		if it.Name == "dangling" && it.IsDir {
 			t.Errorf("悬空符号链接不应被判为目录")

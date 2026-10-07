@@ -80,6 +80,7 @@ test-go:
 test-web:
 	$(NODE) web/test/render_md.test.js
 	$(NODE) web/test/attachments.test.js
+	$(NODE) web/test/picker.test.js
 
 ## LLM 端点协议测试（pytest，读取系统环境变量 CODEFORGE_API_KEY）
 test-llm:

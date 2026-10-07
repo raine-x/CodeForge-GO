@@ -20,7 +20,10 @@ import (
 type treeItems struct {
 	Error string `json:"error"`
 	Path  string `json:"path"`
-	Items []struct {
+	// ReadError = 目录存在但内容读不出来（权限/分区存储）。
+	// 必须与「目录真的是空的」分开，见 tree_read_error_test.go。
+	ReadError string `json:"read_error"`
+	Items     []struct {
 		Name  string `json:"name"`
 		IsDir bool   `json:"is_dir"`
 	} `json:"items"`

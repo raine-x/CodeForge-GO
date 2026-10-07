@@ -4142,11 +4142,16 @@
     }).finally(function () { workspaceChanging = false; });
     return done;
   }
-  // 内置目录浏览选择器（Linux/macOS 等）；startPath 为服务端给出的默认起始目录
-  // 内置选择器（Linux/macOS/Termux 等没有原生对话框的平台）。
+  // 内置目录浏览选择器（Linux/macOS/Termux 等没有原生对话框的平台）。
   //   mode='dir'（默认）：只列子目录，确认键「选择当前目录」→ onPick(当前路径)；
   //   mode='file'：目录可进入、文件可点选（高亮），确认键「选择此文件」→ onPick(绝对路径)。
   // 面板 DOM 只建一次并复用，所以 mode / 回调 / 当前选中项放在外层变量里。
+  //
+  // 重复点击**不需要**额外守卫：面板复用同一个 DOM 节点（getElementById），
+  // 每次点击只是重置到起始目录并再发一次列举；并发的旧响应由 fetchTreeInto
+  // 里的序号丢弃，最后一次点击的意图必然胜出。
+  // 真正让用户「点好几次」的是**反馈缺失** —— 列举期间界面是一片空白，
+  // 看起来像没弹出。现在那段时间显示「读取中…」（安卓 2026-10 反馈）。
   let pickerMode = 'dir', pickerOnPick = null, pickerSel = '';
   function openBuiltinPicker(startPath, mode, onPick) {
     pickerMode = mode === 'file' ? 'file' : 'dir';
@@ -4188,84 +4193,120 @@
     const okBtn = picker.querySelector('#picker-ok');
     okBtn.textContent = pickerMode === 'file' ? '选择此文件' : '选择当前目录';
     okBtn.disabled = pickerMode === 'file'; // 文件模式：选中文件后才可确认
-    function browse(rel) {
-      // 换目录 = 之前选中的东西作废。pickerSel 里存的是**上一层的绝对路径**，
-      // 不清的话：选中文件 → 点「.. 返回上一级」→ 列表已重绘、高亮消失，
-      // 但「选择此文件」仍可点，点下去拿到的是子目录里的旧路径 ——
-      // 界面上看像在选当前目录的文件，实际是别的层级的东西。
-      pickerSel = '';
-      // ⚠️ 只能是 `=== 'file'`：换目录作废的是**文件模式下已选中的那个文件**，
-      // 所以要重新置灰的也只有文件模式。dir 模式的「选择当前目录」无论当前停在哪
-      // 一层都该可点 —— 写成 `!== 'file'` 会让 dir 模式恒为 true，选择器弹出的
-      // 第一帧按钮就被置灰，非 Windows 平台（Linux/macOS/Termux）因此完全选不了
-      // 工作区目录，Windows 走系统对话框不受影响（2026-09 反馈）。
-      if (okBtn) okBtn.disabled = pickerMode === 'file';
-      // picker=1：内置选择器要浏览工作区外的目录（如 Termux 的 ~/storage/shared），
-      // 服务端只在这个模式下放行绝对路径 —— 不带它会被「路径越出工作区范围」403，
-      // 表现正是「选择目录时列表永远为空」。
-      fetch('/api/tree?depth=1&picker=1' + (rel ? '&path=' + encodeURIComponent(rel) : ''))
-        .then(function (r) { return r.json(); })
-        .then(function (data) {
-          const list = picker.querySelector('#picker-list');
-          if (data.error) { // 出错明确显示，不再静默渲染成「无子目录」
-            list.innerHTML = '<div class="picker-empty">' + (data.error || '浏览失败') + '</div>';
-            return;
-          }
+    picker.classList.remove('leaving', 'hidden');
+    fetchTreeInto(picker, startPath || '');
+  }
+
+  // fetchTreeInto 列举一个目录并渲染到选择器面板。
+  //
+  // 提到 openBuiltinPicker 之外是为了可测（整段跑起来测行为，而不是正则断言源码），
+  // 同时避免 openBuiltinPicker 变成一个既建 DOM 又发请求的巨型函数。
+  function fetchTreeInto(picker, rel) {
+    const okBtn = picker.querySelector('#picker-ok');
+    // 换目录 = 之前选中的东西作废。pickerSel 里存的是**上一层的绝对路径**，
+    // 不清的话：选中文件 → 点「.. 返回上一级」→ 列表已重绘、高亮消失，
+    // 但「选择此文件」仍可点，点下去拿到的是子目录里的旧路径 ——
+    // 界面上看像在选当前目录的文件，实际是别的层级的东西。
+    pickerSel = '';
+    // ⚠️ 只能是 `=== 'file'`：换目录作废的是**文件模式下已选中的那个文件**，
+    // 所以要重新置灰的也只有文件模式。dir 模式的「选择当前目录」无论当前停在哪
+    // 一层都该可点 —— 写成 `!== 'file'` 会让 dir 模式恒为 true，选择器弹出的
+    // 第一帧按钮就被置灰，非 Windows 平台（Linux/macOS/Termux）因此完全选不了
+    // 工作区目录，Windows 走系统对话框不受影响（2026-09 反馈）。
+    if (okBtn) okBtn.disabled = pickerMode === 'file';
+    const list = picker.querySelector('#picker-list');
+    // 列举期间先给一条「读取中」。安卓上列目录经常要几百毫秒到几秒
+    // （FUSE 层 + 存储分区），一片空白的列表会被当成「没弹出 / 弹了个空的」，
+    // 用户于是连点几下 —— 每次点击又发一次请求，正好是「点好几次」的成因。
+    list.innerHTML = '<div class="picker-empty">读取中…</div>';
+    // 每次列举领一个序号：响应回来时若序号已不是最新的，说明用户又点了别处，
+    // 这次结果作废。没有它，慢响应会把列表拉回用户早已离开的目录。
+    const seq = (Number(picker.dataset.seq) || 0) + 1;
+    picker.dataset.seq = String(seq);
+    // picker=1：内置选择器要浏览工作区外的目录（如 Termux 的 ~/storage/shared），
+    // 服务端只在这个模式下放行绝对路径 —— 不带它会被「路径越出工作区范围」403，
+    // 表现正是「选择目录时列表永远为空」。
+    fetch('/api/tree?depth=1&picker=1' + (rel ? '&path=' + encodeURIComponent(rel) : ''))
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        // 迟到的响应不能覆盖已经切走的目录：用户在慢响应回来之前又点了别的目录，
+        // 先发的请求后到 → 列表被拉回上一层，看起来就是「点了没反应」。
+        // 只认最后一次请求的序号，早到的旧响应直接丢弃。
+        if (picker.dataset.seq !== String(seq)) return;
+        if (data.error) { // 出错明确显示，不再静默渲染成「无子目录」
+          list.innerHTML = '<div class="picker-empty">' + (data.error || '浏览失败') + '</div>';
+          return;
+        }
+        // read_error：目录存在但读不出内容（安卓未授权时的 /storage/emulated/0、
+        // Linux 上无权限的目录）。**不能**渲染成「无子目录」—— 两者在界面上
+        // 一模一样，用户会以为目录本来就是空的，于是反复点、反复看到空列表，
+        // 完全不知道缺的是 termux-setup-storage（安卓 2026-10 反馈：弹出来一个空挂载）。
+        if (data.read_error) {
+          list.innerHTML = '<div class="picker-empty picker-warn">' + data.read_error + '</div>';
           picker.dataset.current = data.path || '';
           picker.querySelector('#picker-path').textContent = data.path || '';
-          list.innerHTML = '';
-          const items = data.items || [];
-          // 「.. 返回上一级」置顶。
-          //
-          // 为什么由服务端给 parent 而不是前端切字符串：根目录（/ 与 C:\）、
-          // UNC 前缀、结尾分隔符这些规则各平台不同，前端自己拼会在 Termux /
-          // Windows 上错位。parent 为空串表示已在根上，此时不显示这一行。
-          //
-          // 少了它的话，选择器只能一路往下钻 —— 起点在 ~/storage/shared 之类的
-          // 深层目录时，想回到 ~ 或 / 就只能关掉重开（2026-09-27 反馈）。
-          const parent = data.parent || '';
-          if (parent && parent !== (data.path || '')) {
-            const up = document.createElement('div');
-            up.className = 'picker-item picker-up';
-            up.textContent = '📂 .. 返回上一级';
-            up.title = parent;
-            up.addEventListener('click', function () { browse(parent); });
-            list.appendChild(up);
-          }
-          items.filter(function (it) { return it.is_dir; }).forEach(function (it) {
+          // 读不出内容时「选择当前目录」在 dir 模式下仍有意义（用户要的往往正是
+          // 这个目录本身）；file 模式选不了任何东西，按钮保持置灰。
+          okBtn.disabled = pickerMode === 'file';
+          return;
+        }
+        picker.dataset.current = data.path || '';
+        picker.querySelector('#picker-path').textContent = data.path || '';
+        list.innerHTML = '';
+        const items = data.items || [];
+        // 「.. 返回上一级」置顶。
+        //
+        // 为什么由服务端给 parent 而不是前端切字符串：根目录（/ 与 C:\）、
+        // UNC 前缀、结尾分隔符这些规则各平台不同，前端自己拼会在 Termux /
+        // Windows 上错位。parent 为空串表示已在根上，此时不显示这一行。
+        //
+        // 少了它的话，选择器只能一路往下钻 —— 起点在 ~/storage/shared 之类的
+        // 深层目录时，想回到 ~ 或 / 就只能关掉重开（2026-09-27 反馈）。
+        const parent = data.parent || '';
+        if (parent && parent !== (data.path || '')) {
+          const up = document.createElement('div');
+          up.className = 'picker-item picker-up';
+          up.textContent = '📂 .. 返回上一级';
+          up.title = parent;
+          up.addEventListener('click', function () { fetchTreeInto(picker, parent); });
+          list.appendChild(up);
+        }
+        items.filter(function (it) { return it.is_dir; }).forEach(function (it) {
+          const d = document.createElement('div');
+          d.className = 'picker-item';
+          d.textContent = '📁 ' + it.name;
+          d.addEventListener('click', function () { fetchTreeInto(picker, it.path); });
+          list.appendChild(d);
+        });
+        if (pickerMode === 'file') {
+          items.filter(function (it) { return !it.is_dir; }).forEach(function (it) {
             const d = document.createElement('div');
             d.className = 'picker-item';
-            d.textContent = '📁 ' + it.name;
-            d.addEventListener('click', function () { browse(it.path); });
+            d.textContent = '📄 ' + it.name;
+            d.title = it.path;
+            d.addEventListener('click', function () {
+              pickerSel = it.path;
+              list.querySelectorAll('.picker-item.sel').forEach(function (x) { x.classList.remove('sel'); });
+              d.classList.add('sel');
+              okBtn.disabled = false;
+            });
             list.appendChild(d);
           });
-          if (pickerMode === 'file') {
-            items.filter(function (it) { return !it.is_dir; }).forEach(function (it) {
-              const d = document.createElement('div');
-              d.className = 'picker-item';
-              d.textContent = '📄 ' + it.name;
-              d.title = it.path;
-              d.addEventListener('click', function () {
-                pickerSel = it.path;
-                list.querySelectorAll('.picker-item.sel').forEach(function (x) { x.classList.remove('sel'); });
-                d.classList.add('sel');
-                okBtn.disabled = false;
-              });
-              list.appendChild(d);
-            });
-          }
-          // 空态提示要**排除「.. 返回上一级」**：它不是目录内容。
-          // 否则一个空目录会因为多了这一行而不再显示「无子目录」，
-          // 用户会以为列表漏了东西。
-          const real = list.querySelectorAll('.picker-item:not(.picker-up)');
-          if (!real.length) {
-            list.insertAdjacentHTML('beforeend',
-              '<div class="picker-empty">' + (pickerMode === 'file' ? '此目录为空' : '无子目录') + '</div>');
-          }
-        });
-    }
-    picker.classList.remove('leaving', 'hidden');
-    browse(startPath || '');
+        }
+        // 空态提示要**排除「.. 返回上一级」**：它不是目录内容。
+        // 否则一个空目录会因为多了这一行而不再显示「无子目录」，
+        // 用户会以为列表漏了东西。
+        const real = list.querySelectorAll('.picker-item:not(.picker-up)');
+        if (!real.length) {
+          list.insertAdjacentHTML('beforeend',
+            '<div class="picker-empty">' + (pickerMode === 'file' ? '此目录为空' : '无子目录') + '</div>');
+        }
+      })
+      .catch(function (err) {
+        if (picker.dataset.seq !== String(seq)) return;
+        list.innerHTML = '<div class="picker-empty picker-warn">读取失败：' +
+          ((err && err.message) || '无法连接服务') + '</div>';
+      });
   }
 
   // ---------- 发送按钮三态：■ 打断 / ↑ 发送 / 淡 ----------

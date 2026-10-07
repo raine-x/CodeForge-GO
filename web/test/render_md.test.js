@@ -612,6 +612,55 @@ check('browse 请求带 picker=1（选工作区必须能浏览工作区外目录
 check('tree 返回错误时显示错误而非静默渲染成「无子目录」',
   /if \(data\.error\) \{[\s\S]{0,120}?picker-empty/.test(uiSrc));
 
+// ---------- 6.8 内置选择器：安卓「点好几次弹不出来 / 弹出来是空挂载」 ----------
+// 两个症状同源，且都会自我放大：
+//   ① 列举期间界面是**一片空白** → 用户以为没弹出 → 再点 → N 次点击叠出
+//      N 个选择器实例 + N 条并发 tree 请求，后到的响应互相覆盖，
+//      最终停在一个看起来空、其实是被早先响应盖掉的目录上；
+//   ② 服务端把「目录读不出内容」（安卓未授权的 /storage/emulated/0）吞成空列表，
+//      前端只能显示「无子目录」—— 与「目录真的是空的」完全无法区分。
+group('内置选择器：安卓重复点击与空挂载');
+// 行为层（真跑 openBuiltinPicker / fetchTreeInto，断言「读取中」「read_error
+// 不显示成无子目录」「旧响应不覆盖」「关掉后还能再弹」）在 picker.test.js。
+// 这里只钉源码层不易被重构悄悄改掉的约定。
+
+// 列举期间必须有反馈。空列表在安卓上等几百毫秒到几秒，用户必然重复点击。
+check('列举期间显示「读取中…」（空列表会被当成没弹出，用户连点）',
+  /picker-empty">读取中…/.test(extractFunction(uiSrc, 'fetchTreeInto')));
+
+// 面板节点只建一次（getElementById 复用）→ 重复点击只是重置 + 重新列举，
+// 并发旧响应由序号丢弃，最后一次点击必胜。
+//
+// ⚠️ 这里刻意**不加** busy 守卫。守卫要求「面板可见」，而任何一条关闭路径
+// 漏了清理，面板 hidden 时守卫就既不复位也不新建 —— 表现是「怎么点都不弹」，
+// 比原来的重复点击更难查。行为由 picker.test.js 真跑一遍来钉，不靠正则。
+check('面板节点只建一次并复用（重复点击不叠层）',
+  /let picker = document\.getElementById\('picker-overlay'\);/.test(
+    extractFunction(uiSrc, 'openBuiltinPicker')) &&
+  /if \(!picker\) \{/.test(extractFunction(uiSrc, 'openBuiltinPicker')));
+check('重复点击复位到新起始目录而非被静默忽略',
+  /fetchTreeInto\(picker, startPath \|\| ''\);/.test(extractFunction(uiSrc, 'openBuiltinPicker')));
+
+// 迟到的响应不能覆盖用户已经切走的目录。
+check('列举带序号，旧响应回来即丢弃（否则列表被拉回上一层）',
+  /const seq = \(Number\(picker\.dataset\.seq\) \|\| 0\) \+ 1;/.test(
+    extractFunction(uiSrc, 'fetchTreeInto')) &&
+  /if \(picker\.dataset\.seq !== String\(seq\)\) return;/.test(
+    extractFunction(uiSrc, 'fetchTreeInto')));
+
+// read_error 必须单独渲染，且样式上与「无子目录」可区分。
+check('read_error 单独渲染，不混进「无子目录」',
+  /if \(data\.read_error\) \{[\s\S]{0,300}?picker-empty picker-warn/.test(
+    extractFunction(uiSrc, 'fetchTreeInto')));
+check('read_error 时仍允许 dir 模式确认当前目录（用户要的常正是该目录本身）',
+  /okBtn\.disabled = pickerMode === 'file';/.test(extractFunction(uiSrc, 'fetchTreeInto')));
+check('picker-warn 有区分样式（读不到 ≠ 空，前者是待解决的问题）',
+  /\.picker-empty\.picker-warn \{/.test(css));
+check('picker-empty 长文案必须断行（termux-setup-storage 这串没有空格，不断行会撑破面板）',
+  /\.picker-empty \{[\s\S]{0,220}?overflow-wrap: anywhere/.test(css));
+check('请求失败也走 picker-warn（服务不可达不能显示成「无子目录」）',
+  /读取失败：/.test(uiSrc) && /picker-empty picker-warn">读取失败/.test(uiSrc));
+
 // ---------- 7. 输入框：空对话居中 / 有对话下放 ----------
 // 空对话（消息区无任何记录）时输入卡片在主对话栏内上下左右居中；用户发出第一句话
 // 后下放回底部。易回归点：① 居中态必须由 CSS 类控制（JS 只切类，滚动折叠会写内联
@@ -680,7 +729,7 @@ check('「.. 返回上一级」置顶，且由服务端给的 parent 驱动',
   /parent && parent !== \(data\.path \|\| ''\)/.test(uiSrc) &&
   /📂 \.\. 返回上一级/.test(uiSrc) &&
   /className = 'picker-item picker-up'/.test(uiSrc) &&
-  /browse\(parent\)/.test(uiSrc));
+  /fetchTreeInto\(picker, parent\)/.test(uiSrc));
 check('在根目录上不显示「..」（parent 为空即隐藏）',
   /if \(parent && parent !== \(data\.path \|\| ''\)\) \{/.test(uiSrc));
 check('空态提示排除「..」那一行（否则空目录看起来像漏了内容）',
@@ -1179,7 +1228,7 @@ check('添加文件按平台分流：Windows 资源管理器 / 其他内置选�
 check('内置选择器支持文件模式（文件可点选 + 确认键禁用态）',
   /pickerMode === 'file' \? '选择此文件' : '选择当前目录'/.test(uiSrc) &&
   /okBtn\.disabled = pickerMode === 'file'/.test(uiSrc));
-// ⚠️ 换目录时重置确认键的那一行必须**单独**钉住，且要限定在 browse() 内。
+// ⚠️ 换目录时重置确认键的那一行必须**单独**钉住，且要限定在列举函数内。
 //
 // 原因：打开时的复位和换目录时的复位是**两处独立赋值**，只断言「文件里有
 // okBtn.disabled = pickerMode === 'file'」的话，打开那一行就能把断言喂饱，
@@ -1190,8 +1239,12 @@ check('内置选择器支持文件模式（文件可点选 + 确认键禁用态�
 // 非 Windows 平台（Linux/macOS/Termux）选工作区全废，Windows 走系统对话框
 // 免疫，所以只在 Termux 上被看见。file 模式的反向错误（换目录后误放开）被
 // onPick 里 `if (!pickerSel) return;` 兜住，同样长期无人察觉。
+// 列举逻辑住在 fetchTreeInto()（原先是 openBuiltinPicker 内的 browse()）。
+// 它被提成模块级函数是因为重复点击的复位分支要复用同一份目录渲染 ——
+// 两处各写一遍早晚会长歪（一次加了 picker-warn、另一次没加，
+// 「读不到」与「空」就又混回去了，正是安卓「弹出来一个空挂载」的成因）。
 check('换目录重置确认键：只在 file 模式禁用，dir 模式必须始终可点',
-  /okBtn\.disabled = pickerMode === 'file'/.test(extractFunction(uiSrc, 'browse')));
+  /okBtn\.disabled = pickerMode === 'file'/.test(extractFunction(uiSrc, 'fetchTreeInto')));
 check('确认键禁用条件不得写成反向比较（dir 模式会被置灰点不开）',
   !/okBtn\.disabled = pickerMode !==/.test(uiSrc) &&
   !/okBtn\.disabled = !pickerMode/.test(uiSrc));
