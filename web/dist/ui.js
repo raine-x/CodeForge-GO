@@ -1043,6 +1043,12 @@
   //    更靠下的位置声明，在它之前访问会撞 TDZ（const 没有变量提升）。
   const composerPadEl = $('#composer-wrap');
   let lastComposerPad = -1;
+  function visibleViewportHeight() {
+    let h = window.innerHeight;
+    const vv = window.visualViewport;
+    if (vv && vv.height) h = Math.min(h, vv.height);
+    return h;
+  }
   // 「消息列底部淡出带」的高度，与 --composer-pad-bottom 同一套算法。
   // 单独记一份是为了让 ResizeObserver 的「值没变就不写 DOM」判断能独立生效 ——
   // 折叠时 mask 要变但 pad 不变（pad 本来就够），两者不能共用同一个 last 值。
@@ -1051,7 +1057,7 @@
     const h = composerPadEl.offsetHeight;
     if (h <= 0) return;
     // 卡片离底部还留了 5vh 的空档，多补一点让最后一条能滚到舒服的位置
-    const pad = Math.round(h + window.innerHeight * 0.07);
+    const pad = Math.round(h + visibleViewportHeight() * 0.07);
     if (pad !== lastComposerPad) {   // 值没变就不写 DOM，避免 ResizeObserver 抖动
       lastComposerPad = pad;
       document.documentElement.style.setProperty('--composer-pad-bottom', pad + 'px');
@@ -1059,7 +1065,7 @@
     // 淡出带同样要在初始化时算一次 —— 页面刚加载、用户还没滚动过时
     // 那个 scroll 回调不会跑，若只在那里写，遮罩就一直缺省 200px；
     // 任务清单展开后卡片高过 200px，底部就会露出没被淡出的文字。
-    const maskH = Math.round(h + window.innerHeight * 0.05 + 24);
+    const maskH = Math.round(h + visibleViewportHeight() * 0.05 + 24);
     if (maskH !== lastMaskH) {
       lastMaskH = maskH;
       document.documentElement.style.setProperty('--composer-mask-h', maskH + 'px');
@@ -3902,7 +3908,7 @@
         case 'text':
           streamOf(ev.session_id).reason = '';
           streamOf(ev.session_id).text += ev.text || '';
-          if (!frameIsMine(ev)) { foldReason(); break; }
+          if (!frameIsMine(ev)) break;
           hasModelReplied = true;
           removeResumeRing();
           removeThinking();
@@ -3915,7 +3921,7 @@
           // 工具调用参数正在流式生成（大参数要生成几十 KB）：立即给出反馈，
           // 不然这几分钟界面看起来像卡死。真正的 tool_call 卡片到达后替换。
           const st = streamOf(ev.session_id); st.reason = ''; st.text = '';
-          if (!frameIsMine(ev)) { foldReason(); closeText(); break; }
+          if (!frameIsMine(ev)) break;
           removeThinking();
           removeRetry();
           foldReason();
@@ -3926,7 +3932,7 @@
         }
         case 'tool_call': {
           const stc = streamOf(ev.session_id); stc.reason = ''; stc.text = '';
-          if (!frameIsMine(ev)) { foldReason(); closeText(); break; }
+          if (!frameIsMine(ev)) break;
           hasModelReplied = true;
           if (pendingToolEl) { pendingToolEl.remove(); pendingToolEl = null; }
           // 该段内容此刻已写入会话消息：思考丢弃、正文交给历史回放，不再算未落盘
@@ -3948,7 +3954,7 @@
         case 'subagent': {
           // 子智能体实时进度：每个子任务一张卡片，status 驱动样式
           const ss = streamOf(ev.session_id); ss.reason = ''; ss.text = '';
-          if (!frameIsMine(ev)) { foldReason(); closeText(); break; }
+          if (!frameIsMine(ev)) break;
           removeThinking();
           foldReason();
           closeText();
@@ -5271,7 +5277,7 @@
     syncToBottomBtn();
     if (composerCentered) return; // 居中态（无消息，无可滚动内容）不参与折叠
     // 最大位移 = 卡片自身高度 + 底部间隙（7vh），滑过即完全不可见
-    const max = composerWrap.offsetHeight + window.innerHeight * 0.07 + 10;
+    const max = composerWrap.offsetHeight + visibleViewportHeight() * 0.07 + 10;
     if (delta !== 0) {
       // 折叠与收回**对称**：上翻按滚动量藏，下滚同样按滚动量露。
       //
@@ -5296,7 +5302,7 @@
     // 24px 是渐变过渡带：不留它字会被硬切在半途，看着像渲染错误。
     // Math.max(0, …) 防收起到底时算出负高度（那会让渐变两端颠倒、整列反色）。
     const maskH = Math.max(0,
-      Math.round(composerWrap.offsetHeight + window.innerHeight * 0.05 + 24 - composerHide));
+      Math.round(composerWrap.offsetHeight + visibleViewportHeight() * 0.05 + 24 - composerHide));
     document.documentElement.style.setProperty('--composer-mask-h', maskH + 'px');
   });
   // 聚焦输入框时恢复显示
@@ -7827,9 +7833,7 @@
        缺失时 innerHeight 至少是「跟着地址栏变」的那个，比 100vh 强。 */
     const vv = window.visualViewport;
     function measureH() {
-      let h = window.innerHeight;
-      if (vv && vv.height) h = Math.min(h, vv.height);
-      return Math.round(h);
+      return Math.round(visibleViewportHeight());
     }
     function syncViewport() {
       if (!isMobile()) return;

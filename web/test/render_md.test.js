@@ -1643,7 +1643,16 @@ check('后台事件不画进当前视图（按帧的 session_id 判定）',
   /function frameIsMine\(ev\)/.test(uiSrc) &&
   uiCase('reasoning').includes('streamOf(ev.session_id).reason +=') &&
   uiCase('reasoning').indexOf('streamOf(ev.session_id)') < uiCase('reasoning').indexOf('if (!frameIsMine(ev)) break;') &&
-  uiCase('text').includes("if (!frameIsMine(ev)) { foldReason(); break; }"));
+  ['text', 'tool_pending', 'tool_call', 'subagent'].every(name => {
+    const src = uiCase(name);
+    const guard = src.indexOf('if (!frameIsMine(ev)) break;');
+    if (guard < 0) return false;
+    const dom = ['foldReason()', 'closeText()', 'appendText(', 'appendReason(']
+      .map(token => src.indexOf(token))
+      .filter(index => index >= 0);
+    return dom.length === 0 || guard < Math.min(...dom);
+  }) &&
+  !/if \(!frameIsMine\(ev\)\) \{[^}]*\b(?:foldReason|closeText)\(\)/.test(uiCase('text') + uiCase('tool_pending') + uiCase('tool_call') + uiCase('subagent')));
 // 补的必须是**该会话自己**的桶：并发时若读一个全局槽，就会把别的会话的片段
   // 贴到这一屏 —— 切换不但没修好，还把污染重新贴一遍。
 check('切回运行中会话补渲染未落盘片段（读该会话自己的桶）',
@@ -2192,6 +2201,11 @@ check('消息区底部留白改为按输入卡片实测高度动态计算（不�
 check('留白随卡片尺寸变化（ResizeObserver）+ 折叠后重算',
   /new ResizeObserver\(syncComposerPadding\)\.observe\(composerPadEl\)/.test(uiSrc) &&
   /function applyTodoCollapsed\(\)[\s\S]{0,600}?requestAnimationFrame\(function \(\) \{ syncComposerPadding\(\); \}\)/.test(uiSrc));
+check('移动端底部留白、折叠位移与 app 高度使用同一可见视口',
+  /function visibleViewportHeight\(\)[\s\S]{0,220}?Math\.min\(h, vv\.height\)/.test(uiSrc) &&
+  /syncComposerPadding\(\)[\s\S]{0,500}?visibleViewportHeight\(\) \* 0\.07/.test(uiSrc) &&
+  /composerWrap\.offsetHeight \+ visibleViewportHeight\(\) \* 0\.07/.test(uiSrc) &&
+  /function measureH\(\)[\s\S]{0,100}?visibleViewportHeight\(\)/.test(uiSrc));
 check('不用 CSS 平滑滚动（避免与跟随态滚底打架）',
   /#messages\s*\{[^}]*scroll-behavior:\s*auto/.test(css));
 
