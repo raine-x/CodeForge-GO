@@ -86,9 +86,39 @@ var BuiltinGoalMode = BuiltinPlugin{
 		"6) 预算用尽仍未通过：停止自循环，把问题与证据交回用户，说明需要人工介入。",
 }
 
+// 内容来自对本地 prompts 目录中多类编码代理/研究工具提示词的抽象归纳，
+// 不复制第三方提示词原文：保留规划、证据链、工具边界与复核习惯。
+var BuiltinVulnerabilityResearch = BuiltinPlugin{
+	ID:      "vulnerability_research",
+	Name:    "漏洞挖掘",
+	Purpose: "在授权范围内主动发现、验证和分级应用与系统漏洞",
+	WhenToUse: "用户输入 @vuln_hunt、@security_audit 或 @漏洞挖掘，且目标属于用户拥有或明确授权的范围时使用；" +
+		"未给出范围时先要求目标、授权、测试窗口和禁止动作",
+	Instructions: "先锁定授权边界、资产清单、测试窗口、速率限制和禁止动作。可以更主动地进行端点枚举、" +
+		"协议探测、输入变异、模糊测试、越权验证和最小化利用证明，但必须控制并发、速率和数据量，" +
+		"不得删除或篡改数据、造成拒绝服务、持久化、横向移动、窃取凭据、外传数据或规避检测。" +
+		"优先使用无害载荷和隔离账户；需要可能影响可用性的验证时先说明影响并取得确认。" +
+		"每个发现都记录入口、前置条件、请求与响应证据、影响、复现步骤、修复建议和复测结果；" +
+		"区分事实、推断和未验证项，不能把扫描器告警直接当成漏洞结论。",
+}
+
+var BuiltinReverseAnalysis = BuiltinPlugin{
+	ID:      "reverse_analysis",
+	Name:    "逆向分析",
+	Purpose: "对本地授权样本进行深入静态分析、调试、反汇编和动态行为研究",
+	WhenToUse: "用户输入 @reverse_analysis 或 @逆向分析，且样本位于本地或用户明确授权的分析环境中时使用；" +
+		"来源、授权或隔离条件不明确时先暂停执行",
+	Instructions: "可以更深入地分析本地样本：计算哈希、识别格式与架构、提取字符串和配置、反汇编/反编译、" +
+		"调试、跟踪系统调用、构造输入、运行样本并观察行为。运行前记录样本来源与哈希，" +
+		"优先使用无网络或隔离沙箱、快照和一次性账户；不得让样本接触真实凭据、生产数据或未授权网络。" +
+		"禁止持久化、横向移动、凭据窃取、数据外传、破坏宿主机或为绕过防护而提供可直接滥用的部署步骤；" +
+		"必要的本地调试与脱壳应限于用户控制的样本和环境。结论必须关联函数、输入、状态、输出等证据，" +
+		"明确标注置信度，不把反编译伪代码当作事实。报告包含样本标识、方法、关键路径、行为、局限和下一步。",
+}
+
 // builtinPlugins 列出全部内置插件定义（新增内置插件时在此追加）。
 func builtinPlugins() []BuiltinPlugin {
-	return []BuiltinPlugin{BuiltinSkillCreator, BuiltinMultiAgent, BuiltinPlan, BuiltinGoalMode}
+	return []BuiltinPlugin{BuiltinSkillCreator, BuiltinMultiAgent, BuiltinPlan, BuiltinGoalMode, BuiltinVulnerabilityResearch, BuiltinReverseAnalysis}
 }
 
 // ListBuiltinPlugins 导出全部内置插件定义（设置页列表用）。
@@ -139,6 +169,16 @@ func (a *Agent) SetPlanEnabled(on bool) {
 // SetGoalModeEnabled 同步目标模式插件的提示词开关（工具注册由启动层负责）。
 func (a *Agent) SetGoalModeEnabled(on bool) {
 	a.setBuiltinOn(BuiltinGoalMode.ID, on)
+}
+
+// SetVulnerabilityResearchEnabled 同步漏洞挖掘插件的提示词开关。
+func (a *Agent) SetVulnerabilityResearchEnabled(on bool) {
+	a.setBuiltinOn(BuiltinVulnerabilityResearch.ID, on)
+}
+
+// SetReverseAnalysisEnabled 同步逆向分析插件的提示词开关。
+func (a *Agent) SetReverseAnalysisEnabled(on bool) {
+	a.setBuiltinOn(BuiltinReverseAnalysis.ID, on)
 }
 
 // GoalLedgerFor 返回某会话的目标账本。
@@ -193,6 +233,35 @@ func (a *Agent) goalPluginSection(lastInput string, sess *Session) string {
 	return sb.String()
 }
 
+// triggeredPluginSection 只在用户明确使用对应触发词时注入，避免高风险
+// 操作指南常驻到普通对话；插件开关关闭时即使输入带触发词也不生效。
+func (a *Agent) triggeredPluginSection(p BuiltinPlugin, lastInput string) string {
+	if !a.builtinOnSnapshot()[p.ID] || !pluginTriggered(p.ID, lastInput) {
+		return ""
+	}
+	return fmt.Sprintf(
+		"## 内置插件：%s\n- 能力：%s\n- 调用时机：%s\n- %s\n"+
+			"- 工作流提醒：先确认授权范围和禁止动作，再开始主动操作；报告中区分事实、推断和未验证项。\n",
+		p.Name, p.Purpose, p.WhenToUse, p.Instructions)
+}
+
+func pluginTriggered(id, input string) bool {
+	lower := strings.ToLower(input)
+	var tokens []string
+	switch id {
+	case BuiltinVulnerabilityResearch.ID:
+		tokens = []string{"@vuln_hunt", "@security_audit", "@漏洞挖掘"}
+	case BuiltinReverseAnalysis.ID:
+		tokens = []string{"@reverse_analysis", "@逆向分析"}
+	}
+	for _, token := range tokens {
+		if strings.Contains(lower, strings.ToLower(token)) {
+			return true
+		}
+	}
+	return false
+}
+
 // builtinPluginSection 生成启用的内置插件注入段（含使用约定与工作流提醒要求）。
 //
 // 读启用表走快照：设置页随时可能改它（见 setBuiltinOn）。
@@ -200,6 +269,9 @@ func (a *Agent) builtinPluginSection() string {
 	enabled := a.builtinOnSnapshot()
 	var sb string
 	for _, p := range builtinPlugins() {
+		if p.ID == BuiltinVulnerabilityResearch.ID || p.ID == BuiltinReverseAnalysis.ID {
+			continue // 高风险研究指南按 @ 触发，不常驻注入。
+		}
 		if !enabled[p.ID] {
 			continue
 		}

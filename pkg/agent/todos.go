@@ -69,6 +69,12 @@ func (a *Agent) systemPromptFor(sess *Session) string {
 	if sec := a.goalPluginSection(lastInput, sess); sec != "" {
 		extras = append(extras, sec)
 	}
+	if sec := a.triggeredPluginSection(BuiltinVulnerabilityResearch, lastInput); sec != "" {
+		extras = append(extras, sec)
+	}
+	if sec := a.triggeredPluginSection(BuiltinReverseAnalysis, lastInput); sec != "" {
+		extras = append(extras, sec)
+	}
 	if hint := sess.ContinueHint(); hint != "" {
 		extras = append(extras, hint)
 	}

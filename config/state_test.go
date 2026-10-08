@@ -60,7 +60,9 @@ func TestSaveStateWritesOnlyOwnedFields(t *testing.T) {
 	cfg.LLM.Model = "some-model"
 	on, off := true, false
 	cfg.BuiltinPlugins.SkillCreator = &on
-	cfg.BuiltinPlugins.Plan = &off      // 显式关闭要落盘
+	cfg.BuiltinPlugins.Plan = &off // 显式关闭要落盘
+	cfg.BuiltinPlugins.VulnerabilityResearch = &on
+	cfg.BuiltinPlugins.ReverseAnalysis = &on
 	cfg.BuiltinPlugins.MultiAgent = nil // 未配置：整键省略，不能写成 null
 
 	if err := cfg.SaveState(); err != nil {
@@ -71,7 +73,7 @@ func TestSaveStateWritesOnlyOwnedFields(t *testing.T) {
 		t.Fatalf("读取 state.yaml 失败: %v", err)
 	}
 	got := string(raw)
-	for _, want := range []string{"work_dir", "permission_mode", "model", "skill_creator: true", "plan: false"} {
+	for _, want := range []string{"work_dir", "permission_mode", "model", "skill_creator: true", "plan: false", "vulnerability_research: true", "reverse_analysis: true"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("state.yaml 缺少程序自有字段 %q:\n%s", want, got)
 		}

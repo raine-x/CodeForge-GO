@@ -4158,10 +4158,11 @@
   // 里的序号丢弃，最后一次点击的意图必然胜出。
   // 真正让用户「点好几次」的是**反馈缺失** —— 列举期间界面是一片空白，
   // 看起来像没弹出。现在那段时间显示「读取中…」（安卓 2026-10 反馈）。
-  let pickerMode = 'dir', pickerOnPick = null, pickerSel = '';
-  function openBuiltinPicker(startPath, mode, onPick) {
+  let pickerMode = 'dir', pickerOnPick = null, pickerSel = '', pickerFileFilter = '';
+  function openBuiltinPicker(startPath, mode, onPick, fileFilter) {
     pickerMode = mode === 'file' ? 'file' : 'dir';
     pickerOnPick = onPick || null;
+    pickerFileFilter = pickerMode === 'file' && fileFilter === 'image' ? 'image' : '';
     pickerSel = '';
     let picker = document.getElementById('picker-overlay');
     if (!picker) {
@@ -4285,7 +4286,11 @@
           list.appendChild(d);
         });
         if (pickerMode === 'file') {
-          items.filter(function (it) { return !it.is_dir; }).forEach(function (it) {
+          const files = items.filter(function (it) {
+            if (it.is_dir) return false;
+            return !pickerFileFilter || /\.(png|jpe?g|webp|gif|bmp)$/i.test(it.name || it.path || '');
+          });
+          files.forEach(function (it) {
             const d = document.createElement('div');
             d.className = 'picker-item';
             d.textContent = '📄 ' + it.name;
@@ -4305,7 +4310,8 @@
         const real = list.querySelectorAll('.picker-item:not(.picker-up)');
         if (!real.length) {
           list.insertAdjacentHTML('beforeend',
-            '<div class="picker-empty">' + (pickerMode === 'file' ? '此目录为空' : '无子目录') + '</div>');
+            '<div class="picker-empty">' +
+            (pickerMode === 'file' ? (pickerFileFilter === 'image' ? '此目录没有图片文件' : '此目录为空') : '无子目录') + '</div>');
         }
       })
       .catch(function (err) {
@@ -5797,7 +5803,7 @@
             openBuiltinPicker(d.start_path || '', 'file', function (path) {
               if (!path) return;
               saveBg({ background_path: path }).then(function () { applyBgImage(true); });
-            });
+            }, 'image');
             return;
           }
           if (d.ok && d.path) {

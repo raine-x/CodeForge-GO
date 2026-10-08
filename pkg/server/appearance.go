@@ -59,6 +59,10 @@ func (s *Server) handleAppearance(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "背景图文件不存在: " + p})
 				return
 			}
+			if !isBackgroundImage(p) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "背景图必须是图片文件"})
+				return
+			}
 			s.cfg.Appearance.BackgroundPath = p
 		}
 		if body.Blur != nil {
@@ -242,6 +246,10 @@ func (s *Server) finishBackgroundPick(w http.ResponseWriter, path string, err er
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "背景图文件不存在: " + p})
 		return
 	}
+	if !isBackgroundImage(p) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "背景图必须是图片文件"})
+		return
+	}
 	s.cfg.Appearance.BackgroundPath = p
 	if !s.saveState(w, "外观设置保存失败") {
 		return
@@ -264,4 +272,26 @@ func (s *Server) saveState(w http.ResponseWriter, what string) bool {
 func fileExists(p string) bool {
 	st, err := os.Stat(p)
 	return err == nil && !st.IsDir()
+}
+
+// isBackgroundImage 同时校验扩展名和无后缀文件的内容。Termux 的
+// termux-storage-get 会把选中的图片复制到无后缀目标 background_user，
+// 因此不能只依赖扩展名；但带有明确非图片扩展名的文件仍必须拒绝。
+func isBackgroundImage(p string) bool {
+	ext := strings.ToLower(filepath.Ext(p))
+	if ext != "" {
+		_, ok := bgTypes[ext]
+		return ok
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, 512)
+	n, err := f.Read(buf)
+	if err != nil && n == 0 {
+		return false
+	}
+	return strings.HasPrefix(http.DetectContentType(buf[:n]), "image/")
 }

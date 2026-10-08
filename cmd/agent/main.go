@@ -436,6 +436,17 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 			cfg.BuiltinPlugins.GoalModeRounds())
 	}
 
+	// 内置插件：漏洞挖掘（纯 System Prompt 注入，@vuln_hunt / @security_audit 触发）
+	if cfg.BuiltinPlugins.VulnerabilityResearchEnabled() {
+		ag.SetVulnerabilityResearchEnabled(true)
+		logx.Infof("内置插件已启用：漏洞挖掘（@vuln_hunt / @security_audit；config: builtin_plugins.vulnerability_research=false 可关闭）")
+	}
+	// 内置插件：逆向分析（纯 System Prompt 注入，@reverse_analysis 触发）
+	if cfg.BuiltinPlugins.ReverseAnalysisEnabled() {
+		ag.SetReverseAnalysisEnabled(true)
+		logx.Infof("内置插件已启用：逆向分析（@reverse_analysis；config: builtin_plugins.reverse_analysis=false 可关闭）")
+	}
+
 	// 归档自动清理：启动即清一次 + 每天定时（归档满 10 天即删）
 	purgeArchived := func() {
 		if n, err := st.DeleteArchivedOlderThan(10); err != nil {
@@ -499,6 +510,14 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 				goalTool = nil
 			}
 			ag.SetGoalModeEnabled(on)
+		}
+		if id == agent.BuiltinVulnerabilityResearch.ID {
+			// 漏洞挖掘插件没有专属工具，只同步按触发词生效的提示词开关。
+			ag.SetVulnerabilityResearchEnabled(on)
+		}
+		if id == agent.BuiltinReverseAnalysis.ID {
+			// 逆向分析插件没有专属工具，只同步按触发词生效的提示词开关。
+			ag.SetReverseAnalysisEnabled(on)
 		}
 	})
 	if err := srv.Start(); err != nil {

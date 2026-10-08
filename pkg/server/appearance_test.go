@@ -197,6 +197,26 @@ func TestFinishBackgroundPickRejectsMissingFile(t *testing.T) {
 	}
 }
 
+func TestFinishBackgroundPickRejectsNonImage(t *testing.T) {
+	s, _ := setupAppearance(t)
+	nonImage := filepath.Join(t.TempDir(), "notes.txt")
+	if err := os.WriteFile(nonImage, []byte("not an image"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	s.finishBackgroundPick(rec, nonImage, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("非图片文件应返回 400，实际 %d（%s）", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(decodeBody(t, rec)["error"].(string), "图片文件") {
+		t.Fatalf("错误文案应说明只能选择图片：%s", rec.Body.String())
+	}
+	if s.cfg.Appearance.BackgroundPath != "" {
+		t.Fatal("非图片文件不应写入背景路径")
+	}
+}
+
 // TestFinishBackgroundPickRejectsInvalidUTF8 保证损坏路径不会一路写进配置。
 func TestFinishBackgroundPickRejectsInvalidUTF8(t *testing.T) {
 	s, _ := setupAppearance(t)

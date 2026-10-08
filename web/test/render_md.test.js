@@ -660,6 +660,10 @@ check('picker-empty 长文案必须断行（termux-setup-storage 这串没有空
   /\.picker-empty \{[\s\S]{0,220}?overflow-wrap: anywhere/.test(css));
 check('请求失败也走 picker-warn（服务不可达不能显示成「无子目录」）',
   /读取失败：/.test(uiSrc) && /picker-empty picker-warn">读取失败/.test(uiSrc));
+check('外观背景选择器只显示图片文件',
+  /let pickerMode = 'dir', pickerOnPick = null, pickerSel = '', pickerFileFilter = ''/.test(uiSrc) &&
+  /openBuiltinPicker\(d\.start_path \|\| '', 'file',[\s\S]{0,260}?\}, 'image'\)/.test(uiSrc) &&
+  /pickerFileFilter === 'image' \? '此目录没有图片文件'/.test(uiSrc));
 
 // ---------- 7. 输入框：空对话居中 / 有对话下放 ----------
 // 空对话（消息区无任何记录）时输入卡片在主对话栏内上下左右居中；用户发出第一句话
@@ -3050,7 +3054,17 @@ group('目标模式（Goal Mode）2026-09-27');
 
 check('插件已注册：BuiltinGoalMode.ID = goal_mode',
   /ID:\s*"goal_mode"/.test(bpSrc) &&
-  /BuiltinSkillCreator, BuiltinMultiAgent, BuiltinPlan, BuiltinGoalMode/.test(bpSrc));
+  /BuiltinSkillCreator, BuiltinMultiAgent, BuiltinPlan, BuiltinGoalMode, BuiltinVulnerabilityResearch, BuiltinReverseAnalysis/.test(bpSrc));
+
+check('漏洞挖掘与逆向分析拆分为独立 @ 插件且有授权边界',
+  /ID:\s*"vulnerability_research"/.test(bpSrc) &&
+  /ID:\s*"reverse_analysis"/.test(bpSrc) &&
+  /@vuln_hunt/.test(bpSrc) && /@security_audit/.test(bpSrc) &&
+  /@reverse_analysis/.test(bpSrc) &&
+  /func \(a \*Agent\) triggeredPluginSection\(p BuiltinPlugin, lastInput string\)/.test(bpSrc) &&
+  /不复制第三方提示词原文/.test(bpSrc) &&
+  /vulnerability_research: true/.test(goFile('config/default.yaml')) &&
+  /reverse_analysis: true/.test(goFile('config/default.yaml')));
 
 check('工具名与前端文案同源（goal_verify）',
   /func \(t \*GoalVerifyTool\) Name\(\) string \{ return "goal_verify" \}/.test(toolsBuiltinSrc) &&

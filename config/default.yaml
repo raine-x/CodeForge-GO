@@ -84,6 +84,8 @@ builtin_plugins:
   multi_agent: true        # Multi-Agent：允许委派子智能体并行处理互不重叠的任务（策略见 subagents）
   plan: true               # Plan 计划模式：@plan 触发，只读探索后输出结构化项目计划书
   goal_mode: true          # 目标模式：@goal_mode 触发，自主验证目标是否达成
+  vulnerability_research: true  # 漏洞挖掘：@vuln_hunt / @security_audit 触发
+  reverse_analysis: true         # 本地逆向分析：@reverse_analysis 触发
   # 自循环轮数上限：一次任务内最多验几次，超了就停下来问人。
   # 语义上限而非时长上限 —— 轮数对用户可预期，几分钟不可预期（模型快慢差异极大）。
   # 越界会被夹到 [1, 20]（见 config.BuiltinPluginsConfig.GoalModeRounds）。

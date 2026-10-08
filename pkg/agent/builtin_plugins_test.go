@@ -71,3 +71,39 @@ func TestBuiltinPlanPluginSection(t *testing.T) {
 		t.Error("未启用任何插件时不应有注入段")
 	}
 }
+
+func TestSecurityPluginsAreExplicitAndScoped(t *testing.T) {
+	a := &Agent{}
+	a.SetVulnerabilityResearchEnabled(true)
+	a.SetReverseAnalysisEnabled(true)
+	if got := a.builtinPluginSection(); strings.Contains(got, "漏洞挖掘") || strings.Contains(got, "逆向分析") {
+		t.Fatal("漏洞挖掘与逆向指南不应常驻注入")
+	}
+	for _, tc := range []struct {
+		input, name string
+	}{
+		{"请做 @vuln_hunt", "漏洞挖掘"},
+		{"请做 @security_audit", "漏洞挖掘"},
+		{"进行 @漏洞挖掘", "漏洞挖掘"},
+		{"开始 @reverse_analysis", "逆向分析"},
+		{"进行 @逆向分析", "逆向分析"},
+	} {
+		sec := a.triggeredPluginSection(map[string]BuiltinPlugin{
+			"漏洞挖掘": BuiltinVulnerabilityResearch,
+			"逆向分析": BuiltinReverseAnalysis,
+		}[tc.name], tc.input)
+		for _, want := range []string{"授权范围", "证据", "禁止"} {
+			if !strings.Contains(sec, want) {
+				t.Errorf("%q 的 %s 注入缺少 %q：%q", tc.input, tc.name, want, sec)
+			}
+		}
+	}
+	if a.triggeredPluginSection(BuiltinVulnerabilityResearch, "普通代码问题") != "" ||
+		a.triggeredPluginSection(BuiltinReverseAnalysis, "普通代码问题") != "" {
+		t.Fatal("普通输入不应触发安全插件注入")
+	}
+	a.SetVulnerabilityResearchEnabled(false)
+	if a.triggeredPluginSection(BuiltinVulnerabilityResearch, "@vuln_hunt") != "" {
+		t.Fatal("关闭漏洞挖掘插件后不应注入")
+	}
+}

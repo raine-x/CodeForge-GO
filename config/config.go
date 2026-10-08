@@ -186,6 +186,10 @@ type BuiltinPluginsConfig struct {
 	Plan *bool `yaml:"plan"`
 	// GoalMode：目标模式（@goal_mode 触发，自主验证目标是否达成）。
 	GoalMode *bool `yaml:"goal_mode"`
+	// VulnerabilityResearch：授权漏洞挖掘（@vuln_hunt / @security_audit 触发）。
+	VulnerabilityResearch *bool `yaml:"vulnerability_research"`
+	// ReverseAnalysis：本地样本逆向分析（@reverse_analysis 触发）。
+	ReverseAnalysis *bool `yaml:"reverse_analysis"`
 	// GoalModeMaxRounds：目标模式的自循环轮数上限（一次任务内最多验几次）。
 	//
 	// 为什么是轮数而不是时长：轮数是**语义**上限 —— 「验 5 次都不过就停下来问人」
@@ -237,6 +241,16 @@ func (c BuiltinPluginsConfig) PlanEnabled() bool {
 // GoalModeEnabled 缺省开启，写 false 才关闭。
 func (c BuiltinPluginsConfig) GoalModeEnabled() bool {
 	return c.GoalMode == nil || *c.GoalMode
+}
+
+// VulnerabilityResearchEnabled 缺省开启，写 false 才关闭。
+func (c BuiltinPluginsConfig) VulnerabilityResearchEnabled() bool {
+	return c.VulnerabilityResearch == nil || *c.VulnerabilityResearch
+}
+
+// ReverseAnalysisEnabled 缺省开启，写 false 才关闭。
+func (c BuiltinPluginsConfig) ReverseAnalysisEnabled() bool {
+	return c.ReverseAnalysis == nil || *c.ReverseAnalysis
 }
 
 // GoalModeRounds 返回自循环轮数上限，缺省 5。

@@ -25,6 +25,10 @@ func (s *Server) builtinEnabled(id string) bool {
 		return s.cfg.BuiltinPlugins.PlanEnabled()
 	case agent.BuiltinGoalMode.ID:
 		return s.cfg.BuiltinPlugins.GoalModeEnabled()
+	case agent.BuiltinVulnerabilityResearch.ID:
+		return s.cfg.BuiltinPlugins.VulnerabilityResearchEnabled()
+	case agent.BuiltinReverseAnalysis.ID:
+		return s.cfg.BuiltinPlugins.ReverseAnalysisEnabled()
 	default:
 		return false
 	}
@@ -41,6 +45,10 @@ func (s *Server) setBuiltinEnabled(id string, on bool) error {
 		s.cfg.BuiltinPlugins.Plan = &on
 	case agent.BuiltinGoalMode.ID:
 		s.cfg.BuiltinPlugins.GoalMode = &on
+	case agent.BuiltinVulnerabilityResearch.ID:
+		s.cfg.BuiltinPlugins.VulnerabilityResearch = &on
+	case agent.BuiltinReverseAnalysis.ID:
+		s.cfg.BuiltinPlugins.ReverseAnalysis = &on
 	default:
 		return nil // 未知插件：仅运行态应用，不落盘
 	}
