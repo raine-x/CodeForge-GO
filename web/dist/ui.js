@@ -1278,6 +1278,7 @@
     web_search:   '搜索网页',
     create_skill: 'Skill Creator 插件', // 内置插件工具：审批显示「需要审批：Skill Creator 插件」
     delegate_subagents: 'Multi-Agent 插件',
+    tool_result_read: '读取外置输出',
   };
   function toolPhrase(name) {
     // 与 toolLabel 同一套规则：插件工具（插件名.工具名）按去前缀的本名查表，
@@ -1340,6 +1341,17 @@
       }
       case 'save_memory': return '保存了记忆';
       case 'todo_write':  return '更新了任务清单';
+      // 读回被外置的工具输出：卡片上直接带出 id 与行区间，
+      // 用户能对上「哪次大输出被读了第几行」，而不只是一句「读了东西」。
+      case 'tool_result_read': {
+        const t = (input && typeof input === 'object') ? input : {};
+        const id = t.id ? String(t.id) : '';
+        let range = '';
+        if (t.start_line) {
+          range = ' 第 ' + t.start_line + (t.end_line ? '–' + t.end_line : '') + ' 行';
+        }
+        return '读取外置输出' + (id ? ' ' + id : '') + range;
+      }
       case 'goal_verify': {
         // 显示判定与轮次：目标模式的价值就在于「判定是可见的」，
         // 只写一句「验证了目标」等于把证据藏起来 —— 那和没有验证没有区别。

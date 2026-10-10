@@ -35,6 +35,13 @@ agent:
   # 通常也不会主动调用），但注册/执行/权限/审计链路不变。按真实工具名填写，
   # 如 ["web_search"]。注意：隐藏只影响可见面，禁止执行需在 Executor/Policy 加规则。
   hidden_tools: []
+  # 工具结果外置：结果超过这个字节数就不再硬截断，而是完整存到
+  # ~/.codeforge/toolout/<会话>/，上下文里只留一段预览 + 一个短 id，
+  # 模型可用 tool_result_read 按行取回完整内容。
+  # 与压缩不同 —— 摘要有损、机械压缩直接丢，外置一个字节都不少。
+  # 设为 0 关闭（退回截断行为）。做 APK 逆向这类大输出负载时强烈建议开着。
+  tool_out_spill_bytes: 8192
+  tool_out_preview_bytes: 2048
 
 security:
   # 前端「权限控制」三态：readonly / ask / auto。缺省 ask（请求审批）。

@@ -31,6 +31,11 @@ type Executor struct {
 	// approvalTimeout 是**人工审批自己的**等待上界，与 timeout（工具执行超时）
 	// 是两件事，不能互相借用。
 	approvalTimeout time.Duration
+	// toolOut 是工具结果外置存储；nil = 关闭，退回纯截断行为。
+	//
+	// 可选而非必需：外置是优化，缺了它系统仍然正确（只是超限结果会被丢弃），
+	// 不该因为它没装配上就让整条工具链不可用。
+	toolOut *ToolOutStore
 }
 
 // defaultMaxOutput 是 maxOutput 的兜底默认值（构造与限幅两条路径共用同一个数）。
@@ -85,6 +90,16 @@ func (e *Executor) ApprovalTimeout() time.Duration { return e.approvalTimeout }
 
 // MaxOutput 返回输出截断阈值。
 func (e *Executor) MaxOutput() int { return e.maxOutput }
+
+// ToolOut 返回工具结果外置存储（nil = 未启用）。
+func (e *Executor) ToolOut() *ToolOutStore { return e.toolOut }
+
+// SetToolOut 装配工具结果外置存储。
+//
+// 为什么是「装配」而不是构造参数：外置只需要一个落盘根目录，与策略、审批、
+// 审计都无关，塞进 NewExecutor 的七个参数里只会让那串参数更难读
+// （它已经长到需要 role.go 专门解释其中两个了）。
+func (e *Executor) SetToolOut(s *ToolOutStore) { e.toolOut = s }
 
 // SetApprover 在服务启动后注入审批实现。
 func (e *Executor) SetApprover(a Approver) { e.approver = a }
@@ -287,12 +302,12 @@ func (e *Executor) Execute(ctx context.Context, name string, args json.RawMessag
 			// 也要限幅：这条短路返回的是工具自己产出的结果，
 			// 可能一样超大（插件驱动的 invokeFn 理论上能同时给 res 和 err）。
 			// 不限幅的话一个走错分支的大结果就能绕过全部防护。
-			return e.truncate(res), nil
+			return e.truncate(ctx, res), nil
 		}
 		// 给模型/用户的说明带上工具名与成因 —— 光说「工具执行失败」等于没说
 		return Err("%s", errs.FriendlyOr("执行工具 "+name, err)), nil
 	}
-	res = e.truncate(res)
+	res = e.truncate(ctx, res)
 
 	entry.Success = res == nil || res.Success
 	if res != nil && !res.Success {
@@ -384,7 +399,11 @@ const truncateHint = "结果过大已被限幅。请缩小范围（更窄的 pat
 //     （有测试钉住，见 executor_truncate_test.go）。
 //  3. 这是**兜底**。大结果该由工具自己分页/限流 —— 见 read_file 的
 //     maxReadBytes 注释：工具不收尾，执行器硬切会让模型拿着残本重写文件。
-func (e *Executor) truncate(res *ToolResult) *ToolResult {
+//
+// 超过 spillThreshold 时**先外置再限幅**（见 spill.go）：外置时内容零丢失，
+// 只有外置不可用/失败才落到下面的硬切。外置不可用是常态而非异常 ——
+// 单测里绝大多数用例都没装配存储，而那条路径必须与改动前逐字节一致。
+func (e *Executor) truncate(ctx context.Context, res *ToolResult) *ToolResult {
 	if res == nil {
 		return res
 	}
@@ -392,11 +411,22 @@ func (e *Executor) truncate(res *ToolResult) *ToolResult {
 	if max <= 0 {
 		max = defaultMaxOutput
 	}
+	sessionID := ""
+	if sc, ok := SessionFrom(ctx); ok {
+		sessionID = sc.SessionID
+	}
 
 	// ① 纯文本：形态不变，只在尾部挂标记。
 	if s, ok := res.Data.(string); ok {
 		if len(s) <= max {
 			return res
+		}
+		if e.toolOut.ShouldSpill(s) {
+			if ref, preview, ok := e.toolOut.Store(sessionID, s); ok {
+				e.noteSpill(res, ref)
+				res.Data = preview
+				return res
+			}
 		}
 		res.Data = truncateString(s, max) + fmt.Sprintf("\n... [输出已截断，原始长度 %d 字节]", len(s))
 		return res
@@ -408,7 +438,26 @@ func (e *Executor) truncate(res *ToolResult) *ToolResult {
 		return res
 	}
 
-	// ③ 超限：换成合法 JSON 替身。
+	// ③ 超限：结构化结果同样优先外置 —— 外置的是**完整 JSON**，
+	// 预览只是给人看的线索，回取时拿到的是原样。
+	if e.toolOut.ShouldSpill(string(raw)) {
+		if ref, preview, ok := e.toolOut.Store(sessionID, string(raw)); ok {
+			e.noteSpill(res, ref)
+			env, mErr := json.Marshal(map[string]any{
+				"spilled": true, "id": ref.ID, "bytes": ref.Bytes,
+				"lines": ref.Lines, "preview": preview,
+				"hint": "完整内容未丢失，用 tool_result_read(id, start_line) 分段读取；不要凭预览猜测。",
+			})
+			if mErr == nil {
+				res.Data = json.RawMessage(env)
+				return res
+			}
+			// 理论上不可达（全是基础类型）。真发生就退回下面的硬切信封，
+			// 绝不能把未经转义的 preview 直接塞进 Data —— 那会产出非法 JSON。
+		}
+	}
+
+	// ④ 兜底：换成合法 JSON 替身。
 	//
 	// preview 取原文**前缀** —— 结构化结果的信息密度在开头（首条命中、首个错误）。
 	//
@@ -441,6 +490,19 @@ func (e *Executor) truncate(res *ToolResult) *ToolResult {
 	}
 	res.Data = json.RawMessage(out)
 	return res
+}
+
+// noteSpill 把外置句柄记进结果元数据。
+//
+// 目的有两个：界面能显示「已外置，可回取」，以及将来若有按 id 清理/导出的
+// 需求不必改截断逻辑。元数据是既有字段（ToolResult.Metadata），不新增概念。
+func (e *Executor) noteSpill(res *ToolResult, ref ToolOutRef) {
+	if res.Metadata == nil {
+		res.Metadata = map[string]any{}
+	}
+	res.Metadata["tool_out"] = map[string]any{
+		"id": ref.ID, "bytes": ref.Bytes, "lines": ref.Lines,
+	}
 }
 
 // truncateString 在 rune 边界安全截断字符串。

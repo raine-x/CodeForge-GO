@@ -109,6 +109,7 @@ comit时直接使用简短的中文描述此次更改完成了什么，示例：
 | 判断模型能不能收下附件 | `mediaVerdict` / `ForgetMediaCapability` | `pkg/agent/capability.go` |
 | 发请求前的 RPM 节流 | `reserve`（预约式滑动窗口）/ `AcquireSlot` | `pkg/llm/ratelimit.go` |
 | 把多格式文件读成纯文本 | `extractDocText`（docx/pptx/xlsx/pdf，视频在此明确报「读不了」） | `pkg/tools/builtin/doc_extract.go` |
+| 大工具结果不进上下文 | `ToolOutStore`（落盘 + 留引用，模型用 `tool_result_read` 取回） | `pkg/tools/spill.go` |
 
 **规则**：新增功能前，先 grep 上表和相邻包。确实要新增，在提交说明里写清"现有的为什么不够"。
 
@@ -143,7 +144,7 @@ comit时直接使用简短的中文描述此次更改完成了什么，示例：
 **分层落地时的三条既定决策**（改之前先看，别重新讨论）：
 
 1. **`pathLocks` 留在 Guard，不下沉 Backend。** 锁序是 `pathLock → Guard.mu`（`casWrite` 持路径锁期间要取 `mu` 读 `readSeen`）。跨对象无法表达这个顺序 —— 接口层没有机制保证它不被违反，一次「顺手」重构就会翻成反向顺序，死锁而不是失败。
-2. **撤销副本 scratch 目录（默认 `~/.codeforge/undo`）刻意不进 Backend。** 它是进程级、跨工作区的。进 Backend 等于给远程后端定义「往我本地 home 目录写文件」的契约。
+2. **撤销副本 scratch 目录（默认 `~/.codeforge/undo`）刻意不进 Backend。** 它是进程级、跨工作区的。进 Backend 等于给远程后端定义「往我本地 home 目录写文件」的契约。工具结果外置目录（`~/.codeforge/toolout`，见 `pkg/tools/spill.go`）属同一类，因此**全部 IO 放在 `pkg/tools` 而不在 `pkg/tools/builtin`** —— 这样内置工具一行 `os.*` 都不用写，`layering_test.go` 的 `allowed` 表不需要为它开条目。
 3. **`Backend` 不加 `IsInScope` / `CheckScope` 之类的方法。** 加了就等于邀请每个后端自己实现一遍围栏，安全逻辑必然分叉。Backend 只提供 `Realpath`，判断在 Guard。
 
 ---

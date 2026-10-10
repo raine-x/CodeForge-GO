@@ -371,6 +371,31 @@ type History struct {
 	mu    sync.RWMutex
 	st    *store.Store
 	cache map[string]*Session
+
+	// onDelete 是「会话被删除」时的副作用钩子（main.go 注入，用来清掉
+	// 该会话的工具结果外置目录）。
+	//
+	// 为什么做成钩子而不是直接持有 store：History 属于 pkg/agent，
+	// 外置存储属于 pkg/tools，两者本不该互相持有（谁先初始化、谁持有谁
+	// 都没有道理）。这里只留一个回调，落点由组装方决定。
+	// 清理**失败不阻断删除** —— 会话没了就该没了，外置目录是缓存。
+	onDelete func(sessionID string)
+}
+
+// SetOnDelete 装配「会话删除后」钩子。
+func (h *History) SetOnDelete(fn func(sessionID string)) {
+	h.mu.Lock()
+	h.onDelete = fn
+	h.mu.Unlock()
+}
+
+func (h *History) fireDelete(id string) {
+	h.mu.RLock()
+	fn := h.onDelete
+	h.mu.RUnlock()
+	if fn != nil {
+		fn(id)
+	}
 }
 
 // NewHistory 构造会话历史管理器（st 为已打开的 SQLite 存储）。
@@ -588,7 +613,11 @@ func (h *History) Delete(id string) error {
 	h.mu.Lock()
 	delete(h.cache, id)
 	h.mu.Unlock()
-	return h.st.DeleteSession(id)
+	err := h.st.DeleteSession(id)
+	if err == nil {
+		h.fireDelete(id)
+	}
+	return err
 }
 
 // DeleteWorkspace 删除整个项目（工作区）下的全部会话，并清掉缓存中属于该项目的会话。
@@ -596,6 +625,7 @@ func (h *History) Delete(id string) error {
 // Workspace 字段本身也受 Session.mu 保护（SetWorkspace 会改它），
 // 所以判断归属要连 s.mu 一起读 —— 锁序 h.mu → s.mu，与 Get 一致。
 func (h *History) DeleteWorkspace(workspace string) error {
+	var removed []string
 	h.mu.Lock()
 	for id, s := range h.cache {
 		s.mu.RLock()
@@ -603,10 +633,20 @@ func (h *History) DeleteWorkspace(workspace string) error {
 		s.mu.RUnlock()
 		if match {
 			delete(h.cache, id)
+			removed = append(removed, id)
 		}
 	}
 	h.mu.Unlock()
-	return h.st.DeleteWorkspace(workspace)
+	if err := h.st.DeleteWorkspace(workspace); err != nil {
+		return err
+	}
+	// 只有删成功才清外置：删失败时会话还在，外置文件还要留着。
+	// 注意只覆盖**缓存里**的会话 —— 未加载过的会话（重启后没碰过的）
+	// 其外置目录由启动 GC 兜底。
+	for _, id := range removed {
+		h.fireDelete(id)
+	}
+	return nil
 }
 
 // firstUserText 提取首条用户消息文本，用于生成会话标题。

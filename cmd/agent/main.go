@@ -331,6 +331,32 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 
 	executor := tools.NewExecutor(registry, policy, audit, nil, 120*time.Second, 32*1024)
 
+	// 2.5) 工具结果外置（context offloading）
+	//
+	// 装配顺序有讲究：store 要在注册 tool_result_read **之前**建好，
+	// 而 tool_result_read 必须在 executor 之前注册 —— 工具表是一次性快照的。
+	//
+	// 启动先清空整个外置目录：产物是**本次进程的缓存**而不是用户资产，
+	// 留着只会占盘（APK 逆向那种负载一次会话能落几百 MB）。
+	// 前提是单实例，而 main.go 已在检测到已有实例时拒绝启动。
+	toolOut := tools.NewToolOutStore(
+		tools.DefaultToolOutRoot(),
+		cfg.Agent.ToolOutSpillBytes,
+		cfg.Agent.ToolOutPreviewBytes,
+	)
+	if toolOut.Enabled() {
+		if err := toolOut.GC(); err != nil {
+			logx.Warnf("清理工具结果外置目录失败（不影响使用）: %v", err)
+		}
+		executor.SetToolOut(toolOut)
+		registry.Register(builtin.NewToolOutTool(toolOut))
+		logx.Infof("工具结果外置已启用：超过 %d 字节的结果落盘 %s，上下文只留 %d 字节预览",
+			cfg.Agent.ToolOutSpillBytes, tools.DefaultToolOutRoot(), cfg.Agent.ToolOutPreviewBytes)
+	} else {
+		logx.Infof("工具结果外置未启用：超过 %d 字节的工具结果会被截断（agent.tool_out_spill_bytes=0）",
+			executor.MaxOutput())
+	}
+
 	// 3) 插件引擎
 	manager := plugins.NewManager(registry, policy, cfg.Plugins)
 	if err := manager.LoadAll(context.Background()); err != nil {
@@ -363,6 +389,15 @@ func startCmd(configDir, workDir string, noOpen bool, resumeArg string) int {
 		logx.Infof("已迁移 %d 条旧版 JSON 会话到 SQLite", n)
 	}
 	history := agent.NewHistory(st)
+	// 会话删掉时顺手清掉它的外置目录。不接这个钩子的话，一次 APK 逆向
+	// 留下的几百 MB 会一直躺在盘上，直到下次启动才被 GC 掉。
+	if toolOut.Enabled() {
+		history.SetOnDelete(func(sessionID string) {
+			if err := toolOut.RemoveSession(sessionID); err != nil {
+				logx.Debugf("清理会话 %s 的外置输出失败: %v", sessionID, err)
+			}
+		})
+	}
 	ag := agent.New(cfg.Agent, cfg.LLM, provider, executor, history, wd)
 	ag.SetMemoryStore(st)                // 用户记忆与 History 共用同一 SQLite 库
 	builtin.RegisterMemory(registry, ag) // save_memory 工具

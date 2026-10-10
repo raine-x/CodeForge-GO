@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -61,7 +62,7 @@ func TestTruncateStructuredStaysValidJSON(t *testing.T) {
 		t.Fatalf("夹具太小，测不到限幅：%d 字节", len(original))
 	}
 
-	got := e.truncate(&ToolResult{Success: true, Data: hits})
+	got := e.truncate(context.Background(), &ToolResult{Success: true, Data: hits})
 
 	out, err := json.Marshal(got.Data)
 	if err != nil {
@@ -110,7 +111,7 @@ func TestTruncateStringBranchUnchanged(t *testing.T) {
 	e := newTruncExec(max)
 	big := strings.Repeat("行内容\n", 2000)
 
-	got := e.truncate(&ToolResult{Success: true, Data: big})
+	got := e.truncate(context.Background(), &ToolResult{Success: true, Data: big})
 	s, ok := got.Data.(string)
 	if !ok {
 		t.Fatalf("纯文本结果应仍是 string，实际 %T", got.Data)
@@ -131,7 +132,7 @@ func TestTruncateUnderLimitIsNoop(t *testing.T) {
 	e := newTruncExec(32 * 1024)
 	small := []bigHit{{File: "a.go", Line: 1, Text: "x"}}
 
-	got := e.truncate(&ToolResult{Success: true, Data: small})
+	got := e.truncate(context.Background(), &ToolResult{Success: true, Data: small})
 	out, err := json.Marshal(got.Data)
 	if err != nil {
 		t.Fatal(err)
@@ -144,10 +145,10 @@ func TestTruncateUnderLimitIsNoop(t *testing.T) {
 // TestTruncateNilAndError 边界：nil 结果不 panic；失败结果（Data==nil）不受影响。
 func TestTruncateNilAndError(t *testing.T) {
 	e := newTruncExec(1024)
-	if got := e.truncate(nil); got != nil {
+	if got := e.truncate(context.Background(), nil); got != nil {
 		t.Errorf("truncate(nil) 应返回 nil，实际 %+v", got)
 	}
-	res := e.truncate(Err("失败：%v", "某个很长的原因"))
+	res := e.truncate(context.Background(), Err("失败：%v", "某个很长的原因"))
 	if res.Data != nil {
 		t.Errorf("失败结果的 Data 应保持 nil，实际 %T", res.Data)
 	}
@@ -173,7 +174,7 @@ func TestTruncateEscapingInflation(t *testing.T) {
 		t.Fatalf("夹具太小: %d", len(original))
 	}
 
-	got := e.truncate(&ToolResult{Success: true, Data: hits})
+	got := e.truncate(context.Background(), &ToolResult{Success: true, Data: hits})
 	out, err := json.Marshal(got.Data)
 	if err != nil {
 		t.Fatalf("序列化失败: %v", err)
@@ -193,7 +194,7 @@ func TestTruncateMarshalFailure(t *testing.T) {
 	bad := map[string]any{"ch": make(chan int), "pad": strings.Repeat("x", 4096)}
 
 	// 关键是「不 panic」
-	got := e.truncate(&ToolResult{Success: true, Data: bad})
+	got := e.truncate(context.Background(), &ToolResult{Success: true, Data: bad})
 	if got == nil {
 		t.Fatal("不应返回 nil")
 	}
@@ -205,7 +206,7 @@ func TestTruncateSingleHugeValue(t *testing.T) {
 	e := newTruncExec(max)
 	one := map[string]any{"content": strings.Repeat("x", 100*1024)}
 
-	got := e.truncate(&ToolResult{Success: true, Data: one})
+	got := e.truncate(context.Background(), &ToolResult{Success: true, Data: one})
 	out, err := json.Marshal(got.Data)
 	if err != nil {
 		t.Fatalf("序列化失败: %v", err)

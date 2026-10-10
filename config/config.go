@@ -71,6 +71,12 @@ type LLMConfig struct {
 	RPM int `yaml:"rpm,omitempty"`
 }
 
+// DefaultToolOutSpillBytes 是「工具结果多大就外置」的缺省阈值（8 KiB）。
+//
+// 放在 config 里而不在 pkg/tools，是为了让 default.yaml 的注释成为
+// 这一项的唯一说明来源；pkg/tools 侧只认传进来的值。
+const DefaultToolOutSpillBytes = 8 * 1024
+
 // AgentConfig 描述 Agent 引擎行为。
 type AgentConfig struct {
 	MaxSteps           int `yaml:"max_steps"`
@@ -87,6 +93,16 @@ type AgentConfig struct {
 	// 审计链路不变 —— 隐藏 ≠ 禁止执行，如需隐藏即禁用应在 Executor/Policy 加规则。
 	// 按真实工具名匹配（如 "web_fetch"），不是清洗后的 wire 名。
 	HiddenTools []string `yaml:"hidden_tools"`
+	// ToolOutSpillBytes 是「工具结果多大就外置」的阈值（字节）。
+	//
+	// 超过它，结果**不再被硬截断**而是完整落盘到 ~/.codeforge/toolout/，
+	// 上下文里只留一段预览 + 一个短 id，模型可用 tool_result_read 按行取回。
+	// 这与压缩不同：摘要有损、机械压缩直接丢，外置**一个字节都不少**。
+	//
+	// 0 = 关闭（退回改动前的截断行为）。负数按 0 处理。
+	ToolOutSpillBytes int `yaml:"tool_out_spill_bytes"`
+	// ToolOutPreviewBytes 是外置后留在上下文里的预览长度。<=0 用内置缺省。
+	ToolOutPreviewBytes int `yaml:"tool_out_preview_bytes"`
 }
 
 // SecurityRule 是一条有序匹配的权限规则。
@@ -396,6 +412,7 @@ func Default() *Config {
 			MaxSteps:             500,
 			ContextTokenBudget:   120000,
 			ContextCompressRatio: 0.80,
+			ToolOutSpillBytes:    DefaultToolOutSpillBytes,
 		},
 		Security: SecurityConfig{
 			DefaultDecision:     "ask",
@@ -601,6 +618,14 @@ func normalize(cfg *Config) {
 	// 太大则留给输出与摘要的空间不足。
 	if cfg.Agent.ContextCompressRatio < 0.5 || cfg.Agent.ContextCompressRatio > 0.99 {
 		cfg.Agent.ContextCompressRatio = 0.80
+	}
+	// 外置阈值：负数按 0（关闭）处理；**刻意不**把 0 抬回缺省值 ——
+	// 「显式写 0 关掉」必须真的关得掉，否则用户改不动这个开关。
+	if cfg.Agent.ToolOutSpillBytes < 0 {
+		cfg.Agent.ToolOutSpillBytes = 0
+	}
+	if cfg.Agent.ToolOutPreviewBytes < 0 {
+		cfg.Agent.ToolOutPreviewBytes = 0
 	}
 	if cfg.LLM.MaxTokens <= 0 {
 		cfg.LLM.MaxTokens = 8192

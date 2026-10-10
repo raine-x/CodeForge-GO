@@ -77,6 +77,9 @@ func NewExecutorFor(parent *Executor, role Role, registry *Registry) *Executor {
 		timeout:         spec.timeout,
 		maxOutput:       spec.maxOutput,
 		approvalTimeout: parent.ApprovalTimeout(),
+		// 外置存储同样从 parent 取，且**必须**取：子智能体跑出来的
+		// 大结果同样进主会话的历史，不外置的话子任务一多就把窗口填满。
+		toolOut: parent.toolOut,
 	}
 	if spec.inheritApprover {
 		e.approver = parent.Approver()
