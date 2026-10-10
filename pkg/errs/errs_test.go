@@ -76,7 +76,7 @@ func TestClassifyStatus(t *testing.T) {
 		500: KindUpstream,
 		502: KindUpstream,
 		503: KindUpstream,
-		404: KindNotFound,
+		404: KindRouteNotFound,
 	}
 	for code, want := range cases {
 		if got := ClassifyStatus(code); got != want {
@@ -95,6 +95,37 @@ func TestClassifyUnknown(t *testing.T) {
 	}
 }
 
+// 404 与本机文件不存在是两回事，文案不能互相串。
+//
+// 这条是本次拆分的起因：OpenRouter 对不可用的模型 slug 回 404，
+// 于是每一轮都报「找不到目标（文件或资源不存在）。确认路径是否正确」，
+// 用户去查文件路径，而真凶是模型 id 写错。这类错误只有把两者的
+// 排查方向分开才能定位，所以用断言钉住：**路由 404 的提示里不许
+// 出现「路径」二字，本机文件缺失的提示里必须出现**。
+func TestRouteNotFoundHintPointsAtModelNotPath(t *testing.T) {
+	route := Cause(KindRouteNotFound) + Hint(KindRouteNotFound)
+	if strings.Contains(route, "路径") {
+		t.Errorf("KindRouteNotFound 的文案不该让用户去查文件路径，实际: %s", route)
+	}
+	if !strings.Contains(route, "模型") {
+		t.Errorf("KindRouteNotFound 的文案应指向模型 id / 接口地址，实际: %s", route)
+	}
+
+	local := Cause(KindNotFound) + Hint(KindNotFound)
+	if !strings.Contains(local, "路径") {
+		t.Errorf("KindNotFound 的文案应保留「确认路径是否正确」这条唯一有用的建议，实际: %s", local)
+	}
+
+	// 端到端：上游 404 经 Classify 后必须落到路由类，且不可重试。
+	err := NewStatus(404, `{"error":{"message":"No endpoints found for xxx.","code":404}}`, 0, nil)
+	if got := Classify(err); got != KindRouteNotFound {
+		t.Errorf("上游 404 应归为 KindRouteNotFound，实际 %v", got)
+	}
+	if Retryable(Classify(err)) {
+		t.Error("上游 404 重试一百次结果都一样，不该可重试")
+	}
+}
+
 // ---------- 可重试性 ----------
 
 func TestRetryable(t *testing.T) {
@@ -105,7 +136,7 @@ func TestRetryable(t *testing.T) {
 		}
 	}
 	// 这几种重试一百次结果都一样，不该自动重试。
-	notRetryable := []Kind{KindAuth, KindPermission, KindNotFound, KindParse, KindDiskFull, KindCanceled}
+	notRetryable := []Kind{KindAuth, KindPermission, KindNotFound, KindRouteNotFound, KindParse, KindDiskFull, KindCanceled}
 	for _, k := range notRetryable {
 		if Retryable(k) {
 			t.Errorf("%v 不应可重试", k)

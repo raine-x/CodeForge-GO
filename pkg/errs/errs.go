@@ -60,8 +60,22 @@ const (
 	KindUpstream
 	// KindPermission 本机文件/资源权限不足。
 	KindPermission
-	// KindNotFound 目标文件或资源不存在。
+	// KindNotFound **本机**目标文件或资源不存在（os.ErrNotExist）。
 	KindNotFound
+	// KindRouteNotFound 上游返回 HTTP 404：接口地址或模型标识不存在。
+	//
+	// 必须与 KindNotFound 分开，理由同 KindUnsupportedMedia ——
+	// 两者真实成因毫无关系，共用一个 Kind 就等于给出错误的排查方向：
+	// 实测（2026-10）OpenRouter 对未知模型 slug 回
+	// `{"error":{"message":"No endpoints found for xxx.","code":404}}`，
+	// 于是每一轮都报「找不到目标（文件或资源不存在）。确认路径是否正确」。
+	// 现场压根没有文件 involvement，用户照着提示去查路径，永远查不到真凶
+	// （真凶是 llm.model 写错了一个这个 key 不可用的 slug）。
+	//
+	// 不合并的做法也可以是把 Hint 改成中性措辞，但那样**真正**的文件丢失
+	// （read_file 打错路径）就失去它唯一有用的那条建议 —— 而那条建议
+	// 正是 KindNotFound 存在的理由。所以拆开，各说各的。
+	KindRouteNotFound
 	// KindDiskFull 磁盘写满。
 	KindDiskFull
 	// KindParse 数据格式错误：JSON/YAML 解析失败。
@@ -356,7 +370,7 @@ func ClassifyStatus(code int) Kind {
 	case code >= statusServerErrFrom:
 		return KindUpstream
 	case code == statusNotFound:
-		return KindNotFound
+		return KindRouteNotFound
 	case code == statusBadRequest:
 		return KindParse
 	}
@@ -388,6 +402,8 @@ func Cause(k Kind) string {
 		return "权限不足（没有读写该文件/目录的权限）"
 	case KindNotFound:
 		return "找不到目标（文件或资源不存在）"
+	case KindRouteNotFound:
+		return "接口不存在（地址或模型标识不对）"
 	case KindDiskFull:
 		return "磁盘空间不足"
 	case KindParse:
@@ -430,6 +446,8 @@ func Hint(k Kind) string {
 		return "检查该文件/目录的权限，或换一个可写的位置"
 	case KindNotFound:
 		return "确认路径是否正确"
+	case KindRouteNotFound:
+		return "到「设置 → 模型」检查模型 id 与接口地址"
 	case KindDiskFull:
 		return "清理磁盘空间后重试"
 	case KindParse:
