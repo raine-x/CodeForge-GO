@@ -27,11 +27,18 @@ type ctxStubProvider struct {
 	reply   string
 	err     error
 	prompts []string // 每次调用的 user 消息文本
+	// summaryReqs 记录被判为「摘要请求」的那次调用的 System 与 MaxTokens。
+	// 摘要提示词里的字数上限必须与 MaxTokens 匹配（中文 1 字 ≈ 1 token），
+	// 不匹配就会写到一半被硬切，所以这两项要能被断言。
+	summaryReqs []llm.Request
 }
 
 func (p *ctxStubProvider) Name() string { return "ctx-stub" }
 
 func (p *ctxStubProvider) Stream(_ context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+	if isSummaryRequest(req) {
+		p.summaryReqs = append(p.summaryReqs, req)
+	}
 	for _, m := range req.Messages {
 		for _, b := range m.Content {
 			if b.Type == llm.BlockText {
@@ -399,6 +406,52 @@ func TestRunLoopCompressesRequestOverhead(t *testing.T) {
 	if !compressed {
 		t.Fatal("system prompt overhead did not trigger compression")
 	}
+}
+
+// 摘要提示词里的字数上限必须 ≤ 本次实际能输出的字数（MaxTokens）。
+//
+// 中文 1 字 ≈ 1 token（与 EstimateTokens 同口径），两者本该一一对应。
+// 若提示词按存储上限告知 12000 字、而模型 ctx_out 只有 2048，模型会写到
+// 一半被 max_tokens 硬切，留下断在半句的摘要 —— 读起来就是「信息丢了」，
+// 比老老实实写一个短摘要糟得多。
+func TestSummaryPromptRuneLimitNeverExceedsMaxTokens(t *testing.T) {
+	for _, maxTokens := range []int{0, 2048, 8192, summaryOutputCap, 200000} {
+		cfg := config.AgentConfig{ContextTokenBudget: 2000, ContextCompressRatio: 0.95}
+		p := &ctxStubProvider{reply: "## 摘要"}
+		a := newCtxAgent(cfg, config.LLMConfig{MaxTokens: maxTokens}, p)
+
+		msgs := buildTurns(12, 400)
+		msgs = append(msgs, llm.TextMessage(llm.RoleUser, "现在总结一下"))
+		sess := &Session{ID: "s1", Messages: msgs}
+		a.prepareMessages(context.Background(), sess, func(Event) {})
+
+		if len(p.summaryReqs) == 0 {
+			t.Fatalf("MaxTokens=%d 时应发出摘要请求，实际没有", maxTokens)
+		}
+		req := p.summaryReqs[0]
+		effective := a.summaryMaxTokens()
+		if effective > summaryOutputCap {
+			effective = summaryOutputCap
+		}
+		limit := summaryPromptRuneLimit(effective)
+		if !strings.Contains(req.System, fmt.Sprintf("控制在 %d 字以内", limit)) {
+			t.Fatalf("MaxTokens=%d 时摘要提示词未按 %d 字告知，实际提示词尾部为 %q",
+				maxTokens, limit, clipForMsg(req.System, 40))
+		}
+		if limit > effective {
+			t.Errorf("MaxTokens=%d 时提示词字数上限 %d 超过了实际可输出字数 %d",
+				maxTokens, limit, effective)
+		}
+	}
+}
+
+// clipForMsg 只用于测试失败时的报错，截一段尾巴便于定位。
+func clipForMsg(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return "…" + string(r[len(r)-n:])
 }
 
 func TestPrepareMessagesSummarizes(t *testing.T) {

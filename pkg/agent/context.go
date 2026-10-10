@@ -36,8 +36,14 @@ const (
 
 	// chunkRatioNum / chunkRatioDen 是单次摘要请求可承载的历史占比。
 	// 历史可能远超模型窗口，必须分块滚动摘要，否则「为了摘要而超窗」。
+	//
+	// 占比取 1/4 而不是 1/2，理由与「块小才快」直接相关：
+	// 块越大，单次摘要请求越慢，越容易撞上 summaryTimeout 而**超时**——
+	// 而超时是最贵的一种失败（要先白等满超时才判定失败），随后还要减半重试。
+	// 摘要本来就是滚动累积的（每块都带 prev 作为背景），块小只是多几次请求，
+	// 每次都快且稳；块大则常常一次都跑不完。宁可多发几次，也不要整段回退机械压缩。
 	chunkRatioNum = 1
-	chunkRatioDen = 2
+	chunkRatioDen = 4
 
 	// minSummaryChunk 是摘要块预算收缩的**绝对下限**（tokens）。
 	//
@@ -51,7 +57,12 @@ const (
 	summaryChunkFloorDiv = 8
 
 	// summaryMaxRunes 是摘要正文的长度上限（字符），提示词里也会告知模型。
-	summaryMaxRunes = 6000
+	//
+	// 这是「压缩后还能记住多少」的硬天花板：切点之前的历史无论多少，
+	// 压完都只剩这么多字。原值 6000 对做 APK 逆向这类会话太窄 ——
+	// 光是「读过哪些文件、每个文件改了什么」就写不下，用户侧表现为
+	// 明明聊过的事，压缩几轮后模型开始重新问一遍。
+	summaryMaxRunes = 12000
 	// transcriptBlockRunes 是单条消息在摘要输入里的截断上限。
 	// 比机械压缩的 400 字宽松得多 —— 摘要要「详细」，得先让模型看到细节。
 	transcriptBlockRunes = 4000
@@ -102,7 +113,11 @@ const (
 	// 所以只影响「重启后第一炮」，不会长期把压缩线压得过低。
 	uncalibratedTokenFactor = 1.15
 	// summaryOutputCap 是摘要请求输出上限的绝对上限（不沿用模型的大输出上限）。
-	summaryOutputCap = 8192
+	//
+	// 必须与 summaryMaxRunes 匹配：中文 1 字 ≈ 1 token（见 EstimateTokens 口径），
+	// 输出上限低于字数上限时，模型会写到一半被 max_tokens 硬切，
+	// 留下一个断在半句的摘要 —— 那比短摘要糟得多（读起来像丢了信息）。
+	summaryOutputCap = 16384
 	// imageTokens 是单张图片的固定估算值（不再写死 4096，见 EstimateTokens）。
 	imageTokens = 4096
 	// videoTokensFloor 是视频估算的固定下限，保证「哪怕是空视频也占一点预算」。
@@ -584,10 +599,18 @@ func (a *Agent) summarizeChunk(ctx context.Context, prev, transcript string) (st
 	cctx, cancel := context.WithTimeout(ctx, summaryTimeout)
 	defer cancel()
 
+	// 提示词里的字数上限取「存储上限」与「本次实际能写出的字数」的较小者。
+	//
+	// 为什么要取小：中文 1 字 ≈ 1 token，两者口径一致。若按 summaryMaxRunes
+	// 告知 12000 字，而模型输出上限（ctx_out）只有 4096，模型会写到一半被
+	// max_tokens 硬切，留下断在半句的摘要 —— 读起来就像「信息丢了」，
+	// 比老老实实写短更糟。
+	maxOut := a.summaryMaxTokens()
+
 	stream, err := provider.Stream(cctx, llm.Request{
-		System:      fmt.Sprintf(summarySystemPrompt, summaryMaxRunes),
+		System:      fmt.Sprintf(summarySystemPrompt, summaryPromptRuneLimit(maxOut)),
 		Messages:    []llm.Message{llm.TextMessage(llm.RoleUser, sb.String())},
-		MaxTokens:   a.summaryMaxTokens(),
+		MaxTokens:   maxOut,
 		Temperature: 0,
 	})
 	if err != nil {
@@ -835,6 +858,21 @@ func (a *Agent) summarizeChunkBudget() int {
 		return 2000
 	}
 	return b
+}
+
+// summaryPromptRuneLimit 返回「应当告知模型的摘要字数上限」。
+//
+// 取「存储上限 summaryMaxRunes」与「本次实际能输出的字数 maxOut」的较小者。
+//
+// 为什么要取小：中文 1 字 ≈ 1 token（与 EstimateTokens 同口径），两者一一对应。
+// 若按存储上限告知 12000 字、而模型 ctx_out 只有 4096，模型会写到一半被
+// max_tokens 硬切，留下断在半句的摘要 —— 读起来就像「信息丢了」，
+// 比老老实实写一个短摘要糟得多。
+func summaryPromptRuneLimit(maxOut int) int {
+	if maxOut > 0 && maxOut < summaryMaxRunes {
+		return maxOut
+	}
+	return summaryMaxRunes
 }
 
 // summaryMaxTokens 返回摘要请求的输出上限。
