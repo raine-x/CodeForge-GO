@@ -591,6 +591,8 @@ body { background: transparent; }
   text-align: left;
 }
 .nav-item svg { color: var(--text-dim); flex: 0 0 auto; }
+/* 独立设置页入口是 <a>，去掉链接默认下划线 */
+a.nav-item { text-decoration: none; }
 .nav-item:hover { background: var(--bg-elev-2); }
 .nav-item.active { background: var(--bg-elev-2); font-weight: 600; }
 .nav-item.active svg { color: var(--accent); }

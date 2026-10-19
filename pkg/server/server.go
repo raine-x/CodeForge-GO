@@ -310,6 +310,10 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // handleRoot 提供前端静态资源（SPA 回退到 index.html）。
+//
+// 带 index.html 的子目录按目录索引直出（如 /settings/ → settings/index.html，
+// 独立设置页）；目录请求没带末尾斜杠时先重定向补上 —— 否则页面里的相对路径
+// （styles.css / app.js）会按上一级解析，样式和脚本全部 404。
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	s.ensureCookie(w, r)
 
@@ -319,6 +323,13 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dist := web.Dist()
+	if st, err := fs.Stat(dist, name); err == nil && st.IsDir() {
+		if !strings.HasSuffix(r.URL.Path, "/") {
+			http.Redirect(w, r, r.URL.Path+"/", http.StatusMovedPermanently)
+			return
+		}
+		name = path.Join(name, "index.html")
+	}
 	data, err := fs.ReadFile(dist, name)
 	if err != nil {
 		name = "index.html"
