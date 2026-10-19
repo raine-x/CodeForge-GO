@@ -3794,8 +3794,11 @@ body.bg-dark .fs-tip {
 #page-models .mrow.batch.sel { border-color: var(--accent-solid); background: var(--accent-dim); }
 
 /* ── 栏 3：详情 / 编辑 ────────────────────────────────────────── */
+/* 宽度由栅格定死（minmax(320px,360px)），内容不撑栏：
+   overflow-x 必须显式给 hidden —— 只写 overflow-y 时，可见轴会算成 auto，
+   右栏横向滚动条就冒出来了（内容再宽也不该让整栏滑走）。 */
 #page-models .m3-detail {
-  overflow-y: auto; min-height: 0;
+  overflow-y: auto; overflow-x: hidden; min-height: 0; min-width: 0;
   background: var(--bg-elev);
   border-left: 1px solid var(--border-soft);
   padding: 16px 16px 28px;
@@ -3805,23 +3808,27 @@ body.bg-dark .fs-tip {
 #page-models .d-head-title { font-size: 15px; font-weight: 700; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #page-models .d-head-sub { font-size: 12px; color: var(--text-dim); margin-bottom: 14px; word-break: break-all; line-height: 1.5; }
 #page-models .d-back { display: none; }
-#page-models .d-form { display: flex; flex-direction: column; gap: 12px; }
+#page-models .d-form { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+/* 表单控件铺满所在字段并计入内边距：input 默认按 size 宽度，长值会把右栏顶宽 */
+#page-models .f-field input, #page-models .f-field select { width: 100%; box-sizing: border-box; }
+/* 连接信息提示：一行灰字说明来源即可，不做成文本框（它不是可编辑字段，
+   给它边框/底色会让人以为能在里面改，实际只能去供应商那里改）。 */
+#page-models .me-inherit {
+  font-size: 12px; color: var(--text-dim);
+  line-height: 1.7; word-break: break-all; overflow-wrap: anywhere;
+  margin-top: 10px;
+}
 #page-models .d-actions {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border-soft);
-}
-#page-models .me-inherit {
-  font-size: 12px; color: var(--text-dim); background: var(--bg);
-  border: 1px solid var(--border-soft); border-radius: 8px;
-  padding: 9px 11px; line-height: 1.6; word-break: break-all;
-  margin-top: 12px;
 }
 
 /* 上下文档位选择器（本页重排为「数字框 + 预设 chips」两行） */
 #page-models .ctx-pick { display: flex; flex-direction: column; align-items: stretch; gap: 7px; }
 #page-models .ctx-num { font-family: var(--mono); }
 #page-models .ctx-chips { display: flex; gap: 6px; flex-wrap: wrap; }
-#page-models .ctx-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+/* 输入/输出上下两行排（并排会把每个数字框压到半个栏宽，chips 也挤成两截） */
+#page-models .ctx-pair { display: flex; flex-direction: column; gap: 12px; }
 
 /* 密钥控件：眼睛按钮叠在输入框内（旧的 .key-eye-wrap 是行内并排，这里必须覆盖） */
 #page-models .key-eye-wrap { position: relative; flex: 1; min-width: 150px; display: flex; }
@@ -3886,5 +3893,4 @@ body.bg-dark .fs-tip {
   #page-models .m3-back, #page-models .d-back { display: inline-block; }
   #page-models .m3-detail { border-left: 0; }
   #page-models .m3-side { border-right: 0; }
-  #page-models .ctx-pair { grid-template-columns: 1fr; }
 }

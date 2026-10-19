@@ -7080,7 +7080,7 @@
     var vision = buildCapSeg('vision', m.vision);
     var video = buildCapSeg('video', m.video);
     form.appendChild(field('图片能力', vision.node));
-    form.appendChild(field('视频能力（原生透传）', video.node));
+    form.appendChild(field('视频能力', video.node));
 
     var rpmIn = mkInput('number', m.rpm > 0 ? String(m.rpm) : '', '留空或 0 = 不限制');
     form.appendChild(field('每分钟请求上限（RPM）', rpmIn));
@@ -7289,7 +7289,7 @@
     var vision = buildCapSeg('vision', null);
     var video = buildCapSeg('video', null);
     form.appendChild(field('图片能力', vision.node));
-    form.appendChild(field('视频能力（原生透传）', video.node));
+    form.appendChild(field('视频能力', video.node));
     var rpmIn = mkInput('number', '', '留空 = 不限制');
     form.appendChild(field('每分钟请求上限（RPM）', rpmIn));
     box.appendChild(form);

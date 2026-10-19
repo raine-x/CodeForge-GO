@@ -1432,6 +1432,20 @@ check('样式契约：能力分段三等分铺满、模型列表滚动由中间�
   /#page-models \.key-seg\.cap \{[^}]*display:\s*flex[^}]*width:\s*100%/.test(cssCode) &&
   /#page-models \.key-seg\.cap button \{[^}]*flex:\s*1/.test(cssCode) &&
   /#page-models \.m3-list \{[^}]*flex:\s*1[^}]*overflow-y:\s*auto[^}]*min-height:\s*0/.test(cssCode));
+check('右栏不横向滑动：宽度由栅格定死，overflow-x 显式 hidden',
+  // 只写 overflow-y 时可见轴会算成 auto，右栏会自己长出横向滚动条
+  /#page-models \.m3-detail \{[^}]*overflow-y:\s*auto;\s*overflow-x:\s*hidden;[^}]*min-width:\s*0/.test(cssCode) &&
+  /#page-models \.m3 \{[^}]*grid-template-columns: 200px minmax\(0, 1fr\) minmax\(320px, 360px\)/.test(cssCode));
+check('上下文输入/输出上下两行排，不并排挤半栏',
+  /#page-models \.ctx-pair \{[^}]*flex-direction:\s*column/.test(cssCode) &&
+  !/#page-models \.ctx-pair \{[^}]*grid-template-columns/.test(cssCode));
+check('连接信息提示是灰字不是文本框（没边框/底色，它不是可编辑字段）',
+  /#page-models \.me-inherit \{[^}]*font-size:\s*12px; color:\s*var\(--text-dim\)/.test(cssCode) &&
+  !/#page-models \.me-inherit \{[^}]*border:/.test(cssCode) &&
+  !/#page-models \.me-inherit \{[^}]*background:/.test(cssCode));
+check('视频能力标注去掉「原生透传」（那是实现细节，不是用户要判断的事）',
+  !/视频能力（原生透传）/.test(uiSrc) &&
+  /field\('视频能力', video\.node\)/.test(uiSrc));
 
 
 // ---------------------------------------------------------------------------
