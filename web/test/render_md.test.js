@@ -1332,298 +1332,107 @@ check('子智能体控件联动置灰（总开关/禁写）',
   /sub-allow-delete'\)\.disabled = true/.test(uiSrc));
 
 // ---------------------------------------------------------------------------
-// 添加模型：/models 拉取列表 → 选中 → 填入模型 id 到表单
-check('模型表单有「获取模型列表」入口',
-  /id="mf-discover"/.test(htmlSrc) &&
-  /id="mf-discover-panel"/.test(htmlSrc) &&
-  /id="disc-list"/.test(htmlSrc) &&
-  /id="disc-add"/.test(htmlSrc));
-check('发现模型走 /api/models/discover',
-  /function discoverModels/.test(uiSrc) &&
-  /fetch\('\/api\/models\/discover'/.test(uiSrc));
-// 已在库中的模型不可选、加「已添加」标记；选中只填 id，不再直接批量写库
-check('已在库的模型标记为已添加且不可选',
+// 模型管理（三栏：供应商 ▸ 模型 ▸ 详情 + 批量管理）
+// 2026-10：旧三 Tab（模型列表 / 供应商管理 / 添加模型）整体重排为单页三栏。
+// 以下断言同时钉住「新结构在」与「旧结构不留残迹」。
+check('模型页是三栏骨架：供应商列表 / 模型列表 / 详情栏在同一条 DOM 上',
+  /<section id="page-models" class="settings-page">/.test(htmlSrc) &&
+  /<div class="m3" id="m3">/.test(htmlSrc) &&
+  /id="m-prov-list"/.test(htmlSrc) &&
+  /id="m-model-list"/.test(htmlSrc) &&
+  /id="m-detail"/.test(htmlSrc));
+check('旧三 Tab 残迹清零（HTML 无 mtab，ui.js 无 showMTab / renderModelItems / renderProviders）',
+  !/data-mtab|\bmtab-/.test(htmlSrc) &&
+  !/models-tabs/.test(htmlSrc) &&
+  !/showMTab/.test(uiSrc) &&
+  !/renderModelItems|renderProviders/.test(uiSrc));
+check('「模型」导航项：自己切页面高亮并拉取三栏数据',
+  /\$\('#nav-models'\)\.addEventListener\('click'/.test(uiSrc) &&
+  /nav-models'\)\.addEventListener\('click'[\s\S]{0,560}?p\.id === 'page-models'[\s\S]{0,90}?loadModelViews\(\)/.test(uiSrc));
+check('供应商侧栏：全部模型 + 未归属伪分组，齿轮进供应商详情',
+  /function renderProvSide/.test(uiSrc) &&
+  /provItem\(ALL, '全部模型'/.test(uiSrc) &&
+  /provItem\('', '未归属供应商'/.test(uiSrc) &&
+  /pv-gear/.test(uiSrc) &&
+  /openProviderDetail\(id\)/.test(uiSrc));
+check('模型列表行：当前徽标 + 设为当前走 /api/models/apply',
+  /function renderModelList/.test(uiSrc) &&
+  /badge accent', '当前'/.test(uiSrc) &&
+  /api\('\/api\/models\/apply'/.test(uiSrc));
+check('批量管理：入口在中间栏工具条，四类动作与面板齐全',
+  /id="m-batch"/.test(htmlSrc) &&
+  /id="m-batch-bar"/.test(htmlSrc) &&
+  /id="m-batch-all"/.test(htmlSrc) &&
+  /id="m-batch-count"/.test(htmlSrc) &&
+  /id="m-batch-ctx"/.test(htmlSrc) &&
+  /id="m-batch-rpm"/.test(htmlSrc) &&
+  /id="m-batch-cap"/.test(htmlSrc) &&
+  /id="m-batch-del"/.test(htmlSrc) &&
+  /id="m-batch-panel"/.test(htmlSrc) &&
+  /function setBatchMode/.test(uiSrc) &&
+  /function toggleBatchPanel/.test(uiSrc));
+check('批量保存逐条走 /api/models/save，未指明字段沿用条目现值（provider 条目走 inherit_key）',
+  /function batchBodyFor/.test(uiSrc) &&
+  /body\.inherit_key = true/.test(uiSrc) &&
+  /api\('\/api\/models\/save', \{ method: 'POST', body: batchBodyFor\(m, patch\) \}/.test(uiSrc));
+check('批量能力是四态（不修改 / 不声明 / 支持 / 不支持），「不修改」不下发字段',
+  /function buildCapSeg4/.test(uiSrc) &&
+  /\['keep', '不修改'\], \['unset', '不声明'\], \['yes', '支持'\], \['no', '不支持'\]/.test(uiSrc) &&
+  /if \(state === 'keep'\) return undefined/.test(uiSrc));
+check('批量删除有内联确认，且提示「包含当前生效模型」',
+  /function batchDelete/.test(uiSrc) &&
+  /其中包含当前生效模型/.test(uiSrc) &&
+  /delConfirm\.disabled = !ids\.length/.test(uiSrc));
+check('详情页密钥可直接改：挂供应商改共享密钥（key_touched 先落供应商再存模型）',
+  /function buildKeyControl/.test(uiSrc) &&
+  /buildKeyControl\(prov \|\| m\)/.test(uiSrc) &&
+  /key_touched: true/.test(uiSrc) &&
+  /if \(prov && keyCtl\.touched\(\)\)/.test(uiSrc));
+check('测试连接用「所见即所得」的密钥：挂供应商时也带三件套先测',
+  /function openModelDetail/.test(uiSrc) &&
+  /if \(prov\) \{\s*body\.key_source = keyCtl\.source\(\)/.test(uiSrc) &&
+  /body\.probe_context = true/.test(uiSrc));
+check('能力三态：不声明 / 支持 / 不支持，get() 返回 null / true / false',
+  /function buildCapSeg/.test(uiSrc) &&
+  /if \(state === 'yes'\) return true/.test(uiSrc) &&
+  /if \(state === 'no'\) return false/.test(uiSrc) &&
+  /return null; \/\/ 不声明/.test(uiSrc));
+check('RPM：0 与未设置都回填成空框；无条件下发数值（0 = 不限制）',
+  /mkInput\('number', m\.rpm > 0 \? String\(m\.rpm\) : ''/.test(uiSrc) &&
+  /rpm: Math\.max\(0, parseInt\(rpmIn\.value, 10\) \|\| 0\)/.test(uiSrc));
+check('上下文档位：1M/512K/256K/128K 与 384K/256K/128K 预设，chips 同步高亮',
+  /CTX_PRESETS_IN = \[1048576, 524288, 262144, 131072\]/.test(uiSrc) &&
+  /CTX_PRESETS_OUT = \[393216, 262144, 131072\]/.test(uiSrc) &&
+  /function buildCtxPicker/.test(uiSrc) &&
+  /classList\.toggle\('on', Number\(b\.dataset\.v\) === v\)/.test(uiSrc));
+check('刷新出口：refreshModelViews 置假 modelsLoaded 并同步主界面；loadModelViews 不动它',
+  /function refreshModelViews\(\) \{\s*modelsLoaded = false;/.test(uiSrc) &&
+  /function loadModelViews\(\) \{\s*return loadLibrary\(\)/.test(uiSrc) &&
+  /return loadModels\(\);/.test(uiSrc));
+check('正在编辑的表单不被刷新打断（d-form 在场就不重绘详情）',
+  /function ensureDetailStillValid/.test(uiSrc) &&
+  /\$\('#m-detail \.d-form'\)/.test(uiSrc));
+check('获取上游模型列表：discover + save_batch，已在库的标「已在库」且禁用',
+  /function discoverForNew/.test(uiSrc) &&
+  /api\('\/api\/models\/discover'/.test(uiSrc) &&
+  /api\('\/api\/models\/save_batch'/.test(uiSrc) &&
   /cb\.disabled = !!m\.in_library/.test(uiSrc) &&
-  /badge\.textContent = '已添加'/.test(uiSrc) &&
-  /'disc-item' \+ \(m\.in_library \? ' added' : ''\)/.test(uiSrc) &&
-  /\.disc-item\.added\s*\{/.test(css));
-// 勾选后入库：**选了供应商就一次写入多个 id** —— 这是「同一个供应商下不必一个一个
-// 添加」的主路径；没选供应商（新建供应商态）才退回「填入单个 id 到表单」。
-check('勾选后批量入库：选了供应商就一次写入多个 id',
-  /function addSelectedDiscModels/.test(uiSrc) &&
-  /const ids = Object\.keys\(discSelected\)/.test(uiSrc) &&
-  /provider_id: pid/.test(uiSrc) &&
-  /models: ids\.map/.test(uiSrc) &&
-  /fetch\('\/api\/models\/save_batch'/.test(uiSrc));
-check('未选供应商时退回「填入单个模型 id」到表单',
-  /if \(!pid\) \{[\s\S]{0,420}?document\.getElementById\('mf-id'\)\.value = id/.test(uiSrc));
-check('上游列表多选（checkbox），勾选状态按 id 记录',
-  /cb\.type = 'checkbox'/.test(uiSrc) &&
-  /discSelected\[m\.id\] = true/.test(uiSrc) &&
-  /delete discSelected\[m\.id\]/.test(uiSrc));
-check('上游列表只保留筛选 + 收起，去掉全选/清空',
-  /id="disc-filter"/.test(htmlSrc) &&
-  /id="disc-close"/.test(htmlSrc) &&
-  !htmlSrc.includes('id="disc-all"') && !htmlSrc.includes('id="disc-none"') &&
-  /document\.getElementById\('disc-filter'\)\.addEventListener\('input', renderDiscList\)/.test(uiSrc));
-check('填入后收起面板并提示补密钥保存',
-  /setTestResult\(true, '已填入模型 id/.test(uiSrc) &&
-  /collapseDiscover\(\);\s*\n\s*return;/.test(uiSrc));
-check('切换/保存模型时收起上游列表（防状态串味）',
-  /collapseDiscover\(\); \/\/ 换了模型就收起上一次的上游列表/.test(uiSrc) &&
-  /collapseDiscover\(\);\s*\n\s*showMTab\('list'\)/.test(uiSrc));
+  /disc-badge', '已在库'/.test(uiSrc));
+check('窄屏单栏下钻：show-prov / show-models / show-detail 与返回键',
+  /function m3Show/.test(uiSrc) &&
+  /m3\.classList\.toggle\('show-detail', pane === 'detail'\)/.test(uiSrc) &&
+  /id="m-back-prov"/.test(htmlSrc) &&
+  /m3Show\('prov'\)/.test(uiSrc) &&
+  /m3Show\('models'\)/.test(uiSrc));
+check('样式契约：三栏网格 + 内容区去内边距 + 窄屏收单列',
+  /#page-models \.m3 \{[^}]*grid-template-columns:\s*200px minmax\(0, 1fr\) minmax\(320px, 360px\)/.test(cssCode) &&
+  /\.settings-content:has\(#page-models\.active\)\s*\{\s*padding:\s*0; overflow:\s*hidden;/.test(cssCode) &&
+  /#page-models \.m3\.show-detail \.m3-detail \{ display: block; \}/.test(cssCode));
+check('样式契约：能力分段三等分铺满、模型列表滚动由中间栏自己扛',
+  /#page-models \.key-seg\.cap \{[^}]*display:\s*flex[^}]*width:\s*100%/.test(cssCode) &&
+  /#page-models \.key-seg\.cap button \{[^}]*flex:\s*1/.test(cssCode) &&
+  /#page-models \.m3-list \{[^}]*flex:\s*1[^}]*overflow-y:\s*auto[^}]*min-height:\s*0/.test(cssCode));
 
-// ---------------------------------------------------------------------------
-// 模型管理：子 Tab「添加模型」+ 列表「编辑」复用同款表单 + 保存后进入对话框模型选择
-// 需求链路：设置 → 模型 → 添加模型 → 保存 = 模型列表与对话框弹层同时出现新条目。
-group('模型管理：添加 / 编辑 / 对话框选择');
-check('子 Tab 文案为「模型列表 / 供应商管理 / 添加模型」',
-  /data-mtab="list">模型列表</.test(htmlSrc) &&
-  /data-mtab="prov">供应商管理</.test(htmlSrc) &&
-  /data-mtab="config">添加模型</.test(htmlSrc) &&
-  !htmlSrc.includes('模型配置'));
-check('表单标题区分添加 / 编辑（编辑复用同一表单）',
-  /id="mf-title"/.test(htmlSrc) &&
-  /editingIndex >= 0 \? '编辑模型' : '添加模型'/.test(uiSrc));
-check('列表「编辑」改为**就地展开**，不再跳去添加模型面板',
-  // 2026-09-20 改造：编辑不再复用「添加模型」那张表单（含供应商下拉/地址/密钥，太重），
-  // 改成在模型行下方就地展开一个只含模型自身字段的编辑区。
-  /acts\.appendChild\(domButton\('编辑', '', function \(\) \{ toggleEdit\(\); \}\)\)/.test(uiSrc) &&
-  /function buildModelEditor/.test(uiSrc) &&
-  !/showMTab\('config'\)[\s\S]{0,80}?fillForm/.test(uiSrc));
-check('「添加模型」tab 仍是独立的空白新建态（未被编辑复用）',
-  /name === 'config'\) \{[\s\S]{0,140}?loadLibrary\(\)\.then\(function \(\) \{ resetForm\(\); \}\)/.test(uiSrc) &&
-  /function resetForm/.test(uiSrc));
-check('点「添加模型」tab 回到空白新建态',
-  /name === 'config'\) \{[\s\S]{0,140}?loadLibrary\(\)\.then\(function \(\) \{ resetForm\(\); \}\)/.test(uiSrc));
-check('供应商 tab 切换时重新渲染供应商列表',
-  // 2026-09-29：模型列表与供应商详情数据同源，切到任一子 Tab 都走 loadModelViews()
-  // （一次取数 + 重绘两个视图），不再分别调各自的 render。
-  /name === 'config'\)[\s\S]{0,400}?\} else \{\s*loadModelViews\(\)/.test(uiSrc) &&
-  /function loadModelViews\(\)[\s\S]{0,120}?loadLibrary\(\)\.then\(renderModelViews\)/.test(uiSrc));
-check('对话框模型弹层列出模型库全部条目（不再只显示当前一个）',
-  // 现在遍历的是「按当前供应商过滤后」的列表（modelChoices 的子集），
-  // 全部条目仍来自 modelChoices；切供应商时自动换列表。
-  /filtered\.forEach\(function \(m\)/.test(uiSrc) &&
-  /modelChoices\.filter\(function \(m\) \{[\s\S]{0,80}?m\.provider_id === curProvId/.test(uiSrc) &&
-  /b\.dataset\.model = m\.id/.test(uiSrc) &&
-  /fetchModelChoices[\s\S]{0,200}?fetch\('\/api\/models\/list'\)/.test(uiSrc));
-check('弹层点选即切换生效模型（/api/models/apply）',
-  /function switchActiveModel/.test(uiSrc) &&
-  /switchActiveModel\(m\.id\)/.test(uiSrc) &&
-  /fetch\('\/api\/models\/apply'/.test(uiSrc));
-check('保存成功：刷新模型列表并用新快照刷新对话框选择',
-  // 2026-09-29：收敛到 refreshModelViews()——它内部置 modelsLoaded=false 并调
-  // loadModels()，所以「新条目出现在对话框模型选择里」这个语义由出口保证。
-  /showMTab\('list'\);[\s\S]{0,200}?refreshModelViews\(\);/.test(uiSrc) &&
-  /function refreshModelViews\(\)[\s\S]{0,200}?return loadModels\(\)/.test(uiSrc));
-check('样式契约：弹层列表限高滚动 + 表单标题',
-  /#model-list\s*\{[^}]*max-height[^}]*overflow-y:\s*auto/.test(css) &&
-  /\.mf-title\s*\{/.test(css));
-// 编辑已有模型：脱敏回显的明文框是空的，保存时绝不能把空值当成「用户清空了密钥」。
-// 前端用 keyTouched 记录本次是否动过密钥，没动过就不提交 key_value，服务端保持旧值。
-check('编辑未动密钥时不提交 key_value（不删除已存 key）',
-  /let keyTouched = false/.test(uiSrc) &&
-  /editingIndex >= 0 && !keyTouched/.test(uiSrc) &&
-  /keyTouched = false; \/\/ 刚回填的表单没有改过密钥/.test(uiSrc) &&
-  /keyTouched = true/.test(uiSrc));
-
-// ---------- 模型多模态能力（vision / video）：三态，不是布尔 ----------
-//
-// 「不声明」与「不支持」混为一谈是这个功能最容易出的错，且症状极隐蔽：
-// 用户点错一次 → 该模型永久收不到图片 → 界面上看不出任何异常。
-// 所以这三条钉的是「三态存在」与「留空时不下发字段」。
-check('多模态能力是三态分段（不声明 / 支持 / 不支持），不是两个复选框',
-  /capState = \{ vision: 'unset', video: 'unset' \}/.test(uiSrc) &&
-  /value === true \? 'yes' : value === false \? 'no' : 'unset'/.test(uiSrc) &&
-  /v === 'yes'\) return true;[\s\S]{0,80}?v === 'no'\) return false;[\s\S]{0,40}?return null; \/\/ 不声明/.test(uiSrc) &&
-  /id="mf-vision-seg"/.test(htmlSrc) && /id="mf-video-seg"/.test(htmlSrc) &&
-  /data-cap="unset"[^>]*>不声明</.test(htmlSrc) &&
-  /data-cap="yes"[^>]*>支持</.test(htmlSrc) &&
-  /data-cap="no"[^>]*>不支持</.test(htmlSrc));
-check('留「不声明」时不下发 vision/video 字段（而非下发 false）',
-  // 服务端把「没写」读成三态里的 unknown；下发 false 会被读成「明确不支持」，
-  // 于是模型永久收不到图，而用户没有任何入口纠正。
-  /const vision = getCap\('vision'\);[\s\S]{0,120}?if \(vision !== null\) f\.vision = vision;/.test(uiSrc) &&
-  /if \(video !== null\) f\.video = video;/.test(uiSrc));
-check('表单回填按三态还原（下发 true/false/null 各落到对应档位）',
-  /setCap\('vision', m\.vision\);/.test(uiSrc) && /setCap\('video', m\.video\);/.test(uiSrc) &&
-  /setCap\(which, b\.dataset\.cap === 'yes' \? true : b\.dataset\.cap === 'no' \? false : null\)/.test(uiSrc));
-check('模型列表只给「显式声明支持」加徽标（未声明不加）',
-  // 未声明是绝大多数，全标出来等于没标；而用户判断「贴截图它看没看见」
-  // 只能看这个徽标。
-  /\[\['vision', '图'\], \['video', '视频'\]\]/.test(uiSrc) &&
-  /if \(m\[pair\[0\]\] === true\)/.test(uiSrc));
-check('能力文案说清「视频是原生解析，不是本地抽帧」',
-  /原生解析（整段视频直接交给上游），不是本地抽帧/.test(htmlSrc));
-
-// ---------- 模型 RPM 限制 ----------
-//
-// 三个容易搞错的地方，各钉一条：
-//   1. 空值必须回填成**空框**而不是 0（0 在界面上长得像「限 0 个」）；
-//   2. 采集时必须**下发 0** 而不是省略 —— 它是标量，省略会让旧值留存
-//      （与 vision 的三态处理恰好相反）；
-//   3. 列表只在 >0 时才显示，0 是默认值不该占位。
-check('RPM 回填：0 与未设置都回填成空框（默认不限制）',
-  /document\.getElementById\('mf-rpm'\)\.value = m\.rpm > 0 \? String\(m\.rpm\) : ''/.test(uiSrc) &&
-  /<input id="mf-rpm" type="number" min="0"/.test(htmlSrc) &&
-  /placeholder="留空 = 不限制"/.test(htmlSrc));
-check('RPM 采集：无条件下发数值（0 表示不限制，不靠省略）',
-  /f\.rpm = Math\.max\(0, parseInt\(document\.getElementById\('mf-rpm'\)\.value, 10\) \|\| 0\)/.test(uiSrc));
-check('模型列表只在限速生效时显示 RPM',
-  /m\.rpm > 0 \? ' · 每分钟限 ' \+ m\.rpm \+ ' 请求' : ''/.test(uiSrc));
-
-// ---------- 限流最终失败走黄色警告，不是红色错误 ----------
-//
-// error 帧在前端会删乐观气泡 —— 限流时用户那句提问还等着回答，
-// 把它抹掉比标红更糟。所以必须是独立的 warn 帧，且不走 error 分支的收尾。
-check('限流走独立的 warn 帧（黄色），不进 error 分支的收尾动作',
-  /case 'warn': \{[\s\S]{0,900}?addWarn\(describeLLMError\(ev\.error \|\| '请求被限流，请稍后重试'\)\)/.test(uiSrc) &&
-  /case 'warn': \{[\s\S]{0,900}?removeThinking\(\);[\s\S]{0,200}?foldReason\(\);/.test(uiSrc));
-check('warn 分支绝不调用 dropOptimisticBubble / clearRunVisuals',
-  // 这两个是「这轮彻底作废」的收尾；限流时这轮只是没跑完。
-  /case 'warn': \{[\s\S]{0,900}?\}/.test(uiSrc) &&
-  !/case 'warn': \{[\s\S]{0,900}?dropOptimisticBubble\(\)/.test(uiSrc) &&
-  !/case 'warn': \{[\s\S]{0,900}?clearRunVisuals\(\)/.test(uiSrc));
-check('黄色提示有独立样式（不用红色错误色）',
-  /\.msg-warn \{[^}]*color: var\(--warn\)/.test(css) &&
-  /function addWarn\(text\)/.test(uiSrc) && /d\.className = 'msg-warn'/.test(uiSrc));
-
-// ---------- 模型管理页：tab 条独占一行且居中；供应商管理收敛成一屏 ----------
-group('模型管理页：tab 条独占一行且居中');
-check('HTML 里有独立的 tab 条行，里面只有那颗 pill',
-  /<div class="models-tabs-bar">\s*<div class="models-tabs">[\s\S]{0,400}?<\/div>\s*<\/div>/.test(htmlSrc));
-// ⚠️ 契约：**不许**做 sticky。悬浮在内容之上会盖住从下方滚过去的文字
-//（用户反馈：「不能覆盖到下面的滚动文字」）。它只是普通的一行，
-// 下面内容从这一行的下沿开始排。
-check('tab 条不悬浮（无 sticky / 无 z-index 抬层）',
-  /\.models-tabs-bar\s*\{[^}]*position:\s*sticky/.test(cssCode) === false &&
-  !/\.models-tabs\s*\{[^}]*position:\s*sticky/.test(cssCode) &&
-  !/\.models-tabs-bar\s*\{[^}]*z-index/.test(cssCode));
-check('tab 条行不吃高度也不需要不透明背板（既然不悬浮，遮盖的问题就不存在）',
-  /\.models-tabs-bar\s*\{[^}]*margin:\s*-10px 0 14px/.test(cssCode) &&
-  /\.models-tabs-bar\s*\{[^}]*background/.test(cssCode) === false);
-check('负上外边距把 pill 贴向顶部（吃掉 .settings-content 的 26px 上内边距）',
-  /\.models-tabs-bar\s*\{[^}]*margin:\s*-10px 0 14px/.test(cssCode) &&
-  /\.settings-content\s*\{[^}]*padding:\s*26px 30px/.test(css));
-check('pill 在这一行里居中：块级 flex + fit-content + auto 外边距（inline-flex 无法 auto 居中）',
-  /\.models-tabs\s*\{[^}]*display:\s*flex[^}]*width:\s*fit-content[^}]*margin:\s*0 auto/.test(cssCode) &&
-  // 居中后不能再靠 margin-bottom 撑开与内容的距离
-  !/\.models-tabs\s*\{[^}]*margin-bottom/.test(cssCode));
-check('三个 tab 按钮与 data-mtab 接线未被动过',
-  /class="models-tab active" data-mtab="list">模型列表</.test(htmlSrc) &&
-  /data-mtab="prov">供应商管理</.test(htmlSrc) &&
-  /data-mtab="config">添加模型</.test(htmlSrc));
-
-group('模型管理页：供应商管理收敛成一屏');
-check('高度预算走 flex 链，不写 100dvh - Nxx 魔数（内边距一改就错位成「差几像素也要滚」）',
-  /\.settings-page#page-models\.active\s*\{[^}]*display:\s*flex[^}]*flex-direction:\s*column[^}]*height:\s*100%/.test(css) &&
-  /#mtab-prov\.active\s*\{[^}]*display:\s*flex[^}]*flex:\s*1 1 auto[^}]*min-height:\s*0/.test(css) &&
-  !/calc\(100dvh/.test(cssCode));
-check('去掉 min-height:420px 硬地板（有它在，内容短时白撑空白把页面顶到要滚）',
-  /\.prov-md\s*\{[^}]*flex:\s*1 1 auto[^}]*min-height:\s*260px/.test(css) &&
-  !/min-height:\s*420px/.test(cssCode));
-check('两列各自在内部滚（min-height:0 + overflow-y:auto），页面本身永远不滚',
-  /\.prov-list\s*\{[^}]*min-height:\s*0[^}]*overflow-y:\s*auto/.test(cssCode) &&
-  /\.prov-detail\s*\{[^}]*min-height:\s*0[^}]*overflow-y:\s*auto/.test(cssCode));
-// ⚠️ 两处会让「内部滚动」静默失效的坑：
-//  ① 行高必须是 minmax(0,1fr)。隐式行是 auto（按内容高），内容比容器高时行会溢出、
-//     被 .prov-md 的 overflow:hidden 裁掉，两列的 overflow-y:auto 压根不触发 ——
-//     症状是「下半截看不见，也滚不动」。
-//  ② .prov-detail 绝不能是 flex 列容器。它是块流排版，flex 没用；换上 flex 反而
-//     让 .pv-disc（获取模型列表，overflow:hidden）的自动最小尺寸变成 0，
-//     空间不够时被压到 0 高，里面的 .disc-list 一起消失（2026-09 反馈）。
-check('行高锁成 minmax(0,1fr)，两列才有确定的行高可分（auto 行会溢出被裁，滚不动）',
-  /\.prov-md\s*\{[^}]*grid-template-rows:\s*minmax\(0, 1fr\)/.test(cssCode));
-check('.prov-detail 保持块流（不得改成 flex 列，否则获取模型列表面板被压扁消失）',
-  /\.prov-detail\s*\{[^}]*\}/.test(cssCode) && // 能匹配到规则
-  !/\.prov-detail\s*\{[^}]*display:\s*flex/.test(cssCode) &&
-  // 判据的另一半：那个面板确实是 overflow:hidden（所以在 flex 里会被压到 0 高）
-  /\.pv-disc\s*\{[^}]*overflow:\s*hidden/.test(cssCode) &&
-  /\.disc-list\s*\{[^}]*max-height:\s*300px[^}]*overflow-y:\s*auto/.test(cssCode));
-check('表单改两列网格（原先 5 个整宽竖排字段就 ~320px，单它一个就撑爆一屏）',
-  /\.prov-form\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/.test(css) &&
-  /\.prov-form \.f-field-wide\s*\{\s*grid-column:\s*1 \/ -1/.test(css));
-check('长值字段（Base URL / 密钥 / 停用开关）占满整行，其余两两并排',
-  /form\.appendChild\(domField\('名称', nameIn\)\);\s*\n\s*form\.appendChild\(domField\('兼容协议', protoSel\)\);\s*\n\s*form\.appendChild\(domField\('Base URL', urlIn, 'f-field-wide'\)\);\s*\n\s*form\.appendChild\(domField\('密钥', key\.node, 'f-field-wide'\)\)/.test(uiSrc) &&
-  /domEl\('label', 'f-field f-field-wide'\)/.test(uiSrc));
-check('domField 的第三参是可选类名（共享函数，加必填会连带改掉模型表单的 4 处调用）',
-  /function domField\(label, control, cls\) \{[\s\S]{0,200}?domEl\('label', 'f-field' \+ \(cls \? ' ' \+ cls : ''\)\)/.test(uiSrc) &&
-  // 模型表单那两处仍是两参调用
-  /domField\('显示名称', nameIn\)/.test(uiSrc) && /domField\('模型 id', idIn\)/.test(uiSrc));
-check('内边距同步收窄（省下的高度正是给表单两列用的）',
-  /\.prov-detail\s*\{[^}]*padding:\s*14px 18px 16px/.test(css) &&
-  /\.prov-item\s*\{[^}]*padding:\s*7px 10px/.test(css) &&
-  /\.prov-sub\s*\{[^}]*margin:\s*14px 0 6px/.test(css) &&
-  /\.prov-actions\s*\{[^}]*margin-top:\s*10px/.test(css));
-
-group('模型管理页：添加模型的按钮不用滚到底才够得着');
-// 故障：「保存 / 测试连接」在表单最下方，7 个整宽竖排字段把它顶到一屏开外，
-// 想点保存得先滚到底（2026-09 反馈）。修法两条：表单改两列（高度直接砍半），
-// 并且滚动只发生在表单区内部，动作条留在卡片底部常驻。
-const cfgHtml = (function () {
-  const a = htmlSrc.indexOf('id="mtab-config"');
-  // 切到本 section 结束（要含整个动作条，不能切在 #mf-save 之前）
-  const b = htmlSrc.indexOf('</section>', a);
-  return a < 0 ? '' : htmlSrc.slice(a, b);
-})();
-// 「滚动区内容」= 从 <div class="mf-scroll"> 到**真正**把它关掉的那个 </div> 之间。
-// ⚠️ 只能用深度计数找边界：光比较 indexOf 大小 / 用 lastIndexOf('</div>') 都判不出来 ——
-// 把面板挪到滚动区外面之后，index 顺序照样不变、动作条前照样有个 </div>，断言会假过。
-function innerOfDiv(html, openMarker) {
-  const start = html.indexOf(openMarker);
-  if (start < 0) return '';
-  const re = /<div\b|<\/div>/g;
-  re.lastIndex = start + openMarker.length;
-  let depth = 1, m;
-  while ((m = re.exec(html))) {
-    depth += m[0] === '</div>' ? -1 : 1;
-    if (depth === 0) return html.slice(start + openMarker.length, m.index);
-  }
-  return '';
-}
-const cfgScrollInner = innerOfDiv(cfgHtml, '<div class="mf-scroll">');
-check('表单区与动作条分开：.mf-scroll 里是表单 + 上游模型面板，动作条在它外面',
-  /class="mf-scroll">\s*<div class="form-grid">/.test(cfgHtml) &&
-  // 上游模型勾选面板也必须放进滚动区（否则展开后把动作条顶下去）
-  cfgScrollInner.includes('id="mf-discover-panel"') &&
-  !cfgScrollInner.includes('class="mf-actions"'));
-check('动作条（测试连接 / 重置 / 保存）完整且在滚动区之外',
-  /id="mf-test">测试连接</.test(cfgHtml) && /id="mf-reset">重置</.test(cfgHtml) &&
-  /id="mf-save" class="primary">保存</.test(cfgHtml) &&
-  cfgHtml.lastIndexOf('class="mf-actions"') > cfgHtml.indexOf('id="mf-discover-panel"'));
-check('高度链与滚动边界：pane / 卡片 / .mf-scroll 各负其职，标题与动作条不收缩',
-  /#mtab-config\.active\s*\{[^}]*display:\s*flex[^}]*flex:\s*1 1 auto[^}]*min-height:\s*0/.test(cssCode) &&
-  /#mtab-config > \.settings-card\s*\{[^}]*flex:\s*1 1 auto[^}]*min-height:\s*0[^}]*display:\s*flex[^}]*flex-direction:\s*column/.test(cssCode) &&
-  /\.mf-scroll\s*\{[^}]*flex:\s*1 1 auto[^}]*min-height:\s*0[^}]*overflow-y:\s*auto/.test(cssCode) &&
-  /#mtab-config \.mf-title,\s*\n?\s*#mtab-config \.mf-actions\s*\{\s*flex:\s*none/.test(cssCode));
-check('表单改两列，且作用域限死在本页（.form-grid 是共享类，全局改会连带变形另三个表单）',
-  /#mtab-config \.form-grid\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/.test(cssCode) &&
-  // 共享的 .form-grid 本身必须还是单列竖排
-  /^\.form-grid\s*\{[^}]*display:\s*flex[^}]*flex-direction:\s*column/m.test(cssCode) &&
-  // 另外三个表单 + ui.js 的就地编辑都还在用它
-  (htmlSrc.match(/class="form-grid"/g) || []).length >= 4 &&
-  /domEl\('div', 'form-grid'\)/.test(uiSrc));
-check('长值字段占满整行：模型 id（带「获取模型列表」按钮）/ 密钥 / 上下文 / 继承块',
-  /class="f-field f-field-wide" id="mf-inherit-field"/.test(cfgHtml) &&
-  /class="f-field f-field-wide"><span>模型 id</.test(cfgHtml) &&
-  /class="f-field f-field-wide" id="mf-key-field"/.test(cfgHtml) &&
-  /class="f-field ctx-row f-field-wide"/.test(cfgHtml) &&
-  /#mtab-config \.f-field-wide\s*\{\s*grid-column:\s*1 \/ -1/.test(cssCode));
-// 窄字段必须成对相邻，否则网格里会留下半行空洞。
-// 选供应商时 请求地址 / 协议 / 密钥 由 JS 整组隐藏（ui.js syncProvForm），
-// 隐藏的格子在 grid 里不留空位，所以两种组合都是整行。
-check('窄字段两两成对：供应商|显示名称 一行、请求地址|协议 一行（DOM 顺序已按网格排）',
-  cfgHtml.indexOf('id="mf-prov"') < cfgHtml.indexOf('id="mf-name"') &&
-  cfgHtml.indexOf('id="mf-name"') < cfgHtml.indexOf('id="mf-url-field"') &&
-  cfgHtml.indexOf('id="mf-url-field"') < cfgHtml.indexOf('id="mf-proto-field"') &&
-  cfgHtml.indexOf('id="mf-proto-field"') < cfgHtml.indexOf('id="mf-id"') &&
-  cfgHtml.indexOf('id="mf-id"') < cfgHtml.indexOf('id="mf-key-field"'));
-check('隐藏靠 hidden 属性，且全局有 [hidden]{display:none!important} 兜住 .f-field 的 display:flex',
-  /document\.getElementById\('mf-url-field'\)\.hidden = !!p/.test(uiSrc) &&
-  /document\.getElementById\('mf-key-field'\)\.hidden = !!p/.test(uiSrc) &&
-  /document\.getElementById\('mf-proto-field'\)\.hidden = !!p/.test(uiSrc) &&
-  /\[hidden\] \{ display: none !important; \}/.test(cssCode));
 
 // ---------------------------------------------------------------------------
 // 运行中体验：思考过程自动贴底 / 允许切换会话 + 运行中会话转圈 / 事件按会话路由
@@ -1932,19 +1741,20 @@ check('占位提示只提示状态，不泄露工具 ID',
 
 group('模型删除原位确认（不弹浏览器框）');
 {
-  // 删除按钮现在建在 modelRowEl()（逐行渲染）里，不在 renderModelItems()（分组装配）里。
-  const render = extractFunction(uiSrc, 'modelRowEl');
-  check('删除为按钮级原位确认：首次点「删除」变「确认删除」，配「取消」按钮',
-    render.includes("domButton('删除'") &&
-    render.includes("domButton('确认删除', 'confirming'") &&
-    render.includes("domButton('取消'"));
+  // 三栏页里删除在右栏详情（openModelDetail）内，原位两段确认：
+  // 「删除模型」→「确认删除」+「取消」。
+  const render = extractFunction(uiSrc, 'openModelDetail');
+  check('删除为按钮级原位确认：首次点「删除模型」变「确认删除」，配「取消」按钮',
+    render.includes("button('删除模型'") &&
+    render.includes("button('确认删除', 'btn confirming'") &&
+    render.includes("button('取消'"));
   check('「确认删除」再次点击才执行，取消按钮恢复原删除按钮',
-    render.includes('acts.removeChild(confirmBtn)') && render.includes('acts.appendChild(delBtn)'));
+    render.includes('acts.replaceChild(delBtn, confirmBtn)') && render.includes('acts.appendChild(cancelBtn)'));
   check('模型删除不再调用浏览器 confirm 确认框',
     !/\bconfirm\('从模型库删除/.test(uiSrc));
   const css = fs.readFileSync(path.join(DIST, 'app.css'), 'utf8');
   check('「确认删除」态有红色危险样式',
-    /\.mi-actions button\.confirming \{ [^}]*color: var\(--danger\)/.test(css));
+    /#page-models \.btn\.confirming \{[^}]*background: var\(--danger\)/.test(css));
 }
 
 group('上下文占用说明');
@@ -2321,87 +2131,82 @@ check('继续圆环的样式类跟着改名（.resume-ring，不留 .retry-ring�
 group('模型与供应商管理');
 check('「供应商机制」说明横幅已删除',
   !/供应商机制/.test(htmlSrc) && !/只在供应商上维护一份/.test(htmlSrc));
-check('「添加供应商」用真值哨兵，不会被「自动选第一个」吃掉',
-  // 空串是假值，会被 renderProviders 开头的自动选择重置 → 点添加没反应
-  /const PROV_NEW = '__new__'/.test(uiSrc) &&
-  /provSelected = PROV_NEW; renderProviders\(\)/.test(uiSrc) &&
-  !/provSelected = ''; renderProviders\(\)/.test(uiSrc));
-check('详情区对哨兵值走「新建」分支（不会当成某个供应商）',
-  /provSelected !== PROV_NEW\) \? findProvider\(provSelected\) : null/.test(uiSrc));
+check('「添加供应商」直接进详情栏的新建分支（不再需要哨兵防「自动选第一个」吃掉）',
+  /\$\('#m-prov-new'\)\.addEventListener\('click', function \(\) \{ openProviderDetail\(null\); \}\)/.test(uiSrc) &&
+  !/PROV_NEW/.test(uiSrc));
+check('详情区对 null 走「新建供应商」分支（不会当成某个供应商）',
+  /function openProviderDetail\(id\)[\s\S]{0,200}?var isNew = !id/.test(uiSrc) &&
+  /function openProviderDetail\(id\)[\s\S]{0,400}?isNew \? null : findProvider\(id\)/.test(uiSrc));
 check('供应商详情里有「获取模型列表」，就地展开不弹窗',
-  /function fetchUpstream\(\)/.test(uiSrc) &&
-  /domButton\('获取模型列表'/.test(uiSrc) &&
-  /domEl\('div', 'pv-disc hidden'\)/.test(uiSrc));
-check('获取到的模型可勾选并批量入库（按供应商归类）',
-  /function commitPicked\(\)/.test(uiSrc) &&
+  /var fetchUpstream = function/.test(uiSrc) &&
+  /button\('获取模型列表', 'btn ghost', fetchUpstream\)/.test(uiSrc) &&
+  /el\('div', 'disc-panel hidden'\)/.test(uiSrc));
+check('获取到的模型可勾选并批量入库（按供应商归类，已在库的禁用）',
+  /discPick\[m\.id\]/.test(uiSrc) &&
+  /cb\.disabled = !!m\.in_library/.test(uiSrc) &&
   /provider_id: p\.id/.test(uiSrc) &&
   /\/api\/models\/save_batch/.test(uiSrc));
-check('模型列表：子模型有独立容器（供缩进）',
-  /const kids = domEl\('div', 'model-children'\)/.test(uiSrc) &&
-  /\.model-children\s*\{[^}]*margin-left/.test(css));
-check('模型列表：供应商分组可折叠，且折叠时不渲染子模型',
-  /modelGroupFolded/.test(uiSrc) && /mg-fold/.test(uiSrc) &&
-  /if \(folded\) return;/.test(uiSrc));
-check('编辑模型改为就地展开，不再复用「添加模型」表单',
-  /function buildModelEditor/.test(uiSrc) &&
-  !/function editModel/.test(uiSrc) &&
+check('模型列表：行内展示 id · 上下文 · RPM · 归属（组内一眼可比）',
+  /var meta = m\.id \+ ' · 上下文 ' \+ fmtCtx\(m\.ctx_in\) \+ ' \/ ' \+ fmtCtx\(m\.ctx_out\)/.test(uiSrc) &&
+  /if \(m\.rpm > 0\) meta \+= ' · 限 ' \+ m\.rpm \+ ' RPM'/.test(uiSrc) &&
+  /findProvider\(m\.provider_id\)\.name \|\| m\.provider_id\) : '未归属'/.test(uiSrc));
+check('模型列表：当前生效模型置顶，未归属分组独立成组',
+  /list\.sort\(function \(a, b\)/.test(uiSrc) &&
+  /a\.id === activeModelId \? 0 : 1/.test(uiSrc) &&
+  /title = '未归属供应商';/.test(uiSrc));
+check('编辑模型走右栏详情表单（openModelDetail），不再有独立的就地编辑器',
+  /function openModelDetail/.test(uiSrc) &&
+  !/function buildModelEditor/.test(uiSrc) &&
   !/function editModel/.test(uiSrc));
-check('就地编辑不再提交密钥明文（列表是脱敏视图，提交会覆盖掉已存密钥）',
-  /body\.key_source = m\.key_source/.test(uiSrc) &&
-  !/key_value:/.test(uiSrc.slice(uiSrc.indexOf('function buildModelEditor'), uiSrc.indexOf('function buildModelEditor') + 3000)));
+check('密钥编辑是显式提交：动过才带 key_value（未归属条目）/ key_touched（供应商）',
+  /if \(keyCtl && keyCtl\.touched\(\)\) body\.key_value = keyCtl\.value\(\);/.test(uiSrc) &&
+  /if \(prov && keyCtl\.touched\(\)\)/.test(uiSrc) &&
+  /key_touched: true/.test(uiSrc));
 
-// ---------- 模型库刷新：单一出口（2026-09-29）----------
-// 故障：在「供应商管理」里删模型，模型确实没了，列表却不动，重新进入该页面才对。
-// 原因：模型行同时渲染在两个视图（模型列表 #model-items / 供应商详情 #prov-detail），
-// 而删除回调只刷了 renderModelItems —— 供应商详情那块 DOM 从没重绘。
-// 修法：抽出 refreshModelViews() 作唯一出口，两个 render 退化为纯渲染。
+// ---------- 模型库刷新：单一出口（2026-09-29，三栏版沿用）----------
+// 故障（旧版）：在供应商管理里删模型，模型确实没了，列表却不动。
+// 原因：同一份数据渲染在两个视图，写删的回调只刷了一个。
+// 修法：抽出 refreshModelViews() 作唯一出口；三栏页所有写操作后都走它。
 group('模型库视图刷新走单一出口');
-check('存在统一出口，一次取数后重绘两个视图 + 同步主界面',
+check('存在统一出口，一次取数后重绘三栏 + 置假 modelsLoaded 并同步主界面',
   /function refreshModelViews\(\)/.test(uiSrc) &&
-  /modelsLoaded = false;[\s\S]{0,120}?loadLibrary\(\)\.then\(function \(\) \{\s*renderModelItems\(\);\s*renderProviders\(\);/.test(uiSrc) &&
-  /function loadModelViews\(\)/.test(uiSrc));
-check('两个 render 都不再自带 loadLibrary（纯渲染，避免重复取数）',
-  // 取数收敛到出口后，render 里再拉一次就是同一 endpoint 打两次
-  !/function renderModelItems\(\)[\s\S]{0,400}?loadLibrary\(\)/.test(uiSrc) &&
-  !/function renderProviders\(\)[\s\S]{0,400}?loadLibrary\(\)/.test(uiSrc));
+  /modelsLoaded = false;[\s\S]{0,400}?loadLibrary\(\)\.then\(function \(\) \{[\s\S]{0,400}?renderProvSide\(\);[\s\S]{0,200}?renderModelList\(\)/.test(uiSrc) &&
+  /return loadModels\(\);/.test(uiSrc));
+check('两个 render 都不自带 loadLibrary（纯渲染，避免重复取数）',
+  !/function renderProvSide\(\)[\s\S]{0,600}?loadLibrary\(\)/.test(uiSrc) &&
+  !/function renderModelList\(\)[\s\S]{0,900}?loadLibrary\(\)/.test(uiSrc));
 check('没有任何取数点自带「取完就刷视图」的组合', (function () {
-  // 不变量（比数个数更耐改）：loadLibrary 的每个调用点，后面都不允许直接跟
-  // renderModelItems / renderProviders —— 那正是本次漏刷的形态。
-  // 先把两个出口函数体摘掉，它们内部的取数是设计如此（由下一条断言锁住职责）。
+  // 不变量：loadLibrary 的调用点后面不允许直接跟 render 组合 —— 那正是漏刷的形态。
+  // 先摘掉两个出口函数体（它们内部的取数是设计如此）。
   const body = uiSrc
     .replace(/function refreshModelViews\(\)[\s\S]*?\n  \}/, '')
     .replace(/function loadModelViews\(\)[\s\S]*?\n  \}/, '');
   const re = /loadLibrary\(\)/g;
-  let m, bad = 0, n = 0;
+  let m, bad = 0;
   while ((m = re.exec(body)) !== null) {
-    n++;
-    if (/renderModelItems\(\)|renderProviders\(\)|renderModelViews\(\)/.test(body.slice(m.index, m.index + 90))) bad++;
+    if (/renderProvSide\(\)|renderModelList\(\)/.test(body.slice(m.index, m.index + 90))) bad++;
   }
-  return n >= 3 && bad === 0;   // 摘掉出口后应剩：gotoAddModel、切 config tab
+  return bad === 0;
 })());
-check('两个出口各自承担职责：refreshModelViews 刷全部并同步主界面，loadModelViews 只重绘',
-  /function refreshModelViews\(\) \{\s*\n\s*modelsLoaded = false;[\s\S]{0,200}?renderModelItems\(\);\s*\n\s*renderProviders\(\);\s*\n\s*return loadModels\(\);/.test(uiSrc) &&
-  /function loadModelViews\(\) \{\s*\n\s*return loadLibrary\(\)\.then\(renderModelViews\);/.test(uiSrc));
-check('无条件重绘两个视图，不按当前 tab 条件刷',
-  // 早先 applyModel 里的 `if (mtab-prov.active) renderProviders()` 就是条件判断
-  // 漏刷的第二处；且它后面紧跟 showPage('general')，条件恒真、本就是死代码。
-  !/mtab-prov'\)\.classList\.contains\('active'\)/.test(uiSrc));
-check('modelRowEl 不再收 afterChange 钩子（钩子只有一个调用点传且没传）',
-  /function modelRowEl\(m\)/.test(uiSrc) &&
-  !/opts\.afterChange/.test(uiSrc));
-check('模型删除成功后走统一出口（供应商页删模型即时消失）', (function () {
-  const i = uiSrc.indexOf('function modelRowEl');
-  const body = uiSrc.slice(i, uiSrc.indexOf('\n  }', i));
+check('两个出口职责分开：refreshModelViews 刷全部并同步主界面，loadModelViews 只重绘',
+  /function refreshModelViews\(\) \{\s*\n\s*modelsLoaded = false;/.test(uiSrc) &&
+  /function loadModelViews\(\) \{\s*return loadLibrary\(\)/.test(uiSrc) &&
+  /function loadModelViews\(\)[\s\S]{0,500}?m3Show\('prov'\)/.test(uiSrc));
+check('无条件重绘三栏，不按当前栏条件刷',
+  !/classList\.contains\('active'\)[\s\S]{0,60}?renderProvSide/.test(uiSrc));
+check('模型删除成功后走统一出口', (function () {
+  const i = uiSrc.indexOf('function openModelDetail');
+  const body = uiSrc.slice(i, i + 9000);
   return /\/api\/models\/delete/.test(body) && /refreshModelViews\(\)/.test(body);
 })());
 
 // ---------- 删除类操作：原位二次确认的一致性（2026-09-29 审计）----------
 group('删除操作的二次确认');
-check('模型删除：查 d.ok，失败时先提示再退出、不刷新界面', (function () {
-  const i = uiSrc.indexOf('function modelRowEl');
-  const body = uiSrc.slice(i, uiSrc.indexOf('\n  }', i));
-  // ok 分支在 !d.ok 分支**之后**才调 refreshModelViews —— 顺序反了就是失败也刷
-  const bad = body.indexOf('if (!d.ok)');
+check('模型删除：查 res.data.ok，失败时先提示再退出、不刷新界面', (function () {
+  const i = uiSrc.indexOf('function openModelDetail');
+  const body = uiSrc.slice(i, i + 9000);
+  // ok 分支在 !ok 分支**之后**才调 refreshModelViews —— 顺序反了就是失败也刷
+  const bad = body.indexOf('if (!res.data.ok)');
   const good = body.indexOf('refreshModelViews()');
   return /删除失败/.test(body) && bad >= 0 && good > bad;
 })());
@@ -2432,27 +2237,27 @@ check('档位标签按二进制 K 渲染（256K→262144、384K→393216）',
   /function fmtCtxSlot\(n\)/.test(uiSrc) &&
   /n % 1048576 === 0/.test(uiSrc) && /n % 1024 === 0/.test(uiSrc));
 check('保留数字输入框（非整档的既有值不会被静默改掉）',
-  /const num = domInput\('number', '', ''\)/.test(uiSrc) &&
+  /var num = mkInput\('number'\)/.test(uiSrc) &&
   /num\.value = String\(Number\(current\) \|\| fallback\)/.test(uiSrc));
 check('档位做成**直接点击**的按钮（不是下拉、不弹层）',
-  /domEl\('button', 'ctx-chip', fmtCtxSlot\(v\)\)/.test(uiSrc) &&
+  /el\('button', 'ctx-chip', fmtCtxSlot\(v\)\)/.test(uiSrc) &&
   /b\.addEventListener\('click', function \(\) \{ num\.value = String\(v\); sync\(\); \}\)/.test(uiSrc) &&
   !/CTX_CUSTOM/.test(uiSrc) &&
-  !/buildCtxPicker[\s\S]{0,900}?domEl\('select'\)/.test(uiSrc));
+  !/buildCtxPicker[\s\S]{0,900}?el\('select'\)/.test(uiSrc));
 check('输入值命中某档时该档高亮（否则看不出当前是哪个档）',
   /function sync\(\)[\s\S]{0,200}?classList\.toggle\('on', Number\(b\.dataset\.v\) === v\)/.test(uiSrc) &&
   /num\.addEventListener\('input', sync\)/.test(uiSrc));
 check('表单不再直接读写 mf-ctx-in / mf-ctx-out 的值（统一走控件）',
   !/getElementById\('mf-ctx-in'\)\.value/.test(uiSrc) &&
   !/getElementById\('mf-ctx-out'\)\.value/.test(uiSrc) &&
-  /ctxInPicker \? ctxInPicker\.value\(\) : 262144/.test(uiSrc) &&
-  /ctxOutPicker \? ctxOutPicker\.value\(\) : 131072/.test(uiSrc));
+  /ctx_in: ctxIn\.value\(\),/.test(uiSrc) &&
+  /ctx_out: ctxOut\.value\(\),/.test(uiSrc));
 check('回填走控件的 set（否则输入框不会更新）',
-  /ctxInPicker\.set\(m\.ctx_in \|\| 262144\)/.test(uiSrc) &&
-  /ctxOutPicker\.set\(m\.ctx_out \|\| 131072\)/.test(uiSrc));
+  /if \(got > 0\) ctxIn\.set\(got\)/.test(uiSrc) &&
+  /set: function \(v\) \{ num\.value = String\(Number\(v\) \|\| fallback\); sync\(\); \}/.test(uiSrc));
 check('就地编辑模型也用同一套控件',
-  /const ctxIn = buildCtxPicker\(m\.ctx_in, CTX_PRESETS_IN, 262144\)/.test(uiSrc) &&
-  /const ctxOut = buildCtxPicker\(m\.ctx_out, CTX_PRESETS_OUT, 131072\)/.test(uiSrc));
+  /var ctxIn = buildCtxPicker\(m\.ctx_in, CTX_PRESETS_IN, 262144\)/.test(uiSrc) &&
+  /var ctxOut = buildCtxPicker\(m\.ctx_out, CTX_PRESETS_OUT, 131072\)/.test(uiSrc));
 check('样式契约：整行铺开（输入组靠左、输出组靠右）',
   /\.ctx-inputs\s*\{[^}]*justify-content:\s*space-between/.test(css));
 check('样式契约：档位按钮 + 命中态高亮',

@@ -420,10 +420,9 @@
       loadModels();
       const mEl = document.getElementById('settings-model');
       if (mEl) { mEl.textContent = modelName || model || '--'; mEl.title = model || ''; }
-      // 设置页开着时同步两个视图里的「当前」徽标（对话框弹层切换也会走到这里）。
-      // 必须用 loadModelViews 而不是 renderModelViews：activeModelId 是**设置页
-      // 的变量**，只由 loadLibrary 写。对话框弹层切模型不经设置页，
-      // 不重新取数的话徽标会停在上一个模型上。
+      // 设置页开着时同步模型页列表里的「当前」徽标（对话框弹层切换也会走到这里）。
+      // 必须用 loadModelViews：activeModelId 是模型页的变量，只由 loadLibrary 写。
+      // 对话框弹层切模型不经模型页，不重新取数的话徽标会停在上一个模型上。
       if (!settingsOverlay.classList.contains('hidden')) loadModelViews();
       showBanner('已切换到 ' + (modelName || model), 'info');
     }).catch(function (e) {
@@ -6334,83 +6333,41 @@
   settingsOverlay.querySelectorAll('.nav-item[data-page="archived"]').forEach(function (n) {
     n.addEventListener('click', loadArchived);
   });
-  // ---------- 模型管理：模型列表 / 供应商管理 / 添加模型 ----------
+  // ---------- 模型管理：供应商 ▸ 模型 ▸ 详情 三栏 ----------
   //
   // 自供应商机制引入后，连接信息（Base URL / 协议 / 密钥）只在「供应商」上维护
-  // 一份，模型条目只留 id 与显示名。由此得到三条主路径：
-  //   · 模型列表：按供应商分组，点「设为当前」即可在同供应商下换 id；
-  //   · 供应商管理：改地址 / 轮换密钥，其下模型与当前生效配置一起跟着变；
-  //   · 添加模型：选已有供应商 → 只填模型 id（地址与密钥继承），
-  //              或「获取模型列表」勾选多个一次性批量入库。
+  // 一份，模型条目只留 id 与显示名。旧版三个子 Tab（模型列表 / 供应商管理 /
+  // 添加模型）各自成页、同一份数据三处重复渲染，已整体重排为单页三栏：
+  //   · 栏 1 供应商（含「全部模型」与「未归属供应商」伪分组）
+  //   · 栏 2 所选分组的模型列表（行只留「设为当前」，编辑在右栏；支持多选批量）
+  //   · 栏 3 选中对象详情：模型表单 / 供应商连接信息 / 新增表单
+  // 窄屏（app.css 的 820px 断点）三栏收成单栏下钻，用 #m3 上的 show-* 类切换。
 
-  function showPage(id) {
-    settingsOverlay.querySelectorAll('.nav-item').forEach(function (n) {
-      var match = n.dataset.page === id || (id === 'models' && n.id === 'nav-models');
-      n.classList.toggle('active', match);
-    });
-    settingsOverlay.querySelectorAll('.settings-page').forEach(function (p) {
-      p.classList.toggle('active', p.id === 'page-' + id);
-    });
+  function $$(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
   }
-  function showMTab(name) {
-    document.querySelectorAll('.models-tab').forEach(function (t) {
-      t.classList.toggle('active', t.dataset.mtab === name);
-    });
-    // 三个面板用字面量 id 逐个切换，而不是 'mtab-' + name 拼接 ——
-    // test/audit_dom_refs.mjs 靠静态匹配核对「ui.js 找的元素是否真的存在」，
-    // 拼接写法会让它无法解析，等于把这类静默失效漏出审计网。
-    function setPane(id, on) {
-      const pane = document.getElementById(id);
-      if (pane) pane.classList.toggle('active', on);
-    }
-    setPane('mtab-list', name === 'list');
-    setPane('mtab-prov', name === 'prov');
-    setPane('mtab-config', name === 'config');
+  function button(text, cls, fn) {
+    var b = el('button', cls, text);
+    b.type = 'button';
+    if (fn) b.addEventListener('click', fn);
+    return b;
   }
-
-  // ---------- 模型库（服务端唯一数据源）----------
-  //
-  // 列表与供应商都来自 /api/models/list。服务端下发的 base_url / protocol /
-  // key_set 已是「补齐供应商后」的结果，前端因此不必自己再拼一遍继承逻辑。
-  // 旧的 localStorage 方案已废弃 —— 它把明文 API Key 存在浏览器里，且与服务端不同步。
-  let editingIndex = -1;   // -1 = 新增；>=0 编辑现有项（仅用于表单标题态，列表以 id 判重）
-  let modelsCache = [];    // 最近一次 /api/models/list 的脱敏模型列表
-  let providersCache = []; // 同上，供应商列表
-  let activeModelId = '';  // 当前生效模型 id
-  // 供应商管理页「新建」态的哨兵值。
-  // ⚠️ 不能用空串表示新建态：renderProviders 开头有
-  //     `if (!provSelected && providersCache.length) provSelected = providersCache[0].id;`
-  //   空串是假值，点「添加供应商」置空后立刻被重置回第一个供应商 ——
-  //   表现就是「点添加没反应」（2026-09-20 实际故障）。用真值哨兵就不会被吃掉。
-  const PROV_NEW = '__new__';
-  let provSelected = '';   // 供应商管理页选中的供应商 id；'' = 尚未选择（会自动选第一个）
-  // 一次性回执：由批量添加等操作写入，renderProviderDetail 渲染时取走并清空。
-  // 为什么要这么绕：详情区是整块重绘的，直接往旧 DOM 上写提示会被下一次重绘冲掉。
-  let provFlash = '';
-
-  function loadLibrary() {
-    return fetch('/api/models/list').then(function (r) { return r.json(); }).then(function (d) {
-      modelsCache = d.models || [];
-      providersCache = d.providers || [];
-      activeModelId = d.active || '';
-      return d;
-    });
+  function mkInput(type, value, placeholder) {
+    var i = el('input');
+    i.type = type;
+    if (value) i.value = value;
+    if (placeholder) i.placeholder = placeholder;
+    return i;
   }
-  function findProvider(id) {
-    for (let i = 0; i < providersCache.length; i++) {
-      if (providersCache[i].id === id) return providersCache[i];
-    }
-    return null;
-  }
-  function modelsOfProvider(pid) {
-    return modelsCache.filter(function (m) { return (m.provider_id || '') === pid; });
-  }
-  // 供应商密钥的可读描述：明文只有「当前生效模型所属供应商」会下发。
-  function providerKeyLabel(p) {
-    if (!p) return '未设置';
-    if (p.key_source === 'env') return p.key_name ? ('环境变量 ' + p.key_name) : '未设置环境变量';
-    if (p.key_plain) return p.key_plain;
-    return p.key_set ? '已保存（留空保持不变）' : '未设置';
+  function field(label, control, wide) {
+    var w = el('label', 'f-field' + (wide ? ' wide' : ''));
+    w.appendChild(el('span', null, label));
+    w.appendChild(control);
+    return w;
   }
   function fmtCtx(n) {
     n = Number(n) || 0;
@@ -6418,45 +6375,94 @@
     if (n >= 1000) return Math.round(n / 1000) + 'K';
     return String(n);
   }
-
-  // ---------- 上下文长度：数字输入框 + 右侧**直接点击**的预置档位 ----------
-  // 档位按**二进制 K（1024）**算，与各家模型的标注口径一致：256K = 262144。
-  // 输出单独一套档：不少模型的输出上限是输入的 1/2 或 3/8，384K 是常见档。
-  const CTX_PRESETS_IN = [1048576, 524288, 262144, 131072]; // 1M / 512K / 256K / 128K
-  const CTX_PRESETS_OUT = [393216, 262144, 131072];         // 384K / 256K / 128K
-
-  // 把 token 数渲染成档位标签：1048576 → 1M、393216 → 384K。
-  // 不是整 K 的（如历史配置里的 1040000）**原样显示**，不要四舍五入成假档位 ——
-  // 那会让用户以为自己配的是 1M。
   function fmtCtxSlot(n) {
     n = Number(n) || 0;
     if (n >= 1048576 && n % 1048576 === 0) return (n / 1048576) + 'M';
     if (n >= 1024 && n % 1024 === 0) return (n / 1024) + 'K';
     return String(n);
   }
+  function setNote(node, ok, msg) {
+    if (!node) return;
+    node.className = 'note' + (ok === true ? ' ok' : ok === false ? ' fail' : '');
+    node.textContent = msg || '';
+  }
+  // 统一 API：JSON 解包。网络异常返回 {ok:false,...} 而不是 reject ——
+  // 调用点全是「拿 d.error 显示到 note」，reject 会让每个调用点多一段 catch。
+  function api(url, opts) {
+    opts = opts || {};
+    if (opts.body && typeof opts.body !== 'string') {
+      opts.headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
+      opts.body = JSON.stringify(opts.body);
+    }
+    return fetch(url, opts).then(function (r) {
+      return r.text().then(function (t) {
+        var data = {};
+        try { data = t ? JSON.parse(t) : {}; } catch (e) { data = { error: t.slice(0, 300) }; }
+        return { ok: r.ok, status: r.status, data: data };
+      });
+    }).catch(function (e) {
+      return { ok: false, status: 0, data: { error: '服务不可达：' + e } };
+    });
+  }
 
-  // 上下文控件：**保留数字输入框**（可自由填任意值），右侧挂几个直接点的档位按钮。
-  // 点档位 = 把数值写进输入框，不做下拉、不弹层；输入框里的值命中某档时该档高亮。
-  // 返回 { node, value(), set(v) }。
-  //
-  // 为什么不做成纯下拉：配置里本来就有非整档的值（实测 deepseek-flash 是
-  // ctx_in=1040000 / ctx_out=384000），纯下拉会退化成第一项、一保存就静默改数。
-  // 保留输入框就天然没有这个问题，也不用再搞「自定义…」出口。
+  var ALL = '__all__';       // 「全部模型」伪分组
+  var modelsCache = [];      // 最近一次 /api/models/list 的脱敏模型列表
+  var providersCache = [];   // 同上，供应商列表
+  var activeModelId = '';    // 当前生效模型 id
+  var provSel = ALL;         // 当前选中的分组：ALL | ''（未归属）| provider id
+  var provNameFilter = '';
+  var modelNameFilter = '';
+  var modelSel = '';         // 详情栏当前打开的模型 id
+  var detailMode = '';       // '' | 'model' | 'newmodel' | 'provider'
+
+  var CTX_PRESETS_IN = [1048576, 524288, 262144, 131072]; // 1M / 512K / 256K / 128K
+  var CTX_PRESETS_OUT = [393216, 262144, 131072];         // 384K / 256K / 128K
+
+  function loadLibrary() {
+    return api('/api/models/list').then(function (res) {
+      var d = res.data || {};
+      modelsCache = d.models || [];
+      providersCache = d.providers || [];
+      activeModelId = d.active || '';
+      return d;
+    });
+  }
+  function findProvider(id) {
+    for (var i = 0; i < providersCache.length; i++) {
+      if (providersCache[i].id === id) return providersCache[i];
+    }
+    return null;
+  }
+  function modelsOfProvider(pid) {
+    return modelsCache.filter(function (m) { return (m.provider_id || '') === pid; });
+  }
+  function providerKeyLabel(p) {
+    if (!p) return '未设置';
+    if (p.key_source === 'env') return p.key_name ? ('环境变量 ' + p.key_name) : '未设置环境变量';
+    if (p.key_plain) return p.key_plain;
+    return p.key_set ? '已保存（留空保持不变）' : '未设置';
+  }
+  function m3Show(pane) { // 'prov' | 'models' | 'detail' —— 仅窄屏生效
+    var m3 = $('#m3');
+    if (!m3) return;
+    m3.classList.toggle('show-prov', pane === 'prov');
+    m3.classList.toggle('show-models', pane === 'models');
+    m3.classList.toggle('show-detail', pane === 'detail');
+  }
+
+  /* ---------- 上下文档位选择器 ---------- */
   function buildCtxPicker(current, presets, fallback) {
-    const wrap = domEl('span', 'ctx-pick');
-    const num = domInput('number', '', '');
+    var wrap = el('span', 'ctx-pick');
+    var num = mkInput('number');
     num.className = 'ctx-num';
-    const chips = domEl('span', 'ctx-chips');
-    const btns = [];
-
-    // 输入值命中某档 → 该档高亮；否则全部熄灭（表示这是自定义值）
+    var chips = el('span', 'ctx-chips');
+    var btns = [];
     function sync() {
-      const v = Number(num.value);
+      var v = Number(num.value);
       btns.forEach(function (b) { b.classList.toggle('on', Number(b.dataset.v) === v); });
     }
-
     presets.forEach(function (v) {
-      const b = domEl('button', 'ctx-chip', fmtCtxSlot(v));
+      var b = el('button', 'ctx-chip', fmtCtxSlot(v));
       b.type = 'button';
       b.dataset.v = String(v);
       b.title = fmtCtxSlot(v) + ' = ' + v + ' tokens';
@@ -6464,11 +6470,9 @@
       btns.push(b);
       chips.appendChild(b);
     });
-
     num.addEventListener('input', sync);
     num.value = String(Number(current) || fallback);
     sync();
-
     wrap.appendChild(num);
     wrap.appendChild(chips);
     return {
@@ -6477,423 +6481,51 @@
       set: function (v) { num.value = String(Number(v) || fallback); sync(); }
     };
   }
-  function domEl(tag, cls, text) {
-    const e = document.createElement(tag);
-    if (cls) e.className = cls;
-    if (text !== undefined && text !== null) e.textContent = text;
-    return e;
-  }
-  // cls 可选：给字段加类名。供应商表单是网格布局，Base URL / 密钥这类长值
-  // 需要挂 .f-field-wide 占满整行，否则塞进半列会被压到换行。
-  function domField(label, control, cls) {
-    const w = domEl('label', 'f-field' + (cls ? ' ' + cls : ''));
-    w.appendChild(domEl('span', null, label));
-    w.appendChild(control);
-    return w;
-  }
-  function domInput(type, value, placeholder) {
-    const i = domEl('input');
-    i.type = type;
-    if (value) i.value = value;
-    if (placeholder) i.placeholder = placeholder;
-    return i;
-  }
-  function domButton(text, cls, onClick) {
-    const b = domEl('button', cls, text);
-    b.type = 'button';
-    b.addEventListener('click', onClick);
-    return b;
-  }
-  function setNote(node, ok, msg) {
-    if (!node) return;
-    node.className = 'mf-test-result' + (ok === true ? ' ok' : ok === false ? ' fail' : '');
-    node.textContent = msg || '';
-  }
 
-  // 模型行：显示名 / id / 上下文 + 密钥状态 + 操作。
-  // 不再收 opts / afterChange 钩子：所有写操作统一走 refreshModelViews()，
-  // 由它决定刷哪些视图。早先这个钩子只有一个调用点（供应商详情）传，且没传 ——
-  // 于是「供应商页删模型不消失」和「编辑模型后详情不刷新」两个 bug 同源。
-  function modelRowEl(m) {
-    const wrap = domEl('div', 'model-wrap');
-    const row = domEl('div', 'model-item');
-    const main = domEl('div', 'mi-main');
-    const nm = domEl('div', 'mi-name', m.name || m.id);
-    if (m.id === activeModelId) {
-      const tag = domEl('span', 'mi-badge ok', '当前');
-      tag.style.marginLeft = '8px';
-      nm.appendChild(tag);
-    }
-    main.appendChild(nm);
-    main.appendChild(domEl('div', 'mi-id',
-      m.id + ' · 上下文 ' + fmtCtx(m.ctx_in) + ' / ' + fmtCtx(m.ctx_out) +
-      (m.rpm > 0 ? ' · 每分钟限 ' + m.rpm + ' 请求' : '')));
-
-    // 多模态徽标：**只标显式声明过的**。
-    //
-    // 不标「未声明」是因为它占绝大多数（models.yaml 由设置页生成，多数条目没写），
-    // 全标出来等于没标；而「声明支持」才是用户需要一眼看到的信息 ——
-    // 「贴截图它到底看没看见」只能靠这里判断。
-    [['vision', '图'], ['video', '视频']].forEach(function (pair) {
-      if (m[pair[0]] === true) {
-        const b = domEl('span', 'mi-badge ok', pair[1]);
-        b.style.marginLeft = '8px';
-        nm.appendChild(b);
-      }
-    });
-
-    const badge = domEl('span', 'mi-badge' + (m.key_set ? '' : ' err'),
-      m.key_set ? '密钥✓' : '无密钥');
-
-    const acts = domEl('div', 'mi-actions');
-    if (m.id !== activeModelId) {
-      acts.appendChild(domButton('设为当前', 'apply', function () { applyModel(m.id); }));
-    }
-    acts.appendChild(domButton('编辑', '', function () { toggleEdit(); }));
-
-    // 原位二次确认：首次点「删除」就地变「确认删除」+「取消」，不弹浏览器框。
-    //
-    // 三个细节，缺一个就会出事：
-    //   · busy 防连点：确认按钮点下去到响应回来之间不禁用，手快就发出两次
-    //     DELETE。服务端第二次会 404（模型已不在列表），表现为「删除报错」——
-    //     用户会以为第一次没删掉。
-    //   · 必须查 d.ok：删除失败时不能当成功刷新，否则界面显示已删、实际还在。
-    //   · 走 refreshModelViews 统一出口：本行可能渲染在「模型列表」也可能在
-    //     「供应商详情」，两个视图都得重绘。早先这里只刷 renderModelItems，
-    //     于是供应商页删完看着没反应，重新进页面才对（2026-09 实际故障）。
-    const delBtn = domButton('删除', '', function () {
-      let busy = false;
-      const confirmBtn = domButton('确认删除', 'confirming', function () {
-        if (busy) return;
-        busy = true;
-        confirmBtn.disabled = true;
-        fetch('/api/models/delete', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model: m.id })
-        }).then(function (r) { return r.json(); }).then(function (d) {
-          if (!d.ok) {
-            busy = false;
-            confirmBtn.disabled = false;
-            showBanner('删除失败：' + (d.error || '未知错误'), 'error');
-            return;
-          }
-          refreshModelViews();
-        }).catch(function (err) {
-          busy = false;
-          confirmBtn.disabled = false;
-          showBanner('删除失败：' + err, 'error');
-        });
-      });
-      const cancelBtn = domButton('取消', '', function () {
-        acts.removeChild(confirmBtn);
-        acts.removeChild(cancelBtn);
-        acts.appendChild(delBtn);
-      });
-      acts.replaceChild(confirmBtn, delBtn);
-      acts.appendChild(cancelBtn);
-    });
-    acts.appendChild(delBtn);
-
-    row.appendChild(main);
-    row.appendChild(badge);
-    row.appendChild(acts);
-    wrap.appendChild(row);
-
-    // 就地展开编辑区。
-    // ⚠️ 不再跳去「添加模型」标签页复用那张表单 —— 那张表单含供应商下拉、地址、协议、
-    // 密钥分段控件，对「改个名字 / 调上下文」这种小修改来说太重，也容易让人误以为
-    // 要重填密钥。这里只放模型自己的字段，连接信息以只读方式展示来源。
-    let editor = null;
-    function toggleEdit() {
-      if (editor) { wrap.removeChild(editor); editor = null; row.classList.remove('editing'); return; }
-      editor = buildModelEditor(m, function () {
-        if (editor) { wrap.removeChild(editor); editor = null; }
-        row.classList.remove('editing');
-      });
-      wrap.appendChild(editor);
-      row.classList.add('editing');
-      const first = editor.querySelector('input');
-      if (first) first.focus();
-    }
-
-    return wrap;
-  }
-
-  // 就地编辑一个模型：只改模型自身字段，不动连接信息。
-  function buildModelEditor(m, close) {
-    const box = domEl('div', 'model-editor');
-    const grid = domEl('div', 'form-grid');
-
-    const nameIn = domInput('text', m.name || '', '界面显示的名称');
-    const idIn = domInput('text', m.id || '', '如 gpt-4o');
-    grid.appendChild(domField('显示名称', nameIn));
-    grid.appendChild(domField('模型 id', idIn));
-
-    const ctxRow = domEl('div', 'f-field ctx-row');
-    ctxRow.appendChild(domEl('span', null, '上下文'));
-    const ctxInputs = domEl('div', 'ctx-inputs');
-    // 与「添加模型」表单同一套控件：预置档位 + 自定义
-    const ctxIn = buildCtxPicker(m.ctx_in, CTX_PRESETS_IN, 262144);
-    const ctxOut = buildCtxPicker(m.ctx_out, CTX_PRESETS_OUT, 131072);
-    const inLab = domEl('label', null, '输入 ');
-    inLab.appendChild(ctxIn.node);
-    const outLab = domEl('label', null, '输出 ');
-    outLab.appendChild(ctxOut.node);
-    ctxInputs.appendChild(inLab);
-    ctxInputs.appendChild(outLab);
-    ctxRow.appendChild(ctxInputs);
-    grid.appendChild(ctxRow);
-
-    // 归属供应商：只读展示连接信息来源，编辑区里不重复出现地址与密钥
-    const p = m.provider_id ? findProvider(m.provider_id) : null;
-    const provRow = domEl('div', 'f-field');
-    provRow.appendChild(domEl('span', null, '连接信息'));
-    provRow.appendChild(domEl('div', 'me-inherit',
-      p ? ((p.name || p.id) + ' · ' + p.base_url + '（地址与密钥继承自该供应商，无需在此填写）')
-        : '写在本条目上（该模型未归属供应商）'));
-    grid.appendChild(provRow);
-    box.appendChild(grid);
-
-    const foot = domEl('div', 'me-foot');
-    const note = domEl('span', 'mf-test-result');
-    foot.appendChild(note);
-
-    foot.appendChild(domButton('取消', '', close));
-    const saveBtn = domButton('保存修改', 'primary', function () {
-      const id = idIn.value.trim();
-      if (!id) { setNote(note, false, '模型 id 不能为空'); return; }
-      const body = {
-        name: nameIn.value.trim(),
-        id: id,
-        model: id,
-        ctx_in: ctxIn.value(),
-        ctx_out: ctxOut.value()
-      };
-      if (m.provider_id) {
-        body.provider_id = m.provider_id;
-        body.protocol = '';
-        body.inherit_key = true; // 清掉条目上历史遗留的自带密钥，否则它会一直压着供应商的
-      } else {
-        // 未归属供应商的旧条目：连接信息写在自己身上，必须原样带回，否则会被清空。
-        // 密钥**不提交** —— 列表是脱敏视图拿不到明文，服务端按「保持已存密钥」处理。
-        body.provider_id = '';
-        body.base_url = m.base_url || '';
-        body.protocol = m.protocol || 'openai';
-        body.key_source = m.key_source || 'env';
-        body.key_name = m.key_name || '';
-      }
-      saveBtn.disabled = true;
-      setNote(note, null, '保存中…');
-      fetch('/api/models/save', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      }).then(function (r) { return r.json(); }).then(function (d) {
-        if (!d.ok) { setNote(note, false, d.error || '保存失败'); saveBtn.disabled = false; return; }
-        // 统一出口：本编辑器既可能开在模型列表也可能开在供应商详情，两个视图都要重绘。
-        refreshModelViews().then(function () { close(); });
-      }).catch(function (e) {
-        setNote(note, false, '保存失败：' + e);
-        saveBtn.disabled = false;
-      });
-    });
-    foot.appendChild(saveBtn);
-    box.appendChild(foot);
-    return box;
-  }
-
-  // 切换生效模型：服务端热切换后刷新主界面（对话框弹层 + 常规页显示）。
-  function applyModel(id) {
-    fetch('/api/models/apply', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: id })
-    }).then(function (r) { return r.json(); }).then(function (d) {
-      if (!d.ok) { alert('应用失败：' + (d.error || '未知错误')); return; }
-      activeModelId = id;
-      // 走统一出口。「当前」徽标在两个视图里都有（模型列表行 + 供应商详情行），
-      // 早先这里按 mtab-prov.active 条件刷，实际紧接着就 showPage('general') 跳走，
-      // 条件恒真 —— 换成无条件刷新，条件判断那类漏刷就没有藏身处了。
-      refreshModelViews();
-      showPage('general');
-    });
-  }
-
-  // 编辑模型已改为**就地展开**（见 modelRowEl / buildModelEditor），
-  // 不再跳到「添加模型」标签页复用那张表单 —— 所以原来的 editModel() 已删除。
-
-  // ---------- 模型列表：按供应商分组 ----------
-  // 模型列表里「供应商分组」的折叠状态：provider_id → 是否折叠（内存态，刷新重置）。
-  // 与侧栏 wsFolded 同一套做法，只是作用对象换成模型分组。
-  const modelGroupFolded = {};
-
-  // 纯渲染：只读 modelsCache / providersCache，**不自己取数**。
-  // 取数统一由 loadModelViews / refreshModelViews 负责。
-  function renderModelItems() {
-    const box = document.getElementById('model-items');
-    if (!box) return;
-    box.innerHTML = '';
-    if (!modelsCache.length) {
-      box.innerHTML = '<div class="mi-empty">还没有模型：切到「添加模型」，选定供应商后只需填模型 id</div>';
-      return;
-    }
-    {
-      // 按 provider_id 分组；未归属供应商的（旧格式条目）单独成组。
-      const order = [];
-      const groups = {};
-      modelsCache.forEach(function (m) {
-        const key = m.provider_id || '';
-        if (!groups[key]) { groups[key] = []; order.push(key); }
-        groups[key].push(m);
-      });
-      order.forEach(function (pid) {
-        const p = pid ? findProvider(pid) : null;
-        const folded = !!modelGroupFolded[pid];
-        const head = domEl('div', 'model-group');
-
-        // 折叠箭头：供应商下的子模型可以整组收起（模型多的时候不用一直滚）
-        const fold = document.createElement('button');
-        fold.type = 'button';
-        fold.className = 'label-btn mg-fold' + (folded ? ' folded' : '');
-        fold.title = folded ? '展开该供应商的模型' : '收起该供应商的模型';
-        const arrow = svgIcon('M6 9l6 6 6-6', 12);
-        arrow.setAttribute('stroke', 'currentColor');
-        arrow.setAttribute('fill', 'none');
-        arrow.setAttribute('stroke-width', '2');
-        arrow.setAttribute('stroke-linecap', 'round');
-        arrow.setAttribute('stroke-linejoin', 'round');
-        fold.appendChild(arrow);
-        fold.addEventListener('click', function () {
-          modelGroupFolded[pid] = !modelGroupFolded[pid];
-          // 只重画模型列表：折叠是纯 UI 状态，且 renderProviders 会重绘详情区，
-          // 连带抹掉供应商表单里正在输入的内容。renderModelItems 现在是纯渲染，
-          // 不重新取数，所以这里直接调它。
-          renderModelItems();
-        });
-        head.appendChild(fold);
-
-        head.appendChild(domEl('span', 'mg-name', p ? (p.name || p.id) : '未归属供应商'));
-        head.appendChild(domEl('span', 'mg-base',
-          p ? p.base_url : '各条目自带连接信息'));
-        head.appendChild(domEl('span', 'mi-badge', groups[pid].length + ' 个模型'));
-        if (p) {
-          head.appendChild(domEl('span', 'mi-badge' + (p.disabled ? ' err' : ' ok'),
-            p.disabled ? '已停用' : '密钥共用'));
-        }
-        head.appendChild(domEl('span', 'mg-sp'));
-        if (p) {
-          head.appendChild(domButton('＋ 添加模型', '', function () {
-            gotoAddModel(p.id);
-          }));
-        }
-        box.appendChild(head);
-
-        if (folded) return;   // 收起时子模型整组不渲染（也省掉一批 DOM）
-
-        // 子模型缩进一层，视觉上从属于上面的供应商
-        const kids = domEl('div', 'model-children');
-        groups[pid].forEach(function (m) { kids.appendChild(modelRowEl(m)); });
-        box.appendChild(kids);
-      });
-    }
-  }
-
-  // 跳到「添加模型」并预选供应商：地址与密钥继承，用户只需填 id。
-  function gotoAddModel(providerId) {
-    showPage('models');
-    showMTab('config');
-    loadLibrary().then(function () {
-      resetForm();
-      const sel = document.getElementById('mf-prov');
-      if (sel && providerId) { sel.value = providerId; syncProviderForm(); }
-      const idEl = document.getElementById('mf-id');
-      if (idEl) idEl.focus();
-    });
-  }
-
-  // ---------- 视图刷新：模型库变更后的**唯一出口** ----------
-  //
-  // 一次取数 → 重绘两个视图 → 同步主界面。三件事缺一不可：
-  //   · 模型列表（#model-items）与供应商详情（#prov-detail）都渲染同一份 modelsCache，
-  //     任何写操作都会改动两者，只刷一个就是「删掉了但列表还在，重新进页面才对」；
-  //   · modelsLoaded 置假让 loadModels() 重拉生效配置与对话框弹层快照 ——
-  //     删掉的可能就是当前模型，或改的是当前供应商的地址/密钥。
-  //
-  // 为什么无条件刷两个视图而不判断当前 tab：两个 pane 都常驻 DOM（showMTab 只切
-  // .active），重绘成本就是几十个节点；换来的是调用点不必知道自己站在哪个 tab ——
-  // 早先 applyModel 里的 `if (mtab-prov.active) renderProviders()` 就是这类
-  // 条件判断漏掉的第二处。
-  function refreshModelViews() {
-    modelsLoaded = false;
-    return loadLibrary().then(function () {
-      renderModelItems();
-      renderProviders();
-      return loadModels();
-    });
-  }
-
-  // 只重绘、复用已有缓存：折叠/展开这类纯 UI 操作用，不该重新拉接口。
-  function renderModelViews() {
-    renderModelItems();
-    renderProviders();
-  }
-
-  // 进入页面 / 切子 Tab：数据可能来自别的进程或上一轮会话，先取数再重绘。
-  // 与 refreshModelViews 的区别是**不动** modelsLoaded —— 打开设置页不该
-  // 连带把主界面的生效配置也重拉一遍。
-  function loadModelViews() {
-    return loadLibrary().then(renderModelViews);
-  }
-
-  // ---------- 供应商管理：左列供应商 / 右侧详情 ----------
-  // 纯渲染，同 renderModelItems：不自带 loadLibrary，取数由 refreshModelViews 负责。
-  function renderProviders() {
-    const listEl = document.getElementById('prov-list');
-    const detailEl = document.getElementById('prov-detail');
-    if (!listEl || !detailEl) return;
-    if (!provSelected && providersCache.length) provSelected = providersCache[0].id;
-    listEl.innerHTML = '';
-    providersCache.forEach(function (p) {
-      const b = domEl('button', 'prov-item' + (p.id === provSelected ? ' active' : ''));
+  /* ---------- 多模态三态分段 ---------- */
+  function buildCapSeg(which, value) {
+    var wrap = el('div', 'key-seg cap');
+    var state = value === true ? 'yes' : value === false ? 'no' : 'unset';
+    [['unset', '不声明'], ['yes', '支持'], ['no', '不支持']].forEach(function (pair) {
+      var b = el('button', null, pair[1]);
       b.type = 'button';
-      b.appendChild(domEl('span', 'pv-dot' + (p.disabled ? ' off' : '')));
-      b.appendChild(domEl('span', null, p.name || p.id));
-      b.appendChild(domEl('span', 'pv-cnt', String(modelsOfProvider(p.id).length)));
-      b.addEventListener('click', function () { provSelected = p.id; renderProviders(); });
-      listEl.appendChild(b);
+      b.dataset.cap = pair[0];
+      if (pair[0] === state) b.classList.add('active');
+      b.addEventListener('click', function () {
+        state = pair[0];
+        $$('button', wrap).forEach(function (x) { x.classList.toggle('active', x.dataset.cap === state); });
+      });
+      wrap.appendChild(b);
     });
-    const add = domEl('button', 'prov-item prov-add', '＋ 添加供应商');
-    add.type = 'button';
-    if (provSelected === PROV_NEW) add.classList.add('active');
-    add.addEventListener('click', function () { provSelected = PROV_NEW; renderProviders(); });
-    listEl.appendChild(add);
-    renderProviderDetail(detailEl);
+    return {
+      node: wrap,
+      get: function () {
+        if (state === 'yes') return true;
+        if (state === 'no') return false;
+        return null; // 不声明
+      }
+    };
   }
 
-  // 密钥输入控件（供应商表单用）：环境变量 / 明文 分段 + 眼睛。
-  // 返回取值接口；touched 记录用户是否动过，决定保存时是否提交 key_value。
-  function buildKeyControl(state) {
-    const wrap = domEl('div', 'key-row');
-    const seg = domEl('div', 'key-seg');
-    const envBtn = domEl('button', 'active', '环境变量');
-    envBtn.type = 'button';
-    const plainBtn = domEl('button', null, '明文密钥');
-    plainBtn.type = 'button';
+  /* ---------- 密钥控件（供应商表单 / 未归属条目） ---------- */
+  function buildKeyControl(p) {
+    var wrap = el('div', 'key-row');
+    var seg = el('div', 'key-seg');
+    var envBtn = el('button', 'active', '环境变量');
+    var plainBtn = el('button', null, '明文密钥');
+    envBtn.type = 'button'; plainBtn.type = 'button';
     seg.appendChild(envBtn); seg.appendChild(plainBtn);
-
-    const envIn = domInput('text', state.name, '变量名，如 CODEFORGE_API_KEY');
-    const eyeWrap = domEl('span', 'key-eye-wrap');
-    // 明文那一档同样支持 ${VAR}：填进去的是变量引用，文件里就不落密钥。
-    // 与「环境变量」档的区别是后者只记变量名（key_source=env），
-    // 前者把引用写在 key_value 里 —— 适合「地址和密钥要用同一个变量拼」的情况。
-    const plainIn = domInput('password', state.plain,
-      state.placeholder || 'sk-... 或 ${VAR}');
-    const eye = domEl('button', 'key-eye', '👁');
+    var envIn = mkInput('text', p ? p.key_name : '', '变量名，如 CODEFORGE_API_KEY');
+    var eyeWrap = el('span', 'key-eye-wrap');
+    var plainIn = mkInput('password', (p && p.key_plain) ? p.key_plain : '',
+      (p && p.key_set && !p.key_plain) ? '已保存（留空保持不变）' : 'sk-... 或 ${VAR}');
+    var eye = el('button', 'key-eye', '👁');
     eye.type = 'button';
     eyeWrap.appendChild(plainIn); eyeWrap.appendChild(eye);
-
     wrap.appendChild(seg); wrap.appendChild(envIn); wrap.appendChild(eyeWrap);
 
-    let src = state.source === 'plain' ? 'plain' : 'env';
-    let touched = false;
+    var src = (p && p.key_source === 'plain') ? 'plain' : 'env';
+    var touched = false;
     function apply() {
       envBtn.classList.toggle('active', src === 'env');
       plainBtn.classList.toggle('active', src === 'plain');
@@ -6906,7 +6538,7 @@
     envIn.addEventListener('input', function () { touched = true; });
     plainIn.addEventListener('input', function () { touched = true; apply(); });
     eye.addEventListener('click', function () {
-      const show = plainIn.type === 'password';
+      var show = plainIn.type === 'password';
       plainIn.type = show ? 'text' : 'password';
       eye.textContent = show ? '🙈' : '👁';
     });
@@ -6920,828 +6552,1220 @@
     };
   }
 
-  function renderProviderDetail(host) {
-    // PROV_NEW（或 id 已失效）→ findProvider 返回 undefined → 走「新建供应商」分支
-    const p = (provSelected && provSelected !== PROV_NEW) ? findProvider(provSelected) : null;
-    host.innerHTML = '';
+  /* ---------- 栏 1：供应商列表 ---------- */
+  function renderProvSide() {
+    var box = $('#m-prov-list');
+    if (!box) return;
+    box.innerHTML = '';
+    var q = provNameFilter.trim().toLowerCase();
 
-    const title = domEl('div', 'mf-title', p ? (p.name || p.id) : '新建供应商');
-    if (p) {
-      const tag = domEl('span', 'mi-badge' + (p.disabled ? ' err' : ' ok'),
-        p.disabled ? '已停用' : '已启用');
-      tag.style.marginLeft = '8px';
-      title.appendChild(tag);
-    }
-    host.appendChild(title);
-
-    // 一次性回执（如「已添加 N 个模型」）：跨重绘保留，显示一次即清空
-    if (provFlash) {
-      const flash = domEl('div', 'prov-flash', provFlash);
-      provFlash = '';
-      host.appendChild(flash);
-    }
-
-    const form = domEl('div', 'prov-form');
-    const nameIn = domInput('text', p ? p.name : '', '如 上海模型实验室 / SiliconFlow');
-    const urlIn = domInput('text', p ? p.base_url : '', 'https://api.example.com/v1');
-    const protoSel = domEl('select');
-    ['openai', 'anthropic'].forEach(function (v) {
-      const o = domEl('option', null, v === 'anthropic' ? 'Anthropic' : 'OpenAI');
-      o.value = v;
-      protoSel.appendChild(o);
-    });
-    protoSel.value = (p && p.protocol === 'anthropic') ? 'anthropic' : 'openai';
-    const key = buildKeyControl({
-      source: p ? p.key_source : 'env',
-      name: p ? p.key_name : '',
-      plain: (p && p.key_plain) ? p.key_plain : '',
-      placeholder: (p && p.key_set && !p.key_plain) ? '已保存（留空保持不变）' : 'sk-...'
-    });
-
-    // 字段顺序 = 网格的分行顺序（.prov-form 是两列）：
-    //   名称 | 兼容协议  →  Base URL（满行） → 密钥（满行） → 停用（满行）
-    form.appendChild(domField('名称', nameIn));
-    form.appendChild(domField('兼容协议', protoSel));
-    form.appendChild(domField('Base URL', urlIn, 'f-field-wide'));
-    form.appendChild(domField('密钥', key.node, 'f-field-wide'));
-
-    const disWrap = domEl('label', 'f-field f-field-wide');
-    disWrap.style.flexDirection = 'row';
-    disWrap.style.alignItems = 'center';
-    disWrap.style.gap = '8px';
-    const disIn = domEl('input');
-    disIn.type = 'checkbox';
-    disIn.checked = !!(p && p.disabled);
-    disWrap.appendChild(disIn);
-    disWrap.appendChild(domEl('span', null, '停用该供应商（其下模型不可选用，配置保留）'));
-    form.appendChild(disWrap);
-    host.appendChild(form);
-
-    const result = domEl('span', 'mf-test-result');
-    result.id = 'pv-result'; // 保存成功后整块重绘，靠 id 找回新节点写回执
-    const acts = domEl('div', 'prov-actions');
-    acts.appendChild(result);
-
-    const testBtn = domButton('测试连接', '', function () {
-      if (!p) { setNote(result, false, '先保存供应商再测试'); return; }
-      setNote(result, null, '测试中…');
-      // 用「拉取上游模型列表」当连通性测试：一次请求同时验证地址与密钥，
-      // 还能顺带告诉用户这个供应商下有多少模型可用。
-      fetch('/api/models/discover', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider_id: p.id })
-      }).then(function (r) { return r.json(); }).then(function (d) {
-        if (d.ok) setNote(result, true, '连接正常，上游 ' + (d.count || 0) + ' 个模型可用');
-        else setNote(result, false, '失败：' + (d.error || '未知错误'));
-      }).catch(function (e) { setNote(result, false, '失败：' + e); });
-    });
-    acts.appendChild(testBtn);
-
-    const saveBtn = domButton('保存供应商', 'primary', function () {
-      const name = nameIn.value.trim();
-      const url = urlIn.value.trim();
-      if (!name) { setNote(result, false, '名称不能为空'); return; }
-      if (!url) { setNote(result, false, 'Base URL 不能为空'); return; }
-      const body = {
-        id: p ? p.id : newProviderId(name),
-        name: name,
-        base_url: url,
-        protocol: protoSel.value,
-        key_source: key.source(),
-        key_name: key.name(),
-        key_value: key.value(),
-        key_touched: key.touched(),
-        disabled: disIn.checked
-      };
-      setNote(result, null, '保存中…');
-      fetch('/api/providers/save', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      }).then(function (r) { return r.json(); }).then(function (d) {
-        if (!d.ok) { setNote(result, false, d.error || '保存失败'); return; }
-        provSelected = body.id;
-        // 改地址 / 轮换密钥会热切换当前模型，主界面显示需刷新 → 走统一出口。
-        // 回执要等重绘完再写：整块是重绘的，旧的 result 节点会被丢掉，
-        // 所以按 id 找回新节点（refreshModelViews 内部已含 renderProviders）。
-        refreshModelViews().then(function () {
-          const fresh = document.getElementById('pv-result');
-          setNote(fresh, true, d.hot ? '已保存，当前生效模型已改用新配置' : '已保存');
+    function provItem(id, label, count, opts) {
+      opts = opts || {};
+      if (q && label.toLowerCase().indexOf(q) < 0 && (opts.sub || '').toLowerCase().indexOf(q) < 0) return;
+      var b = el('button', 'prov-item' + (provSel === id ? ' active' : ''));
+      b.type = 'button';
+      b.appendChild(el('span', 'pv-dot' + (opts.disabled ? ' off' : '')));
+      var nm = el('span', 'pv-name', label);
+      if (opts.sub) nm.title = opts.sub;
+      b.appendChild(nm);
+      b.appendChild(el('span', 'pv-cnt', String(count)));
+      if (opts.gear) {
+        var g = el('button', 'pv-gear', '⚙');
+        g.type = 'button';
+        g.title = '编辑供应商连接信息';
+        g.addEventListener('click', function (e) {
+          e.stopPropagation();
+          openProviderDetail(id);
         });
-      }).catch(function (e) { setNote(result, false, '保存失败：' + e); });
-    });
-    acts.appendChild(saveBtn);
-
-    if (p) {
-      // 与模型行的删除同款：原位二次确认 + busy 防连点 + 查 d.ok。
-      const delBtn = domButton('删除', '', function () {
-        const n = modelsOfProvider(p.id).length;
-        let busy = false;
-        const confirmBtn = domButton('确认删除', 'confirming', function () {
-          if (busy) return;
-          busy = true;
-          confirmBtn.disabled = true;
-          fetch('/api/providers/delete', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ provider: p.id })
-          }).then(function (r) { return r.json(); }).then(function (d) {
-            if (!d.ok) {
-              busy = false;
-              confirmBtn.disabled = false;
-              setNote(result, false, d.error || '删除失败');
-              return;
-            }
-            provSelected = '';
-            refreshModelViews();   // 其下模型被解绑，模型列表的分组也要跟着重画
-          }).catch(function (e) {
-            busy = false;
-            confirmBtn.disabled = false;
-            setNote(result, false, '删除失败：' + e);
-          });
-        });
-        const cancelBtn = domButton('取消', '', function () {
-          acts.removeChild(confirmBtn);
-          acts.removeChild(cancelBtn);
-          // 用 appendChild 复位：删除按钮原本就在 acts 末尾（测试 / 保存之后），
-          // 按位置插入会让它取消一次就跳到「测试连接」前面 —— 功能没坏，
-          // 但每误点一次取消，按钮位置就变一次。
-          acts.appendChild(delBtn);
-        });
-        acts.replaceChild(confirmBtn, delBtn);
-        acts.appendChild(cancelBtn);
-        if (n) setNote(result, null, '其下 ' + n + ' 个模型不会被删除，连接信息会保留到各自条目上');
+        b.appendChild(g);
+      }
+      b.addEventListener('click', function () {
+        provSel = id;
+        modelSel = '';
+        renderProvSide();
+        renderModelList();
+        renderDetailEmpty();
+        m3Show('models');
       });
-      delBtn.style.color = 'var(--danger)';
-      acts.appendChild(delBtn);
+      box.appendChild(b);
     }
-    host.appendChild(acts);
 
-    if (!p) {
-      host.appendChild(domEl('div', 'prov-empty',
-        '填好名称、Base URL 与密钥后保存；之后在同一供应商下添加模型只需填模型 id。'));
+    provItem(ALL, '全部模型', modelsCache.length);
+    var unattached = modelsOfProvider('');
+    if (unattached.length) provItem('', '未归属供应商', unattached.length, { sub: '各条目自带连接信息', disabled: true });
+    providersCache.forEach(function (p) {
+      provItem(p.id, p.name || p.id, modelsOfProvider(p.id).length, {
+        disabled: p.disabled,
+        sub: p.base_url,
+        gear: true
+      });
+    });
+
+    if (!box.children.length) {
+      box.appendChild(el('div', 'list-empty', q ? '没有匹配的供应商' : '还没有供应商，点下方新建'));
+    }
+  }
+
+  /* ---------- 栏 2：模型列表 ---------- */
+  function currentGroupModels() {
+    if (provSel === ALL) return modelsCache.slice();
+    return modelsCache.filter(function (m) { return (m.provider_id || '') === provSel; });
+  }
+
+  function renderModelList() {
+    var box = $('#m-model-list');
+    if (!box) return;
+    box.innerHTML = '';
+
+    // 头部：当前分组标题 + 计数
+    var title = '全部模型', sub = '';
+    if (provSel === ALL) {
+      var provCount = providersCache.length;
+      sub = modelsCache.length + ' 个模型 · 来自 ' + provCount + ' 个供应商与 ' +
+        modelsOfProvider('').length + ' 条未归属条目';
+    } else if (provSel === '') {
+      title = '未归属供应商';
+      sub = '连接信息写在各条目上';
+    } else {
+      var p = findProvider(provSel);
+      title = p ? (p.name || p.id) : '供应商';
+      if (p) sub = p.base_url + (p.disabled ? ' · 已停用' : '');
+    }
+    $('#m-main-title').textContent = title;
+    $('#m-main-sub').textContent = sub;
+    var discBtn = $('#m-disc');
+    discBtn.disabled = !(provSel && provSel !== ALL && findProvider(provSel));
+    discBtn.title = discBtn.disabled ? '先选中一个供应商，再获取其上游模型列表' : '向该供应商上游请求模型列表';
+
+    var list = currentGroupModels();
+    var q = modelNameFilter.trim().toLowerCase();
+    if (q) {
+      list = list.filter(function (m) {
+        return (m.id || '').toLowerCase().indexOf(q) >= 0 ||
+          (m.name || '').toLowerCase().indexOf(q) >= 0;
+      });
+    }
+    // 当前生效模型排最前
+    list.sort(function (a, b) {
+      var aa = a.id === activeModelId ? 0 : 1;
+      var bb = b.id === activeModelId ? 0 : 1;
+      return aa - bb;
+    });
+
+    lastListIds = list.map(function (m) { return m.id; });
+
+    if (!list.length) {
+      box.appendChild(el('div', 'list-empty', q ? '没有匹配的模型' :
+        (modelsCache.length ? '该分组下没有模型' : '还没有模型：点右上角「＋ 添加模型」新建')));
+      batchSyncBar();
       return;
     }
 
-    const list = modelsOfProvider(p.id);
-    const sub = domEl('div', 'prov-sub');
-    sub.appendChild(document.createTextNode('模型 · ' + list.length + ' 个'));
-    sub.appendChild(domEl('span', 'pv-hint', '共用上面的 Base URL 与 Key，切换只需换 id'));
-    host.appendChild(sub);
+    list.forEach(function (m) {
+      var row = el('div', 'mrow' +
+        (batchMode ? ' batch' : (m.id === modelSel ? ' active' : '')) +
+        (batchMode && batchSel[m.id] ? ' sel' : ''));
+      if (batchMode) {
+        var cb = mkInput('checkbox');
+        cb.className = 'row-check';
+        cb.checked = !!batchSel[m.id];
+        cb.addEventListener('click', function (e) { e.stopPropagation(); });
+        cb.addEventListener('change', function () {
+          if (cb.checked) batchSel[m.id] = true; else delete batchSel[m.id];
+          row.classList.toggle('sel', cb.checked);
+          batchSyncBar();
+        });
+        row.appendChild(cb);
+      }
+      var main = el('div', 'mrow-main');
+      var name = el('div', 'mrow-name', m.name || m.id);
+      if (m.id === activeModelId) name.appendChild(el('span', 'badge accent', '当前'));
+      if (m.vision === true) name.appendChild(el('span', 'badge ok', '图'));
+      if (m.video === true) name.appendChild(el('span', 'badge ok', '视频'));
+      main.appendChild(name);
 
-    if (list.length) {
-      list.forEach(function (m) { host.appendChild(modelRowEl(m)); });
+      var meta = m.id + ' · 上下文 ' + fmtCtx(m.ctx_in) + ' / ' + fmtCtx(m.ctx_out);
+      if (m.rpm > 0) meta += ' · 限 ' + m.rpm + ' RPM';
+      if (provSel === ALL) meta += ' · ' + ((m.provider_id && findProvider(m.provider_id))
+        ? (findProvider(m.provider_id).name || m.provider_id) : '未归属');
+      main.appendChild(el('div', 'mrow-id', meta));
+      row.appendChild(main);
+
+      var side = el('div', 'mrow-side');
+      side.appendChild(el('span', 'badge ' + (m.key_set ? 'ok' : 'err'), m.key_set ? '密钥✓' : '无密钥'));
+      if (m.id !== activeModelId) {
+        side.appendChild(button('设为当前', 'btn small', function (e) {
+          e.stopPropagation();
+          applyModel(m.id);
+        }));
+      }
+      row.appendChild(side);
+
+      row.addEventListener('click', function () {
+        if (batchMode) {
+          if (batchSel[m.id]) delete batchSel[m.id]; else batchSel[m.id] = true;
+          row.classList.toggle('sel', !!batchSel[m.id]);
+          var cb2 = row.querySelector('input.row-check');
+          if (cb2) cb2.checked = !!batchSel[m.id];
+          batchSyncBar();
+          return;
+        }
+        openModelDetail(m.id);
+      });
+      box.appendChild(row);
+    });
+    batchSyncBar();
+  }
+
+  /* ---------- 批量管理（中间栏） ---------- */
+  var batchMode = false;
+  var batchSel = {};
+  var batchPanelKind = '';
+  var lastListIds = [];
+
+  function batchSelectedIds() {
+    return Object.keys(batchSel).filter(function (id) {
+      return modelsCache.some(function (m) { return m.id === id; });
+    });
+  }
+  function batchSyncBar() {
+    var ids = batchSelectedIds();
+    var cnt = $('#m-batch-count');
+    if (cnt) cnt.textContent = '已选 ' + ids.length + ' 项';
+    var all = $('#m-batch-all');
+    if (all) all.checked = lastListIds.length > 0 && lastListIds.every(function (id) { return !!batchSel[id]; });
+  }
+  function setBatchMode(on) {
+    batchMode = on;
+    batchSel = {};
+    batchPanelKind = '';
+    var btn = $('#m-batch');
+    btn.classList.toggle('primary', on);
+    btn.textContent = on ? '退出批量' : '批量管理';
+    $('#m-batch-bar').classList.toggle('hidden', !on);
+    $('#m-batch-panel').classList.add('hidden');
+    $('#m-batch-panel').innerHTML = '';
+    renderModelList();
+    batchSyncBar();
+  }
+
+  /* 批量 patch → 单条保存载荷。未指明的字段沿用条目现值：
+     vision/video 只有 true/false 才下发（null/未改 = 不声明），
+     与编辑表单的省略语义一致。 */
+  function batchBodyFor(m, patch) {
+    var body = {
+      name: m.name || m.id,
+      id: m.id,
+      model: m.id,
+      ctx_in: patch.ctx_in !== undefined ? patch.ctx_in : (m.ctx_in || 0),
+      ctx_out: patch.ctx_out !== undefined ? patch.ctx_out : (m.ctx_out || 0),
+      rpm: patch.rpm !== undefined ? patch.rpm : Math.max(0, m.rpm || 0)
+    };
+    var vis = patch.vision !== undefined ? patch.vision : m.vision;
+    var vid = patch.video !== undefined ? patch.video : m.video;
+    if (vis === true || vis === false) body.vision = vis;
+    if (vid === true || vid === false) body.video = vid;
+    if (m.provider_id) {
+      body.provider_id = m.provider_id;
+      body.protocol = '';
+      body.inherit_key = true;
     } else {
-      host.appendChild(domEl('div', 'prov-empty',
-        '该供应商下暂无模型 —— 点下方按钮添加，只需填模型 id。'));
+      body.provider_id = '';
+      body.base_url = m.base_url || '';
+      body.protocol = m.protocol || 'openai';
+      body.key_source = m.key_source || 'env';
+      body.key_name = m.key_name || '';
+    }
+    return body;
+  }
+
+  function batchApply(patch, noteEl) {
+    var ids = batchSelectedIds();
+    if (!ids.length) { setNote(noteEl, false, '先勾选要修改的模型'); return Promise.resolve(); }
+    var done = 0, fail = 0;
+    setNote(noteEl, null, '应用中 0/' + ids.length + '…');
+    var chain = Promise.resolve();
+    ids.forEach(function (id) {
+      chain = chain.then(function () {
+        var m = modelsCache.filter(function (x) { return x.id === id; })[0];
+        if (!m) return null;
+        return api('/api/models/save', { method: 'POST', body: batchBodyFor(m, patch) }).then(function (res) {
+          done++;
+          if (!res.data.ok) fail++;
+          setNote(noteEl, null, '应用中 ' + done + '/' + ids.length + '…');
+        });
+      });
+    });
+    return chain.then(function () {
+      var ok = ids.length - fail;
+      setNote(noteEl, fail ? false : true, fail
+        ? ('完成：成功 ' + ok + ' 个，失败 ' + fail + ' 个')
+        : ('已更新 ' + ok + ' 个模型'));
+      showBanner(fail ? ('批量保存：成功 ' + ok + ' 个，失败 ' + fail + ' 个')
+        : ('已更新 ' + ok + ' 个模型'), fail ? 'error' : undefined);
+      return refreshModelViews();
+    });
+  }
+
+  function batchDelete(noteEl) {
+    var ids = batchSelectedIds();
+    if (!ids.length) { setNote(noteEl, false, '先勾选要删除的模型'); return; }
+    var done = 0, fail = 0;
+    setNote(noteEl, null, '删除中 0/' + ids.length + '…');
+    var chain = Promise.resolve();
+    ids.forEach(function (id) {
+      chain = chain.then(function () {
+        return api('/api/models/delete', { method: 'POST', body: { model: id } }).then(function (res) {
+          done++;
+          if (!res.data.ok) fail++;
+          setNote(noteEl, null, '删除中 ' + done + '/' + ids.length + '…');
+        });
+      });
+    });
+    chain.then(function () {
+      var ok = ids.length - fail;
+      setNote(noteEl, fail ? false : true, fail
+        ? ('完成：成功 ' + ok + ' 个，失败 ' + fail + ' 个')
+        : ('已删除 ' + ok + ' 个模型'));
+      showBanner(fail ? ('批量删除：成功 ' + ok + ' 个，失败 ' + fail + ' 个')
+        : ('已删除 ' + ok + ' 个模型'), fail ? 'error' : undefined);
+      ids.forEach(function (id) { delete batchSel[id]; });
+      if (ids.indexOf(modelSel) >= 0) { detailMode = ''; renderDetailEmpty(); }
+      refreshModelViews();
+    });
+  }
+
+  /* 四态能力分段（批量用：默认「不修改」） */
+  function buildCapSeg4() {
+    var wrap = el('div', 'key-seg cap');
+    var state = 'keep';
+    [['keep', '不修改'], ['unset', '不声明'], ['yes', '支持'], ['no', '不支持']].forEach(function (pair) {
+      var b = el('button', null, pair[1]);
+      b.type = 'button';
+      b.dataset.cap = pair[0];
+      if (pair[0] === state) b.classList.add('active');
+      b.addEventListener('click', function () {
+        state = pair[0];
+        $$('button', wrap).forEach(function (x) { x.classList.toggle('active', x.dataset.cap === state); });
+      });
+      wrap.appendChild(b);
+    });
+    return {
+      node: wrap,
+      get: function () {
+        if (state === 'keep') return undefined;
+        if (state === 'unset') return null;
+        return state === 'yes';
+      }
+    };
+  }
+
+  function batchChips(presets, target) {
+    var box = el('span', 'bp-chips');
+    presets.forEach(function (v) {
+      var b = el('button', 'ctx-chip', fmtCtxSlot(v));
+      b.type = 'button';
+      b.title = v + ' tokens';
+      b.addEventListener('click', function () { target.value = String(v); });
+      box.appendChild(b);
+    });
+    return box;
+  }
+
+  function toggleBatchPanel(kind) {
+    var panel = $('#m-batch-panel');
+    if (batchPanelKind === kind) {
+      batchPanelKind = '';
+      panel.classList.add('hidden');
+      panel.innerHTML = '';
+      return;
+    }
+    batchPanelKind = kind;
+    panel.classList.remove('hidden');
+    panel.innerHTML = '';
+    var note = el('span', 'note');
+
+    if (kind === 'ctx') {
+      var inIn = mkInput('number', '', '留空 = 不改');
+      var outIn = mkInput('number', '', '留空 = 不改');
+      var r1 = el('div', 'bp-row');
+      r1.appendChild(el('span', 'bp-label', '输入上下文'));
+      r1.appendChild(inIn);
+      r1.appendChild(batchChips(CTX_PRESETS_IN, inIn));
+      var r2 = el('div', 'bp-row');
+      r2.appendChild(el('span', 'bp-label', '输出上下文'));
+      r2.appendChild(outIn);
+      r2.appendChild(batchChips(CTX_PRESETS_OUT, outIn));
+      var acts = el('div', 'bp-actions');
+      acts.appendChild(button('应用到选中', 'btn primary small', function () {
+        var patch = {};
+        if (inIn.value.trim() !== '') patch.ctx_in = Math.max(1, parseInt(inIn.value, 10) || 0);
+        if (outIn.value.trim() !== '') patch.ctx_out = Math.max(1, parseInt(outIn.value, 10) || 0);
+        if (patch.ctx_in === undefined && patch.ctx_out === undefined) {
+          setNote(note, false, '两项都为空 = 没有要改的内容');
+          return;
+        }
+        batchApply(patch, note);
+      }));
+      acts.appendChild(note);
+      panel.appendChild(r1);
+      panel.appendChild(r2);
+      panel.appendChild(acts);
+      return;
     }
 
-    // ---- 获取模型列表：就地展开，**不弹窗** ----
-    // 放在供应商详情里，因为它用的就是这个供应商的 Base URL 与密钥；
-    // 勾选后一次性批量入库，天然归到该供应商名下（符合「按供应商分类」）。
-    const discBox = domEl('div', 'pv-disc hidden');
-    let discItems = [], discPick = {};
+    if (kind === 'rpm') {
+      var rpmIn = mkInput('number', '', '留空 = 不改；0 = 取消限制');
+      var rr = el('div', 'bp-row');
+      rr.appendChild(el('span', 'bp-label', '每分钟上限'));
+      rr.appendChild(rpmIn);
+      var acts2 = el('div', 'bp-actions');
+      acts2.appendChild(button('应用到选中', 'btn primary small', function () {
+        if (rpmIn.value.trim() === '') { setNote(note, false, '填一个数值再应用（0 = 取消限制）'); return; }
+        batchApply({ rpm: Math.max(0, parseInt(rpmIn.value, 10) || 0) }, note);
+      }));
+      acts2.appendChild(note);
+      panel.appendChild(rr);
+      panel.appendChild(acts2);
+      return;
+    }
 
-    const discHead = domEl('div', 'disc-head');
-    discHead.appendChild(domEl('div', 'disc-title', '上游可用模型'));
-    const discCountEl = domEl('span', 'disc-count');
-    discHead.appendChild(discCountEl);
-    const discTools = domEl('div', 'disc-tools');
-    const discFilter = domInput('text', '', '筛选模型 id…');
-    const discCloseBtn = domButton('收起', '', function () {
-      discItems = []; discPick = {};
-      discBox.classList.add('hidden');
+    if (kind === 'del') {
+      var ids = batchSelectedIds();
+      var hasActive = ids.indexOf(activeModelId) >= 0;
+      var tip = el('div', 'bp-row');
+      tip.textContent = ids.length
+        ? ('将删除选中的 ' + ids.length + ' 个模型，不可撤销。' +
+          (hasActive ? '其中包含当前生效模型：只从列表移除，当前对话不受影响。' : ''))
+        : '还没有勾选任何模型。';
+      var actsD = el('div', 'bp-actions');
+      var delConfirm = button('确认删除 ' + ids.length + ' 个', 'btn danger-ghost small', function () {
+        delConfirm.disabled = true;
+        batchDelete(note);
+      });
+      delConfirm.disabled = !ids.length;
+      actsD.appendChild(delConfirm);
+      actsD.appendChild(note);
+      panel.appendChild(tip);
+      panel.appendChild(actsD);
+      return;
+    }
+
+    if (kind === 'cap') {
+      var vis = buildCapSeg4();
+      var vid = buildCapSeg4();
+      var rv = el('div', 'bp-row');
+      rv.appendChild(el('span', 'bp-label', '图片能力'));
+      rv.appendChild(vis.node);
+      var rvd = el('div', 'bp-row');
+      rvd.appendChild(el('span', 'bp-label', '视频能力'));
+      rvd.appendChild(vid.node);
+      var acts3 = el('div', 'bp-actions');
+      acts3.appendChild(button('应用到选中', 'btn primary small', function () {
+        var patch = {};
+        var v = vis.get();
+        var d = vid.get();
+        if (v !== undefined) patch.vision = v;
+        if (d !== undefined) patch.video = d;
+        if (patch.vision === undefined && patch.video === undefined) {
+          setNote(note, false, '两项都是「不修改」= 没有要改的内容');
+          return;
+        }
+        batchApply(patch, note);
+      }));
+      acts3.appendChild(note);
+      panel.appendChild(rv);
+      panel.appendChild(rvd);
+      panel.appendChild(acts3);
+      return;
+    }
+  }
+
+  /* ---------- 视图刷新：模型库变更后的**唯一出口** ---------- */
+  //
+  // 一次取数 → 重绘三栏 → 同步主界面。缺一不可：
+  //   · modelsLoaded 置假让 loadModels() 重拉生效配置与对话框弹层快照 ——
+  //     删掉的可能就是当前模型，或改的是当前供应商的地址/密钥；
+  //   · 三栏渲染成本就是几十个节点，无条件全刷，调用点不必知道自己站在哪栏。
+  function refreshModelViews() {
+    modelsLoaded = false;
+    return loadLibrary().then(function () {
+      // 选中的分组可能已不存在（供应商被删）→ 回到「全部」
+      if (provSel !== ALL && provSel !== '' && !findProvider(provSel)) provSel = ALL;
+      renderProvSide();
+      renderModelList();
+      ensureDetailStillValid();
+      return loadModels();
     });
+  }
+  function ensureDetailStillValid() {
+    if (detailMode === 'model' && modelSel) {
+      var hit = modelsCache.filter(function (m) { return m.id === modelSel; })[0];
+      if (!hit) { renderDetailEmpty(); return; }
+      if ($('#m-detail .d-form')) return; // 正在编辑时不重绘，避免打断输入
+      openModelDetail(modelSel);
+    }
+  }
+  // 进入页面 / 对话框弹层切了模型之后：先取数再重绘。
+  // 与 refreshModelViews 的区别是**不动** modelsLoaded —— 打开设置页不该
+  // 连带把主界面的生效配置也重拉一遍。
+  function loadModelViews() {
+    return loadLibrary().then(function () {
+      renderProvSide();
+      renderModelList();
+      if (detailMode) {
+        // 刷新时留在原来的详情上；正在编辑的表单不重绘，避免打断输入
+        ensureDetailStillValid();
+      } else {
+        renderDetailEmpty();
+        m3Show('prov');
+      }
+    });
+  }
+
+  function applyModel(id) {
+    api('/api/models/apply', { method: 'POST', body: { model: id } }).then(function (res) {
+      if (!res.data.ok) { showBanner('应用失败：' + (res.data.error || '未知错误'), 'error'); return; }
+      showBanner('已切换为「' + id + '」');
+      refreshModelViews();
+    });
+  }
+
+  /* ---------- 栏 3：模型详情 / 编辑器 ---------- */
+  function renderDetailEmpty() {
+    detailMode = '';
+    modelSel = '';
+    var box = $('#m-detail');
+    if (!box) return;
+    box.innerHTML = '';
+    box.appendChild(el('div', 'm3-empty',
+      '从中间列表选择一个模型查看详情，或点「＋ 添加模型」新建。'));
+  }
+
+  function detailHead(box, title, sub) {
+    var head = el('div', 'd-head');
+    head.appendChild(button('‹', 'btn icon d-back', function () { m3Show('models'); }));
+    head.appendChild(el('div', 'd-head-title', title));
+    box.appendChild(head);
+    if (sub) box.appendChild(el('div', 'd-head-sub', sub));
+    return head;
+  }
+
+  function openModelDetail(id) {
+    var m = modelsCache.filter(function (x) { return x.id === id; })[0];
+    if (!m) return;
+    detailMode = 'model';
+    modelSel = id;
+    renderModelList(); // 选中高亮由 renderModelList 负责
+    m3Show('detail');
+
+    var box = $('#m-detail');
+    box.innerHTML = '';
+    var prov = m.provider_id ? findProvider(m.provider_id) : null;
+    detailHead(box, m.name || m.id, m.id + (prov ? ' · 供应商：' + (prov.name || prov.id) : ' · 未归属供应商'));
+
+    var form = el('div', 'd-form');
+    var nameIn = mkInput('text', m.name || '', '界面显示的名称');
+    var idIn = mkInput('text', m.id || '', '如 gpt-4o');
+    form.appendChild(field('显示名称', nameIn));
+    form.appendChild(field('模型 id', idIn));
+
+    var ctxIn = buildCtxPicker(m.ctx_in, CTX_PRESETS_IN, 262144);
+    var ctxOut = buildCtxPicker(m.ctx_out, CTX_PRESETS_OUT, 131072);
+    var pair = el('div', 'ctx-pair');
+    pair.appendChild(field('上下文 · 输入', ctxIn.node));
+    pair.appendChild(field('上下文 · 输出', ctxOut.node));
+    form.appendChild(pair);
+
+    var vision = buildCapSeg('vision', m.vision);
+    var video = buildCapSeg('video', m.video);
+    form.appendChild(field('图片能力', vision.node));
+    form.appendChild(field('视频能力（原生透传）', video.node));
+
+    var rpmIn = mkInput('number', m.rpm > 0 ? String(m.rpm) : '', '留空或 0 = 不限制');
+    form.appendChild(field('每分钟请求上限（RPM）', rpmIn));
+
+    // 密钥可改：挂供应商时改的是供应商共享密钥（作用于其下所有模型），
+    // 未归属时改的是本条目自己的密钥。
+    var keyCtl = buildKeyControl(prov || m);
+    form.appendChild(field(
+      prov ? ('API Key / 环境变量（供应商「' + (prov.name || prov.id) + '」共享，修改影响其下所有模型）')
+           : 'API Key / 环境变量（写在本模型条目上）',
+      keyCtl.node, true));
+
+    var box2 = $('#m-detail');
+    box2.appendChild(form);
+
+    var inherit = el('div', 'me-inherit',
+      prov ? ('连接信息继承自「' + (prov.name || prov.id) + '」\n' + prov.base_url)
+        : ('连接信息写在本条目上\n' + (m.base_url || '—')));
+    inherit.style.whiteSpace = 'pre-wrap';
+    box2.appendChild(inherit);
+
+    var acts = el('div', 'd-actions');
+    var note = el('span', 'note');
+    acts.appendChild(note);
+    var testBtn = button('测试连接', 'btn ghost', function () {
+      setNote(note, null, '测试中…（通过后逐档探测上下文，可能要几十秒）');
+      var body = collectModelForm(m, nameIn, idIn, ctxIn, ctxOut, vision, video, rpmIn, keyCtl);
+      // 挂供应商时也带上密钥三件套：测试用「所见即所得」的当前值，
+      // 改过但还没保存的密钥可以直接先测（applyProviderDefaults 在给了密钥时不覆盖）。
+      if (prov) {
+        body.key_source = keyCtl.source();
+        body.key_name = keyCtl.name();
+        body.key_value = keyCtl.value();
+      }
+      body.probe_context = true;
+      api('/api/models/test', { method: 'POST', body: body }).then(function (res) {
+        var d = res.data || {};
+        if (!d.ok) { setNote(note, false, '失败：' + (d.error || '未知错误')); return; }
+        var probe = d.probe || {};
+        var got = Number(probe.ctx_in) || 0;
+        var extra = got > 0 ? ('；探测到上下文 ≈ ' + fmtCtx(got)) : ('；上下文未探到：' + (probe.note || '上游未给出长度信号'));
+        setNote(note, true, '连接成功' + extra);
+        if (got > 0) ctxIn.set(got);
+      });
+    });
+    var delBtn = button('删除模型', 'btn danger-ghost', function () {
+      var confirmBtn = button('确认删除', 'btn confirming', function () {
+        confirmBtn.disabled = true;
+        api('/api/models/delete', { method: 'POST', body: { model: m.id } }).then(function (res) {
+          if (!res.data.ok) {
+            confirmBtn.disabled = false;
+            setNote(note, false, '删除失败：' + (res.data.error || '未知错误'));
+            return;
+          }
+          showBanner('已删除模型「' + m.id + '」');
+          detailMode = '';
+          renderDetailEmpty();
+          refreshModelViews();
+        });
+      });
+      var cancelBtn = button('取消', 'btn ghost', function () {
+        acts.replaceChild(delBtn, confirmBtn);
+        acts.removeChild(cancelBtn);
+      });
+      acts.replaceChild(confirmBtn, delBtn);
+      acts.appendChild(cancelBtn);
+    });
+    var saveBtn = button('保存修改', 'btn primary', function () {
+      var body = collectModelForm(m, nameIn, idIn, ctxIn, ctxOut, vision, video, rpmIn, keyCtl);
+      if (!body.id) { setNote(note, false, '模型 id 不能为空'); return; }
+      saveBtn.disabled = true;
+      setNote(note, null, '保存中…');
+      var doSave = function () {
+        api('/api/models/save', { method: 'POST', body: body }).then(function (res) {
+          if (!res.data.ok) { setNote(note, false, res.data.error || '保存失败'); saveBtn.disabled = false; return; }
+          setNote(note, true, '已保存');
+          refreshModelViews();
+          saveBtn.disabled = false;
+        });
+      };
+      // 供应商共享密钥被改过 → 先落供应商（带 key_touched 明确提交），
+      // 再存模型本身（模型仍走 inherit_key，不在条目上留覆盖）。
+      if (prov && keyCtl.touched()) {
+        api('/api/providers/save', { method: 'POST', body: {
+          id: prov.id,
+          name: prov.name || prov.id,
+          base_url: prov.base_url || '',
+          protocol: prov.protocol || 'openai',
+          key_source: keyCtl.source(),
+          key_name: keyCtl.name(),
+          key_value: keyCtl.value(),
+          key_touched: true,
+          disabled: !!prov.disabled
+        } }).then(function (res) {
+          if (!res.data.ok) {
+            setNote(note, false, '供应商密钥保存失败：' + (res.data.error || '未知错误'));
+            saveBtn.disabled = false;
+            return;
+          }
+          doSave();
+        });
+        return;
+      }
+      doSave();
+    });
+    acts.appendChild(testBtn);
+    acts.appendChild(delBtn);
+    acts.appendChild(saveBtn);
+    box2.appendChild(acts);
+  }
+
+  /* 从详情表单收集模型字段（编辑与新增共用）。
+     沿用原设置页的语义：
+     - 归属供应商 → 连接三件套不提交，inherit_key 清掉条目上的历史遗留密钥
+       （此时密钥改的是供应商本身，由调用方先走 /api/providers/save）；
+     - 未归属旧条目 → 原样带回 base_url / protocol / key_source / key_name；
+       密钥框动过才提交 key_value，没动则服务端按「保持已存」处理。 */
+  function collectModelForm(m, nameIn, idIn, ctxIn, ctxOut, vision, video, rpmIn, keyCtl) {
+    var id = idIn.value.trim();
+    var body = {
+      name: nameIn.value.trim(),
+      id: id,
+      model: id,
+      ctx_in: ctxIn.value(),
+      ctx_out: ctxOut.value(),
+      rpm: Math.max(0, parseInt(rpmIn.value, 10) || 0)
+    };
+    var v = vision.get();
+    var vd = video.get();
+    if (v !== null) body.vision = v;
+    if (vd !== null) body.video = vd;
+    if (m && m.provider_id) {
+      body.provider_id = m.provider_id;
+      body.protocol = '';
+      body.inherit_key = true;
+    } else if (m) {
+      body.provider_id = '';
+      body.base_url = m.base_url || '';
+      body.protocol = m.protocol || 'openai';
+      body.key_source = keyCtl ? keyCtl.source() : (m.key_source || 'env');
+      body.key_name = keyCtl ? keyCtl.name() : (m.key_name || '');
+      if (keyCtl && keyCtl.touched()) body.key_value = keyCtl.value();
+    }
+    return body;
+  }
+
+  /* ---------- 新增模型 ---------- */
+  function openNewModel(presetProviderId) {
+    detailMode = 'newmodel';
+    modelSel = '';
+    renderModelList();
+    m3Show('detail');
+
+    var box = $('#m-detail');
+    box.innerHTML = '';
+    detailHead(box, '添加模型', '选定供应商后只需填模型 id —— 地址与密钥继承自供应商');
+
+    var form = el('div', 'd-form');
+    var provSelEl = el('select');
+    var optNew = el('option', null, '＋ 新建供应商（在本表单填地址与密钥）');
+    optNew.value = '';
+    provSelEl.appendChild(optNew);
+    providersCache.forEach(function (p) {
+      var o = el('option', null, (p.name || p.id) + (p.disabled ? '（已停用）' : ''));
+      o.value = p.id;
+      provSelEl.appendChild(o);
+    });
+    if (presetProviderId && findProvider(presetProviderId)) provSelEl.value = presetProviderId;
+    form.appendChild(field('归属供应商', provSelEl));
+
+    var inherit = el('div', 'me-inherit hidden');
+    form.appendChild(inherit);
+
+    var nameIn = mkInput('text', '', '界面显示的名称');
+    form.appendChild(field('显示名称', nameIn));
+
+    var idRow = el('div', 'key-row');
+    var idIn = mkInput('text', '', '如 gpt-4o / claude-sonnet-4');
+    idRow.appendChild(idIn);
+    idRow.appendChild(button('获取模型列表', 'btn ghost', function () { discoverForNew(); }));
+    form.appendChild(field('模型 id', idRow, true));
+
+    var urlIn = mkInput('text', '', 'https://api.openai.com/v1');
+    var urlField = field('请求地址', urlIn, true);
+    form.appendChild(urlField);
+    var protoSel = el('select');
+    ['openai', 'anthropic'].forEach(function (v) {
+      var o = el('option', null, v === 'anthropic' ? 'Anthropic' : 'OpenAI');
+      o.value = v;
+      protoSel.appendChild(o);
+    });
+    var protoField = field('兼容协议', protoSel);
+    form.appendChild(protoField);
+
+    var keyCtl = buildKeyControl(null);
+    var keyField = field('密钥', keyCtl.node, true);
+    form.appendChild(keyField);
+
+    var ctxIn = buildCtxPicker(262144, CTX_PRESETS_IN, 262144);
+    var ctxOut = buildCtxPicker(131072, CTX_PRESETS_OUT, 131072);
+    var pair = el('div', 'ctx-pair');
+    pair.appendChild(field('上下文 · 输入', ctxIn.node));
+    pair.appendChild(field('上下文 · 输出', ctxOut.node));
+    form.appendChild(pair);
+
+    var vision = buildCapSeg('vision', null);
+    var video = buildCapSeg('video', null);
+    form.appendChild(field('图片能力', vision.node));
+    form.appendChild(field('视频能力（原生透传）', video.node));
+    var rpmIn = mkInput('number', '', '留空 = 不限制');
+    form.appendChild(field('每分钟请求上限（RPM）', rpmIn));
+    box.appendChild(form);
+
+    // 上游模型勾选面板
+    var discPanel = el('div', 'disc-panel hidden');
+    var discHead = el('div', 'disc-head');
+    discHead.appendChild(el('div', 'disc-title', '上游可用模型'));
+    var discCount = el('span', 'disc-count');
+    discHead.appendChild(discCount);
+    var discTools = el('div', 'disc-tools');
+    var discFilter = mkInput('search', '', '筛选模型 id…');
     discTools.appendChild(discFilter);
-    discTools.appendChild(discCloseBtn);
+    discTools.appendChild(button('收起', null, function () {
+      discPanel.classList.add('hidden');
+      discItems = []; discPick = {};
+    }));
     discHead.appendChild(discTools);
-    discBox.appendChild(discHead);
-
-    const discListEl = domEl('div', 'disc-list');
-    discBox.appendChild(discListEl);
-
-    const discFoot = domEl('div', 'disc-foot');
-    const discNote = domEl('span', 'mf-test-result');
-    const discAddBtn = domButton('批量添加选中', 'primary', function () { commitPicked(); });
+    discPanel.appendChild(discHead);
+    var discListEl = el('div', 'disc-list');
+    discPanel.appendChild(discListEl);
+    var discFoot = el('div', 'disc-foot');
+    var discNote = el('span', 'note');
+    var discAddBtn = button('添加选中', 'btn primary');
     discAddBtn.disabled = true;
     discFoot.appendChild(discNote);
     discFoot.appendChild(discAddBtn);
-    discBox.appendChild(discFoot);
+    discPanel.appendChild(discFoot);
+    box.appendChild(discPanel);
 
+    var discItems = [];
+    var discPick = {};
     function discSync() {
-      const n = Object.keys(discPick).length;
-      discCountEl.textContent = discItems.length ? '共 ' + discItems.length + ' 个' +
-        (n ? '，已选 ' + n + ' 个' : '') : '';
+      var n = Object.keys(discPick).length;
+      discCount.textContent = discItems.length ? ('共 ' + discItems.length + ' 个' + (n ? '，已选 ' + n + ' 个' : '')) : '';
       discAddBtn.disabled = n === 0;
-      discAddBtn.textContent = n ? '批量添加选中（' + n + ' 个）' : '批量添加选中';
+      discAddBtn.textContent = provSelEl.value ? ('批量添加选中（' + n + ' 个）') : '填入表单';
     }
-
     function discRender() {
-      const q = (discFilter.value || '').trim().toLowerCase();
-      const shown = discItems.filter(function (m) {
-        return !q || m.id.toLowerCase().indexOf(q) >= 0 ||
-          (m.name || '').toLowerCase().indexOf(q) >= 0;
+      var q = discFilter.value.trim().toLowerCase();
+      var shown = discItems.filter(function (m) {
+        return !q || m.id.toLowerCase().indexOf(q) >= 0 || (m.name || '').toLowerCase().indexOf(q) >= 0;
       });
       discListEl.innerHTML = '';
       if (!shown.length) {
-        discListEl.innerHTML = '<div class="disc-empty">' +
-          (discItems.length ? '没有匹配的模型' : '没有可添加的模型') + '</div>';
+        discListEl.appendChild(el('div', 'disc-empty', discItems.length ? '没有匹配的模型' : '没有可添加的模型'));
         discSync();
         return;
       }
       shown.forEach(function (m) {
-        const row = domEl('label', 'disc-item' + (m.in_library ? ' added' : ''));
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
+        var row = el('label', 'disc-item' + (m.in_library ? ' added' : ''));
+        var cb = mkInput('checkbox');
         cb.checked = !!discPick[m.id];
-        cb.disabled = !!m.in_library; // 已在库中：不可选，也不覆盖
+        cb.disabled = !!m.in_library;
         cb.addEventListener('change', function () {
           if (cb.checked) discPick[m.id] = true; else delete discPick[m.id];
           discSync();
         });
         row.appendChild(cb);
-        row.appendChild(domEl('span', 'disc-id', m.id));
-        if (m.in_library) row.appendChild(domEl('span', 'disc-tag', '已在库'));
+        row.appendChild(el('span', 'disc-id', m.id));
+        if (m.name && m.name !== m.id) row.appendChild(el('span', 'disc-name', m.name));
+        if (m.in_library) row.appendChild(el('span', 'disc-badge', '已在库'));
         discListEl.appendChild(row);
       });
       discSync();
     }
+    discFilter.addEventListener('input', discRender);
+    discAddBtn.addEventListener('click', function () {
+      var ids = Object.keys(discPick);
+      if (!ids.length) return;
+      var pick = function (id) {
+        return discItems.filter(function (m) { return m.id === id; })[0] || {};
+      };
+      var pid = provSelEl.value;
+      if (!pid) {
+        var id = ids[0], hit = pick(id);
+        idIn.value = id;
+        if (!nameIn.value.trim() && hit.name && hit.name !== id) nameIn.value = hit.name;
+        setNote(note, true, '已填入模型 id：' + id + '，补好地址与密钥后点「保存」');
+        discPanel.classList.add('hidden');
+        return;
+      }
+      setNote(note, null, '正在添加 ' + ids.length + ' 个模型…');
+      api('/api/models/save_batch', {
+        method: 'POST',
+        body: {
+          provider_id: pid,
+          ctx_in: ctxIn.value(),
+          ctx_out: ctxOut.value(),
+          models: ids.map(function (id) {
+            var hit = pick(id);
+            return { id: id, name: (hit.name && hit.name !== id) ? hit.name : '' };
+          })
+        }
+      }).then(function (res) {
+        if (!res.data.ok) { setNote(note, false, res.data.error || '批量添加失败'); return; }
+        setNote(note, true, '已添加 ' + res.data.added + ' 个模型' +
+          (res.data.skipped ? '，跳过已存在 ' + res.data.skipped + ' 个' : ''));
+        discPanel.classList.add('hidden');
+        discItems = []; discPick = {};
+        refreshModelViews();
+      });
+    });
 
-    function discNoteSet(ok, msg) {
-      discNote.className = 'mf-test-result' + (ok === true ? ' ok' : ok === false ? ' fail' : '');
-      discNote.textContent = msg || '';
-    }
-
-    // 拉取上游模型列表：直接用该供应商已保存的地址与密钥（provider_id），
-    // 不必先「测试连接」——两者其实是同一个请求，合并成一个按钮更省事。
-    function fetchUpstream() {
-      discBox.classList.remove('hidden');
-      discNoteSet(null, '正在获取模型列表…');
-      fetch('/api/models/discover', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider_id: p.id })
-      }).then(function (r) { return r.json(); }).then(function (d) {
+    function discoverForNew() {
+      var ids = collectModelForm(null, nameIn, idIn, ctxIn, ctxOut, vision, video, rpmIn);
+      if (!ids.id) { setNote(note, false, '请先填写模型 id 再获取模型列表'); return; }
+      var body = { provider_id: provSelEl.value };
+      if (!body.provider_id) {
+        body.protocol = protoSel.value;
+        body.base_url = urlIn.value.trim();
+        body.key_source = keyCtl.source();
+        body.key_name = keyCtl.name();
+        body.key_value = keyCtl.value();
+        body.model = ids.id;
+      }
+      discPanel.classList.remove('hidden');
+      setNote(discNote, null, '正在获取模型列表…');
+      api('/api/models/discover', { method: 'POST', body: body }).then(function (res) {
+        var d = res.data || {};
         if (!d.ok) {
           discItems = []; discPick = {};
           discListEl.innerHTML = '';
           discSync();
-          discNoteSet(false, '获取失败：' + (d.error || '未知错误'));
+          setNote(discNote, false, '获取失败：' + (d.error || '未知错误'));
           return;
         }
         discItems = d.models || [];
         discPick = {};
         discFilter.value = '';
         discRender();
-        discNoteSet(true, '已获取 ' + discItems.length + ' 个模型' +
+        setNote(discNote, true, '已获取 ' + discItems.length + ' 个模型' +
           (d.key_from_active ? '（密钥取自当前生效模型）' : ''));
-      }).catch(function (e) {
-        discNoteSet(false, '获取失败：' + e);
       });
     }
 
-    function commitPicked() {
-      const ids = Object.keys(discPick);
-      if (!ids.length) { discNoteSet(false, '请先勾选模型 id'); return; }
-      const pick = function (id) {
-        return discItems.filter(function (m) { return m.id === id; })[0] || {};
-      };
-      discNoteSet(null, '正在添加 ' + ids.length + ' 个模型…');
-      fetch('/api/models/save_batch', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          provider_id: p.id,
-          ctx_in: 262144,
-          ctx_out: 131072,
-          models: ids.map(function (id) {
-            const hit = pick(id);
-            return { id: id, name: (hit.name && hit.name !== id) ? hit.name : '' };
-          })
-        })
-      }).then(function (r) { return r.json(); }).then(function (d) {
-        if (!d.ok) { discNoteSet(false, d.error || '批量添加失败'); return; }
-        discItems = []; discPick = {};
-        // 回执写成一次性闪信再重绘 —— 直接写 DOM 会被这次重绘冲掉。
-        provFlash = '已添加 ' + d.added + ' 个模型（共用该供应商的地址与密钥）' +
-          (d.skipped ? '，跳过已存在 ' + d.skipped + ' 个' : '');
-        refreshModelViews();   // 顺带刷新详情里的模型列表、计数与左列的「N 个」
-      }).catch(function (e) {
-        discNoteSet(false, '批量添加失败：' + e);
-      });
+    function syncProvider() {
+      var pid = provSelEl.value;
+      var p = pid ? findProvider(pid) : null;
+      inherit.classList.toggle('hidden', !p);
+      urlField.classList.toggle('hidden', !!p);
+      protoField.classList.toggle('hidden', !!p);
+      keyField.classList.toggle('hidden', !!p);
+      if (!p) return;
+      inherit.textContent = '继承自供应商「' + (p.name || p.id) + '」\n' +
+        'Base URL：' + p.base_url + '\n' +
+        'API Key：' + providerKeyLabel(p);
     }
+    provSelEl.addEventListener('change', syncProvider);
+    syncProvider();
 
-    discFilter.addEventListener('input', discRender);
-    host.appendChild(discBox);
-
-    const acts2 = domEl('div', 'prov-actions');
-    acts2.appendChild(domButton('＋ 添加模型到此供应商', 'primary', function () {
-      gotoAddModel(p.id);
+    var acts = el('div', 'd-actions');
+    var note = el('span', 'note');
+    acts.appendChild(note);
+    acts.appendChild(button('测试连接', 'btn ghost', function () {
+      var body = collectModelForm(null, nameIn, idIn, ctxIn, ctxOut, vision, video, rpmIn);
+      if (!body.id) { setNote(note, false, '模型 id 不能为空'); return; }
+      if (provSelEl.value) {
+        body.provider_id = provSelEl.value;
+        delete body.base_url; delete body.key_source; delete body.key_name;
+      } else {
+        body.provider_id = '';
+        body.protocol = protoSel.value;
+        body.base_url = urlIn.value.trim();
+        body.key_source = keyCtl.source();
+        body.key_name = keyCtl.name();
+        body.key_value = keyCtl.value();
+      }
+      body.probe_context = true;
+      setNote(note, null, '测试中…（可能要几十秒）');
+      api('/api/models/test', { method: 'POST', body: body }).then(function (res) {
+        var d = res.data || {};
+        if (!d.ok) { setNote(note, false, '失败：' + (d.error || '未知错误')); return; }
+        var got = Number((d.probe || {}).ctx_in) || 0;
+        setNote(note, true, '连接成功' + (got > 0 ? ('；探测到上下文 ≈ ' + fmtCtx(got)) : ''));
+        if (got > 0) ctxIn.set(got);
+      });
     }));
-    acts2.appendChild(domButton('获取模型列表', '', fetchUpstream));
-    host.appendChild(acts2);
+    acts.appendChild(button('重置', 'btn ghost', function () { openNewModel(provSelEl.value || presetProviderId); }));
+    var saveBtn = button('保存', 'btn primary', function () {
+      var body = collectModelForm(null, nameIn, idIn, ctxIn, ctxOut, vision, video, rpmIn);
+      if (!body.id) { setNote(note, false, '模型 id 不能为空'); return; }
+      if (provSelEl.value) {
+        body.provider_id = provSelEl.value;
+        body.protocol = '';
+        body.inherit_key = true;
+      } else {
+        body.provider_id = '';
+        body.base_url = urlIn.value.trim();
+        body.protocol = protoSel.value;
+        body.key_source = keyCtl.source();
+        body.key_name = keyCtl.name();
+        if (keyCtl.touched()) body.key_value = keyCtl.value();
+      }
+      saveBtn.disabled = true;
+      setNote(note, null, '保存中…');
+      api('/api/models/save', { method: 'POST', body: body }).then(function (res) {
+        if (!res.data.ok) { setNote(note, false, res.data.error || '保存失败'); saveBtn.disabled = false; return; }
+        showBanner('已保存模型「' + body.id + '」');
+        detailMode = '';
+        renderDetailEmpty();
+        refreshModelViews();
+        m3Show('models');
+      });
+    });
+    acts.appendChild(saveBtn);
+    box.appendChild(acts);
   }
 
-  // 由名称生成一个稳定的供应商 id（重名追加序号）。
+  /* ---------- 供应商详情 / 编辑器 ---------- */
+  function openProviderDetail(id) {
+    var isNew = !id;
+    var p = isNew ? null : findProvider(id);
+    if (!isNew && !p) return;
+    detailMode = 'provider';
+    modelSel = '';
+    renderModelList();
+    m3Show('detail');
+
+    var box = $('#m-detail');
+    box.innerHTML = '';
+    detailHead(box, isNew ? '新建供应商' : (p.name || p.id),
+      isNew ? '连接信息只维护这一份，其下模型只填 id' : (p.base_url + (p.disabled ? ' · 已停用' : '')));
+
+    var form = el('div', 'd-form');
+    var nameIn = mkInput('text', p ? p.name : '', '如 上海模型实验室 / SiliconFlow');
+    var urlIn = mkInput('text', p ? p.base_url : '', 'https://api.example.com/v1');
+    var protoSel = el('select');
+    ['openai', 'anthropic'].forEach(function (v) {
+      var o = el('option', null, v === 'anthropic' ? 'Anthropic' : 'OpenAI');
+      o.value = v;
+      protoSel.appendChild(o);
+    });
+    protoSel.value = (p && p.protocol === 'anthropic') ? 'anthropic' : 'openai';
+    var keyCtl = buildKeyControl(p);
+
+    form.appendChild(field('名称', nameIn));
+    form.appendChild(field('兼容协议', protoSel));
+    form.appendChild(field('Base URL', urlIn, true));
+    form.appendChild(field('密钥', keyCtl.node, true));
+    var disWrap = el('label', 'f-field wide');
+    var dis = mkInput('checkbox');
+    dis.checked = !!(p && p.disabled);
+    var disLabel = el('span');
+    disLabel.style.cssText = 'display:flex;align-items:center;gap:8px;font-weight:400';
+    disLabel.appendChild(dis);
+    disLabel.appendChild(el('span', null, '停用该供应商（其下模型不可选用，配置保留）'));
+    disWrap.appendChild(disLabel);
+    form.appendChild(disWrap);
+    box.appendChild(form);
+
+    var discPanel = null, discItems = [], discPick = {};
+    if (!isNew) {
+      discPanel = el('div', 'disc-panel hidden');
+      var discHead = el('div', 'disc-head');
+      discHead.appendChild(el('div', 'disc-title', '上游可用模型'));
+      var discCount = el('span', 'disc-count');
+      discHead.appendChild(discCount);
+      var discTools = el('div', 'disc-tools');
+      var discFilter = mkInput('search', '', '筛选模型 id…');
+      discTools.appendChild(discFilter);
+      discTools.appendChild(button('收起', null, function () {
+        discPanel.classList.add('hidden'); discItems = []; discPick = {};
+      }));
+      discHead.appendChild(discTools);
+      discPanel.appendChild(discHead);
+      var discListEl = el('div', 'disc-list');
+      discPanel.appendChild(discListEl);
+      var discFoot = el('div', 'disc-foot');
+      var discNote = el('span', 'note');
+      var discAddBtn = button('批量添加选中', 'btn primary');
+      discAddBtn.disabled = true;
+      discFoot.appendChild(discNote);
+      discFoot.appendChild(discAddBtn);
+      discPanel.appendChild(discFoot);
+      box.appendChild(discPanel);
+
+      var sync = function () {
+        var n = Object.keys(discPick).length;
+        discCount.textContent = discItems.length ? ('共 ' + discItems.length + ' 个' + (n ? '，已选 ' + n + ' 个' : '')) : '';
+        discAddBtn.disabled = n === 0;
+        discAddBtn.textContent = n ? ('批量添加选中（' + n + ' 个）') : '批量添加选中';
+      };
+      var renderDisc = function () {
+        var q = discFilter.value.trim().toLowerCase();
+        var shown = discItems.filter(function (m) {
+          return !q || m.id.toLowerCase().indexOf(q) >= 0 || (m.name || '').toLowerCase().indexOf(q) >= 0;
+        });
+        discListEl.innerHTML = '';
+        if (!shown.length) {
+          discListEl.appendChild(el('div', 'disc-empty', discItems.length ? '没有匹配的模型' : '没有可添加的模型'));
+          sync(); return;
+        }
+        shown.forEach(function (m) {
+          var row = el('label', 'disc-item' + (m.in_library ? ' added' : ''));
+          var cb = mkInput('checkbox');
+          cb.checked = !!discPick[m.id];
+          cb.disabled = !!m.in_library;
+          cb.addEventListener('change', function () {
+            if (cb.checked) discPick[m.id] = true; else delete discPick[m.id];
+            sync();
+          });
+          row.appendChild(cb);
+          row.appendChild(el('span', 'disc-id', m.id));
+          if (m.name && m.name !== m.id) row.appendChild(el('span', 'disc-name', m.name));
+          if (m.in_library) row.appendChild(el('span', 'disc-badge', '已在库'));
+          discListEl.appendChild(row);
+        });
+        sync();
+      };
+      discFilter.addEventListener('input', renderDisc);
+      discAddBtn.addEventListener('click', function () {
+        var ids = Object.keys(discPick);
+        if (!ids.length) return;
+        var pick = function (id) { return discItems.filter(function (m) { return m.id === id; })[0] || {}; };
+        setNote(discNote, null, '正在添加 ' + ids.length + ' 个模型…');
+        api('/api/models/save_batch', {
+          method: 'POST',
+          body: {
+            provider_id: p.id,
+            ctx_in: 262144,
+            ctx_out: 131072,
+            models: ids.map(function (id) {
+              var hit = pick(id);
+              return { id: id, name: (hit.name && hit.name !== id) ? hit.name : '' };
+            })
+          }
+        }).then(function (res) {
+          if (!res.data.ok) { setNote(discNote, false, res.data.error || '批量添加失败'); return; }
+          discPanel.classList.add('hidden');
+          discItems = []; discPick = {};
+          showBanner('已添加 ' + res.data.added + ' 个模型（共用该供应商的地址与密钥）' +
+            (res.data.skipped ? '，跳过已存在 ' + res.data.skipped + ' 个' : ''));
+          refreshModelViews();
+        });
+      });
+      // 「获取上游模型列表」按钮
+      var fetchUpstream = function () {
+        discPanel.classList.remove('hidden');
+        setNote(discNote, null, '正在获取模型列表…');
+        api('/api/models/discover', { method: 'POST', body: { provider_id: p.id } }).then(function (res) {
+          var d = res.data || {};
+          if (!d.ok) {
+            discItems = []; discPick = {};
+            discListEl.innerHTML = '';
+            sync();
+            setNote(discNote, false, '获取失败：' + (d.error || '未知错误'));
+            return;
+          }
+          discItems = d.models || [];
+          discPick = {};
+          discFilter.value = '';
+          renderDisc();
+          setNote(discNote, true, '已获取 ' + discItems.length + ' 个模型' +
+            (d.key_from_active ? '（密钥取自当前生效模型）' : ''));
+        });
+      };
+      var acts2 = el('div', 'd-actions');
+      acts2.appendChild(button('获取模型列表', 'btn ghost', fetchUpstream));
+      acts2.appendChild(button('＋ 添加模型到此供应商', 'btn ghost', function () {
+        openNewModel(p.id);
+      }));
+      box.appendChild(acts2);
+    }
+
+    var acts = el('div', 'd-actions');
+    var note = el('span', 'note');
+    acts.appendChild(note);
+    acts.appendChild(button('测试连接', 'btn ghost', function () {
+      if (isNew) { setNote(note, false, '先保存供应商再测试'); return; }
+      setNote(note, null, '测试中…');
+      api('/api/models/discover', { method: 'POST', body: { provider_id: p.id } }).then(function (res) {
+        var d = res.data || {};
+        if (d.ok) setNote(note, true, '连接正常，上游 ' + (d.count || 0) + ' 个模型可用');
+        else setNote(note, false, '失败：' + (d.error || '未知错误'));
+      });
+    }));
+    if (!isNew) {
+      var delBtn = button('删除供应商', 'btn danger-ghost', function () {
+        var n = modelsOfProvider(p.id).length;
+        if (n && !confirm('其下 ' + n + ' 个模型不会被删除，连接信息会保留到各自条目上。\n\n确认删除供应商「' + (p.name || p.id) + '」？')) return;
+        var confirmBtn = button('确认删除', 'btn confirming', function () {
+          confirmBtn.disabled = true;
+          api('/api/providers/delete', { method: 'POST', body: { provider: p.id } }).then(function (res) {
+            if (!res.data.ok) {
+              confirmBtn.disabled = false;
+              setNote(note, false, res.data.error || '删除失败');
+              return;
+            }
+            showBanner('已删除供应商「' + (p.name || p.id) + '」');
+            provSel = ALL;
+            detailMode = '';
+            renderDetailEmpty();
+            refreshModelViews();
+            m3Show('prov');
+          });
+        });
+        var cancelBtn = button('取消', 'btn ghost', function () {
+          acts.replaceChild(delBtn, confirmBtn);
+          acts.removeChild(cancelBtn);
+        });
+        acts.replaceChild(confirmBtn, delBtn);
+        acts.appendChild(cancelBtn);
+      });
+      acts.appendChild(delBtn);
+    }
+    var saveBtn = button('保存供应商', 'btn primary', function () {
+      var name = nameIn.value.trim();
+      var url = urlIn.value.trim();
+      if (!name) { setNote(note, false, '名称不能为空'); return; }
+      if (!url) { setNote(note, false, 'Base URL 不能为空'); return; }
+      var body = {
+        id: isNew ? newProviderId(name) : p.id,
+        name: name,
+        base_url: url,
+        protocol: protoSel.value,
+        key_source: keyCtl.source(),
+        key_name: keyCtl.name(),
+        key_value: keyCtl.value(),
+        key_touched: keyCtl.touched(),
+        disabled: dis.checked
+      };
+      saveBtn.disabled = true;
+      setNote(note, null, '保存中…');
+      api('/api/providers/save', { method: 'POST', body: body }).then(function (res) {
+        if (!res.data.ok) { setNote(note, false, res.data.error || '保存失败'); saveBtn.disabled = false; return; }
+        showBanner(res.data.hot ? '已保存，当前生效模型已改用新配置' : '已保存供应商「' + name + '」');
+        provSel = body.id;
+        refreshModelViews();
+        openProviderDetail(body.id);
+      });
+    });
+    acts.appendChild(saveBtn);
+    box.appendChild(acts);
+  }
   function newProviderId(name) {
-    let slug = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    var slug = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
     if (!slug) slug = 'provider';
-    let id = 'p-' + slug;
-    for (let n = 2; findProvider(id); n++) id = 'p-' + slug + '-' + n;
+    var id = 'p-' + slug;
+    for (var n = 2; findProvider(id); n++) id = 'p-' + slug + '-' + n;
     return id;
   }
 
-  // ---------- 添加 / 编辑模型表单 ----------
-
-  // 供应商下拉：'' 表示「新建供应商」，此时连接信息在本表单填写。
-  function populateProviderSelect(selected) {
-    const sel = document.getElementById('mf-prov');
-    if (!sel) return;
-    sel.innerHTML = '';
-    const optNew = domEl('option', null, '＋ 新建供应商（在本表单填地址与密钥）');
-    optNew.value = '';
-    sel.appendChild(optNew);
-    providersCache.forEach(function (p) {
-      const o = domEl('option', null, (p.name || p.id) + (p.disabled ? '（已停用）' : ''));
-      o.value = p.id;
-      sel.appendChild(o);
-    });
-    sel.value = selected || '';
-  }
-
-  // 选定供应商后，地址 / 协议 / 密钥三块换成「继承自供应商」只读块 ——
-  // 表单只剩 模型 id / 显示名 / 上下文。这就是「同供应商下加模型只填 id」。
-  function syncProviderForm() {
-    const inheritField = document.getElementById('mf-inherit-field');
-    if (!inheritField) return;
-    const pid = document.getElementById('mf-prov').value;
-    const p = pid ? findProvider(pid) : null;
-    inheritField.hidden = !p;
-    document.getElementById('mf-url-field').hidden = !!p;
-    document.getElementById('mf-key-field').hidden = !!p;
-    document.getElementById('mf-proto-field').hidden = !!p;
-    if (!p) return;
-
-    const box = document.getElementById('mf-inherit');
-    box.innerHTML = '';
-    box.appendChild(domEl('div', 'ih', '继承自供应商「' + (p.name || p.id) + '」，无需重复填写'));
-    [
-      ['Base URL', p.base_url],
-      ['API 格式', p.protocol === 'anthropic'
-        ? 'Anthropic Messages (/v1/messages)'
-        : 'Chat Completions (/chat/completions)'],
-      ['API Key', providerKeyLabel(p)]
-    ].forEach(function (pair) {
-      const r = domEl('div', 'ir');
-      r.appendChild(domEl('span', null, pair[0]));
-      r.appendChild(domEl('code', null, pair[1] || '—'));
-      box.appendChild(r);
-    });
-  }
-
-  // fillForm 接收列表条目：
-  //  - 普通条目是脱敏视图（无明文，只有 key_set），明文框只显示占位；
-  //  - 「当前生效」模型会带 key_plain 明文，回填到掩码框并可用眼睛切换查看。
-  function fillForm(m) {
-    // 编辑与新增复用同一表单，仅标题区分；editingIndex 由调用方先行设置。
-    document.getElementById('mf-title').textContent = editingIndex >= 0 ? '编辑模型' : '添加模型';
-    keyTouched = false; // 刚回填的表单没有改过密钥（脱敏明文框为空 ≠ 删除）
-    document.getElementById('mf-name').value = m.name || '';
-    document.getElementById('mf-id').value = m.id || '';
-    document.getElementById('mf-url').value = m.base_url || '';
-    setKeySrc(m.key_source || 'env');
-    document.getElementById('mf-key-env').value = m.key_name || '';
-    const kp = document.getElementById('mf-key-plain');
-    kp.value = m.key_plain || '';
-    kp.placeholder = (m.key_set && !m.key_plain) ? '已保存（留空保持不变）' : 'sk-...';
-    updateKeyEye();
-    const proto = (m.protocol || 'openai').toLowerCase();
-    document.getElementById('mf-proto').value = proto === 'custom' ? 'openai' : proto; // 旧数据 custom ≡ openai
-    if (ctxInPicker) ctxInPicker.set(m.ctx_in || 262144);
-    if (ctxOutPicker) ctxOutPicker.set(m.ctx_out || 131072);
-    setCap('vision', m.vision);
-    setCap('video', m.video);
-    // RPM 是标量不是三态：0 与「未设置」都表示不限制，回填成空框即可。
-    document.getElementById('mf-rpm').value = m.rpm > 0 ? String(m.rpm) : '';
-    populateProviderSelect(m.provider_id || '');
-    syncProviderForm();
-    setTestResult('', '');
-    collapseDiscover(); // 换了模型就收起上一次的上游列表，避免勾选状态串味
-  }
-  function resetForm() {
-    editingIndex = -1;
-    fillForm({ protocol: 'openai', ctx_in: 262144, ctx_out: 131072 });
-    document.getElementById('mf-key-plain').placeholder = 'sk-...';
-    updateKeyEye();
-  }
-  function collectForm() {
-    const pid = document.getElementById('mf-prov').value;
-    const id = document.getElementById('mf-id').value.trim();
-    const f = {
-      name: document.getElementById('mf-name').value.trim(),
-      id: id,
-      model: id, // 测试 / 发现接口的字段名（后端 modelTestReq.model）
-      provider_id: pid,
-      ctx_in: ctxInPicker ? ctxInPicker.value() : 262144,
-      ctx_out: ctxOutPicker ? ctxOutPicker.value() : 131072
-    };
-    // 能力声明是三态：留「不声明」时字段**整个不下发**，而不是下发 null/false ——
-    // 后端把它读成「不知道」，与「不支持」是两回事（判错会让模型永久收不到图）。
-    const vision = getCap('vision');
-    const video = getCap('video');
-    if (vision !== null) f.vision = vision;
-    if (video !== null) f.video = video;
-    // RPM：空 = 不限制 = 0。**必须下发 0 而不是省略** —— 服务端把它当标量，
-    // 省略会让「上一条模型限到 60」的旧值留在表单里（与 vision 的三态不同）。
-    f.rpm = Math.max(0, parseInt(document.getElementById('mf-rpm').value, 10) || 0);
-    if (pid) {
-      // 归属供应商：连接信息全部继承，条目上不写任何覆盖值；
-      // inherit_key 让服务端清掉条目上历史遗留的自带密钥，否则它会一直压着供应商的密钥。
-      f.protocol = '';
-      f.inherit_key = true;
-    } else {
-      f.base_url = document.getElementById('mf-url').value.trim();
-      f.key_source = keySrc;
-      f.key_name = document.getElementById('mf-key-env').value.trim();
-      f.key_value = document.getElementById('mf-key-plain').value;
-      f.protocol = document.getElementById('mf-proto').value;
-    }
-    return f;
-  }
-  function setTestResult(ok, msg) {
-    const el = document.getElementById('mf-test-result');
-    el.className = 'mf-test-result' + (ok === true ? ' ok' : ok === false ? ' fail' : '');
-    el.textContent = msg || '';
-  }
-
-  // 密钥来源分段；keyTouched 记录本次编辑是否动过密钥（决定保存时是否提交 key_value）。
-  let keySrc = 'env';
-  let keyTouched = false;
-
-  // ---------- 多模态能力（图片 / 视频）：三态分段 ----------
-  //
-  // 「不声明」与「不支持」**必须**是分开的两档。服务端按三态处理：
-  // 不声明 = 不知道 → 照常尝试发送，真被上游拒了才自动记住并中止；
-  // 不支持 = 提前拦下，附件根本不发。
-  //
-  // 如果把「不声明」当成「不支持」，用户随手点错就会让这个模型永久收不到图片，
-  // 而界面上看不出任何异常（表现为「粘贴截图后它就是看不见」）。
-  const capState = { vision: 'unset', video: 'unset' };
-  function capSegId(which) { return 'mf-' + which + '-seg'; }
-  function setCap(which, value) {
-    // value 是后端下发的三态：true / false / null|undefined。
-    const state = value === true ? 'yes' : value === false ? 'no' : 'unset';
-    capState[which] = state;
-    document.querySelectorAll('#' + capSegId(which) + ' button').forEach(function (b) {
-      b.classList.toggle('active', b.dataset.cap === state);
-    });
-  }
-  function getCap(which) {
-    const v = capState[which];
-    if (v === 'yes') return true;
-    if (v === 'no') return false;
-    return null; // 不声明
-  }
-  ['vision', 'video'].forEach(function (which) {
-    const seg = document.getElementById(capSegId(which));
-    if (!seg) return;
-    seg.addEventListener('click', function (e) {
-      const b = e.target.closest('button[data-cap]');
-      if (!b) return;
-      setCap(which, b.dataset.cap === 'yes' ? true : b.dataset.cap === 'no' ? false : null);
-    });
+  /* ---------- 模型页事件绑定 ---------- */
+  $('#m-prov-new').addEventListener('click', function () { openProviderDetail(null); });
+  $('#m-add').addEventListener('click', function () {
+    var preset = (provSel && provSel !== ALL) ? provSel : '';
+    openNewModel(preset);
   });
-
-  // 上下文输入/输出控件（预置档位 + 自定义）。在下方 init 里挂到 #mf-ctx-*-host 上，
-  // 表单其余部分一律通过这两个对象读写，不再直接碰 DOM —— 免得预置/自定义两套状态各写各的。
-  let ctxInPicker = null;
-  let ctxOutPicker = null;
-  (function initCtxPickers() {
-    const inHost = document.getElementById('mf-ctx-in-host');
-    const outHost = document.getElementById('mf-ctx-out-host');
-    if (!inHost || !outHost) return;
-    ctxInPicker = buildCtxPicker(262144, CTX_PRESETS_IN, 262144);
-    ctxOutPicker = buildCtxPicker(131072, CTX_PRESETS_OUT, 131072);
-    inHost.appendChild(ctxInPicker.node);
-    outHost.appendChild(ctxOutPicker.node);
-  })();
-  function setKeySrc(ks) {
-    keySrc = ks === 'plain' ? 'plain' : 'env';
-    document.querySelectorAll('#mf-key-seg button').forEach(function (b) {
-      b.classList.toggle('active', b.dataset.ks === keySrc);
-    });
-    document.getElementById('mf-key-env').style.display = keySrc === 'env' ? '' : 'none';
-    document.getElementById('mf-key-plain').style.display = keySrc === 'plain' ? '' : 'none';
-    updateKeyEye();
-  }
-  // 眼睛按钮：仅当「明文密钥」tab 里有实际值时才显示，点击切换掩码/明文。
-  function updateKeyEye() {
-    const kp = document.getElementById('mf-key-plain');
-    const eye = document.getElementById('mf-key-eye');
-    const visible = keySrc === 'plain' && kp.value.length > 0;
-    eye.style.display = visible ? '' : 'none';
-    if (!visible) {
-      kp.type = 'password';
-      eye.textContent = '👁';
-    }
-  }
-  document.getElementById('mf-key-eye').addEventListener('click', function () {
-    const kp = document.getElementById('mf-key-plain');
-    const show = kp.type === 'password';
-    kp.type = show ? 'text' : 'password';
-    this.textContent = show ? '🙈' : '👁';
+  $('#m-batch').addEventListener('click', function () { setBatchMode(!batchMode); });
+  $('#m-batch-all').addEventListener('change', function () {
+    var on = this.checked;
+    lastListIds.forEach(function (id) { if (on) batchSel[id] = true; else delete batchSel[id]; });
+    renderModelList();
+    batchSyncBar();
   });
-  document.getElementById('mf-key-plain').addEventListener('input', function () {
-    keyTouched = true;
-    updateKeyEye();
+  $('#m-batch-ctx').addEventListener('click', function () { toggleBatchPanel('ctx'); });
+  $('#m-batch-rpm').addEventListener('click', function () { toggleBatchPanel('rpm'); });
+  $('#m-batch-cap').addEventListener('click', function () { toggleBatchPanel('cap'); });
+  $('#m-batch-del').addEventListener('click', function () { toggleBatchPanel('del'); });
+  $('#m-back-prov').addEventListener('click', function () { m3Show('prov'); });
+  $('#m-prov-filter').addEventListener('input', function () { provNameFilter = this.value; renderProvSide(); });
+  $('#m-model-filter').addEventListener('input', function () { modelNameFilter = this.value; renderModelList(); });
+  $('#m-disc').addEventListener('click', function () {
+    if (provSel && provSel !== ALL && findProvider(provSel)) openProviderDetail(provSel);
   });
-  document.getElementById('mf-key-env').addEventListener('input', function () { keyTouched = true; });
-  document.querySelectorAll('#mf-key-seg button').forEach(function (b) {
-    b.addEventListener('click', function () {
-      if (b.dataset.ks !== keySrc) keyTouched = true; // 主动切换来源也算动过密钥
-      setKeySrc(b.dataset.ks);
-    });
-  });
-  // 切换归属供应商 → 地址与密钥在「继承 / 手填」之间切换。
-  document.getElementById('mf-prov').addEventListener('change', function () {
-    syncProviderForm();
-    updateDiscCount();
-  });
-
-  // 「模型」导航项 → 模型管理页（列表视图）
-  document.getElementById('nav-models').addEventListener('click', function () {
+  // 「模型」导航项 → 模型管理页（三栏）。data-page 的通用绑定不覆盖它
+  // （这个 nav-item 没有 data-page），页面切换与高亮在这里自己做一遍。
+  $('#nav-models').addEventListener('click', function () {
     settingsOverlay.querySelectorAll('.nav-item').forEach(function (n) { n.classList.remove('active'); });
     this.classList.add('active');
-    showPage('models');
-    showMTab('list');
+    settingsOverlay.querySelectorAll('.settings-page').forEach(function (p) {
+      p.classList.toggle('active', p.id === 'page-models');
+    });
     loadModelViews();
   });
-  // 子 Tab：模型列表 / 供应商管理 / 添加模型
-  // （点「添加模型」即回到空白新建态，编辑态复用同一表单）
-  document.querySelectorAll('.models-tab').forEach(function (t) {
-    t.addEventListener('click', function () {
-      const name = t.dataset.mtab;
-      showMTab(name);
-      if (name === 'config') {
-        loadLibrary().then(function () { resetForm(); });
-      } else {
-        loadModelViews();   // 两个子 Tab 的数据同源，一起刷新省一次请求
-      }
-    });
-  });
-
-  // 把探测结论说成人话。探不到时必须明说「未探到」并保留手填值 ——
-  // 显示成 0 或悄悄清空字段，比不探测更糟（压缩线会按 0 回退到默认预算）。
-  function ctxProbeText(probe) {
-    if (!probe) return '';
-    const steps = probe.steps || [];
-    const got = Number(probe.ctx_in) || 0;
-    if (got <= 0) {
-      return '；上下文未探到：' + (probe.note || '上游未给出长度信号') + '（保留手填值）';
-    }
-    let idx = -1;
-    for (let i = 0; i < steps.length; i++) { if (steps[i].accepted) { idx = i; break; } }
-    const above = idx > 0 ? steps[idx - 1].want : 0;
-    return '；上下文 ≈ ' + fmtTokens(got) + ' tokens' +
-      (above ? '（' + fmtTokens(above) + ' 那一档被上游拒了）' : '（最大档就被接受，可能被高估）');
-  }
-
-  // 测试连接（连通后顺带逐档探测输入上下文）
-  document.getElementById('mf-test').addEventListener('click', function () {
-    const m = collectForm();
-    m.probe_context = true;
-    setTestResult(null, '测试中…（通过后开始逐档探测上下文，最大档要上传数 MB 输入，可能要几十秒）');
-    fetch('/api/models/test', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(m)
-    }).then(function (r) { return r.json(); }).then(function (d) {
-      if (!d.ok) { setTestResult(false, '失败：' + (d.error || '未知错误')); return; }
-      setTestResult(true, '连接成功' + ctxProbeText(d.probe));
-      // 探到了就填进表单（保存时随表单落库）；探不到保留用户手填值，绝不清零。
-      const got = Number((d.probe && d.probe.ctx_in) || 0);
-      if (got > 0 && ctxInPicker) ctxInPicker.set(got);
-    }).catch(function (e) {
-      setTestResult(false, '失败：' + e);
-    });
-  });
-  // 重置
-  document.getElementById('mf-reset').addEventListener('click', resetForm);
-  // 保存（写入服务端模型库 config/models.yaml；编辑当前生效模型时服务端
-  // 会实时热切换，无需再点「应用」）
-  document.getElementById('mf-save').addEventListener('click', function () {
-    const m = collectForm();
-    if (!m.id) { setTestResult(false, '模型 id 不能为空'); return; }
-    if (m.provider_id) {
-      // 归属供应商：连接信息继承，不提交任何覆盖值。
-      delete m.key_value;
-    } else if (editingIndex >= 0 && !keyTouched) {
-      // 编辑已有模型且本次没动过密钥 → 不提交 key_value，服务端按「保持库里已存
-      // 密钥」处理。前端拿到的列表是脱敏视图，明文框为空只是回显受限，绝不能被
-      // 当成「用户清空了密钥」而覆盖掉。
-      delete m.key_value;
-    } else if (m.key_source === 'plain' && !String(m.key_value || '').trim()) {
-      delete m.key_value;
-    }
-    setTestResult(null, '保存中…');
-    fetch('/api/models/save', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(m)
-    }).then(function (r) { return r.json(); }).then(function (d) {
-      if (d.ok) {
-        editingIndex = -1;
-        collapseDiscover();
-        showMTab('list');
-        // 统一出口：modelsLoaded 置假 → loadModels 重拉模型库快照，
-        // 对话框的模型选择随之出现新条目；两个设置页视图也一起重绘。
-        refreshModelViews();
-      } else {
-        setTestResult(false, d.error || '保存失败');
-      }
-    }).catch(function (e) {
-      setTestResult(false, '保存失败：' + e);
-    });
-  });
-
-  // ---------- 添加模型：从上游 /models 拉取列表 → 勾选 → 批量入库 ----------
-  // 与「测试连接」的区别：测试是「所见即所测」，这里允许在表单没填地址/密钥时
-  // 回退到当前生效模型，服务端会在响应里用 key_from_active 如实告知。
-  //
-  // 用 var 而非 let 声明状态：collapseDiscover 会被 fillForm/resetForm 早期调用，
-  // var 提升到函数顶部（值为 undefined）不会踩 let 的暂时性死区。
-  var discModels = [];
-  var discSelected = {};
-
-  function discPanel() { return document.getElementById('mf-discover-panel'); }
-
-  function setDiscResult(ok, msg) {
-    const el = document.getElementById('disc-result');
-    if (!el) return;
-    el.className = 'mf-test-result' + (ok === true ? ' ok' : ok === false ? ' fail' : '');
-    el.textContent = msg || '';
-  }
-
-  // collapseDiscover 收起面板并清空状态（切换模型 / 保存成功后调用，避免上次的结果串味）。
-  function collapseDiscover() {
-    discModels = [];
-    discSelected = {};
-    const panel = discPanel();
-    if (panel) panel.classList.add('hidden');
-    const list = document.getElementById('disc-list');
-    if (list) list.innerHTML = '';
-    const flt = document.getElementById('disc-filter');
-    if (flt) flt.value = '';
-    const cnt = document.getElementById('disc-count');
-    if (cnt) cnt.textContent = '';
-    setDiscResult(null, '');
-  }
-
-  function updateDiscCount() {
-    const n = Object.keys(discSelected).length;
-    const cnt = document.getElementById('disc-count');
-    if (cnt) cnt.textContent = '共 ' + (discModels || []).length + ' 个' + (n ? '，已选 ' + n + ' 个' : '');
-    const btn = document.getElementById('disc-add');
-    if (btn) {
-      const pid = document.getElementById('mf-prov').value;
-      btn.disabled = n === 0;
-      // 有供应商 → 直接批量入库；还没确认连接信息 → 只填入表单。
-      btn.textContent = pid ? ('批量添加选中（' + n + ' 个）') : '填入表单';
-    }
-  }
-
-  function renderDiscList() {
-    const box = document.getElementById('disc-list');
-    if (!box) return;
-    const q = (document.getElementById('disc-filter').value || '').trim().toLowerCase();
-    const shown = (discModels || []).filter(function (m) {
-      if (!q) return true;
-      return m.id.toLowerCase().indexOf(q) >= 0 ||
-        (m.name || '').toLowerCase().indexOf(q) >= 0;
-    });
-    box.innerHTML = '';
-    if (!shown.length) {
-      box.innerHTML = '<div class="disc-empty">' +
-        ((discModels || []).length ? '没有匹配的模型' : '没有可添加的模型') + '</div>';
-      updateDiscCount();
-      return;
-    }
-    shown.forEach(function (m) {
-      const row = document.createElement('label');
-      row.className = 'disc-item' + (m.in_library ? ' added' : '');
-      const cb = document.createElement('input');
-      // 多选：选中的 id 会一次性批量写入同一供应商（地址与密钥共用），
-      // 这正是「同一个供应商下不必一个一个添加」的实现方式。
-      cb.type = 'checkbox';
-      cb.checked = !!discSelected[m.id];
-      cb.disabled = !!m.in_library; // 已在库中：不可选，也不覆盖
-      cb.addEventListener('change', function () {
-        if (cb.checked) discSelected[m.id] = true;
-        else delete discSelected[m.id];
-        updateDiscCount();
-      });
-      const idEl = document.createElement('span');
-      idEl.className = 'disc-id';
-      idEl.textContent = m.id;
-      row.appendChild(cb);
-      row.appendChild(idEl);
-      if (m.name && m.name !== m.id) {
-        const nm = document.createElement('span');
-        nm.className = 'disc-name';
-        nm.textContent = m.name;
-        row.appendChild(nm);
-      }
-      if (m.in_library) {
-        const badge = document.createElement('span');
-        badge.className = 'disc-badge';
-        badge.textContent = '已添加';
-        row.appendChild(badge);
-      }
-      box.appendChild(row);
-    });
-    updateDiscCount();
-  }
-
-  function discoverModels() {
-    const btn = document.getElementById('mf-discover');
-    btn.disabled = true;
-    setDiscResult(null, '正在获取模型列表…');
-    discPanel().classList.remove('hidden');
-    fetch('/api/models/discover', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(collectForm())
-    }).then(function (r) { return r.json(); }).then(function (d) {
-      if (!d.ok) {
-        discModels = [];
-        discSelected = {};
-        document.getElementById('disc-list').innerHTML = '';
-        updateDiscCount();
-        setDiscResult(false, '获取失败：' + (d.error || '未知错误'));
-        return;
-      }
-      discModels = d.models || [];
-      discSelected = {};
-      document.getElementById('disc-filter').value = '';
-      renderDiscList();
-      setDiscResult(true, '已获取 ' + discModels.length + ' 个模型' +
-        (d.key_from_active ? '（密钥取自当前生效模型）' : ''));
-    }).catch(function (e) {
-      setDiscResult(false, '获取失败：' + e);
-    }).then(function () { btn.disabled = false; });
-  }
-
-  // 「批量添加选中」：
-  //  - 已选定供应商 → 一次 POST 把全部选中的 id 写进该供应商（地址与密钥共用）；
-  //  - 还没选供应商（正在新建）→ 只把第一个 id 填进表单，由用户补好地址与密钥后
-  //    再点「保存」正式入库 —— 所见即所得，不把还没确认的连接信息偷偷写进模型库。
-  function addSelectedDiscModels() {
-    const ids = Object.keys(discSelected);
-    if (!ids.length) { setDiscResult(false, '请先勾选模型 id'); return; }
-    const pick = function (id) {
-      return (discModels || []).filter(function (m) { return m.id === id; })[0] || {};
-    };
-    const pid = document.getElementById('mf-prov').value;
-
-    if (!pid) {
-      const id = ids[0];
-      const hit = pick(id);
-      document.getElementById('mf-id').value = id;
-      const nameEl = document.getElementById('mf-name');
-      if (!nameEl.value.trim() && hit.name && hit.name !== id) nameEl.value = hit.name;
-      setTestResult(true, '已填入模型 id：' + id + '，补好地址与密钥后点「保存」');
-      collapseDiscover();
-      return;
-    }
-
-    const payload = {
-      provider_id: pid,
-      ctx_in: ctxInPicker ? ctxInPicker.value() : 262144,
-      ctx_out: ctxOutPicker ? ctxOutPicker.value() : 131072,
-      models: ids.map(function (id) {
-        const hit = pick(id);
-        return { id: id, name: (hit.name && hit.name !== id) ? hit.name : '' };
-      })
-    };
-    setDiscResult(null, '正在添加 ' + ids.length + ' 个模型…');
-    fetch('/api/models/save_batch', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    }).then(function (r) { return r.json(); }).then(function (d) {
-      if (!d.ok) { setDiscResult(false, d.error || '批量添加失败'); return; }
-      const msg = '已添加 ' + d.added + ' 个模型（共用该供应商的地址与密钥）' +
-        (d.skipped ? '，跳过已存在 ' + d.skipped + ' 个' : '');
-      setDiscResult(true, msg);
-      collapseDiscover();
-      // 统一出口；回执写在「添加模型」面板里，refreshModelViews 不重绘那个
-      // 面板（它只管模型列表与供应商详情），所以这里的提示不会被冲掉。
-      refreshModelViews();
-    }).catch(function (e) {
-      setDiscResult(false, '批量添加失败：' + e);
-    });
-  }
-
-  (function bindModelDiscover() {
-    const btn = document.getElementById('mf-discover');
-    if (!btn) return;
-    btn.addEventListener('click', discoverModels);
-    document.getElementById('disc-close').addEventListener('click', collapseDiscover);
-    document.getElementById('disc-filter').addEventListener('input', renderDiscList);
-    document.getElementById('disc-add').addEventListener('click', addSelectedDiscModels);
-  })();
 
   /* ══════════════════════════════════════════════════════════════════
      移动端壳层
@@ -7889,34 +7913,9 @@
     window.addEventListener('orientationchange', syncViewportStable);
     if (screen.orientation) screen.orientation.addEventListener('change', syncViewportStable);
 
-    /* 供应商管理下钻：窄屏下 .prov-md 从左右双栏变单列，只靠堆叠会让用户
-       每改一个供应商都先滚过整张列表，所以改成「列表 → 详情」两级。
-
-       用**事件委托**挂在 .prov-list 上，而不是改 renderProviders：
-       renderProviders 每次都重建全部 .prov-item，挂在按钮上的监听器会被
-       冲掉，挂在静态父节点上的不会。捕获阶段是为了不受 stopPropagation 影响。
-
-       同理不需要调 renderProviders() —— 详情本来就是渲染好的，
-       这里只是决定显示哪一半。 */
-    const provList = document.getElementById('prov-list');
-    const provBack = document.getElementById('m-prov-back');
-    function showProvList() { document.body.classList.remove('m-prov-detail'); }
-    if (provList) {
-      provList.addEventListener('click', function (e) {
-        if (!isMobile()) return;
-        if (e.target.closest('.prov-item')) document.body.classList.add('m-prov-detail');
-      }, true);
-    }
-    if (provBack) provBack.addEventListener('click', showProvList);
-
-    // 切到模型列表/添加模型时撤掉下钻，否则再切回供应商管理会直接落在详情上，
-    // 而用户上一眼看到的其实是列表 —— 状态与记忆不一致。
-    const modelsTabs = document.querySelector('.models-tabs');
-    if (modelsTabs) {
-      modelsTabs.addEventListener('click', function (e) {
-        if (e.target.closest('[data-mtab]')) showProvList();
-      }, true);
-    }
+    /* 模型管理页的窄屏下钻（供应商 → 模型 → 详情）由 #m3 上的 show-* 类
+       驱动（m3Show），显示哪一栏纯由 CSS 决定；这里只在断点切换时把
+       上一侧的状态清干净，避免转屏后落在半截下钻里。 */
 
     /* 断点切换：把上一侧残留的状态清干净。
        漏清的后果是具体的，不是「可能有点怪」：
@@ -7930,7 +7929,7 @@
         syncViewport();
       } else {
         closeDrawer();
-        showProvList();
+        m3Show('prov');
         if (sidebar) { sidebar.style.width = ''; sidebar.style.transform = ''; }
         document.querySelectorAll('.popup:not(.hidden)').forEach(function (p) {
           p.classList.add('hidden');

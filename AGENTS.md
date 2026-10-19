@@ -22,7 +22,6 @@ comit时直接使用简短的中文描述此次更改完成了什么，示例：
 
 - Go 编写的 Agent 框架。目标：跨平台（Windows amd64 / Linux amd64 / Android arm64）、纯静态编译（`CGO_ENABLED=0`）、低内存、浏览器界面。
 - 前端：`web/dist/ui.js` 单文件 IIFE，**没有构建步骤**，`go:embed` 内嵌。
-- 独立设置页：`web/dist/settings/`（模型管理三栏 + 批量管理），`handleRoot` 目录索引直出 `/settings/`，同源 `/api`；旧设置浮层仍保留，入口在设置导航顶部。
 - 存储：SQLite（`~/.codeforge/data.db`）；审计日志为 JSONL。
 
 一次对话的调用链：

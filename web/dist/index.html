@@ -196,12 +196,6 @@
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
           <span>返回</span>
         </button>
-        <!-- 独立设置页（模型管理三栏 + 批量管理），新标签页打开；不带 data-page，
-             不参与设置浮层的页面切换（ui.js 只绑 .nav-item[data-page]）。 -->
-        <a class="nav-item" href="/settings/" target="_blank" rel="noopener" title="模型管理增强版（三栏管理 + 批量修改），在新标签页打开">
-          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3h7v7M21 3l-9 9M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>
-          <span>独立设置页 ↗</span>
-        </a>
         <div class="nav-group">个人</div>
         <button class="nav-item active" data-page="general">
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.09a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.09a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z"/></svg>
@@ -588,146 +582,57 @@
           </div>
         </section>
 
-        <!-- 模型管理：模型列表 / 供应商管理 / 添加模型
-             供应商持有 Base URL 与密钥，其下模型只填 id —— 同供应商下切换模型不必重复配置 -->
+        <!-- 模型管理：三栏 —— 供应商 ▸ 模型 ▸ 详情/编辑
+             供应商持有 Base URL 与密钥，其下模型只填 id；右栏就地编辑表单，
+             中间栏支持多选批量改上下文 / RPM / 能力或删除。 -->
         <section id="page-models" class="settings-page">
-          <!-- tab 条独占一整行，只有中间那颗 pill；下面内容从这一行下沿开始排，
-               不会被它盖住（刻意不用 sticky —— 悬浮会压住从下面滚过去的文字）。 -->
-          <div class="models-tabs-bar">
-            <div class="models-tabs">
-              <button type="button" class="models-tab active" data-mtab="list">模型列表</button>
-              <button type="button" class="models-tab" data-mtab="prov">供应商管理</button>
-              <button type="button" class="models-tab" data-mtab="config">添加模型</button>
-            </div>
-          </div>
+          <div class="m3" id="m3">
+            <!-- 栏 1：供应商 -->
+            <aside class="m3-side">
+              <div class="m3-side-head">
+                <input id="m-prov-filter" type="search" placeholder="筛选供应商…" autocomplete="off">
+              </div>
+              <div class="m3-side-list" id="m-prov-list"></div>
+              <div class="m3-side-foot">
+                <button id="m-prov-new" class="btn ghost wide">＋ 新建供应商</button>
+              </div>
+            </aside>
 
-          <!-- 模型列表：按供应商分组，逐行「设为当前」 -->
-          <div id="mtab-list" class="mtab-pane active">
-            <div id="model-items" class="settings-card model-items"></div>
-          </div>
-
-          <!-- 供应商管理：左列供应商 / 右侧详情（连接信息 + 其下模型） -->
-          <div id="mtab-prov" class="mtab-pane">
-            <!-- 移动端下钻的返回键。桌面端不显示（见 app.css 的 #m-prov-back）：
-                 桌面是左右双栏，列表一直在左边，没有"回列表"这一步。
-                 放在 .prov-md **外面** —— #prov-detail 的内容由
-                 renderProviderDetail() 整块重写，放里面会被一起清掉。 -->
-            <button type="button" id="m-prov-back">‹ 供应商列表</button>
-            <div class="prov-md">
-              <div class="prov-list" id="prov-list"></div>
-              <div class="prov-detail" id="prov-detail"></div>
-            </div>
-          </div>
-
-          <!-- 添加模型（编辑复用同款表单，仅标题切换） -->
-          <div id="mtab-config" class="mtab-pane">
-            <div class="settings-card">
-              <div id="mf-title" class="mf-title">添加模型</div>
-              <!-- 表单区自己滚：「测试连接 / 重置 / 保存」留在卡片底部常驻可见，
-                   不用为了点保存先把整页滚到底。 -->
-              <div class="mf-scroll">
-                <div class="form-grid">
-                  <label class="f-field"><span>归属供应商</span>
-                    <select id="mf-prov"></select>
-                  </label>
-                  <!-- 选定供应商后：地址与密钥自动继承，表单里不再重复出现这两项 -->
-                  <div class="f-field f-field-wide" id="mf-inherit-field" hidden>
-                    <span>请求地址 / 密钥</span>
-                    <div class="mf-inherit" id="mf-inherit"></div>
-                  </div>
-                  <label class="f-field"><span>显示名称</span><input id="mf-name" type="text" placeholder="界面显示的名称"></label>
-                  <label class="f-field" id="mf-url-field"><span>请求地址</span><input id="mf-url" type="text" placeholder="https://api.openai.com/v1"></label>
-                  <label class="f-field" id="mf-proto-field"><span>兼容协议</span>
-                    <select id="mf-proto">
-                      <option value="openai">OpenAI</option>
-                      <option value="anthropic">Anthropic</option>
-                    </select>
-                  </label>
-                  <label class="f-field f-field-wide"><span>模型 id</span>
-                    <div class="id-row">
-                      <input id="mf-id" type="text" placeholder="如 gpt-4o / claude-sonnet-4">
-                      <button type="button" id="mf-discover" title="向上游请求模型列表，可勾选多个一次性批量添加">获取模型列表</button>
-                    </div>
-                  </label>
-                  <div class="f-field f-field-wide" id="mf-key-field">
-                    <span>密钥</span>
-                    <div class="key-row">
-                      <div class="key-seg" id="mf-key-seg">
-                        <button type="button" data-ks="env" class="active">环境变量</button>
-                        <button type="button" data-ks="plain">明文密钥</button>
-                      </div>
-                      <input id="mf-key-env" type="text" placeholder="变量名，如 OPENAI_API_KEY">
-                      <span class="key-eye-wrap">
-                        <input id="mf-key-plain" type="password" placeholder="sk-..." style="display:none">
-                        <button type="button" id="mf-key-eye" class="key-eye" title="显示/隐藏密钥" style="display:none">👁</button>
-                      </span>
-                    </div>
-                  </div>
-                  <div class="f-field ctx-row f-field-wide">
-                    <span>上下文</span>
-                    <div class="ctx-inputs">
-                      <!-- 输入/输出改成「预置档位 + 自定义」的下拉：档位由 ui.js 的
-                           buildCtxPicker 填充（预置档见 CTX_PRESETS_IN / _OUT）。 -->
-                      <label>输入 <span id="mf-ctx-in-host"></span></label>
-                      <label>输出 <span id="mf-ctx-out-host"></span></label>
-                    </div>
-                  </div>
-                  <!-- 多模态能力：每个模态三态（不声明 / 支持 / 不支持）。
-                       「不声明」是**独立**的一档，不是「不支持」的另一种写法：
-                       没声明 = 系统不知道，会照常尝试发送、失败后自动记住；
-                       误勾成「不支持」会让这个模型永久收不到图片，而用户
-                       只能靠「试试取消勾选」才发现是自己配错了。 -->
-                  <div class="f-field f-field-wide">
-                    <span>多模态能力</span>
-                    <div class="cap-rows">
-                      <label class="cap-row">图片
-                        <div class="key-seg" id="mf-vision-seg">
-                          <button type="button" data-cap="unset" class="active">不声明</button>
-                          <button type="button" data-cap="yes">支持</button>
-                          <button type="button" data-cap="no">不支持</button>
-                        </div>
-                      </label>
-                      <label class="cap-row">视频
-                        <div class="key-seg" id="mf-video-seg">
-                          <button type="button" data-cap="unset" class="active">不声明</button>
-                          <button type="button" data-cap="yes">支持</button>
-                          <button type="button" data-cap="no">不支持</button>
-                        </div>
-                      </label>
-                    </div>
-                    <p class="cap-hint">视频指模型原生解析（整段视频直接交给上游），不是本地抽帧。填错会让附件发不出去或被静默忽略。</p>
-                  </div>
-                  <!-- RPM：客户端节流上限，留空 = 不限制（默认）。
-                       语义是「每分钟最多发几个请求」，从**请求发起前**就错开，
-                       不去撞上游 429；与「撞了 429 之后等 10 秒」是两套机制。 -->
-                  <label class="f-field"><span>每分钟请求上限（RPM）</span>
-                    <input id="mf-rpm" type="number" min="0" step="1"
-                           placeholder="留空 = 不限制">
-                  </label>
-                </div>
-                <!-- 从上游 /models 拉取的模型列表（点「获取模型列表」后展开，选中后填入模型 id） -->
-                <div id="mf-discover-panel" class="discover-panel hidden">
-                  <div class="disc-head">
-                    <div class="disc-title">上游可用模型<span id="disc-count" class="disc-count"></span></div>
-                    <div class="disc-tools">
-                      <input id="disc-filter" type="text" placeholder="筛选模型 id…">
-                      <button type="button" id="disc-close">收起</button>
-                    </div>
-                  </div>
-                  <div id="disc-list" class="disc-list"></div>
-                  <div class="disc-foot">
-                    <span id="disc-result" class="mf-test-result"></span>
-                    <button type="button" id="disc-add" class="primary">添加选中</button>
+            <!-- 栏 2：模型列表 -->
+            <section class="m3-main">
+              <header class="m3-main-head">
+                <div class="m3-head-left">
+                  <button id="m-back-prov" class="btn icon m3-back" title="返回供应商列表">‹</button>
+                  <div class="m3-head-text">
+                    <div class="m3-title" id="m-main-title">模型</div>
+                    <div class="m3-sub" id="m-main-sub"></div>
                   </div>
                 </div>
+                <div class="m3-tools">
+                  <input id="m-model-filter" type="search" placeholder="筛选模型…" autocomplete="off">
+                  <button id="m-batch" class="btn ghost" title="多选模型，批量改上下文 / RPM / 能力或删除">批量管理</button>
+                  <button id="m-disc" class="btn ghost" title="向该供应商上游请求模型列表">获取模型列表</button>
+                  <button id="m-add" class="btn primary">＋ 添加模型</button>
+                </div>
+              </header>
+              <div id="m-batch-bar" class="batch-bar hidden">
+                <label class="batch-all"><input type="checkbox" id="m-batch-all"><span>全选</span></label>
+                <span class="batch-count" id="m-batch-count">已选 0 项</span>
+                <div class="batch-acts">
+                  <button id="m-batch-ctx" class="btn ghost small">上下文</button>
+                  <button id="m-batch-rpm" class="btn ghost small">RPM</button>
+                  <button id="m-batch-cap" class="btn ghost small">能力</button>
+                  <button id="m-batch-del" class="btn danger-ghost small">删除</button>
+                </div>
               </div>
-              <div class="mf-actions">
-                <span id="mf-test-result" class="mf-test-result"></span>
-                <button type="button" id="mf-test">测试连接</button>
-                <button type="button" id="mf-reset">重置</button>
-                <button type="button" id="mf-save" class="primary">保存</button>
-              </div>
-            </div>
+              <div id="m-batch-panel" class="batch-panel hidden"></div>
+              <div class="m3-list" id="m-model-list"></div>
+            </section>
+
+            <!-- 栏 3：详情 / 编辑 -->
+            <aside class="m3-detail" id="m-detail">
+              <div class="m3-empty">从中间列表选择一个模型查看详情，或点「＋ 添加模型」新建。<br><br>选中供应商后点 ⚙ 可编辑其连接信息（Base URL / 密钥）。</div>
+            </aside>
           </div>
         </section>
       </div>
