@@ -586,6 +586,23 @@
              供应商持有 Base URL 与密钥，其下模型只填 id；右栏就地编辑表单，
              中间栏支持多选批量改上下文 / RPM / 能力或删除。 -->
         <section id="page-models" class="settings-page">
+          <!-- 布局切换 + 三套布局的挂载点。
+               三套布局共用同一份 modelsCache / providersCache 与同一组 /api，
+               由 renderModelLayouts() 统一重绘（它是模型库变更后的唯一出口）。
+               切到非「经典」时隐藏下面的 m3 三栏：那是并行的两套视图，
+               同时显示只会让 .prov-md 的双栏高度链失效。
+               这一段必须在 m3 三栏**之前**：web/test 有一段断言是从 m3 那一栏
+               切到本 section 末尾做结构检查的，插在后面会混进它的检查范围。 -->
+          <div class="models-alt">
+            <span class="models-alt-label">布局</span>
+            <div class="models-layouts" id="models-layouts-bar">
+              <button type="button" class="models-layout" data-layout="table">表格</button>
+              <button type="button" class="models-layout" data-layout="cards">看板</button>
+              <button type="button" class="models-layout" data-layout="studio">工作台</button>
+              <button type="button" class="models-layout" data-layout="classic">经典</button>
+            </div>
+          </div>
+          <div id="model-layouts" class="model-layouts"></div>
           <div class="m3" id="m3">
             <!-- 栏 1：供应商 -->
             <aside class="m3-side">

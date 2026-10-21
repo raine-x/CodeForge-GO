@@ -6995,6 +6995,7 @@
       renderProvSide();
       renderModelList();
       ensureDetailStillValid();
+      renderModelLayouts();   // 三套布局共用同一份缓存：变了要一起重绘
       return loadModels();
     });
   }
@@ -7013,6 +7014,7 @@
     return loadLibrary().then(function () {
       renderProvSide();
       renderModelList();
+      renderModelLayouts();   // 三套布局共用同一份缓存：变了要一起重绘
       if (detailMode) {
         // 刷新时留在原来的详情上；正在编辑的表单不重绘，避免打断输入
         ensureDetailStillValid();
@@ -7029,6 +7031,1671 @@
       showBanner('已切换为「' + id + '」');
       refreshModelViews();
     });
+  }
+
+  // ---------- 模型管理三布局（表格 / 看板 / 工作台） ----------
+  //
+  // 三套布局与下面的「经典」三 tab 并列，是同一份 modelsCache / providersCache
+  // 的四种呈现，不是四份数据：所有写操作仍走 refreshModelViews() 这一个出口。
+  //
+  // 为什么挂在设置页里而不是各开一页：
+  //   · 模型库只有一个数据源，分成独立页面就得各自处理令牌 cookie 与「改完刷新主界面」；
+  //   · 设置页是用户已经在的地方，多一个「跳去别处改模型」的入口反而容易两边不一致。
+  //
+  // 因此布局是**页内**的：#model-layouts 是挂载点，切到「经典」时整块 display:none
+  // 把下面的三 tab 放出来，两套视图不同时在场（同时在场会让 .prov-md 双栏高度链失效）。
+  //
+  // 零件（表单 / 三态控件 / 上下文档位 / 发现面板）是三套布局共用的：
+  // 同一件事在三个布局里各写一遍，是这类改动最容易出分叉的地方 —— 比如某个布局
+  // 忘了 inherit_key，就会给用户留下「改挂供应商后密钥还是旧的」这种只在某一屏复现的坑。
+  const ML_LAYOUT_KEY = 'cf_models_layout';
+  const ML_LAYOUTS = [
+    { id: 'table', name: '表格' },
+    { id: 'cards', name: '看板' },
+    { id: 'studio', name: '工作台' },
+    { id: 'classic', name: '经典' }
+  ];
+  // 默认落在「经典」（m3 三栏）：那是模型页当前的样子，三套新布局是可选视图，
+  // 不是默认 —— 一上线就把用户看到的界面换掉，不是加个布局该做的事。
+  let mlLayout = 'classic';
+  try {
+    const saved = localStorage.getItem(ML_LAYOUT_KEY);
+    if (saved && ML_LAYOUTS.some(function (l) { return l.id === saved; })) mlLayout = saved;
+  } catch (e) { /* 隐私模式：忽略，用默认经典 */ }
+  // 各布局自己的瞬时状态（选中项 / 筛选 / 展开的发现面板）。放这里而不是散进渲染函数里，
+  // 是为了让重绘（refreshModelViews）不至于把它们清零。
+  const mlState = {
+    table: { q: '', prov: '', sel: {}, sortKey: 'name', sortDir: 1 },
+    cards: { q: '', filter: 'all', sel: null, discover: null },
+    studio: { sel: null, q: '', folded: {} }
+  };
+
+  // ---------- 三布局共用零件 ----------
+  function mlHost() { return document.getElementById('model-layouts'); }
+  function mlSections() { return document.querySelector('#page-models'); }
+
+  // 统一出口：一处请求 + 一处错误兜底。
+  // 这里不散落请求是有的意的 —— 三套布局共 8 个调用点，抄 8 遍迟早漏掉一个 .catch。
+  // 走 api() 这条统一封装（AGENTS.md 18）：它已经把网络异常兜成 {ok:false,...}。
+  function mlApi(path, body) {
+    const opts = body === undefined ? { method: 'GET' } : { method: 'POST', body: body };
+    return api(path, opts).then(function (res) {
+      const d = res.data || {};
+      if (d.ok === undefined) d.ok = res.ok;
+      if (!d.ok && !d.error) d.error = '请求失败（HTTP ' + res.status + '）';
+      return d;
+    });
+  }
+  function mlNote(node, state, msg) {
+    if (!node) return;
+    node.className = 'ml-note ' + (state === true ? 'ok' : state === false ? 'err' : '');
+    node.textContent = msg || '';
+  }
+  function mlBtn(text, cls, onClick) {
+    const b = button(text, 'ml-btn ' + (cls || ''), onClick);
+    return b;
+  }
+  function mlBox(label, ctrl, wide) {
+    const f = el('label', 'ml-fbox' + (wide ? ' wide' : ''));
+    f.appendChild(el('span', null, label));
+    f.appendChild(ctrl);
+    return f;
+  }
+  function mlKeyLabel(m) {
+    const p = m.provider_id ? findProvider(m.provider_id) : null;
+    if (!p) return m.key_set ? '条目自带' : '无密钥';
+    return providerKeyLabel(p);
+  }
+  function mlCapabilityBadges(m, host) {
+    // 只标显式声明过的（与经典视图同一条纪律）：models.yaml 多数条目没写这两个字段，
+    // 全标出来等于没标；而「声明支持」才是用户要一眼看到的信息。
+    if (m.vision === true) host.appendChild(el('span', 'ml-badge ok', '图'));
+    if (m.video === true) host.appendChild(el('span', 'ml-badge ok', '视频'));
+    return host;
+  }
+
+  // 三态能力控件：不声明 / 支持 / 不支持。
+  // 「不声明」是独立一档，不是「不支持」的另一种写法 —— 误勾成「不支持」会让模型永久收不到图，
+  // 而用户只能靠「试试取消勾选」才发现是自己配错了（AGENTS.md 16b）。
+  function mlTri(value, onChange) {
+    const wrap = el('span', 'ml-seg tri');
+    const btns = {};
+    [['unset', '不声明'], ['yes', '支持'], ['no', '不支持']].forEach(function (pair) {
+      const b = button(pair[1], '', function () {
+        set(pair[0]);
+        onChange(pair[0] === 'unset' ? null : pair[0] === 'yes');
+      });
+      b.dataset.v = pair[0];
+      btns[pair[0]] = b;
+      wrap.appendChild(b);
+    });
+    function set(v) {
+      Object.keys(btns).forEach(function (k) { btns[k].classList.toggle('on', k === v); });
+    }
+    set(value === null || value === undefined ? 'unset' : (value ? 'yes' : 'no'));
+    return { node: wrap, set: set };
+  }
+
+  // 模型表单：三套布局共用的字段集。返回 { node, read() }。
+  // read() 产出与经典 buildModelEditor 同一形状的请求体（含 inherit_key）。
+  function mlModelForm(m, opts) {
+    const o = opts || {};
+    const isNew = !m;
+    const grid = el('div', 'ml-grid2');
+    let vision = m ? (m.vision === undefined ? null : m.vision) : null;
+    let video = m ? (m.video === undefined ? null : m.video) : null;
+    let providerId = m ? (m.provider_id || '') : (o.providerId || '');
+
+    const provSel = el('select', 'ml-sel');
+    providersCache.forEach(function (p) {
+      const opt = el('option', null, (p.name || p.id) + (p.disabled ? '（已停用）' : ''));
+      opt.value = p.id;
+      provSel.appendChild(opt);
+    });
+    const noneOpt = el('option', null, '未归属（自带地址 / 密钥）');
+    noneOpt.value = '';
+    provSel.appendChild(noneOpt);
+    provSel.value = providerId;
+    grid.appendChild(mlBox('归属供应商', provSel));
+
+    const nameIn = mkInput('text', (m && m.name) || '', '界面显示名称');
+    nameIn.className = 'ml-inp';
+    const idIn = mkInput('text', (m && m.id) || '', '如 gpt-4o');
+    idIn.className = 'ml-inp';
+    grid.appendChild(mlBox('显示名称', nameIn));
+    grid.appendChild(mlBox('模型 id', idIn));
+
+    const inherit = el('div', 'ml-ro');
+    grid.appendChild(mlBox('请求地址 / 密钥（继承）', inherit, true));
+
+    // 未归属时才需要自带连接信息：选定了供应商就隐藏，避免两处都能填、语义打架。
+    const own = el('div', 'ml-grid2');
+    own.style.gridColumn = '1/-1';
+    const urlIn = mkInput('text', (m && m.base_url) || '', 'https://api.example.com/v1');
+    urlIn.className = 'ml-inp';
+    const protoSel = el('select', 'ml-sel');
+    ['openai', 'anthropic'].forEach(function (v) {
+      const opt = el('option', null, v === 'anthropic' ? 'Anthropic' : 'OpenAI');
+      opt.value = v;
+      protoSel.appendChild(opt);
+    });
+    protoSel.value = (m && m.protocol) || 'openai';
+    const keyIn = mkInput('password', '', 'sk-… 或 ${VAR}（留空保持不变）');
+    keyIn.className = 'ml-inp';
+    own.appendChild(mlBox('Base URL（未归属时必填）', urlIn));
+    own.appendChild(mlBox('兼容协议', protoSel));
+    own.appendChild(mlBox('密钥（未归属时必填）', keyIn, true));
+    grid.appendChild(own);
+
+    const ctxIn = buildCtxPicker((m && m.ctx_in) || 262144, CTX_PRESETS_IN, 262144);
+    const ctxOut = buildCtxPicker((m && m.ctx_out) || 131072, CTX_PRESETS_OUT, 131072);
+    grid.appendChild(mlBox('上下文 · 输入 tokens', ctxIn.node));
+    grid.appendChild(mlBox('上下文 · 输出 tokens', ctxOut.node));
+
+    const capWrap = el('div');
+    const vTri = mlTri(vision, function (v) { vision = v; });
+    const dTri = mlTri(video, function (v) { video = v; });
+    const vRow = el('div', 'ml-caprow');
+    vRow.appendChild(el('span', null, '图片'));
+    vRow.appendChild(vTri.node);
+    capWrap.appendChild(vRow);
+    const dRow = el('div', 'ml-caprow');
+    dRow.appendChild(el('span', null, '视频'));
+    dRow.appendChild(dTri.node);
+    capWrap.appendChild(dRow);
+    grid.appendChild(mlBox('多模态能力（三态）', capWrap, true));
+    grid.appendChild(mlBox('', el('p', 'ml-hint warn',
+      '「不声明」= 系统不知道，会照常发送、失败后自动记住；误勾「不支持」会让该模型永久收不到图片。'), true));
+
+    const rpmIn = mkInput('number', m && m.rpm > 0 ? String(m.rpm) : '', '留空 = 不限制');
+    rpmIn.className = 'ml-inp';
+    rpmIn.min = '0';
+    grid.appendChild(mlBox('每分钟请求上限 RPM', rpmIn));
+
+    function syncInherit() {
+      const p = providerId ? findProvider(providerId) : null;
+      if (p) {
+        inherit.textContent = '继承自「' + (p.name || p.id) + '」：' + p.base_url +
+          ' · 密钥 ' + providerKeyLabel(p) + ' → 同供应商下切换模型不必重填';
+        own.style.display = 'none';
+      } else {
+        inherit.textContent = '未归属供应商：地址 / 协议 / 密钥需在这里填写';
+        own.style.display = '';
+      }
+    }
+    provSel.addEventListener('change', function () {
+      providerId = provSel.value;
+      syncInherit();
+    });
+    syncInherit();
+
+    if (o.hideConnection) {
+      // 看板/工作台里连接信息归供应商管，模型表单不再重复出现地址与密钥。
+      grid.removeChild(inherit);
+      own.remove();
+    }
+
+    function read() {
+      const body = {
+        id: idIn.value.trim(),
+        model: idIn.value.trim(),
+        name: nameIn.value.trim() || idIn.value.trim(),
+        provider_id: providerId,
+        ctx_in: ctxIn.value(),
+        ctx_out: ctxOut.value(),
+        rpm: Math.max(0, parseInt(rpmIn.value, 10) || 0),
+        vision: vision,
+        video: video
+      };
+      if (providerId) {
+        // 继承：清掉条目上历史遗留的自带密钥，否则它会一直压着供应商的。
+        body.inherit_key = true;
+      } else {
+        // hideConnection 时地址/协议/密钥的输入框不在树上（它们归供应商或原条目管）。
+        // 这时**必须**回带原值，否则改个显示名就会把未归属条目的地址清空 ——
+        // 那是用户填的、且列表视图拿不到的东西，清掉就没了。
+        body.base_url = (o.hideConnection && m) ? (m.base_url || '') : urlIn.value.trim();
+        body.protocol = (o.hideConnection && m) ? (m.protocol || 'openai') : protoSel.value;
+        if (o.hideConnection && m) {
+          body.key_source = m.key_source || 'env';
+          body.key_name = m.key_name || '';
+        } else {
+          body.key_source = 'plain';
+          body.key_value = keyIn.value;
+        }
+      }
+      return body;
+    }
+    return { node: grid, read: read, providerSel: provSel, setProvider: function (v) { providerId = v; provSel.value = v; syncInherit(); } };
+  }
+
+  // 模型保存：三套布局统一走这里，成功后由 refreshModelViews() 重绘。
+  function mlSaveModel(body, okMsg, onFail) {
+    if (!body.id) {
+      if (onFail) onFail('模型 id 不能为空');
+      return Promise.resolve(false);
+    }
+    return mlApi('/api/models/save', body).then(function (d) {
+      if (!d.ok) {
+        if (onFail) onFail(d.error || '保存失败');
+        return false;
+      }
+      showBanner(okMsg || ('已保存 ' + body.id), 'info');
+      return refreshModelViews().then(function () { return true; });
+    });
+  }
+  function mlDeleteModel(id, label) {
+    return mlApi('/api/models/delete', { model: id }).then(function (d) {
+      if (!d.ok) {
+        showBanner('删除失败：' + (d.error || '未知错误'), 'error');
+        return false;
+      }
+      showBanner('已删除 ' + (label || id), 'info');
+      delete mlState.table.sel[id];
+      return refreshModelViews().then(function () { return true; });
+    });
+  }
+  function mlDeleteProvider(p) {
+    const n = modelsOfProvider(p.id).length;
+    return mlApi('/api/providers/delete', { provider: p.id }).then(function (d) {
+      if (!d.ok) {
+        showBanner('删除失败：' + (d.error || '未知错误'), 'error');
+        return false;
+      }
+      showBanner('已删除供应商' + (n ? '，其下 ' + n + ' 个模型转为未归属' : ''), 'info');
+      return refreshModelViews().then(function () { return true; });
+    });
+  }
+  function mlApplyModel(id) {
+    // 复用经典的 applyModel：它内部会 showPage('general') 跳回主界面 —— 这里要留在设置页，
+    // 所以自己发一次请求，成功后只重绘本视图。
+    return mlApi('/api/models/apply', { model: id }).then(function (d) {
+      if (!d.ok) {
+        showBanner('应用失败：' + (d.error || '未知错误'), 'error');
+        return false;
+      }
+      showBanner('已切换生效模型', 'info');
+      return refreshModelViews().then(function () { return true; });
+    });
+  }
+
+  // 上游模型发现面板：拉取 → 筛选 → 勾选 → 批量添加。三套布局共用。
+  function mlDiscoverPanel(providerId, onDone) {
+    const box = el('div', 'ml-disc');
+    let items = [], pick = {};
+    const pid = providerId || (providersCache[0] ? providersCache[0].id : '');
+
+    const hd = el('div', 'ml-disc-hd');
+    hd.appendChild(el('span', null, '上游可用模型'));
+    const status = el('span', 'ml-tag', '未拉取');
+    hd.appendChild(status);
+    box.appendChild(hd);
+
+    const tools = el('div', 'ml-disc-hd');
+    tools.style.borderBottom = '1px solid var(--border)';
+    const filter = mkInput('text', '', '筛选模型 id…');
+    filter.className = 'ml-inp';
+    filter.style.flex = '1';
+    const fetchBtn = button('拉取', 'sm', fetchUpstream);
+    fetchBtn.className = 'ml-btn sm';
+    tools.appendChild(filter);
+    tools.appendChild(fetchBtn);
+    box.appendChild(tools);
+
+    const listBox = el('div', 'ml-disc-list');
+    box.appendChild(listBox);
+    const ft = el('div', 'ml-disc-ft');
+    const cnt = el('span', 'ml-note');
+    const addBtn = button('添加选中', 'sm primary', commit);
+    addBtn.className = 'ml-btn sm primary';
+    addBtn.disabled = true;
+    const spacer = el('span', 'ml-sp');
+    ft.appendChild(cnt);
+    ft.appendChild(spacer);
+    ft.appendChild(addBtn);
+    box.appendChild(ft);
+
+    function sync() {
+      const n = Object.keys(pick).length;
+      cnt.textContent = (items.length ? '共 ' + items.length + ' 个' : '') + (n ? '，已选 ' + n + ' 个' : '');
+      addBtn.disabled = n === 0;
+      addBtn.textContent = n ? ('添加选中（' + n + '）') : '添加选中';
+    }
+    function draw() {
+      const q = (filter.value || '').trim().toLowerCase();
+      listBox.innerHTML = '';
+      const shown = items.filter(function (m) {
+        return !q || (m.id || '').toLowerCase().indexOf(q) >= 0 || (m.name || '').toLowerCase().indexOf(q) >= 0;
+      });
+      if (!shown.length) {
+        listBox.appendChild(el('div', 'ml-disc-empty', items.length ? '没有匹配的模型' : '点「拉取」获取上游模型'));
+        sync();
+        return;
+      }
+      shown.forEach(function (m) {
+        const row = el('label', 'ml-disc-item' + (m.in_library ? ' added' : ''));
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = !!pick[m.id];
+        // 已在库中：不可选。批量添加的语义是「补进上游还没有的」，
+        // 覆盖会悄悄改掉用户手调过的上下文上限等设置。
+        cb.disabled = !!m.in_library;
+        cb.addEventListener('change', function () {
+          if (cb.checked) pick[m.id] = true; else delete pick[m.id];
+          sync();
+        });
+        row.appendChild(cb);
+        row.appendChild(el('span', 'id', m.id));
+        if (m.in_library) row.appendChild(el('span', 'ml-tag', '已在库'));
+        listBox.appendChild(row);
+      });
+      sync();
+    }
+    function fetchUpstream() {
+      status.className = 'ml-tag';
+      status.textContent = '拉取中…';
+      items = [];
+      pick = {};
+      listBox.innerHTML = '';
+      sync();
+      mlApi('/api/models/discover', { provider_id: pid }).then(function (d) {
+        if (!d.ok) {
+          status.className = 'ml-tag';
+          status.textContent = '失败';
+          status.title = d.error || '';
+          draw();
+          return;
+        }
+        items = d.models || [];
+        filter.value = '';
+        status.className = 'ml-badge ok';
+        status.textContent = items.length + ' 个';
+        draw();
+      });
+    }
+    function commit() {
+      const ids = Object.keys(pick);
+      if (!ids.length) return;
+      const selected = {};
+      items.forEach(function (m) { selected[m.id] = m; });
+      mlApi('/api/models/save_batch', {
+        provider_id: pid,
+        ctx_in: 262144,
+        ctx_out: 131072,
+        models: ids.map(function (id) {
+          const hit = selected[id] || {};
+          return { id: id, name: (hit.name && hit.name !== id) ? hit.name : '' };
+        })
+      }).then(function (d) {
+        if (!d.ok) {
+          showBanner('批量添加失败：' + (d.error || '未知错误'), 'error');
+          return;
+        }
+        showBanner('已添加 ' + d.added + ' 个模型' + (d.skipped ? '，跳过已存在 ' + d.skipped + ' 个' : ''), 'info');
+        if (onDone) onDone();
+        refreshModelViews();
+      });
+    }
+    filter.addEventListener('input', draw);
+    draw();
+    return box;
+  }
+
+  // 模型编辑弹层：A 的表格行与 B 的卡片都点「编辑」进这里，
+  // C 的工作台是就地编辑（不用弹层）—— 那是它与另两套的主要差别。
+  function mlOpenModelDialog(m, providerId) {
+    const mask = el('div', 'ml-mask ml-modal-mask');
+    const modal = el('div', 'ml-modal');
+    mask.appendChild(modal);
+    document.body.appendChild(mask);
+    const isNew = !m;
+
+    const head = el('header');
+    head.appendChild(el('h2', null, isNew ? '新建模型' : '编辑模型 · ' + (m.name || m.id)));
+    const x = button('✕', 'x', close);
+    x.className = 'ml-x';
+    head.appendChild(x);
+    modal.appendChild(head);
+
+    const body = el('div', 'body');
+    const form = mlModelForm(m, { providerId: providerId });
+    body.appendChild(form.node);
+    modal.appendChild(body);
+
+    const foot = el('footer');
+    const note = el('span', 'ml-note');
+    const discBtn = button('获取模型列表', '', function () {
+      openDisc();
+    });
+    discBtn.className = 'ml-btn';
+    const cancelBtn = button('取消', '', close);
+    cancelBtn.className = 'ml-btn';
+    const saveBtn = button(isNew ? '添加模型' : '保存', 'primary', save);
+    saveBtn.className = 'ml-btn primary';
+    const spacer = el('span', 'ml-sp');
+    foot.appendChild(note);
+    foot.appendChild(spacer);
+    foot.appendChild(discBtn);
+    foot.appendChild(cancelBtn);
+    foot.appendChild(saveBtn);
+    modal.appendChild(foot);
+
+    function close() { mask.remove(); }
+    function openDisc() {
+      close();
+      const pid = form.providerSel.value;
+      if (!pid) {
+        showBanner('先选定供应商再拉取上游模型（未归属条目请先保存）', 'warn');
+        return;
+      }
+      mlOpenDiscoverDialog(pid);
+    }
+    function save() {
+      const body2 = form.read();
+      if (!body2.id) {
+        mlNote(note, false, '模型 id 不能为空');
+        return;
+      }
+      saveBtn.disabled = true;
+      mlNote(note, null, '保存中…');
+      mlSaveModel(body2, isNew ? '已添加 ' + body2.id : '已保存 ' + body2.id, function (msg) {
+        mlNote(note, false, msg);
+        saveBtn.disabled = false;
+      }).then(function (ok) { if (ok) close(); });
+    }
+    mask.addEventListener('click', function (e) { if (e.target === mask) close(); });
+    requestAnimationFrame(function () { mask.classList.add('on'); });
+    return mask;
+  }
+
+  function mlOpenDiscoverDialog(providerId) {
+    const mask = el('div', 'ml-mask ml-modal-mask');
+    const modal = el('div', 'ml-modal');
+    mask.appendChild(modal);
+    document.body.appendChild(mask);
+    const head = el('header');
+    head.appendChild(el('h2', null, '获取上游模型'));
+    const x = button('✕', 'x', close);
+    x.className = 'ml-x';
+    head.appendChild(x);
+    modal.appendChild(head);
+    const body = el('div', 'body');
+    const panel = mlDiscoverPanel(providerId, function () { close(); });
+    body.appendChild(panel);
+    modal.appendChild(body);
+    function close() { mask.remove(); }
+    mask.addEventListener('click', function (e) { if (e.target === mask) close(); });
+    requestAnimationFrame(function () { mask.classList.add('on'); });
+    return mask;
+  }
+
+  // 原位二次确认删除：不用 confirm()，它会把整页阻塞掉。
+  // busy 防连点是必须的 —— 确认到响应回来之间不禁用，手快就发两次 DELETE，
+  // 第二次 404 会表现成「删除报错」。
+  function mlAskDelete(anchor, label, run) {
+    const pop = el('div', 'ml-pop');
+    pop.appendChild(el('span', 'msg', '确认删除「' + label + '」？'));
+    const ok = button('确认删除', 'danger', function () {
+      if (busy) return;
+      busy = true;
+      ok.disabled = true;
+      Promise.resolve(run()).then(close);
+    });
+    ok.className = 'ml-btn sm danger';
+    const no = button('取消', '', close);
+    no.className = 'ml-btn sm';
+    pop.appendChild(ok);
+    pop.appendChild(no);
+    document.body.appendChild(pop);
+    const r = anchor.getBoundingClientRect();
+    pop.style.top = Math.min(window.innerHeight - 60, Math.max(8, r.bottom + 6)) + 'px';
+    pop.style.left = Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 8)) + 'px';
+    let busy = false;
+    function close() { pop.remove(); }
+    setTimeout(function () {
+      document.addEventListener('click', function h(e) {
+        if (!pop.contains(e.target)) { close(); document.removeEventListener('click', h); }
+      });
+    }, 0);
+  }
+
+  // ---------- 布局 A：表格控制台 ----------
+  // 与经典列表的差别不在皮肤，而在**操作模型**：一屏一张表 + 多选批量改。
+  // 经典是一行一次操作（设为当前 / 编辑 / 删除），改 8 个模型的限速要点 8 次。
+  function mlRenderTable(host) {
+    const st = mlState.table;
+    const bar = el('div', 'ml-bar');
+
+    const search = el('div', 'ml-search');
+    const qIn = mkInput('search', st.q, '搜索名称 / 模型 id / 供应商…');
+    search.appendChild(qIn);
+    bar.appendChild(search);
+
+    const provSel = el('select', 'ml-sel');
+    const allOpt = el('option', null, '全部供应商');
+    allOpt.value = '';
+    provSel.appendChild(allOpt);
+    providersCache.forEach(function (p) {
+      const o = el('option', null, (p.name || p.id) + '（' + modelsOfProvider(p.id).length + '）');
+      o.value = p.id;
+      provSel.appendChild(o);
+    });
+    const noneOpt = el('option', null, '未归属供应商');
+    noneOpt.value = '__none';
+    provSel.appendChild(noneOpt);
+    provSel.value = st.prov;
+    bar.appendChild(provSel);
+
+    const activeSel = el('select', 'ml-sel');
+    modelsCache.forEach(function (m) {
+      const p = m.provider_id ? findProvider(m.provider_id) : null;
+      const o = el('option', null, (p ? (p.name || p.id) + ' / ' : '') + (m.name || m.id));
+      o.value = m.id;
+      activeSel.appendChild(o);
+    });
+    activeSel.value = activeModelId;
+    activeSel.addEventListener('change', function () { mlApplyModel(activeSel.value); });
+    bar.appendChild(activeSel);
+
+    const spacer = el('span', 'ml-sp');
+    bar.appendChild(spacer);
+    bar.appendChild(mlBtn('供应商管理', '', mlOpenProviderDrawer));
+    bar.appendChild(mlBtn('＋ 新建模型', 'primary', function () { mlOpenModelDialog(null); }));
+    host.appendChild(bar);
+
+    // 批量条：只在有选中时出现，避免常驻一排灰按钮。
+    const selIds = Object.keys(st.sel).filter(function (id) { return st.sel[id]; });
+    const batch = el('div', 'ml-batch');
+    if (selIds.length) {
+      const b = el('span');
+      b.appendChild(document.createTextNode('已选 '));
+      b.appendChild(el('b', null, String(selIds.length)));
+      b.appendChild(document.createTextNode(' 项'));
+      batch.appendChild(b);
+      batch.appendChild(mlBtn('设为当前', 'sm', function () { mlApplyModel(selIds[0]); }));
+      batch.appendChild(mlBtn('批量限速…', 'sm', function () { mlBatchRpm(selIds); }));
+      batch.appendChild(mlBtn('批量改供应商…', 'sm', function () { mlBatchMove(selIds); }));
+      batch.appendChild(mlBtn('批量删除', 'sm danger', function () {
+        if (!confirm('确认删除选中的 ' + selIds.length + ' 个模型？此操作不可撤销。')) return;
+        mlBatchDelete(selIds);
+      }));
+      batch.appendChild(mlBtn('清除选择', 'sm ghost', function () {
+        st.sel = {};
+        renderModelLayouts();
+      }));
+    } else {
+      const all = el('label', '');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.addEventListener('change', function () {
+        mlTableRows().forEach(function (m) {
+          if (cb.checked) st.sel[m.id] = true; else delete st.sel[m.id];
+        });
+        renderModelLayouts();
+      });
+      all.appendChild(cb);
+      all.appendChild(document.createTextNode('全选本页'));
+      batch.appendChild(all);
+    }
+    host.appendChild(batch);
+
+    // 过滤 + 排序
+    function rows() {
+      const q = (st.q || '').trim().toLowerCase();
+      let list = modelsCache.filter(function (m) {
+        if (st.prov && m.provider_id !== st.prov) return false;
+        if (!q) return true;
+        const p = m.provider_id ? findProvider(m.provider_id) : null;
+        return ((m.name || '') + ' ' + m.id + ' ' + (p ? (p.name || p.id) : '')).toLowerCase().indexOf(q) >= 0;
+      });
+      function keyOf(m) {
+        const p = m.provider_id ? findProvider(m.provider_id) : null;
+        switch (st.sortKey) {
+          case 'id': return m.id.toLowerCase();
+          case 'provider': return p ? (p.name || p.id) : '￿';
+          case 'ctx': return m.ctx_in || 0;
+          case 'rpm': return m.rpm || 0;
+          default: return (m.name || m.id).toLowerCase();
+        }
+      }
+      list.sort(function (a, b) {
+        const x = keyOf(a), y = keyOf(b);
+        return (x > y ? 1 : x < y ? -1 : 0) * st.sortDir;
+      });
+      return list;
+    }
+    function mlTableRows() { return rows(); }
+
+    const wrap = el('div', 'ml-table-wrap');
+    const table = el('table', 'ml-table');
+    const thead = el('thead');
+    const hr = el('tr');
+    const cols = [
+      ['', 'cb'], ['名称', 'name'], ['模型 id', 'id'], ['供应商', 'provider'],
+      ['协议', ''], ['上下文 入/出', 'ctx'], ['RPM', 'rpm'], ['密钥', ''], ['能力', ''], ['', 'act']
+    ];
+    const SORTABLE = ['name', 'id', 'provider', 'ctx', 'rpm'];
+    cols.forEach(function (c) {
+      const cls = c[1] === 'act' ? 'c-act' : (c[1] === 'ctx' || c[1] === 'rpm' ? 'c-dim' : '');
+      const th = el('th', cls, c[0]);
+      if (SORTABLE.indexOf(c[1]) >= 0) {
+        th.className = cls;
+        th.dataset.k = c[1];
+        th.title = '按「' + c[0] + '」排序';
+        if (st.sortKey === c[1]) th.classList.add('sorted');
+        th.appendChild(el('span', 'arrow', st.sortKey === c[1] ? (st.sortDir > 0 ? '↑' : '↓') : '↕'));
+        th.addEventListener('click', function () {
+          if (st.sortKey === c[1]) st.sortDir = -st.sortDir;
+          else { st.sortKey = c[1]; st.sortDir = 1; }
+          renderModelLayouts();
+        });
+      }
+      hr.appendChild(th);
+    });
+    thead.appendChild(hr);
+    table.appendChild(thead);
+
+    const tbody = el('tbody');
+    const list = rows();
+    if (!list.length) {
+      const tr = el('tr');
+      const td = el('td', 'ml-empty', modelsCache.length ? '没有匹配的模型' : '还没有模型：点右上角「＋ 新建模型」，或先建一个供应商再从上游批量拉取');
+      td.colSpan = cols.length;
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    }
+    list.forEach(function (m) {
+      const p = m.provider_id ? findProvider(m.provider_id) : null;
+      const tr = el('tr');
+      if (st.sel[m.id]) tr.classList.add('sel-row');
+      if (m.id === activeModelId) tr.classList.add('active-row');
+
+      const cbTd = el('td');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = !!st.sel[m.id];
+      cb.addEventListener('change', function () {
+        if (cb.checked) st.sel[m.id] = true; else delete st.sel[m.id];
+        renderModelLayouts();
+      });
+      cbTd.appendChild(cb);
+      tr.appendChild(cbTd);
+
+      const nameTd = el('td');
+      const nameWrap = el('div', 'ml-name');
+      nameWrap.appendChild(el('b', null, m.name || m.id));
+      if (m.id === activeModelId) nameWrap.appendChild(el('span', 'ml-badge cur', '当前'));
+      mlCapabilityBadges(m, nameWrap);
+      nameTd.appendChild(nameWrap);
+      tr.appendChild(nameTd);
+
+      const idTd = el('td', 'c-id', m.id);
+      idTd.title = m.id;
+      tr.appendChild(idTd);
+
+      const provTd = el('td');
+      const pill = el('span', 'ml-pill' + (p ? '' : ' none'));
+      if (p) {
+        pill.appendChild(el('span', 'ml-dot' + (p.disabled ? ' off' : '')));
+        pill.appendChild(el('span', null, p.name || p.id));
+      } else {
+        pill.textContent = '未归属';
+      }
+      provTd.appendChild(pill);
+      tr.appendChild(provTd);
+
+      tr.appendChild(el('td', 'c-dim', (p ? p.protocol : m.protocol) || 'openai'));
+      tr.appendChild(el('td', 'c-dim', fmtCtx(m.ctx_in) + ' / ' + fmtCtx(m.ctx_out)));
+      tr.appendChild(el('td', 'c-dim', m.rpm > 0 ? (m.rpm + '/min') : '不限'));
+
+      const keyTd = el('td');
+      keyTd.appendChild(el('span', 'ml-badge ' + (m.key_set ? 'plain' : 'err'), mlKeyLabel(m)));
+      tr.appendChild(keyTd);
+
+      const capTd = el('td');
+      if (m.vision === undefined) capTd.appendChild(el('span', 'ml-tag', '图未声明'));
+      if (m.video === undefined) capTd.appendChild(el('span', 'ml-tag', '视频未声明'));
+      tr.appendChild(capTd);
+
+      const actTd = el('td', 'c-act');
+      if (m.id !== activeModelId) actTd.appendChild(mlBtn('设为当前', 'sm ghost', function () { mlApplyModel(m.id); }));
+      actTd.appendChild(mlBtn('编辑', 'sm ghost', function () { mlOpenModelDialog(m); }));
+      const delBtn = mlBtn('删除', 'sm ghost', function (e) {
+        mlAskDelete(delBtn, m.name || m.id, function () { return mlDeleteModel(m.id, m.name || m.id); });
+      });
+      delBtn.style.color = 'var(--danger)';
+      actTd.appendChild(delBtn);
+      tr.appendChild(actTd);
+
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    host.appendChild(wrap);
+
+    qIn.addEventListener('input', function () {
+      st.q = qIn.value;
+      renderModelLayouts();
+      // 重绘会换掉输入框，把焦点还给新节点，否则边打字边丢焦点。
+      const next = host.querySelector('.ml-search input');
+      if (next) { next.focus(); next.setSelectionRange(next.value.length, next.value.length); }
+    });
+    provSel.addEventListener('change', function () { st.prov = provSel.value; renderModelLayouts(); });
+
+    function mlBatchDelete(ids) {
+      let left = ids.length;
+      ids.forEach(function (id) {
+        mlApi('/api/models/delete', { model: id }).then(function (d) {
+          if (!d.ok) showBanner('删除失败：' + (d.error || '未知错误'), 'error');
+          else delete st.sel[id];
+          if (--left === 0) {
+            showBanner('批量删除完成', 'info');
+            refreshModelViews();
+          }
+        });
+      });
+    }
+    function mlBatchRpm(ids) {
+      const raw = prompt('为选中的 ' + ids.length + ' 个模型设置每分钟请求上限（留空 = 不限制）：');
+      if (raw === null) return;
+      const rpm = Math.max(0, parseInt(raw, 10) || 0);
+      let left = ids.length;
+      ids.forEach(function (id) {
+        const m = modelsCache.filter(function (x) { return x.id === id; })[0];
+        if (!m) { if (--left === 0) refreshModelViews(); return; }
+        const body = {
+          id: m.id, model: m.id, name: m.name,
+          provider_id: m.provider_id || '', ctx_in: m.ctx_in, ctx_out: m.ctx_out,
+          rpm: rpm, vision: m.vision, video: m.video
+        };
+        if (m.provider_id) body.inherit_key = true;
+        else { body.base_url = m.base_url || ''; body.protocol = m.protocol || 'openai'; body.key_source = m.key_source || 'env'; body.key_name = m.key_name || ''; }
+        mlApi('/api/models/save', body).then(function (d) {
+          if (!d.ok) showBanner('限速设置失败：' + (d.error || '未知错误'), 'error');
+          if (--left === 0) { showBanner('已更新 ' + ids.length + ' 个模型的限速', 'info'); refreshModelViews(); }
+        });
+      });
+    }
+    function mlBatchMove(ids) {
+      const mask = el('div', 'ml-mask ml-modal-mask');
+      const modal = el('div', 'ml-modal');
+      modal.style.width = '440px';
+      mask.appendChild(modal);
+      document.body.appendChild(modal);
+      const head = el('header');
+      head.appendChild(el('h2', null, '批量改供应商（' + ids.length + ' 个）'));
+      const x = button('✕', 'x', function () { mask.remove(); });
+      x.className = 'ml-x';
+      head.appendChild(x);
+      modal.appendChild(head);
+      const body = el('div', 'body');
+      body.appendChild(el('p', 'ml-hint', '把选中的模型统一改挂到某个供应商下，地址与密钥随之继承。'));
+      const sel = el('select', 'ml-sel');
+      sel.style.width = '100%';
+      providersCache.forEach(function (p) {
+        const o = el('option', null, p.name || p.id);
+        o.value = p.id;
+        sel.appendChild(o);
+      });
+      const noneO = el('option', null, '未归属（清掉继承，回到自带连接信息）');
+      noneO.value = '';
+      sel.appendChild(noneO);
+      body.appendChild(sel);
+      modal.appendChild(body);
+      const foot = el('footer');
+      const sp = el('span', 'ml-sp');
+      const cancel = button('取消', '', function () { mask.remove(); });
+      cancel.className = 'ml-btn';
+      const ok = button('确认改挂', 'primary', function () {
+        const target = sel.value;
+        let left = ids.length;
+        ids.forEach(function (id) {
+          const m = modelsCache.filter(function (y) { return y.id === id; })[0];
+          if (!m) { if (--left === 0) refreshModelViews(); return; }
+          const body2 = {
+            id: m.id, model: m.id, name: m.name, provider_id: target,
+            ctx_in: m.ctx_in, ctx_out: m.ctx_out, rpm: m.rpm, vision: m.vision, video: m.video
+          };
+          if (target) body2.inherit_key = true;
+          else { body2.base_url = m.base_url || ''; body2.protocol = m.protocol || 'openai'; body2.key_source = m.key_source || 'env'; body2.key_name = m.key_name || ''; }
+          mlApi('/api/models/save', body2).then(function (d) {
+            if (!d.ok) showBanner('改挂失败：' + (d.error || '未知错误'), 'error');
+            if (--left === 0) {
+              mask.remove();
+              showBanner('已改挂 ' + ids.length + ' 个模型', 'info');
+              refreshModelViews();
+            }
+          });
+        });
+      });
+      ok.className = 'ml-btn primary';
+      foot.appendChild(sp);
+      foot.appendChild(cancel);
+      foot.appendChild(ok);
+      modal.appendChild(foot);
+      mask.addEventListener('click', function (e) { if (e.target === mask) mask.remove(); });
+      requestAnimationFrame(function () { mask.classList.add('on'); });
+    }
+  }
+
+  // ---------- 布局 B：卡片看板 ----------
+  // 与另两套的差别：模型是「卡片」而不是行，编辑**就地**发生（不弹窗），
+  // 供应商天然是一张卡（上一次编辑它的连接信息的位置）。
+  function mlRenderCards(host) {
+    const st = mlState.cards;
+    const shell = el('div', 'ml-b');
+
+    // 左栏：能力筛选 + 供应商
+    const rail = el('div', 'ml-rail');
+    const g1 = el('div', 'grp');
+    g1.appendChild(el('h4', null, '能力筛选'));
+    const counts = {
+      all: modelsCache.length,
+      active: modelsCache.filter(function (m) { return m.id === activeModelId; }).length,
+      vision: modelsCache.filter(function (m) { return m.vision === true; }).length,
+      video: modelsCache.filter(function (m) { return m.video === true; }).length,
+      rpm: modelsCache.filter(function (m) { return m.rpm > 0; }).length
+    };
+    [['all', '全部模型'], ['active', '当前生效'], ['vision', '支持图片'], ['video', '支持视频'], ['rpm', '有限速']].forEach(function (pair) {
+      const b = button('', '', function () { st.filter = pair[0]; renderModelLayouts(); });
+      b.className = 'ml-chipfilter' + (st.filter === pair[0] ? ' on' : '');
+      b.appendChild(el('span', null, pair[1]));
+      b.appendChild(el('span', 'n', String(counts[pair[0]])));
+      g1.appendChild(b);
+    });
+    rail.appendChild(g1);
+
+    const g2 = el('div', 'grp');
+    g2.appendChild(el('h4', null, '按供应商'));
+    providersCache.forEach(function (p) {
+      const b = button('', '', function () {
+        st.filter = st.filter === p.id ? 'all' : p.id;
+        renderModelLayouts();
+      });
+      b.className = 'ml-chipfilter' + (st.filter === p.id ? ' on' : '');
+      b.appendChild(el('span', 'dot' + (p.disabled ? ' off' : '')));
+      b.appendChild(el('span', null, p.name || p.id));
+      b.appendChild(el('span', 'n', String(modelsOfProvider(p.id).length)));
+      g2.appendChild(b);
+    });
+    const un = button('', '', function () {
+      st.filter = '__none';
+      renderModelLayouts();
+    });
+    un.className = 'ml-chipfilter' + (st.filter === '__none' ? ' on' : '');
+    un.appendChild(el('span', null, '未归属'));
+    un.appendChild(el('span', 'n', String(modelsCache.filter(function (m) { return !m.provider_id; }).length)));
+    g2.appendChild(un);
+    rail.appendChild(g2);
+    shell.appendChild(rail);
+
+    // 中栏：卡片流
+    const board = el('div', 'ml-board');
+    const bar = el('div', 'ml-bar');
+    const search = el('div', 'ml-search');
+    const qIn = mkInput('search', st.q, '搜索模型…');
+    search.appendChild(qIn);
+    bar.appendChild(search);
+    const sp = el('span', 'ml-sp');
+    bar.appendChild(sp);
+    bar.appendChild(mlBtn('＋ 供应商', '', function () { mlOpenProviderDialog(null); }));
+    bar.appendChild(mlBtn('＋ 模型', 'primary', function () {
+      const pid = st.filter && st.filter !== 'all' && st.filter !== '__none' ? st.filter : '';
+      mlOpenModelDialog(null, pid);
+    }));
+    board.appendChild(bar);
+
+    function pass(m) {
+      const q = (st.q || '').trim().toLowerCase();
+      if (q && ((m.name || '') + ' ' + m.id).toLowerCase().indexOf(q) < 0) return false;
+      if (st.filter === 'vision') return m.vision === true;
+      if (st.filter === 'video') return m.video === true;
+      if (st.filter === 'rpm') return m.rpm > 0;
+      if (st.filter === 'active') return m.id === activeModelId;
+      if (st.filter === '__none') return !m.provider_id;
+      return true;
+    }
+
+    const cards = el('div', 'ml-cards');
+    function providerCard(p, isNone) {
+      const card = el('div', 'ml-pcard');
+      if (p && p.disabled) card.classList.add('dim');
+      const hd = el('div', 'ml-pcard-hd');
+      hd.appendChild(el('span', 'ml-dot' + (p && p.disabled ? ' off' : '')));
+      const t = el('div', 't');
+      t.appendChild(el('b', null, p ? (p.name || p.id) : '未归属'));
+      t.appendChild(el('div', 'url', p ? p.base_url : '各条目自带连接信息'));
+      hd.appendChild(t);
+      if (p) {
+        const menu = button('⋯', 'menu', function () { st.sel = { type: 'prov', id: p.id }; renderModelLayouts(); });
+        hd.appendChild(menu);
+      }
+      card.appendChild(hd);
+      const meta = el('div', 'ml-pcard-meta');
+      const list = modelsOfProvider(p ? p.id : '').filter(pass);
+      meta.appendChild(el('span', 'ml-badge info', list.length + ' 个模型'));
+      if (p) {
+        meta.appendChild(el('span', 'ml-badge ' + (p.disabled ? 'err' : 'ok'), p.disabled ? '已停用' : '已启用'));
+        meta.appendChild(el('span', 'ml-badge plain', p.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'));
+        meta.appendChild(el('span', 'ml-badge ' + (p.key_set ? 'plain' : 'err'), providerKeyLabel(p)));
+      } else {
+        meta.appendChild(el('span', 'ml-badge plain', '自带连接信息'));
+      }
+      card.appendChild(meta);
+      // 发现面板按供应商就地展开：它用的就是这个供应商的地址与密钥，天然归位。
+      if (p && st.discover === p.id) {
+        card.appendChild(mlDiscoverPanel(p.id));
+      } else {
+        const list2 = el('div', 'ml-mlist');
+        modelsOfProvider(p ? p.id : '').filter(pass).forEach(function (m) {
+          const isSel = st.sel && st.sel.type === 'model' && st.sel.id === m.id;
+          const c = el('div', 'ml-mcard' + (m.id === activeModelId ? ' active' : '') + (isSel ? ' sel' : ''));
+          const nm = el('div', 'nm');
+          nm.appendChild(el('span', null, m.name || m.id));
+          if (m.id === activeModelId) nm.appendChild(el('span', 'ml-badge cur', '当前'));
+          mlCapabilityBadges(m, nm);
+          c.appendChild(nm);
+          c.appendChild(el('div', 'id', m.id));
+          const row2 = el('div', 'row2');
+          row2.appendChild(el('span', 'ml-tag', fmtCtx(m.ctx_in) + '/' + fmtCtx(m.ctx_out)));
+          if (m.rpm > 0) row2.appendChild(el('span', 'ml-badge warn', m.rpm + ' RPM'));
+          const acts = el('div', 'acts');
+          if (m.id !== activeModelId) acts.appendChild(mlBtn('启用', 'sm', function (e) { e.stopPropagation(); mlApplyModel(m.id); }));
+          acts.appendChild(mlBtn('编辑', 'sm', function (e) { e.stopPropagation(); st.sel = { type: 'model', id: m.id }; renderModelLayouts(); }));
+          const del = mlBtn('删除', 'sm', function (e) { e.stopPropagation(); mlAskDelete(del, m.name || m.id, function () { return mlDeleteModel(m.id, m.name || m.id); }); });
+          del.classList.add('del');
+          acts.appendChild(del);
+          row2.appendChild(acts);
+          c.appendChild(row2);
+          c.addEventListener('click', function () { st.sel = { type: 'model', id: m.id }; renderModelLayouts(); });
+          list2.appendChild(c);
+        });
+        const ghost = el('div', 'ml-addghost', '＋ 添加模型到' + (p ? (p.name || p.id) : '本组'));
+        ghost.addEventListener('click', function () { mlOpenModelDialog(null, p ? p.id : ''); });
+        list2.appendChild(ghost);
+        card.appendChild(list2);
+      }
+      cards.appendChild(card);
+    }
+
+    if (st.filter === 'all' || st.filter === '__none') {
+      const unModels = modelsOfProvider('').filter(pass);
+      if (unModels.length || st.filter === '__none') providerCard(null, true);
+    }
+    providersCache.forEach(function (p) {
+      if (st.filter === 'all' || st.filter === p.id) providerCard(p, false);
+    });
+    if (!cards.children.length) {
+      const empty = el('div', 'ml-pcard');
+      empty.appendChild(el('div', 'ml-empty', '没有符合条件的模型：换个筛选，或点上方添加'));
+      cards.appendChild(empty);
+    }
+    board.appendChild(cards);
+    shell.appendChild(board);
+
+    // 右栏：检视（就地编辑，不弹窗）
+    shell.appendChild(mlInspector(st));
+
+    host.appendChild(shell);
+    qIn.addEventListener('input', function () {
+      st.q = qIn.value;
+      renderModelLayouts();
+      const next = host.querySelector('.ml-search input');
+      if (next) { next.focus(); next.setSelectionRange(next.value.length, next.value.length); }
+    });
+  }
+
+  function mlInspector(st) {
+    const box = el('div', 'ml-inspector');
+    const sel = st.sel;
+    if (!sel) {
+      box.appendChild(el('div', 'empty', '选中一张模型卡片或供应商菜单，在这里编辑（不弹窗）'));
+      return box;
+    }
+    const head = el('div', 'ml-bar');
+    head.appendChild(el('b', null, sel.type === 'model' ? '编辑模型' : '供应商设置'));
+    const sp = el('span', 'ml-sp');
+    head.appendChild(sp);
+    head.appendChild(mlBtn('✕', 'sm ghost', function () { st.sel = null; renderModelLayouts(); }));
+    box.appendChild(head);
+
+    if (sel.type === 'prov') {
+      const p = findProvider(sel.id);
+      if (!p) { st.sel = null; return box; }
+      const form = mlProviderForm(p);
+      box.appendChild(form.node);
+      const foot = el('div', 'ml-foot');
+      const note = el('span', 'ml-note');
+      const testBtn = button('测试连接', '', function () {
+        mlNote(note, null, '测试中…');
+        mlApi('/api/models/discover', { provider_id: p.id }).then(function (d) {
+          if (d.ok) mlNote(note, true, '连接正常，上游 ' + (d.models || []).length + ' 个模型可用');
+          else mlNote(note, false, '失败：' + (d.error || '未知错误'));
+        });
+      });
+      testBtn.className = 'ml-btn';
+      const discBtn = button('获取模型列表', '', function () {
+        st.discover = p.id;
+        renderModelLayouts();
+      });
+      discBtn.className = 'ml-btn';
+      const saveBtn = button('保存供应商', 'primary', function () {
+        const body = form.read();
+        mlNote(note, null, '保存中…');
+        mlSaveProvider(body).then(function (ok) {
+          if (ok) mlNote(note, true, '已保存');
+          else mlNote(note, false, '保存失败');
+        });
+      });
+      saveBtn.className = 'ml-btn primary';
+      foot.appendChild(note);
+      foot.appendChild(el('span', 'ml-sp'));
+      foot.appendChild(testBtn);
+      foot.appendChild(discBtn);
+      foot.appendChild(saveBtn);
+      box.appendChild(foot);
+      return box;
+    }
+
+    const m = modelsCache.filter(function (x) { return x.id === sel.id; })[0];
+    if (!m) { st.sel = null; return box; }
+    const p = m.provider_id ? findProvider(m.provider_id) : null;
+    const info = el('div', 'ml-ro');
+    info.textContent = p
+      ? (p.name || p.id) + ' · ' + p.base_url + ' · 密钥 ' + providerKeyLabel(p)
+      : '未归属：' + (m.base_url || '未设置地址');
+    box.appendChild(mlBox('连接来源', info));
+    const form = mlModelForm(m, { hideConnection: true });
+    box.appendChild(form.node);
+    const foot = el('div', 'ml-foot');
+    const note = el('span', 'ml-note');
+    const applyBtn = button(m.id === activeModelId ? '当前生效中' : '设为当前', '', function () { mlApplyModel(m.id); });
+    applyBtn.className = 'ml-btn';
+    applyBtn.disabled = m.id === activeModelId;
+    const delBtn = button('删除', 'danger', function () {
+      mlAskDelete(delBtn, m.name || m.id, function () { return mlDeleteModel(m.id, m.name || m.id); });
+    });
+    delBtn.className = 'ml-btn danger';
+    const saveBtn = button('保存', 'primary', function () {
+      const body = form.read();
+      const oldId = m.id;
+      mlNote(note, null, '保存中…');
+      mlSaveModel(body, null, function (msg) { mlNote(note, false, msg); }).then(function (ok) {
+        if (!ok) return;
+        // 改了 id：老条目已被服务端按新 id 覆盖，这里只更新本地选中态。
+        if (oldId !== body.id) st.sel = { type: 'model', id: body.id };
+      });
+    });
+    saveBtn.className = 'ml-btn primary';
+    foot.appendChild(note);
+    foot.appendChild(el('span', 'ml-sp'));
+    foot.appendChild(applyBtn);
+    foot.appendChild(delBtn);
+    foot.appendChild(saveBtn);
+    box.appendChild(foot);
+    return box;
+  }
+
+  // ---------- 布局 C：三栏工作台 ----------
+  // 与另两套的差别：**零弹窗**。选中即编辑，改的是树节点对应的那份配置；
+  // 「上游模型发现」常驻右栏，不再需要点开再点关。
+  function mlRenderStudio(host) {
+    const st = mlState.studio;
+    const shell = el('div', 'ml-c');
+
+    // 左：结构树
+    const tree = el('div', 'ml-tree');
+    const qIn = mkInput('search', st.q, '搜索…');
+    qIn.className = 'ml-inp';
+    qIn.style.width = '100%';
+    qIn.style.marginBottom = '8px';
+    tree.appendChild(qIn);
+    function pass(m) {
+      const q = (st.q || '').trim().toLowerCase();
+      if (!q) return true;
+      return ((m.name || '') + ' ' + m.id).toLowerCase().indexOf(q) >= 0;
+    }
+    providersCache.forEach(function (p) {
+      const n = button('', '', function () { st.sel = { kind: 'prov', id: p.id }; renderModelLayouts(); });
+      n.className = 'ml-tnode' + (st.sel && st.sel.kind === 'prov' && st.sel.id === p.id ? ' sel' : '');
+      const tw = el('span', 'tw', st.folded[p.id] ? '▸' : '▾');
+      tw.addEventListener('click', function (e) {
+        e.stopPropagation();
+        st.folded[p.id] = !st.folded[p.id];
+        renderModelLayouts();
+      });
+      n.appendChild(tw);
+      n.appendChild(el('span', 'ml-dot' + (p.disabled ? ' off' : '')));
+      n.appendChild(el('span', 'lbl', p.name || p.id));
+      n.appendChild(el('span', 'cnt', String(modelsOfProvider(p.id).filter(pass).length)));
+      tree.appendChild(n);
+      if (!st.folded[p.id]) {
+        modelsOfProvider(p.id).filter(pass).forEach(function (m) {
+          const l = button('', '', function () { st.sel = { kind: 'model', id: m.id }; renderModelLayouts(); });
+          l.className = 'ml-tnode leaf' +
+            (st.sel && st.sel.kind === 'model' && st.sel.id === m.id ? ' sel' : '') +
+            (m.id === activeModelId ? ' active' : '');
+          l.appendChild(el('span', 'tw', m.id === activeModelId ? '●' : '·'));
+          l.appendChild(el('span', 'lbl', m.name || m.id));
+          l.appendChild(el('span', 'cnt', fmtCtx(m.ctx_in)));
+          tree.appendChild(l);
+        });
+      }
+    });
+    const un = modelsOfProvider('').filter(pass);
+    if (un.length) {
+      tree.appendChild(el('div', 'ml-tree-sec', '未归属'));
+      un.forEach(function (m) {
+        const l = button('', '', function () { st.sel = { kind: 'model', id: m.id }; renderModelLayouts(); });
+        l.className = 'ml-tnode leaf' +
+          (st.sel && st.sel.kind === 'model' && st.sel.id === m.id ? ' sel' : '') +
+          (m.id === activeModelId ? ' active' : '');
+        l.appendChild(el('span', 'tw', m.id === activeModelId ? '●' : '·'));
+        l.appendChild(el('span', 'lbl', m.name || m.id));
+        tree.appendChild(l);
+      });
+    }
+    shell.appendChild(tree);
+
+    // 中：工作区（当前选中对象的表单）
+    const ws = el('div', 'ml-ws');
+    const sel = st.sel;
+    if (!sel) {
+      ws.appendChild(el('div', 'crumb', '未选中'));
+      ws.appendChild(el('h3', null, '在左侧选一个模型或供应商'));
+      ws.appendChild(el('p', 'ml-hint', '选中即在这里编辑，不弹窗；「上游模型发现」在右栏常驻。'));
+    } else if (sel.kind === 'model') {
+      const m = modelsCache.filter(function (x) { return x.id === sel.id; })[0];
+      if (m) mlStudioModelWorkspace(ws, m, st);
+      else { st.sel = { kind: 'prov', id: (providersCache[0] || {}).id || '' }; }
+    } else {
+      const p = findProvider(sel.id);
+      if (p) mlStudioProviderWorkspace(ws, p, st);
+      else {
+        st.sel = { kind: 'model', id: (modelsCache[0] || {}).id || '' };
+        ws.appendChild(el('div', 'crumb', '供应商已不存在'));
+        ws.appendChild(el('h3', null, '已跳转到第一个模型'));
+      }
+    }
+    shell.appendChild(ws);
+
+    // 右：上下文
+    shell.appendChild(mlStudioContext(st));
+    host.appendChild(shell);
+    qIn.addEventListener('input', function () {
+      st.q = qIn.value;
+      renderModelLayouts();
+      const next = host.querySelector('.ml-tree input');
+      if (next) { next.focus(); next.setSelectionRange(next.value.length, next.value.length); }
+    });
+  }
+
+  function mlStudioModelWorkspace(ws, m, st) {
+    const p = m.provider_id ? findProvider(m.provider_id) : null;
+    ws.appendChild(el('div', 'crumb', '模型库 / ' + (p ? (p.name || p.id) : '未归属') + ' / ' + (m.name || m.id)));
+    const ttl = el('div', 'ml-bar');
+    ttl.appendChild(el('h3', null, m.name || m.id));
+    if (m.id === activeModelId) ttl.appendChild(el('span', 'ml-badge cur', '当前生效'));
+    if (p && p.disabled) ttl.appendChild(el('span', 'ml-badge warn', '供应商已停用'));
+    ws.appendChild(ttl);
+
+    const s1 = el('div', 'ml-section');
+    s1.appendChild(el('h4', null, '标识'));
+    const form = mlModelForm(m, { hideConnection: true });
+    s1.appendChild(form.node);
+    ws.appendChild(s1);
+
+    const foot = el('div', 'ml-foot');
+    const note = el('span', 'ml-note');
+    const applyBtn = button(m.id === activeModelId ? '已是当前生效' : '设为当前生效', '', function () { mlApplyModel(m.id); });
+    applyBtn.className = 'ml-btn';
+    applyBtn.disabled = m.id === activeModelId;
+    const delBtn = button('删除模型', 'danger', function () {
+      mlAskDelete(delBtn, m.name || m.id, function () {
+        return mlDeleteModel(m.id, m.name || m.id).then(function () {
+          st.sel = { kind: 'prov', id: m.provider_id || '' };
+        });
+      });
+    });
+    delBtn.className = 'ml-btn danger';
+    const saveBtn = button('保存修改', 'primary', function () {
+      const body = form.read();
+      mlNote(note, null, '保存中…');
+      mlSaveModel(body, null, function (msg) { mlNote(note, false, msg); }).then(function (ok) {
+        if (!ok) return;
+        if (body.id !== m.id) st.sel = { kind: 'model', id: body.id };
+        mlNote(note, true, '已保存');
+      });
+    });
+    saveBtn.className = 'ml-btn primary';
+    foot.appendChild(note);
+    foot.appendChild(el('span', 'ml-sp'));
+    foot.appendChild(applyBtn);
+    foot.appendChild(delBtn);
+    foot.appendChild(saveBtn);
+    ws.appendChild(foot);
+  }
+
+  function mlStudioProviderWorkspace(ws, p, st) {
+    ws.appendChild(el('div', 'crumb', '模型库 / 供应商 / ' + (p.name || p.id)));
+    const ttl = el('div', 'ml-bar');
+    ttl.appendChild(el('h3', null, p.name || p.id));
+    ttl.appendChild(el('span', 'ml-badge ' + (p.disabled ? 'warn' : 'ok'), p.disabled ? '已停用' : '已启用'));
+    ttl.appendChild(el('span', 'ml-badge info', modelsOfProvider(p.id).length + ' 个模型'));
+    ws.appendChild(ttl);
+
+    const s1 = el('div', 'ml-section');
+    s1.appendChild(el('h4', null, '连接配置'));
+    const form = mlProviderForm(p);
+    s1.appendChild(form.node);
+    ws.appendChild(s1);
+
+    // 其下模型：工作区内的小表，点行即切换选中（不弹窗）。
+    const list = modelsOfProvider(p.id);
+    const s2 = el('div', 'ml-section');
+    s2.appendChild(el('h4', null, '其下模型 · ' + list.length + ' 个（共用上面的地址与密钥）'));
+    const tbl = el('table', 'ml-rows');
+    const thead = el('thead');
+    const hr = el('tr');
+    ['名称', '模型 id', '上下文', 'RPM', ''].forEach(function (h) { hr.appendChild(el('th', null, h)); });
+    thead.appendChild(hr);
+    tbl.appendChild(thead);
+    const tbody = el('tbody');
+    if (!list.length) {
+      const tr = el('tr');
+      const td = el('td', null, '该供应商下暂无模型 —— 用左上「＋ 模型」，只需填模型 id。');
+      td.colSpan = 5;
+      td.style.color = 'var(--text-dim)';
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    }
+    list.forEach(function (m) {
+      const tr = el('tr', m.id === activeModelId ? '' : '');
+      if (m.id === activeModelId) tr.style.background = 'var(--accent-dim)';
+      tr.appendChild(el('td', null, m.name || m.id));
+      tr.appendChild(el('td', null, m.id));
+      tr.appendChild(el('td', null, fmtCtx(m.ctx_in) + ' / ' + fmtCtx(m.ctx_out)));
+      tr.appendChild(el('td', null, m.rpm > 0 ? String(m.rpm) : '—'));
+      const td = el('td');
+      const b = button('编辑', 'sm', function () { st.sel = { kind: 'model', id: m.id }; renderModelLayouts(); });
+      b.className = 'ml-btn sm';
+      td.appendChild(b);
+      tr.appendChild(td);
+      tr.addEventListener('click', function () { st.sel = { kind: 'model', id: m.id }; renderModelLayouts(); });
+      tbody.appendChild(tr);
+    });
+    tbl.appendChild(tbody);
+    s2.appendChild(tbl);
+    ws.appendChild(s2);
+
+    const foot = el('div', 'ml-foot');
+    const note = el('span', 'ml-note');
+    const testBtn = button('测试连接', '', function () {
+      mlNote(note, null, '测试中…');
+      mlApi('/api/models/discover', { provider_id: p.id }).then(function (d) {
+        if (d.ok) mlNote(note, true, '连接正常，上游 ' + (d.models || []).length + ' 个模型');
+        else mlNote(note, false, '失败：' + (d.error || '未知错误'));
+      });
+    });
+    testBtn.className = 'ml-btn';
+    const delBtn = button('删除供应商', 'danger', function () {
+      mlAskDelete(delBtn, p.name || p.id, function () {
+        return mlDeleteProvider(p).then(function () { st.sel = { kind: 'model', id: (modelsCache[0] || {}).id || '' }; });
+      });
+    });
+    delBtn.className = 'ml-btn danger';
+    const saveBtn = button('保存', 'primary', function () {
+      const body = form.read();
+      mlNote(note, null, '保存中…');
+      mlSaveProvider(body).then(function (ok) { mlNote(note, ok, ok ? '已保存' : '保存失败'); });
+    });
+    saveBtn.className = 'ml-btn primary';
+    foot.appendChild(note);
+    foot.appendChild(el('span', 'ml-sp'));
+    foot.appendChild(testBtn);
+    foot.appendChild(delBtn);
+    foot.appendChild(saveBtn);
+    ws.appendChild(foot);
+  }
+
+  function mlStudioContext(st) {
+    const box = el('div', 'ml-ctx');
+    const sel = st.sel;
+    function kv(k, v) {
+      const r = el('div', 'ml-kv');
+      r.appendChild(el('span', 'k', k));
+      r.appendChild(el('span', 'v', v));
+      return r;
+    }
+    if (sel && sel.kind === 'model') {
+      const m = modelsCache.filter(function (x) { return x.id === sel.id; })[0];
+      if (m) {
+        const p = m.provider_id ? findProvider(m.provider_id) : null;
+        const sec = el('div', 'sec');
+        sec.appendChild(el('h5', null, '模型摘要'));
+        sec.appendChild(kv('上下文', fmtCtx(m.ctx_in) + ' / ' + fmtCtx(m.ctx_out)));
+        sec.appendChild(kv('RPM', m.rpm > 0 ? m.rpm + ' /min' : '不限'));
+        sec.appendChild(kv('图片', m.vision === true ? '支持' : (m.vision === false ? '不支持' : '未声明')));
+        sec.appendChild(kv('视频', m.video === true ? '支持' : (m.video === false ? '不支持' : '未声明')));
+        box.appendChild(sec);
+        if (p) {
+          const s2 = el('div', 'sec');
+          s2.appendChild(el('h5', null, '同供应商其他模型'));
+          const sib = modelsOfProvider(p.id).filter(function (x) { return x.id !== m.id; });
+          if (!sib.length) s2.appendChild(el('p', 'ml-hint', '仅此一个模型。'));
+          sib.forEach(function (x) {
+            const b = button('', '', function () { st.sel = { kind: 'model', id: x.id }; renderModelLayouts(); });
+            b.className = 'ml-mini';
+            b.appendChild(el('span', 'nm', x.name || x.id));
+            if (x.id === activeModelId) b.appendChild(el('span', 'ml-badge cur', '当前'));
+            const act = button('切', 'sm', function (e) { e.stopPropagation(); mlApplyModel(x.id); });
+            act.className = 'ml-btn sm';
+            b.appendChild(act);
+            s2.appendChild(b);
+          });
+          box.appendChild(s2);
+        }
+      }
+    } else if (sel && sel.kind === 'prov') {
+      const p = findProvider(sel.id);
+      if (p) {
+        const sec = el('div', 'sec');
+        sec.appendChild(el('h5', null, '上游模型发现'));
+        sec.appendChild(mlDiscoverPanel(p.id));
+        box.appendChild(sec);
+      }
+    }
+    const g = el('div', 'sec');
+    g.appendChild(el('h5', null, '全局'));
+    g.appendChild(kv('模型', String(modelsCache.length)));
+    g.appendChild(kv('供应商', String(providersCache.length)));
+    g.appendChild(kv('已停用', String(providersCache.filter(function (x) { return x.disabled; }).length)));
+    g.appendChild(kv('有限速', String(modelsCache.filter(function (m) { return m.rpm > 0; }).length)));
+    box.appendChild(g);
+    return box;
+  }
+
+  // 供应商表单：A 的抽屉、B 的检视、C 的工作台共用同一份。
+  // key_touched 只在用户真的动过明文框时为真 —— 列表是脱敏视图，
+  // 明文框空只说明回显受限，绝不能被当成「用户清空了密钥」。
+  function mlProviderForm(p) {
+    const grid = el('div', 'ml-grid2');
+    const nameIn = mkInput('text', p ? p.name : '', '如 硅基流动');
+    nameIn.className = 'ml-inp';
+    const urlIn = mkInput('text', p ? p.base_url : '', 'https://api.example.com/v1');
+    urlIn.className = 'ml-inp';
+    const protoSel = el('select', 'ml-sel');
+    ['openai', 'anthropic'].forEach(function (v) {
+      const o = el('option', null, v === 'anthropic' ? 'Anthropic' : 'OpenAI');
+      o.value = v;
+      protoSel.appendChild(o);
+    });
+    protoSel.value = (p && p.protocol) || 'openai';
+    grid.appendChild(mlBox('名称', nameIn));
+    grid.appendChild(mlBox('Base URL', urlIn));
+    grid.appendChild(mlBox('兼容协议', protoSel));
+
+    let src = (p && p.key_source === 'plain') ? 'plain' : 'env';
+    const seg = el('span', 'ml-seg');
+    const envBtn = button('环境变量', '', function () { src = 'env'; apply(); });
+    const plainBtn = button('明文密钥', '', function () { src = 'plain'; apply(); });
+    seg.appendChild(envBtn);
+    seg.appendChild(plainBtn);
+    const envIn = mkInput('text', (p && p.key_source === 'env' ? p.key_name : '') || '', '变量名，如 SILICONFLOW_API_KEY');
+    envIn.className = 'ml-inp';
+    const plainIn = mkInput('password', (p && p.key_source === 'plain' ? p.key_plain : '') || '',
+      (p && p.key_set && p.key_source !== 'plain') ? '已保存（留空保持不变）' : 'sk-… 或 ${VAR}');
+    plainIn.className = 'ml-inp';
+    const eye = button('👁', 'sm', function () {
+      const show = plainIn.type === 'password';
+      plainIn.type = show ? 'text' : 'password';
+      eye.textContent = show ? '🙈' : '👁';
+    });
+    eye.className = 'ml-btn sm';
+    let touched = false;
+    plainIn.addEventListener('input', function () { touched = true; apply(); });
+    function apply() {
+      envBtn.classList.toggle('on', src === 'env');
+      plainBtn.classList.toggle('on', src === 'plain');
+      envIn.style.display = src === 'env' ? '' : 'none';
+      plainIn.style.display = src === 'plain' ? '' : 'none';
+      eye.style.display = (src === 'plain' && plainIn.value) ? '' : 'none';
+    }
+    envIn.addEventListener('input', function () { touched = true; });
+    apply();
+    const keyRow = el('div');
+    keyRow.style.cssText = 'display:flex;gap:8px';
+    keyRow.appendChild(seg);
+    keyRow.appendChild(envIn);
+    keyRow.appendChild(plainIn);
+    keyRow.appendChild(eye);
+    grid.appendChild(mlBox('密钥（环境变量档：配置文件只存变量名）', keyRow, true));
+
+    const disWrap = el('label', 'ml-fbox wide');
+    disWrap.style.cssText = 'flex-direction:row;align-items:center;gap:8px';
+    const disCb = document.createElement('input');
+    disCb.type = 'checkbox';
+    disCb.checked = !!(p && p.disabled);
+    disWrap.appendChild(disCb);
+    disWrap.appendChild(el('span', null, '停用该供应商（其下模型不可选用，配置保留）'));
+    grid.appendChild(disWrap);
+
+    function read() {
+      return {
+        id: p ? p.id : newProviderId(nameIn.value.trim()),
+        name: nameIn.value.trim(),
+        base_url: urlIn.value.trim(),
+        protocol: protoSel.value,
+        key_source: src,
+        key_name: src === 'env' ? envIn.value.trim() : '',
+        key_value: src === 'plain' ? plainIn.value : '',
+        key_touched: touched,
+        disabled: disCb.checked
+      };
+    }
+    return { node: grid, read: read };
+  }
+  function mlSaveProvider(body) {
+    if (!body.name) { showBanner('名称不能为空', 'error'); return Promise.resolve(false); }
+    if (!body.base_url) { showBanner('Base URL 不能为空', 'error'); return Promise.resolve(false); }
+    return mlApi('/api/providers/save', body).then(function (d) {
+      if (!d.ok) {
+        showBanner('保存失败：' + (d.error || '未知错误'), 'error');
+        return false;
+      }
+      showBanner('供应商已保存' + (d.hot ? '，当前生效模型已改用新配置' : ''), 'info');
+      return refreshModelViews().then(function () { return true; });
+    });
+  }
+  function mlOpenProviderDialog(p) {
+    const mask = el('div', 'ml-mask ml-modal-mask');
+    const modal = el('div', 'ml-modal');
+    modal.style.width = '560px';
+    mask.appendChild(modal);
+    document.body.appendChild(mask);
+    const head = el('header');
+    head.appendChild(el('h2', null, p ? '编辑供应商' : '新建供应商'));
+    const x = button('✕', 'x', close);
+    x.className = 'ml-x';
+    head.appendChild(x);
+    modal.appendChild(head);
+    const body = el('div', 'body');
+    const form = mlProviderForm(p);
+    body.appendChild(form.node);
+    modal.appendChild(body);
+    const foot = el('footer');
+    const note = el('span', 'ml-note');
+    const cancel = button('取消', '', close);
+    cancel.className = 'ml-btn';
+    const save = button('保存供应商', 'primary', function () {
+      save.disabled = true;
+      mlNote(note, null, '保存中…');
+      mlSaveProvider(form.read()).then(function (ok) {
+        if (ok) close();
+        else { mlNote(note, false, '保存失败'); save.disabled = false; }
+      });
+    });
+    save.className = 'ml-btn primary';
+    foot.appendChild(note);
+    foot.appendChild(el('span', 'ml-sp'));
+    foot.appendChild(cancel);
+    foot.appendChild(save);
+    modal.appendChild(foot);
+    function close() { mask.remove(); }
+    mask.addEventListener('click', function (e) { if (e.target === mask) close(); });
+    requestAnimationFrame(function () { mask.classList.add('on'); });
+  }
+
+  // 供应商抽屉：表格布局用的「左列供应商 / 右列详情」形态。
+  function mlOpenProviderDrawer() {
+    const mask = el('div', 'ml-mask');
+    const drawer = el('aside', 'ml-drawer');
+    mask.appendChild(drawer);
+    document.body.appendChild(mask);
+    let selected = (providersCache[0] || {}).id || null;
+
+    function close() {
+      mask.remove();
+      drawer.remove();
+    }
+    function render() {
+      drawer.innerHTML = '';
+      const head = el('header');
+      head.appendChild(el('h2', null, '供应商管理'));
+      const x = button('✕', 'x', close);
+      x.className = 'ml-x';
+      head.appendChild(x);
+      drawer.appendChild(head);
+      const body = el('div', 'body');
+
+      const tabs = el('div', 'ml-bar');
+      providersCache.forEach(function (p) {
+        const b = button((p.name || p.id) + ' · ' + modelsOfProvider(p.id).length, '', function () {
+          selected = p.id;
+          render();
+        });
+        b.className = 'ml-btn sm' + (selected === p.id ? ' primary' : '');
+        tabs.appendChild(b);
+      });
+      const addT = button('＋ 新增', 'sm', function () { close(); mlOpenProviderDialog(null); });
+      addT.className = 'ml-btn sm';
+      tabs.appendChild(addT);
+      body.appendChild(tabs);
+
+      const p = selected ? findProvider(selected) : null;
+      if (!p) {
+        body.appendChild(el('p', 'ml-hint', '还没有供应商：先建一个（填名称 / Base URL / 密钥），之后在同一供应商下添加模型只需填模型 id。'));
+        body.appendChild(mlBtn('＋ 新建供应商', 'primary', function () { close(); mlOpenProviderDialog(null); }));
+      } else {
+        const form = mlProviderForm(p);
+        body.appendChild(form.node);
+        const foot = el('div', 'ml-foot');
+        const note = el('span', 'ml-note');
+        const testBtn = button('测试连接', '', function () {
+          mlNote(note, null, '测试中…');
+          mlApi('/api/models/discover', { provider_id: p.id }).then(function (d) {
+            if (d.ok) mlNote(note, true, '连接正常，上游 ' + (d.models || []).length + ' 个模型可用');
+            else mlNote(note, false, '失败：' + (d.error || '未知错误'));
+          });
+        });
+        testBtn.className = 'ml-btn';
+        const saveBtn = button('保存供应商', 'primary', function () {
+          saveBtn.disabled = true;
+          mlNote(note, null, '保存中…');
+          mlSaveProvider(form.read()).then(function (ok) {
+            saveBtn.disabled = false;
+            mlNote(note, ok, ok ? '已保存' : '保存失败');
+            if (ok) render();
+          });
+        });
+        saveBtn.className = 'ml-btn primary';
+        const delBtn = button('删除', 'danger', function () {
+          mlAskDelete(delBtn, p.name || p.id, function () {
+            return mlDeleteProvider(p).then(function () {
+              selected = (providersCache[0] || {}).id || null;
+              render();
+            });
+          });
+        });
+        delBtn.className = 'ml-btn danger';
+        foot.appendChild(note);
+        foot.appendChild(el('span', 'ml-sp'));
+        foot.appendChild(testBtn);
+        foot.appendChild(delBtn);
+        foot.appendChild(saveBtn);
+        body.appendChild(foot);
+
+        const list = modelsOfProvider(p.id);
+        const sec = el('div', 'ml-section');
+        const head2 = el('div', 'ml-bar');
+        head2.appendChild(el('b', null, '其下模型 · ' + list.length));
+        head2.appendChild(el('span', 'ml-sp'));
+        head2.appendChild(mlBtn('获取模型列表', 'sm', function () { close(); mlOpenDiscoverDialog(p.id); }));
+        head2.appendChild(mlBtn('＋ 添加模型', 'sm primary', function () { close(); mlOpenModelDialog(null, p.id); }));
+        sec.appendChild(head2);
+        list.forEach(function (m) {
+          const row = el('div', 'ml-bar');
+          row.style.borderBottom = '1px solid var(--border)';
+          row.style.padding = '7px 0';
+          const nm = el('div', 'ml-name');
+          nm.appendChild(el('b', null, m.name || m.id));
+          if (m.id === activeModelId) nm.appendChild(el('span', 'ml-badge cur', '当前'));
+          row.appendChild(nm);
+          const idEl = el('span', 'ml-hint', m.id);
+          idEl.style.flex = '1';
+          row.appendChild(idEl);
+          row.appendChild(mlBtn('编辑', 'sm ghost', function () { close(); mlOpenModelDialog(m); }));
+          sec.appendChild(row);
+        });
+        if (!list.length) sec.appendChild(el('p', 'ml-hint', '该供应商下暂无模型。'));
+        body.appendChild(sec);
+      }
+      drawer.appendChild(body);
+    }
+    render();
+    mask.addEventListener('click', close);
+    requestAnimationFrame(function () {
+      mask.classList.add('on');
+      drawer.classList.add('on');
+    });
+  }
+
+  // ---------- 布局总入口 ----------
+  // renderModelLayouts() 调它：模型库每次变更（增删改 / 切生效）后，
+  // 三套布局与经典视图都从这里重绘 —— 一个出口，不给任何一屏留「漏刷新的藏身处」。
+  function renderModelLayouts() {
+    const host = mlHost();
+    const section = mlSections();
+    if (!host || !section) return;
+    if (mlLayout === 'classic') {
+      section.classList.remove('ml-alt-active');
+      host.innerHTML = '';
+      return;
+    }
+    section.classList.add('ml-alt-active');
+    host.innerHTML = '';
+    if (mlLayout === 'table') mlRenderTable(host);
+    else if (mlLayout === 'cards') mlRenderCards(host);
+    else if (mlLayout === 'studio') mlRenderStudio(host);
+  }
+  // 切布局时清掉挂在 body 上的弹层/抽屉/确认条：那些节点属于**旧布局**的交互，
+  // 重绘不会碰它们（它们不在挂载点里），留着就是一层盖在页面上、再也关不掉的幽灵遮罩。
+  // 按选择器清而不是记引用：记引用要记得住每一条创建路径，漏一条就漏一个遮罩。
+  function closeStaleMlLayers() {
+    document.querySelectorAll('body > .ml-mask, body > .ml-drawer, body > .ml-pop').forEach(function (n) { n.remove(); });
+  }
+
+  function applyModelLayout(id) {
+    if (!ML_LAYOUTS.some(function (l) { return l.id === id; })) return;
+    mlLayout = id;
+    try { localStorage.setItem(ML_LAYOUT_KEY, id); } catch (e) { /* 隐私模式：忽略 */ }
+    document.querySelectorAll('#models-layouts-bar .models-layout').forEach(function (b) {
+      b.classList.toggle('active', b.dataset.layout === id);
+    });
+    closeStaleMlLayers();
+    // 经典布局在下面，先把它自己的数据拉齐（列表可能还是旧的缓存）
+    if (id === 'classic') loadModelViews();
+    else renderModelLayouts();
   }
 
   /* ---------- 栏 3：模型详情 / 编辑器 ---------- */
@@ -7734,6 +9401,13 @@
   }
 
   /* ---------- 模型页事件绑定 ---------- */
+  // 模型管理布局切换：表格 / 看板 / 工作台 / 经典。
+  // 首次进入先把 .active 打在持久化的那一档上，别让切换条显示「经典」
+  // 而实际渲染的是表格 —— 那是两套视图对不上的状态。
+  document.querySelectorAll('#models-layouts-bar .models-layout').forEach(function (b) {
+    b.classList.toggle('active', b.dataset.layout === mlLayout);
+    b.addEventListener('click', function () { applyModelLayout(b.dataset.layout); });
+  });
   $('#m-prov-new').addEventListener('click', function () { openProviderDetail(null); });
   $('#m-add').addEventListener('click', function () {
     var preset = (provSel && provSel !== ALL) ? provSel : '';

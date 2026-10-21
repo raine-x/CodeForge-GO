@@ -3060,6 +3060,80 @@ check('用 <details> 实现，与思考过程折叠块同一套做法', (functio
     /\.msg-explore \.explore-body\s*\{[^}]*flex-direction:\s*column/.test(css);
 })());
 
+// ---------- 模型管理：三套布局渲染在原来的模型页内 ----------
+// 三套布局与经典三栏（m3）并列，共用同一份 modelsCache / providersCache。
+// 下面钉的是**契约**，不是样式：出口唯一、经典不塌、切布局不留幽灵遮罩。
+group('模型管理：三套布局（表格 / 看板 / 工作台）渲染在原模型页内');
+check('布局切换条与挂载点都在 #page-models 内，且位置在 m3 三栏之前', (function () {
+  // 用下标比位置，不用大跨度的正则：中间夹着注释，字符数一改断言就假红。
+  const sec = htmlSrc.indexOf('<section id="page-models"');
+  const bar = htmlSrc.indexOf('id="models-layouts-bar"');
+  const host = htmlSrc.indexOf('id="model-layouts"');
+  const classic = htmlSrc.indexOf('<div class="m3" id="m3">');
+  const end = htmlSrc.indexOf('</section>', sec);
+  return sec >= 0 && bar > sec && host > bar && classic > host && classic < end;
+})() &&
+  /class="models-layout" data-layout="table">表格</.test(htmlSrc) &&
+  /class="models-layout" data-layout="cards">看板</.test(htmlSrc) &&
+  /class="models-layout" data-layout="studio">工作台</.test(htmlSrc) &&
+  /class="models-layout" data-layout="classic">经典</.test(htmlSrc));
+check('切换条只给三种新布局 + 经典，经典保留为可回退的那一套（m3 三栏不能没）',
+  (function () {
+    const m = htmlSrc.match(/data-layout="[a-z]+"/g) || [];
+    return m.length === 4;
+  })());
+check('非经典布局时 m3 三栏整块隐藏：两套视图不同时在场（同时在场会让 .prov-md 双栏高度链失效）',
+  /\.model-layouts\s*\{[^}]*display:\s*none/.test(cssCode) &&
+  /#page-models\.ml-alt-active > \.model-layouts\s*\{[^}]*display:\s*block/.test(cssCode) &&
+  /#page-models\.ml-alt-active > #m3\s*\{[^}]*display:\s*none/.test(cssCode));
+check('重绘唯一出口带上三套布局：漏了它就是「增删改了、切过去看不到」',
+  /function refreshModelViews\(\)[\s\S]{0,600}?renderModelLayouts\(\);/.test(uiSrc) &&
+  /function loadModelViews\(\)[\s\S]{0,400}?renderModelLayouts\(\);/.test(uiSrc));
+check('三套布局各有一个渲染函数，由 renderModelLayouts 按当前布局分派',
+  /function renderModelLayouts\(\)[\s\S]{0,900}?mlRenderTable\(host\)/.test(uiSrc) &&
+  /mlRenderCards\(host\)/.test(uiSrc) &&
+  /mlRenderStudio\(host\)/.test(uiSrc) &&
+  /mlLayout === 'classic'/.test(uiSrc));
+check('布局偏好持久化，切换条的 .active 跟着走（别出现「条上写经典、实际渲染表格」）',
+  /const ML_LAYOUT_KEY = 'cf_models_layout'/.test(uiSrc) &&
+  /localStorage\.setItem\(ML_LAYOUT_KEY, id\)/.test(uiSrc) &&
+  /b\.classList\.toggle\('active', b\.dataset\.layout === mlLayout\)/.test(uiSrc) &&
+  /b\.classList\.toggle\('active', b\.dataset\.layout === id\)/.test(uiSrc));
+check('切布局清掉挂在 body 上的弹层/抽屉/确认条：漏一类就留一层关不掉的遮罩',
+  /body > \.ml-mask, body > \.ml-drawer, body > \.ml-pop/.test(uiSrc) &&
+  /function closeStaleMlLayers\(\)/.test(uiSrc));
+check('三套布局的零件共用同一份表单实现（抄三遍必然分叉）',
+  /function mlModelForm\(m, opts\)/.test(uiSrc) &&
+  /function mlProviderForm\(p\)/.test(uiSrc) &&
+  /function mlDiscoverPanel\(providerId, onDone\)/.test(uiSrc) &&
+  /function mlTri\(value, onChange\)/.test(uiSrc));
+check('归属供应商时带 inherit_key，摘掉条目上历史遗留的自带密钥',
+  /body\.inherit_key = true;/.test(uiSrc) &&
+  /function mlSaveModel\(body, okMsg, onFail\)/.test(uiSrc));
+check('hideConnection 且未归属时**回带原连接信息**，不得因改个显示名把地址清空',
+  /body\.base_url = \(o\.hideConnection && m\) \? \(m\.base_url \|\| ''\) : urlIn\.value\.trim\(\);/.test(uiSrc) &&
+  /body\.protocol = \(o\.hideConnection && m\) \? \(m\.protocol \|\| 'openai'\) : protoSel\.value;/.test(uiSrc));
+check('三态控件的「不声明」回传 null，不是 false（压成布尔 = 模型永久收不到图）',
+  /onChange\(pair\[0\] === 'unset' \? null : pair\[0\] === 'yes'\)/.test(uiSrc) &&
+  /vision: vision,/.test(uiSrc) && /video: video/.test(uiSrc));
+check('密钥：只有用户真动过明文框才提交 key_touched（脱敏视图的空格 ≠ 用户清空）',
+  /key_touched: touched/.test(uiSrc) &&
+  /plainIn\.addEventListener\('input', function \(\) \{ touched = true; apply\(\); \}\)/.test(uiSrc));
+check('横幅等级只用 info / warn / error（CSS 只定义了这三档，别的等于没样式）',
+  !/showBanner\([^;]*?'ok'\)/.test(uiSrc));
+check('删除走原位二次确认 + busy 防连点，不用 confirm()（它会阻塞整页）',
+  /function mlAskDelete\(anchor, label, run\)/.test(uiSrc) &&
+  /if \(busy\) return;\s*\n\s*busy = true;/.test(uiSrc) &&
+  /Promise\.resolve\(run\(\)\)\.then\(close\)/.test(uiSrc));
+check('删除失败要查 d.ok，不能当成功刷新（否则界面显示已删、实际还在）',
+  /if \(!d\.ok\) \{[\s\S]{0,200}?showBanner\('删除失败：'/.test(uiSrc));
+check('三套布局的类名一律 ml- 前缀，不与设置页既有类名打架',
+  /\.ml-table\b/.test(cssCode) && /\.ml-pcard\b/.test(cssCode) && /\.ml-tnode\b/.test(cssCode) &&
+  /\.ml-drawer\b/.test(cssCode) && /\.ml-seg\b/.test(cssCode) &&
+  !/^\s*\.ml-table\s*\{/m.test(uiSrc));
+check('三套布局是页内视图，不再有独立页面残留（避免两处实现分叉）',
+  !/models-table\.html/.test(htmlSrc) && !/models-cards\.html/.test(htmlSrc) && !/models-studio\.html/.test(htmlSrc));
+
 console.log('\n' + '-'.repeat(52));
 if (failures.length) {
   console.log('失败 ' + failures.length + ' 项 / 通过 ' + passed + ' 项：');
