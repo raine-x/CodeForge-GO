@@ -4,12 +4,13 @@
 
 单文件静态二进制 · 零运行时依赖 · Windows / Linux / Android Termux
 
-[English](README_EN.md) | [精简版](README.md)
+[English](README_EN.md) | [项目首页](README.md)
 
 ---
 
 ## 目录
 
+- [界面截图](#界面截图)
 - [特性详解](#特性详解)
 - [快速开始](#快速开始)
 - [命令行参数](#命令行参数)
@@ -20,10 +21,17 @@
 - [目标模式](#目标模式)
 - [打断之后怎么接着跑](#打断之后怎么接着跑)
 - [测试](#测试)
+- [系统架构](#系统架构)
 - [目录结构](#目录结构)
 - [技术选型](#技术选型)
 
 ---
+
+## 界面截图
+
+![CodeForge-Go 在新建演示项目中列出文件](test/codeforge-demo.png)
+
+![深色主题下的外观设置](test/cf-ui-settings-dark.png)
 
 ## 特性详解
 
@@ -114,6 +122,12 @@ SQLite 用 `modernc.org/sqlite`（纯 Go 实现），所以不需要 C 编译器
 
 策略判定为 `Ask` 的操作会挂起，在界面上等你的决定。审批有独立超时（默认 15 分钟），与工具执行超时分开 —— 「用户拒绝」和「没人管」在界面上的说法不同。
 
+### 模型管理与上下文
+
+- 在设置里管理供应商、模型和连接配置。支持 OpenAI 兼容接口与 Anthropic 协议。可为每个模型配置请求频率（RPM）及图像、视频能力。
+- 图片和视频是否可发送取决于模型与接口能力。缺少图片能力时会提示并中止本轮。缺少视频能力时会提示并跳过视频。
+- 对话过长时会压缩发给模型的上下文，完整对话仍可回看。较大的工具输出保存在本地，智能体可通过 `tool_result_read` 分段读取。
+
 ### 其它
 
 - **断点续跑**：任务被打断后保留未完成轮次，可从断点重试或编辑重发。
@@ -128,10 +142,19 @@ SQLite 用 `modernc.org/sqlite`（纯 Go 实现），所以不需要 C 编译器
 
 ### 1. 构建
 
+也可以从 [GitHub Releases](https://github.com/raine-x/CodeForge-GO/releases) 下载预览版。源码构建需要 Go 1.25 或更新版本。
+
+Windows PowerShell 在仓库根目录执行：
+
+```powershell
+$env:CGO_ENABLED = '0'
+go build -trimpath -ldflags '-s -w' -o bin/codeforge.exe ./cmd/agent
+```
+
+以下命令适用于 Bash：
 ```bash
-# 本机（Windows 产物是 bin/codeforge.exe —— go build -o bin/codeforge 不会自动补
-# .exe，请显式写全后缀，否则会与 Makefile / cf.cmd 用的文件名不一致）
-CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/codeforge.exe ./cmd/agent
+# Linux / Termux 本机构建
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/codeforge ./cmd/agent
 
 # 交叉编译三件
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/codeforge-windows-amd64.exe ./cmd/agent
@@ -218,7 +241,7 @@ WARN  供应商库 config/providers.yaml 引用了未设置的环境变量：GAT
 # 方式二：直接运行 —— 两个路径都给绝对值，从哪启动都一样
 ./bin/codeforge -config /path/to/project/config -workdir /path/to/project
 
-# 方式三：Makefile（构建 + 启动，会自动切目录）
+# 方式三：Makefile（在仓库根目录构建并启动）
 make run
 
 # 无 GUI 服务器
@@ -270,7 +293,7 @@ codeforge -continue -workdir <目录>  先切到该工作区，再回到它上�
 
 ### 三条通用规则
 
-1. **`-config` 与 `-workdir` 都给绝对路径**。给绝对值之后从哪个目录启动都一样，不必切 CWD（用启动器或 `make run` 则是自动帮你切）。
+1. **`-config` 与 `-workdir` 都给绝对路径**。给绝对值之后从哪个目录启动都一样，不必切 CWD（也可以先切到仓库根目录，再用 `make run`）。
 2. **工作区必须是绝对路径** —— 相对路径没有意义（工作区没法相对自己），放任它会被按进程当前目录解析，换个启动方式工作区就变了。
 3. **配置的工作区不存在或不是目录**，按未选择工作区处理，不会静默设成工作目录。
 
@@ -342,7 +365,7 @@ chmod 600 /etc/codeforge/env && chown root:root /etc/codeforge/env
 .\bin\codeforge.exe -config config
 ```
 
-### Linux x86_64 / arm64
+### Linux x86_64
 
 ```bash
 chmod +x bin/codeforge-linux-amd64
@@ -519,6 +542,21 @@ CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o b
 有 Makefile 的话 `make test` / `make test-web` 可以一次跑完。
 
 ---
+
+## 系统架构
+
+浏览器通过 HTTP 和 WebSocket 连接 Go 服务。服务端把对话交给智能体，智能体通过模型适配层发起流式请求，并经统一执行器调用工具。执行器负责策略、审批和审计。SQLite 保存会话和文件检查点。
+
+| 组件 | 职责 |
+|---|---|
+| [cmd/agent](cmd/agent) | 命令行入口与服务启动 |
+| [web/dist](web/dist) · [web/embed.go](web/embed.go) | 浏览器界面及静态资源嵌入 |
+| [pkg/server](pkg/server) · [pkg/agent](pkg/agent) | HTTP 和 WebSocket、对话编排、上下文与子智能体 |
+| [pkg/llm](pkg/llm) | 模型协议、流式响应与限流 |
+| [pkg/tools](pkg/tools) · [pkg/security](pkg/security) · [pkg/backend](pkg/backend) | 工具执行、策略判定、文件及进程操作 |
+| [pkg/store](pkg/store) · [config](config) | SQLite 持久化与应用配置 |
+
+开发约定见 [AGENTS.md](AGENTS.md)。版本核对、三平台构建及附件校验见[发布流程](docs/releasing.md)。
 
 ## 目录结构
 

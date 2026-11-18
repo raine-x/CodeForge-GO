@@ -5596,7 +5596,7 @@
   // 白名单而非黑名单：localStorage 是用户可改的，存了别的东西时
   // 落回默认值（黑色），而不是给 #composer 挂一个谁都不认识的 class。
   const CBOX_STYLES = ['black', 'white', 'clear'];
-  const CBOX_DEFAULT = 'black';
+  const CBOX_DEFAULT = 'white';
   function applyComposerBox(v) {
     const box = document.getElementById('composer');
     if (!box) return;

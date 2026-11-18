@@ -1,25 +1,24 @@
-# CodeForge-Go
+# CodeForge-Go · English documentation
 
 **Chat with an AI coding agent in your browser. It reads, writes and runs commands inside your project directory.**
 
 Single static binary · Zero runtime dependencies · Windows / Linux / Android Termux
 
-[中文](README.md) | [中文详细版](README_ZH.md)
+[Project overview](README.md) · [简体中文详细文档](README_ZH.md)
 
-<!-- SCREENSHOT:PC -->
-> **Screenshot placeholder** — desktop UI (`test/cf-screenshot-chat.png`)
+## Contents
 
-<!-- SCREENSHOT:MOBILE -->
-> **Screenshot placeholder** — Android Termux WebView (`test/phone.png`)
+- [Features](#features)
+- [Quick start](#quick-start)
+- [Configuration and deployment](#configuration-and-deployment)
+- [Architecture and development](#architecture-and-development)
+- [License](#license)
 
-<!-- GIF:APPROVAL -->
-> **GIF placeholder** — human-in-the-loop approval: an `Ask` decision suspends the operation until you decide
+## Screenshots
 
-<!-- GIF:DIFF -->
-> **GIF placeholder** — diff preview: green/red file changes, click to jump to the change
+![CodeForge-Go listing files in a new demo project](test/codeforge-demo.png)
 
-<!-- GIF:MOBILE -->
-> **GIF placeholder** — mobile: sidebar collapses into a drawer on narrow screens, settings scroll horizontally
+[Light theme](test/cf-ui-light-theme.png) · [Appearance settings](test/cf-ui-settings-dark.png)
 
 ---
 
@@ -28,7 +27,7 @@ Single static binary · Zero runtime dependencies · Windows / Linux / Android T
 ### Conversation & execution
 
 - **Browser is the UI** — the same binary runs on a desktop, a headless server, and an Android phone; no graphical environment needed
-- **16 built-in tools** — file read/write/edit/delete, directory listing, search, `run_command`, todo list, memory, skill creation, web fetch & search, subagent delegation, goal verification, tool-result read-back
+- **Built-in tools** — file read/write/edit/delete, directory listing, search, `run_command`, todo list, memory, skill creation, web fetch & search, subagent delegation, goal verification, tool-result read-back
 - **Resume after interruption** — an interrupted turn is preserved; retry, edit-and-resend, or roll back the files along with it
 - **Steer mid-run** — inject an instruction while the agent is working; it merges at the next step boundary
 
@@ -99,7 +98,7 @@ Single static binary · Zero runtime dependencies · Windows / Linux / Android T
 
 ### Deployment
 
-- **Single static binary** — `CGO_ENABLED=0`, 16 MB; copying one file is the entire deployment
+- **Single static binary** — `CGO_ENABLED=0`, with the browser UI embedded in the executable
 - **Three-platform cross builds** — Windows x64 / Linux amd64 / Android Termux arm64
 - **Zero runtime dependencies** — 4 direct dependencies: WebSocket · WASM · YAML · system-call wrappers
 - **Pure-Go SQLite** — `modernc.org/sqlite`, no C compiler needed, so static builds are never blocked
@@ -107,41 +106,67 @@ Single static binary · Zero runtime dependencies · Windows / Linux / Android T
 
 ---
 
-## Engineering scale
-
-| | |
-|---|---|
-| Go code | 27.5k lines of production code + 29.3k lines of tests, 13 packages |
-| Tests | 138 test files, 76%~87% coverage in core packages |
-| Direct dependencies | 4 (`gorilla/websocket` · `wazero` · `yaml.v3` · `golang.org/x/sys`) |
-| Frontend | Hand-written single-file JS, zero build step |
-
----
-
 ## Quick start
+
+### Download
+
+Choose the executable for your platform from [GitHub Releases](https://github.com/raine-x/CodeForge-GO/releases). The available download is marked as a preview.
+
+| Platform | Asset |
+|---|---|
+| Windows x64 | `codeforge-windows-amd64.exe` |
+| Linux x64 | `codeforge-linux-amd64` |
+| Android ARM64 (Termux) | `codeforge-android-arm64` |
+
+Run the executable from a terminal. On Linux and Termux, grant execute permission with `chmod +x <asset>` and run `./<asset> -no-open`. Keep the Termux executable under `$HOME`.
+
+### Build from source
+
+Use Go 1.25 or later. Clone the repository and run the following from its root.
 
 ```bash
 git clone https://github.com/raine-x/CodeForge-GO.git
 cd CodeForge-GO
+```
 
-export CODEFORGE_API_KEY=sk-xxx      # read from the environment only; the program never reads key files
-go build -o bin/codeforge ./cmd/agent
+**Windows (PowerShell)**
+
+```powershell
+$env:CGO_ENABLED = '0'
+go build -trimpath -ldflags '-s -w' -o bin/codeforge.exe ./cmd/agent
+.\bin\codeforge.exe -no-open
+```
+
+**Linux / Termux**
+
+```bash
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/codeforge ./cmd/agent
 ./bin/codeforge -no-open
 ```
 
-Open <http://127.0.0.1:8420>, pick a workspace, start chatting.
+Open <http://127.0.0.1:8420>, choose a workspace, and configure a provider and model in Settings. Keep your API key in an environment variable such as `CODEFORGE_API_KEY`.
 
-Cross-compile for all three platforms:
+## Configuration and deployment
 
-```bash
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64   go build -trimpath -ldflags "-s -w" -o bin/codeforge-windows-amd64.exe ./cmd/agent
-CGO_ENABLED=0 GOOS=linux   GOARCH=amd64   go build -trimpath -ldflags "-s -w" -o bin/codeforge-linux-amd64 ./cmd/agent
-CGO_ENABLED=0 GOOS=android GOARCH=arm64   go build -trimpath -ldflags "-s -w" -o bin/codeforge-android-arm64 ./cmd/agent
-```
+- Run with `-config <directory>` to load settings from another directory and `-workdir <directory>` to set the initial workspace. See [default settings](config/default.yaml) and the [local override template](config/local.yaml.example).
+- Use the model settings page to configure the provider, model, and endpoint. For a provider-specific key, select its environment variable in Settings or reference it as `${VARIABLE_NAME}` in YAML.
+- Use `-no-open` on a headless host. By default the service listens on `127.0.0.1:8420`. You can reach it from another machine using an SSH tunnel with `ssh -L 8420:127.0.0.1:8420 user@server`.
+- To resume the most recent session for a workspace, use `-continue`. Use `-resume <id-or-title>` to select a specific session.
 
-Full configuration, key precedence and per-platform deployment: **[中文详细版](README_ZH.md)**.
+## Architecture and development
 
----
+The browser connects to the Go server over HTTP and WebSocket. The server forwards conversation turns to the agent. The agent streams requests to model providers and sends tool calls through an executor that checks policy, handles approvals, and records audit events. SQLite stores session data and file checkpoints.
+
+| Area | Implementation |
+|---|---|
+| Entry point | [cmd/agent](cmd/agent) starts the service and handles command-line options. |
+| Browser UI | [web/dist](web/dist) contains the UI sources, which [web/embed.go](web/embed.go) embeds in the binary. |
+| Server and orchestration | [pkg/server](pkg/server) serves HTTP and WebSocket. [pkg/agent](pkg/agent) manages conversation turns, context, and subagents. |
+| Model adapters | [pkg/llm](pkg/llm) handles provider protocols, streaming, and rate limits. |
+| Tool execution | [pkg/tools](pkg/tools) dispatches calls. [pkg/security](pkg/security) evaluates policies, and [pkg/backend](pkg/backend) provides filesystem and process operations. |
+| Persistence and configuration | [pkg/store](pkg/store) implements SQLite persistence. [config](config) defines and loads application settings. |
+
+From the repository root, run `go vet ./...` and `go test ./...`. Run `make test-web` for the three Node.js frontend test suites. See the [release guide](docs/releasing.md) for the platform build matrix and attachment checks, and [AGENTS.md](AGENTS.md) for repository development conventions.
 
 ## License
 

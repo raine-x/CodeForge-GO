@@ -2859,8 +2859,8 @@ check('JS 用白名单校验后落回默认，不给 #composer 挂野 class',
   /const CBOX_STYLES = \['black', 'white', 'clear'\]/.test(uiSrc) &&
   /CBOX_STYLES\.indexOf\(v\) >= 0 \? v : CBOX_DEFAULT/.test(uiSrc));
 
-check('默认黑色，且写入 localStorage（不落服务端）',
-  /const CBOX_DEFAULT = 'black'/.test(uiSrc) &&
+check('默认白色，且写入 localStorage（不落服务端）',
+  /const CBOX_DEFAULT = 'white'/.test(uiSrc) &&
   /localStorage\.setItem\('cf_composer_box'/.test(uiSrc) &&
   /fetch\('\/api\/appearance'[\s\S]{0,80}cf_composer_box/.test(uiSrc) === false);
 
