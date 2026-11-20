@@ -1,8 +1,10 @@
 # CodeForge-Go · English documentation
 
+For Android, use [CodeForge Mobile](https://github.com/raine-x/codeforge-mobile).
+
 **Chat with an AI coding agent in your browser. It reads, writes and runs commands inside your project directory.**
 
-Single static binary · Zero runtime dependencies · Windows / Linux / Android Termux
+Single static binary · Zero runtime dependencies · Windows / Linux
 
 [Project overview](README.md) · [简体中文详细文档](README_ZH.md)
 
@@ -26,7 +28,7 @@ Single static binary · Zero runtime dependencies · Windows / Linux / Android T
 
 ### Conversation & execution
 
-- **Browser is the UI** — the same binary runs on a desktop, a headless server, and an Android phone; no graphical environment needed
+- **Browser is the UI** — the same binary runs on a desktop or a headless server; no graphical environment needed
 - **Built-in tools** — file read/write/edit/delete, directory listing, search, `run_command`, todo list, memory, skill creation, web fetch & search, subagent delegation, goal verification, tool-result read-back
 - **Resume after interruption** — an interrupted turn is preserved; retry, edit-and-resend, or roll back the files along with it
 - **Steer mid-run** — inject an instruction while the agent is working; it merges at the next step boundary
@@ -88,7 +90,7 @@ Single static binary · Zero runtime dependencies · Windows / Linux / Android T
 - **Dark/light themes + custom background** — background image, blur and brightness adjustable
 - **Liquid glass toggle** — available in settings
 - **Mobile layout** — sidebar becomes a drawer on narrow screens, settings scroll horizontally, visible height measured with `visualViewport`
-- **Built-in picker** — a browser-style directory picker when no native dialog exists (Android Termux)
+- **Built-in picker** — a browser-style directory picker when no native dialog exists
 
 ### Extensibility
 
@@ -99,7 +101,7 @@ Single static binary · Zero runtime dependencies · Windows / Linux / Android T
 ### Deployment
 
 - **Single static binary** — `CGO_ENABLED=0`, with the browser UI embedded in the executable
-- **Three-platform cross builds** — Windows x64 / Linux amd64 / Android Termux arm64
+- **Release builds** — Windows x64 / Linux amd64
 - **Zero runtime dependencies** — 4 direct dependencies: WebSocket · WASM · YAML · system-call wrappers
 - **Pure-Go SQLite** — `modernc.org/sqlite`, no C compiler needed, so static builds are never blocked
 - **Access token** — a random token is generated when listening on a non-loopback address, delivered via HttpOnly cookie, validated by both API and WebSocket
@@ -116,9 +118,8 @@ Choose the executable for your platform from [GitHub Releases](https://github.co
 |---|---|
 | Windows x64 | `codeforge-windows-amd64.exe` |
 | Linux x64 | `codeforge-linux-amd64` |
-| Android ARM64 (Termux) | `codeforge-android-arm64` |
 
-Run the executable from a terminal. On Linux and Termux, grant execute permission with `chmod +x <asset>` and run `./<asset> -no-open`. Keep the Termux executable under `$HOME`.
+Run the executable from a terminal. On Linux, grant execute permission with `chmod +x <asset>` and run `./<asset> -no-open`.
 
 ### Build from source
 
@@ -137,7 +138,7 @@ go build -trimpath -ldflags '-s -w' -o bin/codeforge.exe ./cmd/agent
 .\bin\codeforge.exe -no-open
 ```
 
-**Linux / Termux**
+**Linux**
 
 ```bash
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/codeforge ./cmd/agent

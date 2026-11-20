@@ -1,8 +1,10 @@
 # CodeForge-Go · 中文详细版
 
+Android 用户请使用 [CodeForge Mobile](https://github.com/raine-x/codeforge-mobile)。
+
 **在浏览器里和 AI 编码智能体对话。它在你的项目目录里读写文件、跑命令、调模型。**
 
-单文件静态二进制 · 零运行时依赖 · Windows / Linux / Android Termux
+单文件静态二进制 · 零运行时依赖 · Windows / Linux
 
 [English](README_EN.md) | [项目首页](README.md)
 
@@ -42,7 +44,6 @@
 | 场景 | 怎么用 |
 |---|---|
 | **无 GUI 服务器** | SSH 上去启动，`-no-open` 免得它尝试拉浏览器；用本地浏览器访问 `http://<服务器地址>:8420` |
-| **Android Termux** | 手机上直接跑，浏览器开 `http://127.0.0.1:8420` |
 | **容器 / NAS / 树莓派** | 同服务器，暴露端口即可 |
 | **Windows / 桌面 Linux** | 启动后自动打开浏览器 |
 
@@ -57,16 +58,6 @@ server:
 ```
 
 > ⚠️ 改成 `0.0.0.0` 等于把 Agent 的读写权限暴露到网络上。服务自带访问令牌做防护，但**务必只在你信任的网络里这么做**，且不要直接暴露到公网。
-
-### 专为 Termux 与低配环境做的适配
-
-不是「顺便能跑」，是有专门处理：
-
-- **shell 探测**：Termux 上优先用 `$PREFIX/bin/bash`（Android 没有 `/bin/bash`），回退 `/bin/sh`。
-- **存储授权**：主动跑 `termux-setup-storage` 申请权限，授权后 `~/storage/shared` 软链可用。
-- **目录选择器**：没有原生文件夹对话框时用内置浏览器式选择器，起始目录挂在 `~`。
-- **进程组管理**：Android 的进程终止行为与桌面 Linux 不同，单独适配。
-- **内存软上限**：`GOMEMLIMIT` 按物理内存 25% 设定 —— 手机上给的内存配额通常远小于桌面。
 
 ### 低内存占用
 
@@ -97,7 +88,6 @@ server:
 |---|---|
 | Windows x64 | `bin/codeforge-windows-amd64.exe` |
 | Linux x86_64 / arm64 | `bin/codeforge-linux-amd64` |
-| Android Termux arm64 | `bin/codeforge-android-arm64` |
 
 SQLite 用 `modernc.org/sqlite`（纯 Go 实现），所以不需要 C 编译器。
 
@@ -153,13 +143,12 @@ go build -trimpath -ldflags '-s -w' -o bin/codeforge.exe ./cmd/agent
 
 以下命令适用于 Bash：
 ```bash
-# Linux / Termux 本机构建
+# Linux 本机构建
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/codeforge ./cmd/agent
 
-# 交叉编译三件
+# 交叉编译发布产物
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/codeforge-windows-amd64.exe ./cmd/agent
 CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/codeforge-linux-amd64 ./cmd/agent
-CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o bin/codeforge-android-arm64 ./cmd/agent
 ```
 
 有 Makefile 的话 `make build` / `make all-platforms` 一次跑完。
@@ -168,7 +157,7 @@ CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o b
 
 **密钥只从系统环境变量读**，不读任何密钥文件。这样密钥不会躺在项目目录里被同步盘、备份脚本随手带走。
 
-**Linux / macOS / Termux**（写进 shell 配置持久生效）：
+**Linux / macOS**（写进 shell 配置持久生效）：
 
 ```bash
 echo 'export CODEFORGE_API_KEY=sk-...' >> ~/.bashrc
@@ -236,7 +225,7 @@ WARN  供应商库 config/providers.yaml 引用了未设置的环境变量：GAT
 ```bash
 # 方式一：启动器（内部自动切到项目根目录，与当前目录无关）
 ./cf.cmd          # Windows
-./cf              # Linux / Termux
+./cf              # Linux
 
 # 方式二：直接运行 —— 两个路径都给绝对值，从哪启动都一样
 ./bin/codeforge -config /path/to/project/config -workdir /path/to/project
@@ -297,7 +286,7 @@ codeforge -continue -workdir <目录>  先切到该工作区，再回到它上�
 2. **工作区必须是绝对路径** —— 相对路径没有意义（工作区没法相对自己），放任它会被按进程当前目录解析，换个启动方式工作区就变了。
 3. **配置的工作区不存在或不是目录**，按未选择工作区处理，不会静默设成工作目录。
 
-另外：**没有图形环境时加 `-no-open`**（Termux、无 GUI 服务器、容器内都需要）。
+另外：**没有图形环境时加 `-no-open`**（无 GUI 服务器、容器内都需要）。
 
 ### 无 GUI 服务器（Linux / BSD / 容器 / NAS）
 
@@ -371,22 +360,6 @@ chmod 600 /etc/codeforge/env && chown root:root /etc/codeforge/env
 chmod +x bin/codeforge-linux-amd64
 ./bin/codeforge-linux-amd64 -config /path/to/project/config -workdir /path/to/project
 ```
-
-### Android Termux arm64
-
-```bash
-pkg install golang git -y        # 需要 Go 与 git
-git clone https://github.com/raine-x/CodeForge-GO.git
-cd CodeForge-GO
-CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o bin/codeforge ./cmd/agent
-
-# 申请存储权限（读取手机文件时需要）
-termux-setup-storage
-
-./bin/codeforge -no-open
-```
-
-用手机浏览器开 `http://127.0.0.1:8420`。也可以用 `cf-termux.sh` 一键启动。
 
 ### 最小化部署
 
@@ -531,10 +504,9 @@ go test ./...
 node web/test/render_md.test.js
 node web/test/attachments.test.js
 node web/test/picker.test.js
-# 三平台编译
+# 发布版编译
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/ ./cmd/agent
 CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/ ./cmd/agent
-CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o bin/ ./cmd/agent
 ```
 
 `go test -race` 需要 C 编译器（`-race` 依赖 cgo）。没装 gcc 时不可用 —— 这也是为什么并发相关的护栏主要是**结构性断言**（解析源码确认形状）而不是竞态检测。
@@ -556,7 +528,7 @@ CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o b
 | [pkg/tools](pkg/tools) · [pkg/security](pkg/security) · [pkg/backend](pkg/backend) | 工具执行、策略判定、文件及进程操作 |
 | [pkg/store](pkg/store) · [config](config) | SQLite 持久化与应用配置 |
 
-开发约定见 [AGENTS.md](AGENTS.md)。版本核对、三平台构建及附件校验见[发布流程](docs/releasing.md)。
+开发约定见 [AGENTS.md](AGENTS.md)。版本核对、Windows 和 Linux 构建及附件校验见[发布流程](docs/releasing.md)。
 
 ## 目录结构
 
