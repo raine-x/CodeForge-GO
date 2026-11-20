@@ -23,7 +23,7 @@ endif
 
 LOCALBIN := bin/$(BINARY)$(BINEXT)
 
-.PHONY: all build windows linux-amd64 linux-arm64 android-arm64 all-platforms \
+.PHONY: all build windows linux-amd64 android-arm64 all-platforms \
         run stop restart test test-go test-web test-llm test-e2e vet fmt clean
 
 all: build
@@ -57,12 +57,12 @@ windows:
 linux-amd64:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-linux-amd64 $(CMD)
 
-## Android Termux arm64
+## Android ARM64 development build (excluded from public releases)
 android-arm64:
 	CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-android-arm64 $(CMD)
 
-## 全部平台（默认不含 linux-arm64，见上）
-all-platforms: windows linux-amd64 android-arm64
+## Public release assets
+all-platforms: windows linux-amd64
 
 ## 全部测试（Go 单测 / 集成 + 前端渲染器 + LLM 端点 pytest）
 test: test-go test-web test-llm

@@ -15,7 +15,6 @@ $env:CGO_ENABLED = '0'
 $targets = @(
   @{ OS = 'windows'; Arch = 'amd64'; File = 'codeforge-windows-amd64.exe' }
   @{ OS = 'linux';   Arch = 'amd64'; File = 'codeforge-linux-amd64' }
-  @{ OS = 'android'; Arch = 'arm64'; File = 'codeforge-android-arm64' }
 )
 foreach ($target in $targets) {
   $env:GOOS = $target.OS
@@ -34,13 +33,12 @@ Remove-Item Env:GOOS, Env:GOARCH
 |---|---|
 | Windows x64 | `codeforge-windows-amd64.exe` |
 | Linux x64 | `codeforge-linux-amd64` |
-| Android ARM64（Termux） | `codeforge-android-arm64` |
 | SHA-256 校验值 | `SHA256SUMS.txt` |
 
-当前 Makefile 提供这三个构建目标。Windows MSI 需要独立的安装包定义与安装、卸载验证。
+当前 Makefile 提供这两个公开发布目标。Windows MSI 需要独立的安装包定义与安装、卸载验证。
 
 ## 保存 Release 草稿
 
 1. 在 [GitHub Releases](https://github.com/raine-x/CodeForge-GO/releases) 创建草稿。新标签应指向步骤一确认的提交。
 2. 加入发布说明和上表附件。GitHub 会按标签提供源码压缩包；用户可从同版本源码取用 `config/` 和 `LICENSE`。
-3. 下载草稿附件复核 SHA-256。在各目标平台启动程序并打开浏览器界面。Termux 下把二进制放在 `$HOME` 并赋执行权限。核对版本、目标提交和附件后再发布。候选版勾选 **Set as a pre-release**。
+3. 下载草稿附件复核 SHA-256。在各目标平台启动程序并打开浏览器界面。核对版本、目标提交和附件后再发布。候选版勾选 **Set as a pre-release**。

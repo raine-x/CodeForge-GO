@@ -2,7 +2,7 @@
 
 ## 编译准则
 改动后就编译，编译产物放在bin/
-目标平台：windos-exe,windows-msi,linux-amd64,android-arm64,只允许产出codeforge产物，不允许其他产物
+公开发布目标：Windows、Linux。Android ARM64 构建仅供开发使用。只允许产出 CodeForge 构建产物。
  
 ## GIT
 
